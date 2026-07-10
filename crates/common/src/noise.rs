@@ -58,6 +58,29 @@ pub fn origin_handshake(origin_private: &[u8; 32]) -> Result<snow::HandshakeStat
         .build_responder()
 }
 
+/// Length-prefix a message for streaming over a byte transport (2-byte
+/// big-endian length + body). Noise messages are variable-length and capped at
+/// 65535 bytes, so they are framed before being relayed (P3.3).
+pub fn frame(msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + msg.len());
+    out.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    out.extend_from_slice(msg);
+    out
+}
+
+/// Split one framed message off the front of `buf`, returning
+/// `(message, bytes_consumed)` if a complete frame is present, else `None`.
+pub fn take_frame(buf: &[u8]) -> Option<(&[u8], usize)> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let n = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if buf.len() < 2 + n {
+        return None;
+    }
+    Some((&buf[2..2 + n], 2 + n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +159,30 @@ mod tests {
             result.is_err(),
             "handshake must fail when the client pins the wrong Origin key"
         );
+    }
+
+    #[test]
+    fn frame_take_roundtrip() {
+        let framed = frame(b"noise-msg");
+        let (msg, consumed) = take_frame(&framed).unwrap();
+        assert_eq!(msg, b"noise-msg");
+        assert_eq!(consumed, framed.len());
+    }
+
+    #[test]
+    fn take_frame_needs_full_frame() {
+        let framed = frame(b"hello");
+        assert!(take_frame(&framed[..1]).is_none(), "fewer than 2 length bytes");
+        assert!(take_frame(&framed[..4]).is_none(), "body incomplete");
+    }
+
+    #[test]
+    fn take_frame_leaves_remainder() {
+        let mut buf = frame(b"a");
+        buf.extend_from_slice(&frame(b"bb"));
+        let (m1, c1) = take_frame(&buf).unwrap();
+        assert_eq!(m1, b"a");
+        let (m2, _c2) = take_frame(&buf[c1..]).unwrap();
+        assert_eq!(m2, b"bb");
     }
 }

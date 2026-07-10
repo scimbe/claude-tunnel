@@ -112,6 +112,7 @@ Provider-blind E2E via the Noise Protocol Framework (ADR-0013): Noise_IK, static
 - Complete a Noise_IK handshake between two parties; derive transport keys; encrypt/decrypt a message end to end.
 
 ### P3.3 — Noise session over QUIC (through the relay)
+> **Decomposed (cycle 21):** P3.3a (message framing codec — 2-byte length prefix, since Noise messages are variable-length) · P3.3b (drive the Noise handshake + transport through the relay/QUIC; prove the Edge sees only ciphertext).
 - Run the Noise session inside the QUIC stream so the Edge relays only ciphertext (provider-blind).
 
 ### P3.4 — Capability import (Client)

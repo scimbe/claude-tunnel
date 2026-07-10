@@ -17,7 +17,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 
 **🎯 Milestone 2 complete** (relay-first path): P2.1 ✅ (Tunnel Registry) · P2.2 ✅ (Capability register) · P2.3 ✅ (P2.3a token resolution) · P2.4 ✅ (P2.4a relay primitive + P2.4b QUIC relay). Deferred: NAT hole-punching (P2P direct path), full end-to-end wiring.
 
-**Milestone 3** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ (Noise static keypair + Origin Identity) · P3.2 ✅ (Noise_IK handshake + E2E encrypt/decrypt, wrong-pin rejected) · P3.3 ⏳ (Noise over QUIC) · P3.4 (Capability import).
+**Milestone 3** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ · P3.2 ✅ (Noise_IK handshake + E2E, wrong-pin rejected) · P3.3 🔨 (P3.3a ✅ framing codec · P3.3b ⏳ E2E over relay/QUIC) · P3.4 (Capability import).
 
 ## Cycle log
 
@@ -41,6 +41,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 18 — P2.4b**: `ct-edge::relay::relay_quic` joins each `(RecvStream, SendStream)` via `tokio::io::join` and relays through the P2.4a primitive. First QUIC integration test (echo + close) was racy (`ConnectionLost` on teardown) → **fixed** by simplifying to a deterministic one-directional client→agent relay test. **P2.4 done → Milestone 2 relay-first path complete.** Full workspace 44 tests green. Committed.
 - **Cycle 19 — P3.1**: extended the DAG to Milestone 3 (Noise E2E). P3.1: `ct-common::noise` — `generate_static_keypair()` (Noise X25519 via `snow`, params `Noise_IK_25519_ChaChaPoly_BLAKE2s`); public half is the Origin Identity. Tests: 32-byte keys, distinct pairs, public↔OriginIdentity. Full workspace 47 tests green. Committed.
 - **Cycle 20 — P3.2**: `client_handshake` (initiator, pins Origin public) + `origin_handshake` (responder) build Noise_IK states. Tests: full 2-message handshake establishes, transport-mode encrypt/decrypt both directions round-trips, and a client pinning the wrong Origin key fails the handshake. The provider-blind E2E crypto core. Full workspace 49 tests green. Committed.
+- **Cycle 21 — P3.3a**: decomposed P3.3. P3.3a: `ct-common::noise::frame`/`take_frame` — 2-byte big-endian length-prefix framing so variable-length Noise messages can stream over the relay. Tests: round-trip, incomplete-frame → None, multi-frame remainder. Full workspace 52 tests green. Committed.
 
 ## Verification method
 
