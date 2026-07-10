@@ -5,6 +5,7 @@
 //! without KYC. The Edge issues a Challenge; the Client solves it; the Edge
 //! verifies cheaply. P4.1 is the primitive.
 
+use crate::RoutingToken;
 use sha2::{Digest, Sha256};
 
 /// A proof-of-work challenge: find a `solution` such that
@@ -51,6 +52,38 @@ pub fn solve(challenge: &Challenge) -> u64 {
     }
 }
 
+/// Why a gated rendezvous request was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GateError {
+    Malformed,
+    BadProofOfWork,
+}
+
+/// Build a PoW-gated rendezvous request for `token` by solving `challenge`.
+/// Wire form: `solution(8 LE) | token(32)`.
+pub fn build_request(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
+    let solution = solve(challenge);
+    let mut req = Vec::with_capacity(40);
+    req.extend_from_slice(&solution.to_le_bytes());
+    req.extend_from_slice(&token.0);
+    req
+}
+
+/// Verify a PoW-gated rendezvous request against `challenge` and extract the
+/// Routing Token. Rejects malformed requests and insufficient proof of work.
+pub fn check_request(challenge: &Challenge, request: &[u8]) -> Result<RoutingToken, GateError> {
+    if request.len() != 40 {
+        return Err(GateError::Malformed);
+    }
+    let solution = u64::from_le_bytes(request[..8].try_into().unwrap());
+    if !verify(challenge, solution) {
+        return Err(GateError::BadProofOfWork);
+    }
+    let mut token = [0u8; 32];
+    token.copy_from_slice(&request[8..40]);
+    Ok(RoutingToken(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +126,34 @@ mod tests {
             difficulty: (actual + 1) as u8,
         };
         assert!(!verify(&harder, s));
+    }
+
+    #[test]
+    fn build_then_check_roundtrips() {
+        let c = challenge(12);
+        let token = RoutingToken([3u8; 32]);
+        let req = build_request(&c, &token);
+        assert_eq!(check_request(&c, &req), Ok(token));
+    }
+
+    #[test]
+    fn check_rejects_malformed_length() {
+        assert_eq!(check_request(&challenge(8), &[0u8; 10]), Err(GateError::Malformed));
+    }
+
+    #[test]
+    fn check_rejects_insufficient_pow() {
+        // Solve at difficulty 4, then check against a challenge demanding more
+        // bits than that solution provides — deterministically rejected.
+        let easy = challenge(4);
+        let token = RoutingToken([4u8; 32]);
+        let req = build_request(&easy, &token);
+        let solution = u64::from_le_bytes(req[..8].try_into().unwrap());
+        let actual = leading_zero_bits(&hash(&easy.nonce, solution));
+        let harder = Challenge {
+            nonce: easy.nonce,
+            difficulty: (actual + 1) as u8,
+        };
+        assert_eq!(check_request(&harder, &req), Err(GateError::BadProofOfWork));
     }
 }

@@ -127,6 +127,7 @@ Proof-of-work gates expensive Edge operations against floods/sybil (the deferred
 - **Surface:** `crates/common/src/pow.rs` (sha2). **Context:** ADR-0018.
 
 ### P4.2 — Gate rendezvous behind PoW
+> **Decomposed (cycle 25):** P4.2a (`ct-common::pow::build_request`/`check_request` — solve+pack, verify+unpack the gated request) · P4.2b (wire into the QUIC rendezvous: Edge issues a Challenge, Client solves, Edge checks before resolving the token).
 - `resolve_rendezvous` requires a valid PoW solution before resolving a token.
 
 ### P4.3 — Per-token rate limiting
