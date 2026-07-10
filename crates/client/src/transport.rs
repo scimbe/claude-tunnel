@@ -1,6 +1,7 @@
 //! Client → Edge transport (M5.3a).
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 
 use ct_common::pow::{build_request, Challenge};
@@ -43,6 +44,11 @@ pub async fn client_exchange(conn: &Connection, input: &[u8]) -> Result<Vec<u8>,
     send.finish()?;
     let response = recv.read_to_end(64 * 1024).await?;
     Ok(response)
+}
+
+/// Load an Edge certificate (DER) the Edge published to a shared path.
+pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'static>> {
+    Ok(CertificateDer::from(std::fs::read(path)?))
 }
 
 /// Tunnel `input` to the Origin through the Edge in one stream, matching the

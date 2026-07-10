@@ -148,4 +148,15 @@ mod tests {
         conn.close(0u32.into(), b"done");
         edge.await.unwrap().expect("edge resolved");
     }
+
+    #[tokio::test]
+    async fn load_cert_reads_written_der() {
+        use crate::transport::load_cert;
+        let (_endpoint, cert) =
+            ct_edge::transport::build_server_endpoint_with_cert().expect("cert");
+        let path = std::env::temp_dir().join(format!("ct-client-cert-{}.der", std::process::id()));
+        std::fs::write(&path, cert.as_ref()).unwrap();
+        assert_eq!(load_cert(&path).unwrap(), cert);
+        let _ = std::fs::remove_file(&path);
+    }
 }
