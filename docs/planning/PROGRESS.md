@@ -19,7 +19,9 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 
 **🎯 Milestone 3 complete** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ (keypair) · P3.2 ✅ (Noise_IK handshake) · P3.3 ✅ (framing + **E2E through relay: edge sees only ciphertext**) · P3.4 ✅ (Capability import + handshake pinning). Provider-blind mesh crypto demonstrated end to end.
 
-**Milestone 4** (PoW-gated rendezvous, SPEC §10 item 5, ADR-0018): P4.1 ✅ (PoW challenge/solve/verify) · P4.2 🔨 (P4.2a ✅ gate helpers · P4.2b ⏳ wire into QUIC rendezvous) · P4.3 (per-token rate limiting). NAT hole-punching (SPEC §10 item 4) deferred — not hermetically testable (needs real network topology).
+**Milestone 4** (PoW-gated rendezvous, SPEC §10 item 5, ADR-0018): P4.1 ✅ (PoW challenge/solve/verify) · P4.2 🔨 (P4.2a ✅ gate helpers · P4.2b ⏳ wire into QUIC rendezvous) · P4.3 (per-token rate limiting).
+
+**⇢ Reframe (cycle 26): academic testbed + BA thesis, all in Docker.** Emulate the topology in Docker (no host sudo/mininet → containers with `--cap-add=NET_ADMIN` + `tc netem` + iptables-NAT), run performance tests, write a German BA thesis (HAW-konform, scaffolded), compiled via texlive-in-Docker. NAT/hole-punching (SPEC §10 item 4) **now in scope** via emulation (M5). New milestones: **M5** Docker testbed (needs runnable binaries first) · **M6** performance evaluation · **M7** BA thesis. Order: finish M4 → M5 → M6 → M7.
 
 ## Cycle log
 

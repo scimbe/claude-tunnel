@@ -133,6 +133,40 @@ Proof-of-work gates expensive Edge operations against floods/sybil (the deferred
 ### P4.3 — Per-token rate limiting
 - Rate-limit rendezvous per Routing Token / identity.
 
+## Reframe (cycle 26): academic testbed + BA thesis — everything in Docker
+
+The project is now an **academic testbed**: emulate the full topology in Docker, run performance tests, and write a **BA thesis** (HAW Hamburg conventions, **German**, Abstract DE+EN, scaffolded). **Everything runs in Docker** — the host has no passwordless sudo and no mininet, so Docker containers with `--cap-add=NET_ADMIN` + `tc netem` + an iptables NAT container are the mininet-equivalent; LaTeX and plotting are also containerized. **NAT / hole-punching (SPEC §10 item 4), previously deferred, is now in scope via emulation.** Priority: finish M4 → M5 testbed → M6 perf → M7 thesis.
+
+## Milestone 5 — Docker emulation testbed
+
+Prereq: the library crates need runnable **binaries** (the deferred end-to-end wiring).
+
+- **M5.1** Edge binary (`ct-edge` bin): QUIC listener wiring auth + rendezvous + relay from config.
+- **M5.2** Agent binary: enroll → register tunnel → serve a local origin.
+- **M5.3** Client tool: import Capability → PoW-gated rendezvous → Noise E2E to origin.
+- **M5.4** Multi-stage Dockerfiles (build → slim runtime) for edge/agent/client.
+- **M5.5** `docker compose` topology (client-net / edge / agent-net) + `tc netem` link shaping + NAT-gateway container (un-defers hole-punching).
+- **M5.6** End-to-end testbed smoke: client reaches origin through the emulated net; assert the edge relays only ciphertext.
+- **Verification:** `docker compose up` + scripted assertion (not `cargo test`).
+
+## Milestone 6 — Performance evaluation
+
+- **M6.1** Rust bench harness: handshake latency, connection setup, throughput, relay overhead.
+- **M6.2** netem sweep (delay/loss/bandwidth matrix) → metrics to CSV.
+- **M6.3** Plots from CSV (matplotlib in a python container).
+- **M6.4** Results tables + analysis.
+- **Verification:** benches run in-container → CSV + PNG artifacts under `docs/thesis/data/`.
+
+## Milestone 7 — BA thesis (German, HAW-konform, Docker/texlive)
+
+- **M7.1** LaTeX scaffold: Titelblatt, Eidesstattliche Erklärung, Abstract (DE+EN), Gliederung, BibLaTeX; compiled to PDF via a **texlive Docker image**.
+- **M7.2** Einleitung + Grundlagen (ZK-Tunnel, Noise, QUIC, PoW).
+- **M7.3** Architektur (aus ADRs/CONTEXT/SPEC).
+- **M7.4** Implementierung (aus crates).
+- **M7.5** Evaluation (aus M6-Ergebnissen + Plots).
+- **M7.6** Fazit + Ausblick (Backlog-Risiken).
+- **Verification:** thesis PDF compiles cleanly in the texlive container.
+
 ## Notes for the run
 
 - **Readiness gate (D2):** each packet's acceptance tests + stubs must resolve against its bundle before a Haiku agent is assigned; P1.4 is the first likely **decompose** candidate.
