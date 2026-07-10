@@ -1,5 +1,7 @@
 //! Claude Tunnel Agent — customer-run, outbound-only. Custodian of the Origin
-//! key; mints Capabilities. P0.1 is the crate skeleton; transport lands in P1.2.
+//! key; mints Capabilities. See ADR-0004 (transport), ADR-0005 (identity).
+
+pub mod transport;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
 pub const CRATE_NAME: &str = "ct-agent";

@@ -50,6 +50,8 @@ Independent after P0.2: **P1.1, P1.2, P1.3** run in parallel. **P1.4** waits on 
 
 ## P1.2 — Agent QUIC dialer + TCP fallback detection
 
+> **Decomposed (cycle 6):** split into P1.2a (transport-selection decision + QUIC dialer + interop test), P1.2b (reconnect-on-drop with backoff), P1.2c (actual HTTP/2-over-TCP fallback transport). P1.2a done; b/c are follow-ups (P1.3 enrollment prioritised next for the Milestone-1 critical path).
+
 - **Goal:** Agent dials outbound QUIC to a given Edge address; detects blocked UDP and selects HTTP/2-over-TCP fallback.
 - **Acceptance tests:** Agent connects to a P1.1 test Edge; unit test forces UDP-blocked and asserts fallback selection; reconnect on drop.
 - **Allowed surface:** `crates/agent/` (transport module only).

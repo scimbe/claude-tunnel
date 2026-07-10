@@ -67,6 +67,10 @@ name = "ct-agent"
 version = "0.0.0"
 dependencies = [
  "ct-common",
+ "ct-edge",
+ "quinn",
+ "rustls",
+ "tokio",
 ]
 
 [[package]]
