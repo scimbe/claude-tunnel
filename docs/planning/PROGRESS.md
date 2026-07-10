@@ -15,7 +15,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 
 **🎯 Milestone 1 complete** (P0.1–P1.4 core): authenticated QUIC transport between Agent and Edge, backed by enrollment + short-lived credentials. Deferred enhancements: P1.2b (reconnect), P1.2c (HTTP/2-over-TCP fallback).
 
-**Milestone 2** (Tunnel Registry + Rendezvous, SPEC §10 item 2): P2.1 ✅ (Tunnel Registry) · P2.2 ✅ (agent mints Capability + registers token) · P2.3 🔨 (P2.3a ✅ token resolution) · P2.4 ⏳ (relay data path, incl. P2.3b byte relay).
+**Milestone 2** (Tunnel Registry + Rendezvous, SPEC §10 item 2): P2.1 ✅ · P2.2 ✅ · P2.3 🔨 (P2.3a ✅ token resolution) · P2.4 🔨 (P2.4a ✅ relay primitive · P2.4b ⏳ wire onto QUIC streams).
 
 ## Cycle log
 
@@ -35,6 +35,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 14 — P2.1**: extended the DAG to Milestone 2 (Tunnel Registry + Rendezvous). P2.1: `ct-control-plane::registry::TunnelRegistry` — in-memory `RoutingToken` → `TunnelInfo` (tenant, agent); `register`/`lookup`/`unregister`. Tests: register→lookup, unknown→None, unregister-removes (+ idempotent), re-register overwrites. Full workspace 38 tests green. Committed.
 - **Cycle 15 — P2.2**: `ct-agent::capability::mint_capability(origin, edge_addr)` — mints a `Capability` with a fresh random Routing Token (ADR-0014). Tests: distinct tokens across mints; minted token registers + looks up in a `TunnelRegistry` (interop with control-plane). Full workspace 40 tests green. Committed.
 - **Cycle 16 — P2.3a**: decomposed P2.3. P2.3a: `ct-edge::rendezvous::resolve_rendezvous(endpoint, is_known)` — reads a 32-byte Routing Token a Client presents, resolves it via an `is_known` predicate (keeps Edge decoupled from the control-plane registry type), replies OK/NO. Interop tests over QUIC: known token resolves, unknown rejected. Full workspace 42 tests green. Committed.
+- **Cycle 17 — P2.4a**: decomposed P2.4. P2.4a: `ct-edge::relay::relay(a, b)` — provider-blind bidirectional byte relay via `tokio::io::copy_bidirectional` (never inspects bytes). Deterministic test with in-memory `duplex` streams: `c2a`/`a2c` cross correctly, byte counts (3,3). Added tokio `io-util`. Full workspace 43 tests green. Committed.
 
 ## Verification method
 

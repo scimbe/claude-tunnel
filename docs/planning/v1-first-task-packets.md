@@ -97,6 +97,7 @@ Relay path first (correctness before NAT traversal), per ADR-0006 / ADR-0015.
 - Client presents a Routing Token to the Edge; the Edge looks up the registry and relays between Client and Agent (relay-first; NAT hole-punching is a later packet).
 
 ### P2.4 — Relay data path
+> **Decomposed (cycle 17):** P2.4a (generic provider-blind bidirectional relay primitive via `copy_bidirectional`, tested with in-memory duplex) · P2.4b (wire the relay onto paired QUIC streams: Client stream ↔ Agent tunnel).
 - Edge relays opaque ciphertext bytes between the Client stream and the Agent tunnel (provider-blind).
 
 ## Notes for the run

@@ -2,6 +2,7 @@
 //! ciphertext only as fallback; never in the trust path. See ADR-0004/0015.
 
 pub mod auth;
+pub mod relay;
 pub mod rendezvous;
 pub mod transport;
 
