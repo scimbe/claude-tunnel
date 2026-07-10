@@ -142,7 +142,7 @@ The project is now an **academic testbed**: emulate the full topology in Docker,
 Prereq: the library crates need runnable **binaries** (the deferred end-to-end wiring).
 
 - **M5.1** Edge binary (`ct-edge` bin): QUIC listener wiring auth + rendezvous + relay from config.
-  > **Decomposed (cycle 28):** M5.1a (daemon skeleton — `EdgeConfig` from env, bind to configured addr, accept loop; runnable `main.rs`) · M5.1b (rendezvous + relay orchestration: pair Client/Agent connections via the registry).
+  > **Decomposed (cycle 28–29):** M5.1a (daemon skeleton — `EdgeConfig` from env, bind, accept loop) ✅ · M5.1b (`EdgeState<H>` routing registry: token → Agent handle, `is_known` plugs into gated rendezvous) ✅ · M5.1c (async serve orchestration: Agent-register path + Client route→relay path, validated in the M5.6 testbed smoke).
 - **M5.2** Agent binary: enroll → register tunnel → serve a local origin.
 - **M5.3** Client tool: import Capability → PoW-gated rendezvous → Noise E2E to origin.
 - **M5.4** Multi-stage Dockerfiles (build → slim runtime) for edge/agent/client.

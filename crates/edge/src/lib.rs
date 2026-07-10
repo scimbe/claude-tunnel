@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod relay;
 pub mod rendezvous;
+pub mod state;
 pub mod transport;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
