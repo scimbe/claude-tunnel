@@ -9,6 +9,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use ct_common::credential::SignedCredential;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 
@@ -63,6 +64,23 @@ pub async fn dial_quic(
     Ok(conn)
 }
 
+/// Present `signed` to the Edge over a fresh bidirectional stream and await the
+/// Edge's decision. Returns `Ok(())` only if the Edge accepted the credential.
+pub async fn present_credential(
+    conn: &Connection,
+    signed: &SignedCredential,
+) -> Result<(), BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&signed.encode()).await?;
+    send.finish()?;
+    let ack = recv.read_to_end(64).await?;
+    if ack == b"OK" {
+        Ok(())
+    } else {
+        Err("edge rejected credential".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +116,73 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         server_task.await.expect("edge task join");
+    }
+
+    // --- P1.4d-ii: credential handshake over QUIC ---
+
+    use crate::identity::AgentIdentity;
+    use ct_common::{AgentId, TenantId};
+    use ct_control_plane::credential::CredentialIssuer;
+    use ct_control_plane::enrollment::Enrollment;
+    use ct_control_plane::issuance::mint_for_enrolled;
+
+    fn enrolled_credential(
+        expires_at: u64,
+    ) -> (ct_common::credential::SignedCredential, [u8; 32]) {
+        let issuer = CredentialIssuer::generate();
+        let mut enrollment = Enrollment::new();
+        let tenant = TenantId("tenant-1".into());
+        let token = enrollment.issue_join_token(tenant);
+        let identity = AgentIdentity::generate();
+        let agent_id = AgentId("agent-1".into());
+        enrollment
+            .redeem(&token, agent_id.clone(), identity.public_key_bytes())
+            .unwrap();
+        let signed = mint_for_enrolled(&issuer, &enrollment, &agent_id, expires_at).unwrap();
+        (signed, issuer.public_key_bytes())
+    }
+
+    #[tokio::test]
+    async fn agent_authenticates_to_edge_with_valid_credential() {
+        let (signed, issuer_pk) = enrolled_credential(1_000);
+        let (server, cert) =
+            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+
+        let server_task = tokio::spawn(async move {
+            let conn = ct_edge::auth::accept_and_authenticate(&server, &issuer_pk, 500)
+                .await
+                .map_err(|e| e.to_string())?;
+            conn.closed().await;
+            Ok::<(), String>(())
+        });
+
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        present_credential(&conn, &signed)
+            .await
+            .expect("edge accepts valid credential");
+        conn.close(0u32.into(), b"done");
+        server_task.await.expect("join").expect("edge auth ok");
+    }
+
+    #[tokio::test]
+    async fn edge_rejects_expired_credential() {
+        let (signed, issuer_pk) = enrolled_credential(100); // expires at 100
+        let (server, cert) =
+            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+
+        let server_task = tokio::spawn(async move {
+            // now = 500 >= 100 → expired → Err
+            ct_edge::auth::accept_and_authenticate(&server, &issuer_pk, 500)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let result = present_credential(&conn, &signed).await;
+        assert!(result.is_err(), "expired credential must be rejected");
+        let _ = server_task.await;
     }
 }
