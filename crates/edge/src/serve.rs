@@ -7,6 +7,7 @@
 
 use crate::relay::relay_quic;
 use crate::state::EdgeState;
+use ct_common::pow::{check_request, Challenge};
 use ct_common::RoutingToken;
 use quinn::{Connection, RecvStream, SendStream};
 
@@ -47,6 +48,47 @@ pub async fn route_and_relay(
     let (agent_send, agent_recv) = agent_conn.open_bi().await?;
     relay_quic(client_send, client_recv, agent_send, agent_recv).await?;
     Ok(())
+}
+
+/// Serve one connection by dispatching on its first stream's role byte. `'A'`
+/// registers an Agent tunnel (`token`); `'C'` runs a PoW-gated rendezvous, then
+/// routes and relays the same stream to the Agent. This is the unified
+/// per-connection Edge protocol the daemon's accept loop runs.
+pub async fn serve_connection(
+    conn: &Connection,
+    state: &EdgeState<Connection>,
+    challenge: &Challenge,
+) -> Result<(), BoxError> {
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let mut role = [0u8; 1];
+    recv.read_exact(&mut role).await?;
+
+    match role[0] {
+        b'A' => {
+            let mut token = [0u8; 32];
+            recv.read_exact(&mut token).await?;
+            state.register(RoutingToken(token), conn.clone());
+            send.write_all(b"OK").await?;
+            send.finish()?;
+            Ok(())
+        }
+        b'C' => {
+            let mut chal = [0u8; 17];
+            chal[..16].copy_from_slice(&challenge.nonce);
+            chal[16] = challenge.difficulty;
+            send.write_all(&chal).await?;
+
+            let mut req = [0u8; 40];
+            recv.read_exact(&mut req).await?;
+            let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
+
+            let agent_conn = state.route(&token).ok_or("no agent tunnel for token")?;
+            let (agent_send, agent_recv) = agent_conn.open_bi().await?;
+            relay_quic(send, recv, agent_send, agent_recv).await?;
+            Ok(())
+        }
+        other => Err(format!("unknown role byte: {other}").into()),
+    }
 }
 
 #[cfg(test)]

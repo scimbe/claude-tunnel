@@ -3,6 +3,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use ct_common::pow::{build_request, Challenge};
+use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 
@@ -39,6 +41,33 @@ pub async fn client_exchange(conn: &Connection, input: &[u8]) -> Result<Vec<u8>,
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(input).await?;
     send.finish()?;
+    let response = recv.read_to_end(64 * 1024).await?;
+    Ok(response)
+}
+
+/// Tunnel `input` to the Origin through the Edge in one stream, matching the
+/// Edge's `serve_connection` `'C'` path: send role `'C'`, read the challenge,
+/// present `solution | token`, send the data, and read the tunnel's response.
+pub async fn client_tunnel(
+    conn: &Connection,
+    token: &RoutingToken,
+    input: &[u8],
+) -> Result<Vec<u8>, BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(b"C").await?;
+
+    let mut chal = [0u8; 17];
+    recv.read_exact(&mut chal).await?;
+    let challenge = Challenge {
+        nonce: chal[..16].try_into().unwrap(),
+        difficulty: chal[16],
+    };
+
+    let req = build_request(&challenge, token); // solution(8) | token(32) = 40 bytes
+    send.write_all(&req).await?;
+    send.write_all(input).await?;
+    send.finish()?;
+
     let response = recv.read_to_end(64 * 1024).await?;
     Ok(response)
 }

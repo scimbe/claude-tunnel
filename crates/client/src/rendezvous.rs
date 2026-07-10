@@ -36,6 +36,74 @@ mod tests {
     use crate::transport::{client_exchange, dial_edge};
 
     #[tokio::test]
+    async fn client_tunnels_data_to_agent_through_edge() {
+        use crate::transport::client_tunnel;
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+
+        let token = RoutingToken([4u8; 32]);
+        let challenge = Challenge {
+            nonce: [0x33; 16],
+            difficulty: 8,
+        };
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+
+        // Edge: serve the Agent (register) then the Client (rendezvous+route+relay).
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&agent_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&client_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            client_conn.closed().await; // hold the client conn until it closes
+            Ok::<(), String>(())
+        });
+
+        // Agent: register ('A' | token), then echo the relayed stream.
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut ra_send, mut ra_recv) = agent_conn.open_bi().await.unwrap();
+        ra_send.write_all(b"A").await.unwrap();
+        ra_send.write_all(&token.0).await.unwrap();
+        ra_send.finish().unwrap();
+        assert_eq!(ra_recv.read_to_end(8).await.unwrap(), b"OK");
+        let agent_task = tokio::spawn(async move {
+            let (mut s, mut r) = agent_conn.accept_bi().await.unwrap();
+            let data = r.read_to_end(1024).await.unwrap();
+            s.write_all(&data).await.unwrap();
+            s.finish().unwrap();
+            agent_conn.closed().await;
+        });
+
+        // Client: tunnel data through the edge to the agent.
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let resp = client_tunnel(&conn, &token, b"payload")
+            .await
+            .expect("client tunnel");
+        assert_eq!(
+            resp, b"payload",
+            "client data reaches the agent and echoes back through the edge"
+        );
+        conn.close(0u32.into(), b"done");
+        agent_task.abort();
+        let _ = edge.await;
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
