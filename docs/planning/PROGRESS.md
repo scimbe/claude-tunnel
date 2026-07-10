@@ -11,7 +11,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 | P1.1 Edge QUIC listener | ✅ done | P1.1a endpoint/cert · P1.1b connect+echo · P1.1c reject untrusted — 4 ct-edge tests |
 | P1.2 Agent dialer + TCP fallback | 🔨 in progress | P1.2a ✅ (selection + QUIC dialer + interop) · P1.2b (reconnect) · P1.2c (TCP fallback transport) |
 | P1.3 join-token enrollment | ✅ done | P1.3a service + P1.3b agent ed25519 identity + enroll interop |
-| P1.4 short-lived mTLS auth | 🔨 in progress | P1.4a ✅ · P1.4b ✅ · P1.4c ✅ (shared credential + Edge verify) · P1.4d ⏳ (wire into QUIC handshake) |
+| P1.4 short-lived mTLS auth | 🔨 in progress | P1.4a–c ✅ · P1.4d-i ✅ (credential wire encode/decode) · P1.4d-ii ⏳ (QUIC auth handshake) |
 
 ## Cycle log
 
@@ -26,6 +26,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 9 — P1.4a**: decomposed P1.4 into a/b/c. P1.4a: `ct-control-plane::credential` — `CredentialIssuer` mints ed25519 issuer-signed, expiry-bounded credentials; `verify(issuer_pubkey, signed, now)` checks signature + expiry. Time passed in (no wall-clock in lib). Tests: verify-ok-before-expiry, expired, wrong-issuer, tampered-claims. Full workspace 24 tests green. Committed.
 - **Cycle 10 — P1.4b**: `ct-control-plane::issuance::mint_for_enrolled` — mints a credential only for an enrolled Agent (Tenant taken from the binding, not the caller); unenrolled → `MintError::NotEnrolled`. Split Edge-side verify into P1.4c (needs credential types shared across crates — avoid coupling edge→control-plane hastily). 2 tests; full workspace 26 tests green. Committed.
 - **Cycle 11 — P1.4c**: refactor — moved credential claims/wire-form/`verify` to `ct-common::credential`; `ct-control-plane::credential` re-exports them + keeps `CredentialIssuer` (signing key); new `ct-edge::auth::verify_presented_credential` lets the Edge verify statelessly. All prior tests survived the move; full workspace 29 tests green. Committed.
+- **Cycle 12 — P1.4d-i**: caught that serde can't derive `Deserialize` for `[u8; 64]`, so gave `SignedCredential` a hand-rolled binary wire form (`signature | tenant_len | tenant | agent_len | agent | expires_at`) via `encode`/`decode`; added `CredError::Malformed`. Tests: round-trip, truncated, trailing-garbage. Split P1.4d into d-i (this) + d-ii (QUIC handshake). Full workspace 32 tests green. Committed.
 
 ## Verification method
 

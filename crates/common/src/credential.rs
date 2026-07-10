@@ -38,12 +38,14 @@ pub struct SignedCredential {
     pub signature: [u8; 64],
 }
 
-/// Why credential verification failed.
+/// Why credential verification or decoding failed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CredError {
     BadSignature,
     Expired,
     BadKey,
+    /// The wire bytes were not a well-formed credential.
+    Malformed,
 }
 
 impl std::fmt::Display for CredError {
@@ -52,11 +54,67 @@ impl std::fmt::Display for CredError {
             CredError::BadSignature => write!(f, "credential signature invalid"),
             CredError::Expired => write!(f, "credential expired"),
             CredError::BadKey => write!(f, "issuer public key invalid"),
+            CredError::Malformed => write!(f, "credential bytes malformed"),
         }
     }
 }
 
 impl std::error::Error for CredError {}
+
+impl SignedCredential {
+    /// Encode to a self-describing binary wire form:
+    /// `signature(64) | tenant_len(u32 LE) | tenant | agent_len(u32 LE) | agent | expires_at(u64 LE)`.
+    /// (`[u8; 64]` is hand-encoded because serde does not derive arrays > 32.)
+    pub fn encode(&self) -> Vec<u8> {
+        let c = &self.credential;
+        let tenant = c.tenant.0.as_bytes();
+        let agent = c.agent.0.as_bytes();
+        let mut out = Vec::with_capacity(64 + 8 + tenant.len() + agent.len() + 8);
+        out.extend_from_slice(&self.signature);
+        out.extend_from_slice(&(tenant.len() as u32).to_le_bytes());
+        out.extend_from_slice(tenant);
+        out.extend_from_slice(&(agent.len() as u32).to_le_bytes());
+        out.extend_from_slice(agent);
+        out.extend_from_slice(&c.expires_at.to_le_bytes());
+        out
+    }
+
+    /// Decode from [`SignedCredential::encode`]'s wire form.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CredError> {
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], CredError> {
+            if cur.len() < n {
+                return Err(CredError::Malformed);
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head)
+        }
+
+        let mut cur = bytes;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(take(&mut cur, 64)?);
+
+        let tenant_len = u32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap()) as usize;
+        let tenant = String::from_utf8(take(&mut cur, tenant_len)?.to_vec())
+            .map_err(|_| CredError::Malformed)?;
+        let agent_len = u32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap()) as usize;
+        let agent = String::from_utf8(take(&mut cur, agent_len)?.to_vec())
+            .map_err(|_| CredError::Malformed)?;
+        let expires_at = u64::from_le_bytes(take(&mut cur, 8)?.try_into().unwrap());
+
+        if !cur.is_empty() {
+            return Err(CredError::Malformed);
+        }
+        Ok(SignedCredential {
+            credential: Credential {
+                tenant: TenantId(tenant),
+                agent: AgentId(agent),
+                expires_at,
+            },
+            signature,
+        })
+    }
+}
 
 /// Verify a signed credential against `issuer_pubkey` at time `now`.
 pub fn verify(
@@ -114,5 +172,26 @@ mod tests {
         let (pk, mut signed) = signed_cred(1_000);
         signed.credential.expires_at = 9_999;
         assert_eq!(verify(&pk, &signed, 500), Err(CredError::BadSignature));
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let (_pk, signed) = signed_cred(1_234);
+        let bytes = signed.encode();
+        let back = SignedCredential::decode(&bytes).expect("decode");
+        assert_eq!(back, signed);
+    }
+
+    #[test]
+    fn decode_rejects_truncated() {
+        assert_eq!(SignedCredential::decode(&[0u8; 10]), Err(CredError::Malformed));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_garbage() {
+        let (_pk, signed) = signed_cred(1_234);
+        let mut bytes = signed.encode();
+        bytes.push(0xff);
+        assert_eq!(SignedCredential::decode(&bytes), Err(CredError::Malformed));
     }
 }
