@@ -1,0 +1,8 @@
+[package]
+name = "ct-control-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ct-common = { path = "../common" }

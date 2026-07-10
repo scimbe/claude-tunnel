@@ -25,6 +25,7 @@ Thumbs.db
 # Build
 dist/
 build/
+target/
 
 # Ruflo runtime state & vector DBs (regenerated, not source)
 .swarm/
