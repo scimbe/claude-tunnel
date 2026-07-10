@@ -2,6 +2,7 @@
 //! ciphertext only as fallback; never in the trust path. See ADR-0004/0015.
 
 pub mod auth;
+pub mod rendezvous;
 pub mod transport;
 
 /// Stable crate identifier, used by the P0.1 smoke test.

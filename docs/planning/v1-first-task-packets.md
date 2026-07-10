@@ -93,6 +93,7 @@ Relay path first (correctness before NAT traversal), per ADR-0006 / ADR-0015.
 - Agent mints a `Capability` (Routing Token + Origin Identity) and registers the token → tunnel in the registry.
 
 ### P2.3 — Rendezvous (relay path)
+> **Decomposed (cycle 16):** P2.3a (token-resolution handshake — Client presents a Routing Token, Edge resolves via an `is_known` predicate over the registry, replies OK/NO) · P2.3b (byte relay, folded into P2.4).
 - Client presents a Routing Token to the Edge; the Edge looks up the registry and relays between Client and Agent (relay-first; NAT hole-punching is a later packet).
 
 ### P2.4 — Relay data path
