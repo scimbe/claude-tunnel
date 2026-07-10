@@ -115,4 +115,80 @@ mod tests {
         drop(client_conn); // hold the client connection until the assertion
         edge_task.abort();
     }
+
+    #[tokio::test]
+    async fn noise_e2e_through_relay_edge_sees_only_ciphertext() {
+        use ct_common::noise::{client_handshake, generate_static_keypair, origin_handshake};
+        use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+        async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &[u8]) {
+            w.write_all(&(msg.len() as u16).to_be_bytes()).await.unwrap();
+            w.write_all(msg).await.unwrap();
+            w.flush().await.unwrap();
+        }
+        async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Vec<u8> {
+            let mut len = [0u8; 2];
+            r.read_exact(&mut len).await.unwrap();
+            let n = u16::from_be_bytes(len) as usize;
+            let mut buf = vec![0u8; n];
+            r.read_exact(&mut buf).await.unwrap();
+            buf
+        }
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let origin_pub = origin_kp.public;
+
+        // client <-> edge_c   and   edge_a <-> origin; the Edge relays between
+        // edge_c and edge_a, seeing only opaque bytes.
+        let (mut client, mut edge_c) = duplex(8192);
+        let (mut edge_a, mut origin) = duplex(8192);
+
+        let relay_task = tokio::spawn(async move {
+            let _ = relay(&mut edge_c, &mut edge_a).await;
+        });
+
+        // Origin (responder): finish the handshake, decrypt one payload.
+        let origin_task = tokio::spawn(async move {
+            let mut hs = origin_handshake(&origin_kp.private).unwrap();
+            let mut scratch = [0u8; 4096];
+            let m1 = read_frame(&mut origin).await;
+            hs.read_message(&m1, &mut scratch).unwrap();
+            let mut out = [0u8; 4096];
+            let n = hs.write_message(&[], &mut out).unwrap();
+            write_frame(&mut origin, &out[..n]).await;
+            let mut transport = hs.into_transport_mode().unwrap();
+            let ct = read_frame(&mut origin).await;
+            let mut pt = [0u8; 4096];
+            let m = transport.read_message(&ct, &mut pt).unwrap();
+            pt[..m].to_vec()
+        });
+
+        // Client (initiator): pins the Origin's public key.
+        let mut hs = client_handshake(&client_kp.private, &origin_pub).unwrap();
+        let mut out = [0u8; 4096];
+        let n = hs.write_message(&[], &mut out).unwrap();
+        write_frame(&mut client, &out[..n]).await;
+        let m2 = read_frame(&mut client).await;
+        let mut scratch = [0u8; 4096];
+        hs.read_message(&m2, &mut scratch).unwrap();
+        let mut transport = hs.into_transport_mode().unwrap();
+
+        let secret = b"provider-blind payload";
+        let n = transport.write_message(secret, &mut out).unwrap();
+        let ciphertext = out[..n].to_vec();
+        assert_ne!(
+            ciphertext.as_slice(),
+            secret.as_slice(),
+            "the relayed bytes must be ciphertext, not plaintext"
+        );
+        write_frame(&mut client, &ciphertext).await;
+
+        let received = origin_task.await.unwrap();
+        assert_eq!(
+            received, secret,
+            "origin decrypts the E2E payload the edge relayed blindly"
+        );
+        relay_task.abort();
+    }
 }
