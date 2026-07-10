@@ -31,3 +31,14 @@ pub async fn dial_edge(
     let conn = endpoint.connect(edge, "localhost")?.await?;
     Ok(conn)
 }
+
+/// After rendezvous, open a data stream to the Edge and exchange `input` for the
+/// tunnel's response. In the daemon, `input`/output are the Client's local
+/// socket; the Edge relays the stream to the Agent → Origin.
+pub async fn client_exchange(conn: &Connection, input: &[u8]) -> Result<Vec<u8>, BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(input).await?;
+    send.finish()?;
+    let response = recv.read_to_end(64 * 1024).await?;
+    Ok(response)
+}

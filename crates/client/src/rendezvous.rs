@@ -33,7 +33,26 @@ pub async fn client_rendezvous(conn: &Connection, token: &RoutingToken) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::dial_edge;
+    use crate::transport::{client_exchange, dial_edge};
+
+    #[tokio::test]
+    async fn client_exchanges_data_over_stream() {
+        let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            ct_edge::transport::accept_and_echo_one(&server)
+                .await
+                .map_err(|e| e.to_string())
+        });
+
+        let conn = dial_edge(addr, cert).await.expect("dial");
+        let response = client_exchange(&conn, b"hello-origin")
+            .await
+            .expect("exchange");
+        assert_eq!(response, b"hello-origin", "data round-trips over the tunnel stream");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
+    }
 
     #[tokio::test]
     async fn client_completes_pow_gated_rendezvous() {
