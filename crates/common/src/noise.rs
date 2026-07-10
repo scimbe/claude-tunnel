@@ -58,6 +58,16 @@ pub fn origin_handshake(origin_private: &[u8; 32]) -> Result<snow::HandshakeStat
         .build_responder()
 }
 
+/// Build a Client (initiator) handshake that pins the Origin Identity carried
+/// by `cap` (P3.4). The Client imports a Capability out of band, then uses its
+/// Origin Identity as the handshake's pinned remote static key.
+pub fn client_handshake_for(
+    client_private: &[u8; 32],
+    cap: &crate::Capability,
+) -> Result<snow::HandshakeState, snow::Error> {
+    client_handshake(client_private, &cap.origin.0)
+}
+
 /// Length-prefix a message for streaming over a byte transport (2-byte
 /// big-endian length + body). Noise messages are variable-length and capped at
 /// 65535 bytes, so they are framed before being relayed (P3.3).
@@ -184,5 +194,36 @@ mod tests {
         assert_eq!(m1, b"a");
         let (m2, _c2) = take_frame(&buf[c1..]).unwrap();
         assert_eq!(m2, b"bb");
+    }
+
+    #[test]
+    fn handshake_from_imported_capability_completes_with_origin() {
+        use crate::{Capability, OriginIdentity, RoutingToken};
+
+        let origin = generate_static_keypair();
+        let client = generate_static_keypair();
+
+        // Import a Capability carrying the Origin's public key (round-tripped).
+        let cap = Capability {
+            token: RoutingToken([1u8; 32]),
+            origin: OriginIdentity(origin.public),
+            edge_addr: "edge:443".into(),
+        };
+        let cap = Capability::decode(&cap.encode()).unwrap();
+
+        let mut ini = client_handshake_for(&client.private, &cap).unwrap();
+        let mut resp = origin_handshake(&origin.private).unwrap();
+
+        let mut buf = [0u8; 1024];
+        let mut scratch = [0u8; 1024];
+        let n = ini.write_message(&[], &mut buf).unwrap();
+        resp.read_message(&buf[..n], &mut scratch).unwrap();
+        let n = resp.write_message(&[], &mut buf).unwrap();
+        ini.read_message(&buf[..n], &mut scratch).unwrap();
+
+        assert!(
+            ini.is_handshake_finished() && resp.is_handshake_finished(),
+            "handshake pinned from the imported Capability completes with the matching Origin"
+        );
     }
 }
