@@ -100,6 +100,23 @@ Relay path first (correctness before NAT traversal), per ADR-0006 / ADR-0015.
 > **Decomposed (cycle 17):** P2.4a (generic provider-blind bidirectional relay primitive via `copy_bidirectional`, tested with in-memory duplex) · P2.4b (wire the relay onto paired QUIC streams: Client stream ↔ Agent tunnel).
 - Edge relays opaque ciphertext bytes between the Client stream and the Agent tunnel (provider-blind).
 
+## Milestone 3 — Noise Client↔Origin E2E (SPEC §10 item 3)
+
+Provider-blind E2E via the Noise Protocol Framework (ADR-0013): Noise_IK, static X25519 keys, Client pins the Origin Identity.
+
+### P3.1 — Noise static keypair + Origin Identity
+- **Goal:** generate a Noise static X25519 keypair (via `snow`); its public half is the Origin Identity.
+- **Surface:** `crates/common/src/noise.rs`. **Context:** ADR-0013, CONTEXT (Origin Identity).
+
+### P3.2 — Noise handshake (Client↔Origin)
+- Complete a Noise_IK handshake between two parties; derive transport keys; encrypt/decrypt a message end to end.
+
+### P3.3 — Noise session over QUIC (through the relay)
+- Run the Noise session inside the QUIC stream so the Edge relays only ciphertext (provider-blind).
+
+### P3.4 — Capability import (Client)
+- Client parses a `Capability`, pins the Origin Identity, and uses it as the handshake's remote static key.
+
 ## Notes for the run
 
 - **Readiness gate (D2):** each packet's acceptance tests + stubs must resolve against its bundle before a Haiku agent is assigned; P1.4 is the first likely **decompose** candidate.
