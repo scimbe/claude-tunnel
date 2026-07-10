@@ -1,0 +1,76 @@
+# Claude Tunnel testbed topology (M5.5a).
+#
+# Brings up edge + agent(+origin) + client on a static-IP network, coordinating
+# via a shared volume (edge writes its cert; agent writes the Capability). The
+# client tunnels a payload to the origin and exits 0 on a verified round-trip.
+#
+# Run:
+#   docker compose -f docker/docker-compose.yml up --build \
+#       --abort-on-container-exit --exit-code-from client
+
+name: ct-testbed
+
+services:
+  edge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ct-testbed
+    command: ["ct-edge"]
+    environment:
+      CT_EDGE_LISTEN: "0.0.0.0:4433"
+      CT_EDGE_POW_DIFFICULTY: "8"
+      CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
+    volumes:
+      - shared:/shared
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.2
+
+  origin:
+    image: alpine:latest
+    command: ["sh", "-c", "apk add -q socat && exec socat TCP-LISTEN:8080,reuseaddr,fork EXEC:cat"]
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.3
+
+  agent:
+    image: ct-testbed
+    command: ["ct-agent"]
+    environment:
+      CT_AGENT_EDGE: "10.5.0.2:4433"
+      CT_AGENT_ORIGIN: "10.5.0.3:8080"
+      CT_AGENT_EDGE_CERT: "/shared/edge-cert.der"
+      CT_AGENT_CAPABILITY_OUT: "/shared/capability.bin"
+    volumes:
+      - shared:/shared
+    depends_on:
+      - edge
+      - origin
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.4
+
+  client:
+    image: ct-testbed
+    command: ["ct-client"]
+    environment:
+      CT_CLIENT_EDGE_CERT: "/shared/edge-cert.der"
+      CT_CLIENT_CAPABILITY: "/shared/capability.bin"
+      CT_CLIENT_PAYLOAD: "hello-tunnel"
+    volumes:
+      - shared:/shared
+    depends_on:
+      - agent
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.5
+
+volumes:
+  shared:
+
+networks:
+  ct-net:
+    ipam:
+      config:
+        - subnet: 10.5.0.0/24
