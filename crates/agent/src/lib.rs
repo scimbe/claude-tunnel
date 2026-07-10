@@ -4,6 +4,7 @@
 pub mod capability;
 pub mod config;
 pub mod identity;
+pub mod serve;
 pub mod transport;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
