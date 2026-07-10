@@ -51,7 +51,8 @@ fn client_endpoint(edge_cert: CertificateDer<'static>) -> Result<Endpoint, BoxEr
     let cfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    // Bind all interfaces (not loopback) so the Agent can reach a non-local Edge.
+    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
 }

@@ -28,8 +28,9 @@ services:
         ipv4_address: 10.5.0.2
 
   origin:
-    image: alpine:latest
-    command: ["sh", "-c", "apk add -q socat && exec socat TCP-LISTEN:8080,reuseaddr,fork EXEC:cat"]
+    # Pre-built socat image: ready instantly (no apk-install race with the client).
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:8080,reuseaddr,fork", "EXEC:/bin/cat"]
     networks:
       ct-net:
         ipv4_address: 10.5.0.3
