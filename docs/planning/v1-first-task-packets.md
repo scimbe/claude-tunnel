@@ -60,6 +60,8 @@ Independent after P0.2: **P1.1, P1.2, P1.3** run in parallel. **P1.4** waits on 
 
 ## P1.3 — Join-token enrollment
 
+> **Decomposed (cycle 7):** P1.3a (control-plane in-memory enrollment service: issue single-use token, redeem binds Agent public key to Tenant, reject reuse/unknown) — done. P1.3b (Agent ed25519 identity keypair + enroll interop, private key never leaves Agent) — next.
+
 - **Goal:** control-plane endpoint issues a single-use join token; Agent redeems it, generates an identity keypair, and binds its public key to the Tenant.
 - **Acceptance tests:** enroll flow test (issue → redeem → bound); single-use enforced (second redeem rejected); keypair never leaves the Agent (asserted by interface).
 - **Allowed surface:** `crates/control-plane/` (enrollment module), `crates/agent/` (enroll module).

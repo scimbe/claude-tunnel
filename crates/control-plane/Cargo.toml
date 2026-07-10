@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 ct-common = { path = "../common" }
+rand = "0.8"
