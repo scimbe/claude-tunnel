@@ -37,6 +37,11 @@ Independent after P0.2: **P1.1, P1.2, P1.3** run in parallel. **P1.4** waits on 
 
 ## P1.1 — Edge QUIC listener (relay-less echo)
 
+> **Decomposed (cycle 3):** exceeded a single Haiku-sized pass (quinn + async runtime + TLS cert plumbing + connection + echo + integration test). Split into:
+> - **P1.1a** — QUIC/TLS plumbing: server `Endpoint` with self-signed cert binds an ephemeral port. Isolates dependency + crypto-provider risk.
+> - **P1.1b** — connect + bidirectional echo stream (integration test, client↔server).
+> - **P1.1c** — reject malformed/untrusted handshake.
+
 - **Goal:** Edge accepts QUIC/UDP-443 connections (quinn), opens per-stream handling, echoes a stream (transport correctness before routing).
 - **Acceptance tests:** integration test — a QUIC client connects, opens a stream, bytes echo back; malformed handshake rejected.
 - **Allowed surface:** `crates/edge/` (transport module only).
