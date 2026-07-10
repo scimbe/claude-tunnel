@@ -31,10 +31,18 @@ fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), Bo
 ///
 /// Must be called within a Tokio runtime (quinn spawns an I/O driver).
 pub fn build_server_endpoint_with_cert() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    build_server_endpoint_at(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+}
+
+/// Build a QUIC server [`Endpoint`] bound to `addr` with a fresh self-signed
+/// cert, returning the cert. Used by the Edge daemon to bind its configured
+/// listen address.
+pub fn build_server_endpoint_at(
+    addr: SocketAddr,
+) -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
     install_crypto_provider();
     let (cert, key) = self_signed()?;
     let server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let endpoint = Endpoint::server(server_config, addr)?;
     Ok((endpoint, cert))
 }
