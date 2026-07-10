@@ -11,7 +11,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 | P1.1 Edge QUIC listener | ✅ done | P1.1a endpoint/cert · P1.1b connect+echo · P1.1c reject untrusted — 4 ct-edge tests |
 | P1.2 Agent dialer + TCP fallback | 🔨 in progress | P1.2a ✅ (selection + QUIC dialer + interop) · P1.2b (reconnect) · P1.2c (TCP fallback transport) |
 | P1.3 join-token enrollment | ✅ done | P1.3a service + P1.3b agent ed25519 identity + enroll interop |
-| P1.4 short-lived mTLS auth | ⏳ next | depends on P1.1 (edge) + P1.3 (identity) — both done |
+| P1.4 short-lived mTLS auth | 🔨 in progress | P1.4a ✅ (credential mint/verify + expiry) · P1.4b ⏳ (enrollment-gated mint + Edge verify) · P1.4c (wire into QUIC) |
 
 ## Cycle log
 
@@ -23,6 +23,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 6 — P1.2a**: decomposed P1.2 into a/b/c. P1.2a: `ct-agent::transport` — `select_transport(udp_reachable)` decision (QUIC vs TcpFallback) + `dial_quic`; interop test `agent_dials_edge_over_quic` drives a real `ct-edge` server (dev-dep) and round-trips bytes. Full workspace: 14 tests green. Committed.
 - **Cycle 7 — P1.3a**: decomposed P1.3. P1.3a: `ct-control-plane::enrollment` — in-memory `Enrollment` service; `issue_join_token` (random single-use), `redeem` binds Agent public key to Tenant and consumes the token, rejects reuse (`TokenAlreadyUsed`) and unknown tokens. Service holds no private keys. 3 enrollment tests; full workspace 17 tests green. Committed.
 - **Cycle 8 — P1.3b**: `ct-agent::identity::AgentIdentity` — ed25519 keypair (ed25519-dalek 2 + rand 0.8); `public_key_bytes()` + `sign()`, **no signing-key accessor** (private key never leaves the Agent). Tests: distinct keys, signature verifies, and `enroll_binds_agent_identity` redeems a real identity against `ct-control-plane`. **P1.3 complete.** Full workspace 20 tests green. Committed.
+- **Cycle 9 — P1.4a**: decomposed P1.4 into a/b/c. P1.4a: `ct-control-plane::credential` — `CredentialIssuer` mints ed25519 issuer-signed, expiry-bounded credentials; `verify(issuer_pubkey, signed, now)` checks signature + expiry. Time passed in (no wall-clock in lib). Tests: verify-ok-before-expiry, expired, wrong-issuer, tampered-claims. Full workspace 24 tests green. Committed.
 
 ## Verification method
 

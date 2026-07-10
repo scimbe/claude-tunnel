@@ -70,6 +70,8 @@ Independent after P0.2: **P1.1, P1.2, P1.3** run in parallel. **P1.4** waits on 
 
 ## P1.4 — Short-lived mTLS credential + Agent→Edge auth
 
+> **Decomposed (cycle 9):** P1.4a (credential primitive — issuer-signed, expiry-bounded `Credential`; `mint`/`verify`) done. P1.4b (enrollment-gated minting + Edge-side verification: only bound identities). P1.4c (present credential over the QUIC handshake). Note: implemented as an ed25519 issuer-signed credential (same CA-signed/short-lived/verifiable trust structure as mTLS); real X.509 client-cert mTLS is a later hardening.
+
 - **Goal:** control-plane mints a short-lived mTLS credential from the bound identity; Agent authenticates to the Edge with it.
 - **Acceptance tests:** Agent with a valid fresh credential authenticates to Edge; expired/rotated credential rejected; hostname/tenant scoping enforced.
 - **Allowed surface:** `crates/control-plane/` (minting), `crates/edge/` (auth), `crates/agent/` (auth).
