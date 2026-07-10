@@ -1,0 +1,14 @@
+[package]
+name = "ct-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ct-common = { path = "../common" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+[dev-dependencies]
+ct-edge = { path = "../edge" }
