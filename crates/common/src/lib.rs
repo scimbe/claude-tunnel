@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod credential;
 pub mod noise;
+pub mod pow;
 
 /// Stable crate identifier, used by downstream smoke tests.
 pub const CRATE_NAME: &str = "ct-common";

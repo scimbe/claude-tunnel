@@ -17,7 +17,9 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 
 **🎯 Milestone 2 complete** (relay-first path): P2.1 ✅ (Tunnel Registry) · P2.2 ✅ (Capability register) · P2.3 ✅ (P2.3a token resolution) · P2.4 ✅ (P2.4a relay primitive + P2.4b QUIC relay). Deferred: NAT hole-punching (P2P direct path), full end-to-end wiring.
 
-**🎯 Milestone 3 complete** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ (keypair) · P3.2 ✅ (Noise_IK handshake) · P3.3 ✅ (framing + **E2E through relay: edge sees only ciphertext**) · P3.4 ✅ (Capability import + handshake pinning). Provider-blind mesh crypto demonstrated end to end. Next: Milestone 4 — P2P hole-punching (ADR-0015), or SPEC §10 items 5–7 (PoW/billing, telemetry, Browser Plane).
+**🎯 Milestone 3 complete** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ (keypair) · P3.2 ✅ (Noise_IK handshake) · P3.3 ✅ (framing + **E2E through relay: edge sees only ciphertext**) · P3.4 ✅ (Capability import + handshake pinning). Provider-blind mesh crypto demonstrated end to end.
+
+**Milestone 4** (PoW-gated rendezvous, SPEC §10 item 5, ADR-0018): P4.1 ✅ (PoW challenge/solve/verify) · P4.2 ⏳ (gate rendezvous behind PoW) · P4.3 (per-token rate limiting). NAT hole-punching (SPEC §10 item 4) deferred — not hermetically testable (needs real network topology).
 
 ## Cycle log
 
@@ -44,6 +46,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 21 — P3.3a**: decomposed P3.3. P3.3a: `ct-common::noise::frame`/`take_frame` — 2-byte big-endian length-prefix framing so variable-length Noise messages can stream over the relay. Tests: round-trip, incomplete-frame → None, multi-frame remainder. Full workspace 52 tests green. Committed.
 - **Cycle 22 — P3.3b**: `noise_e2e_through_relay_edge_sees_only_ciphertext` (in `ct-edge`, using the relay primitive + `ct_common::noise`): Client and Origin run the full Noise_IK handshake and exchange an encrypted payload *through* the Edge's opaque relay (in-memory duplex). Asserts the Origin decrypts it AND the relayed bytes ≠ plaintext. **P3.3 done — the zero-knowledge property is demonstrated end to end.** Full workspace 53 tests green. Committed.
 - **Cycle 23 — P3.4**: `Capability::encode`/`decode` (portable out-of-band form: token | origin | addr) + `ct-common::noise::client_handshake_for(cap)` pins the Capability's Origin Identity. Tests: capability encode/decode round-trip + truncated rejected; handshake built from an imported Capability completes with the matching Origin. **P3.4 done → Milestone 3 complete.** Full workspace 56 tests green. Committed.
+- **Cycle 24 — P4.1**: extended the DAG to Milestone 4 (PoW gating; NAT hole-punching deferred as not hermetically testable). P4.1: `ct-common::pow` — SHA-256 leading-zero-bits proof-of-work; `Challenge { nonce, difficulty }`, `solve` (brute force), `verify` (one hash). Tests: solve→verify, meets-difficulty, zero-difficulty valid, insufficient-bits rejected (deterministic). Full workspace 60 tests green. Committed.
 
 ## Verification method
 

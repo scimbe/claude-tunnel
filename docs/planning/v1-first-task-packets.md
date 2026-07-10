@@ -118,6 +118,20 @@ Provider-blind E2E via the Noise Protocol Framework (ADR-0013): Noise_IK, static
 ### P3.4 — Capability import (Client)
 - Client parses a `Capability`, pins the Origin Identity, and uses it as the handshake's remote static key.
 
+## Milestone 4 — PoW-gated rendezvous (SPEC §10 item 5, ADR-0018)
+
+Proof-of-work gates expensive Edge operations against floods/sybil (the deferred sybil-resistance lever). **NAT hole-punching (SPEC §10 item 4) is deferred** — it needs real network topology and isn't hermetically testable in the build container; noted, not silently skipped.
+
+### P4.1 — PoW challenge/solve/verify primitive
+- **Goal:** SHA-256 leading-zero-bits PoW. `Challenge { nonce, difficulty }`; `solve` finds a solution; `verify` checks cheaply.
+- **Surface:** `crates/common/src/pow.rs` (sha2). **Context:** ADR-0018.
+
+### P4.2 — Gate rendezvous behind PoW
+- `resolve_rendezvous` requires a valid PoW solution before resolving a token.
+
+### P4.3 — Per-token rate limiting
+- Rate-limit rendezvous per Routing Token / identity.
+
 ## Notes for the run
 
 - **Readiness gate (D2):** each packet's acceptance tests + stubs must resolve against its bundle before a Haiku agent is assigned; P1.4 is the first likely **decompose** candidate.
