@@ -145,7 +145,7 @@ Prereq: the library crates need runnable **binaries** (the deferred end-to-end w
 - **M5.2** Agent binary: enroll → register tunnel → serve a local origin.
 - **M5.3** Client tool: import Capability → PoW-gated rendezvous → Noise E2E to origin.
 - **M5.4** Multi-stage Dockerfiles (build → slim runtime) for edge/agent/client.
-- **M5.5** `docker compose` topology (client-net / edge / agent-net) + `tc netem` link shaping + NAT-gateway container (un-defers hole-punching).
+- **M5.5** `docker compose` topology (client-net / edge / agent-net) + `tc netem` link shaping (verified: `NET_ADMIN` container runs netem) + NAT-gateway container (un-defers hole-punching). **Containernet** (privileged DinD) is the mininet-style alternative — cited + justified in the thesis methodology; Compose+netem chosen for reproducibility/simplicity and because it needs only docker-group, not privileged DinD.
 - **M5.6** End-to-end testbed smoke: client reaches origin through the emulated net; assert the edge relays only ciphertext.
 - **Verification:** `docker compose up` + scripted assertion (not `cargo test`).
 
