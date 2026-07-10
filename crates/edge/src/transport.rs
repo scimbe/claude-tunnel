@@ -114,4 +114,33 @@ mod tests {
         conn.close(0u32.into(), b"done");
         server_task.await.expect("server task join");
     }
+
+    #[tokio::test]
+    async fn untrusted_server_cert_is_rejected() {
+        let (server, _real_cert) = build_server_endpoint_with_cert().expect("server");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                let _ = incoming.await; // handshake is expected to fail
+            }
+        });
+
+        // Client trusts a DIFFERENT self-signed cert, not the server's.
+        let wrong = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("wrong cert");
+        let wrong_cert = wrong.cert.der().clone();
+        let client = build_client_endpoint(wrong_cert).expect("client");
+
+        let result = client
+            .connect(server_addr, "localhost")
+            .expect("connect config")
+            .await;
+        assert!(
+            result.is_err(),
+            "handshake with an untrusted server cert must be rejected"
+        );
+
+        server_task.abort();
+    }
 }
