@@ -21,7 +21,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 
 **🎯 Milestone 4 complete** (PoW-gated rendezvous, SPEC §10 item 5, ADR-0018): P4.1 ✅ (PoW) · P4.2 ✅ (gate helpers + QUIC gate) · P4.3 ✅ (per-token rate limiting). Anti-abuse layer live on the wire.
 
-**Milestone 5** (Docker testbed): M5.1 🔨 (M5.1a ✅ daemon skeleton · M5.1b ✅ `EdgeState` routing registry · M5.1c ⏳ serve orchestration) · M5.2 Agent bin · M5.3 Client tool · M5.4 Dockerfiles · M5.5 compose+netem+NAT · M5.6 e2e smoke.
+**Milestone 5** (Docker testbed): M5.1 🔨 (M5.1a ✅ daemon skeleton · M5.1b ✅ `EdgeState` registry · M5.1c ✅ agent-register path · M5.1d ⏳ client route→relay) · M5.2 Agent bin · M5.3 Client tool · M5.4 Dockerfiles · M5.5 compose+netem+NAT · M5.6 e2e smoke.
 
 **⇢ Reframe (cycle 26): academic testbed + BA thesis, all in Docker.** Emulate the topology in Docker (no host sudo/mininet → containers with `--cap-add=NET_ADMIN` + `tc netem` + iptables-NAT), run performance tests, write a German BA thesis (HAW-konform, scaffolded), compiled via texlive-in-Docker. NAT/hole-punching (SPEC §10 item 4) **now in scope** via emulation (M5). New milestones: **M5** Docker testbed (needs runnable binaries first) · **M6** performance evaluation · **M7** BA thesis. Order: finish M4 → M5 → M6 → M7.
 
@@ -56,6 +56,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 27 — P4.3**: `ct-common::ratelimit::RateLimiter` — fixed-window per-token counter (`allow(token, window)`), time injected. Tests: allows up to limit then rejects, resets on new window, tokens independent. **M4 complete** (PoW + rate limiting). Full workspace 68 tests green. Committed. Next: M5.1 Edge binary.
 - **Cycle 28 — M5.1a**: decomposed M5.1. M5.1a: **first runnable binary** — `ct-edge` bin (`src/main.rs`): `EdgeConfig::from_env` (CT_EDGE_LISTEN / CT_EDGE_POW_DIFFICULTY) → `build_server_endpoint_at(listen)` → accept loop. Refactored transport to bind an arbitrary addr. Tests: config parse valid / bad-listen / bad-difficulty; the bin compiles in the workspace build. Full workspace 71 tests green. Committed. Next: M5.1b orchestration.
 - **Cycle 29 — M5.1b**: `ct-edge::state::EdgeState<H>` — thread-safe registry mapping `RoutingToken` → Agent tunnel handle; `register`/`route`/`remove`/`is_known` (generic over handle so it's unit-testable; `quinn::Connection` in the daemon). `is_known` plugs into `resolve_rendezvous_gated`. Tests: register→route, unknown→None, remove drops. Full workspace 74 tests green. Committed. Next: M5.1c serve orchestration.
+- **Cycle 30 — M5.1c**: `ct-edge::serve::register_agent(conn, state)` — reads `role='A' | token(32)` on a control stream, stores the connection in `EdgeState`, acks `OK`, returns the token. Interop test over QUIC: an Agent registers and the token becomes `is_known` (routable). Full workspace 75 tests green. Committed. Next: M5.1d client route→relay.
 
 ## Verification method
 

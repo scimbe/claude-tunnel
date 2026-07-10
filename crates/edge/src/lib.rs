@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod relay;
 pub mod rendezvous;
+pub mod serve;
 pub mod state;
 pub mod transport;
 
