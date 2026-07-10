@@ -10,6 +10,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use ct_common::credential::SignedCredential;
+use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 
@@ -78,6 +79,22 @@ pub async fn present_credential(
         Ok(())
     } else {
         Err("edge rejected credential".into())
+    }
+}
+
+/// Register this Agent's tunnel for `token` with the Edge over `conn`: open a
+/// control stream, send `role='A' | token(32)`, and await the Edge's `OK`.
+pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<(), BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let mut msg = vec![b'A'];
+    msg.extend_from_slice(&token.0);
+    send.write_all(&msg).await?;
+    send.finish()?;
+    let ack = recv.read_to_end(8).await?;
+    if ack == b"OK" {
+        Ok(())
+    } else {
+        Err("edge rejected tunnel registration".into())
     }
 }
 
@@ -184,5 +201,35 @@ mod tests {
         let result = present_credential(&conn, &signed).await;
         assert!(result.is_err(), "expired credential must be rejected");
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn agent_registers_tunnel_with_edge() {
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::sync::Arc;
+
+        let token = RoutingToken([9u8; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            ct_edge::serve::register_agent(&conn, &state_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            conn.closed().await;
+            Ok::<(), String>(())
+        });
+
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        register_tunnel(&conn, &token)
+            .await
+            .expect("agent registers tunnel");
+        assert!(state.is_known(&token), "edge now routes the agent's token");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
     }
 }
