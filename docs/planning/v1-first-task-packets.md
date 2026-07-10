@@ -80,6 +80,24 @@ Independent after P0.2: **P1.1, P1.2, P1.3** run in parallel. **P1.4** waits on 
 
 ---
 
+## Milestone 2 — Tunnel Registry + Rendezvous (SPEC §10 item 2)
+
+Relay path first (correctness before NAT traversal), per ADR-0006 / ADR-0015.
+
+### P2.1 — Tunnel Registry (in-memory)
+- **Goal:** control-plane registry mapping `RoutingToken` → `TunnelInfo` (tenant, agent); `register` / `lookup` / `unregister`.
+- **Acceptance:** register→lookup; unknown→None; unregister removes; re-register overwrites.
+- **Surface:** `crates/control-plane/src/registry.rs`. **Context:** ADR-0006, ADR-0017, CONTEXT (Tunnel Registry, Routing Token).
+
+### P2.2 — Agent registers a tunnel
+- Agent mints a `Capability` (Routing Token + Origin Identity) and registers the token → tunnel in the registry.
+
+### P2.3 — Rendezvous (relay path)
+- Client presents a Routing Token to the Edge; the Edge looks up the registry and relays between Client and Agent (relay-first; NAT hole-punching is a later packet).
+
+### P2.4 — Relay data path
+- Edge relays opaque ciphertext bytes between the Client stream and the Agent tunnel (provider-blind).
+
 ## Notes for the run
 
 - **Readiness gate (D2):** each packet's acceptance tests + stubs must resolve against its bundle before a Haiku agent is assigned; P1.4 is the first likely **decompose** candidate.

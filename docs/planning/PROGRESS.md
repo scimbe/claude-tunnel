@@ -13,7 +13,9 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 | P1.3 join-token enrollment | ✅ done | P1.3a service + P1.3b agent ed25519 identity + enroll interop |
 | P1.4 short-lived mTLS auth | ✅ done | full auth chain over QUIC: enroll → mint → present → verify (P1.4a–d) |
 
-**🎯 Milestone 1 complete** (P0.1–P1.4 core): authenticated QUIC transport between Agent and Edge, backed by enrollment + short-lived credentials. Deferred enhancements: P1.2b (reconnect), P1.2c (HTTP/2-over-TCP fallback). Next: Milestone 2 — Tunnel Registry + Rendezvous (SPEC §10 item 2).
+**🎯 Milestone 1 complete** (P0.1–P1.4 core): authenticated QUIC transport between Agent and Edge, backed by enrollment + short-lived credentials. Deferred enhancements: P1.2b (reconnect), P1.2c (HTTP/2-over-TCP fallback).
+
+**Milestone 2** (Tunnel Registry + Rendezvous, SPEC §10 item 2): P2.1 ✅ (Tunnel Registry) · P2.2 ⏳ (agent registers tunnel) · P2.3 (rendezvous relay path) · P2.4 (relay data path).
 
 ## Cycle log
 
@@ -30,6 +32,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 11 — P1.4c**: refactor — moved credential claims/wire-form/`verify` to `ct-common::credential`; `ct-control-plane::credential` re-exports them + keeps `CredentialIssuer` (signing key); new `ct-edge::auth::verify_presented_credential` lets the Edge verify statelessly. All prior tests survived the move; full workspace 29 tests green. Committed.
 - **Cycle 12 — P1.4d-i**: caught that serde can't derive `Deserialize` for `[u8; 64]`, so gave `SignedCredential` a hand-rolled binary wire form (`signature | tenant_len | tenant | agent_len | agent | expires_at`) via `encode`/`decode`; added `CredError::Malformed`. Tests: round-trip, truncated, trailing-garbage. Split P1.4d into d-i (this) + d-ii (QUIC handshake). Full workspace 32 tests green. Committed.
 - **Cycle 13 — P1.4d-ii**: `ct-edge::auth::accept_and_authenticate` (accept → read credential → decode → verify → reply OK/NO, return authenticated conn) + `ct-agent::transport::present_credential` (open bi-stream → send encoded credential → await ack). Interop tests over live QUIC: valid credential authenticates; expired is rejected. **P1.4 done → Milestone 1 complete.** Full workspace 34 tests green. Committed.
+- **Cycle 14 — P2.1**: extended the DAG to Milestone 2 (Tunnel Registry + Rendezvous). P2.1: `ct-control-plane::registry::TunnelRegistry` — in-memory `RoutingToken` → `TunnelInfo` (tenant, agent); `register`/`lookup`/`unregister`. Tests: register→lookup, unknown→None, unregister-removes (+ idempotent), re-register overwrites. Full workspace 38 tests green. Committed.
 
 ## Verification method
 
