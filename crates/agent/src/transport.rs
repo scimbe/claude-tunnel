@@ -9,6 +9,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use std::path::Path;
+
 use ct_common::credential::SignedCredential;
 use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
@@ -96,6 +98,11 @@ pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<
     } else {
         Err("edge rejected tunnel registration".into())
     }
+}
+
+/// Load an Edge certificate (DER) the Edge published to a shared path.
+pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'static>> {
+    Ok(CertificateDer::from(std::fs::read(path)?))
 }
 
 #[cfg(test)]
@@ -231,5 +238,16 @@ mod tests {
         assert!(state.is_known(&token), "edge now routes the agent's token");
         conn.close(0u32.into(), b"done");
         let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn load_cert_reads_written_der() {
+        let (_endpoint, cert) =
+            ct_edge::transport::build_server_endpoint_with_cert().expect("cert");
+        let path = std::env::temp_dir().join(format!("ct-agent-cert-{}.der", std::process::id()));
+        std::fs::write(&path, cert.as_ref()).unwrap();
+        let loaded = load_cert(&path).expect("load");
+        assert_eq!(loaded, cert, "agent loads the edge cert from the shared file");
+        let _ = std::fs::remove_file(&path);
     }
 }
