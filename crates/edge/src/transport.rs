@@ -6,6 +6,7 @@
 //! for the Mesh Plane, replaced by Noise (ADR-0013).
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 
 use quinn::Endpoint;
@@ -45,6 +46,17 @@ pub fn build_server_endpoint_at(
     let server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
     let endpoint = Endpoint::server(server_config, addr)?;
     Ok((endpoint, cert))
+}
+
+/// Write the Edge's certificate (DER) to `path` so Agents/Clients can trust it
+/// (a shared volume in the testbed).
+pub fn save_cert(path: impl AsRef<Path>, cert: &CertificateDer<'_>) -> std::io::Result<()> {
+    std::fs::write(path, cert.as_ref())
+}
+
+/// Load an Edge certificate (DER) previously written by [`save_cert`].
+pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'static>> {
+    Ok(CertificateDer::from(std::fs::read(path)?))
 }
 
 /// Build a QUIC server [`Endpoint`] (P1.1a), discarding the cert.
@@ -150,5 +162,15 @@ mod tests {
         );
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cert_save_load_roundtrip() {
+        let (_endpoint, cert) = build_server_endpoint_with_cert().expect("cert");
+        let path = std::env::temp_dir().join(format!("ct-edge-cert-{}.der", std::process::id()));
+        save_cert(&path, &cert).expect("save");
+        let loaded = load_cert(&path).expect("load");
+        assert_eq!(loaded, cert, "cert round-trips through the shared file");
+        let _ = std::fs::remove_file(&path);
     }
 }

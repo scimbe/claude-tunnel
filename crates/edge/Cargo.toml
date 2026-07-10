@@ -10,6 +10,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = "0.13"
+rand = "0.8"
 
 [dev-dependencies]
 ct-control-plane = { path = "../control-plane" }

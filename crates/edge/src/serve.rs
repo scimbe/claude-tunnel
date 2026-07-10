@@ -5,11 +5,16 @@
 //! so a later Client rendezvous for that token can be routed to it. The Client
 //! route→relay path is exercised end to end in the M5.6 testbed smoke.
 
+use std::sync::Arc;
+
+use crate::config::EdgeConfig;
 use crate::relay::relay_quic;
 use crate::state::EdgeState;
+use crate::transport::{build_server_endpoint_at, save_cert};
 use ct_common::pow::{check_request, Challenge};
 use ct_common::RoutingToken;
 use quinn::{Connection, RecvStream, SendStream};
+use rand::RngCore;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -89,6 +94,30 @@ pub async fn serve_connection(
         }
         other => Err(format!("unknown role byte: {other}").into()),
     }
+}
+
+/// Run the Edge daemon: bind to `config.listen`, write the cert to `cert_out`
+/// (shared volume), and serve each incoming connection via [`serve_connection`]
+/// with a fresh per-connection PoW challenge.
+pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
+    let (endpoint, cert) = build_server_endpoint_at(config.listen)?;
+    save_cert(cert_out, &cert)?;
+
+    let state = Arc::new(EdgeState::<Connection>::new());
+    while let Some(incoming) = endpoint.accept().await {
+        let state = state.clone();
+        let difficulty = config.pow_difficulty;
+        tokio::spawn(async move {
+            if let Ok(conn) = incoming.await {
+                let mut nonce = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                let challenge = Challenge { nonce, difficulty };
+                let _ = serve_connection(&conn, &state, &challenge).await;
+                conn.closed().await;
+            }
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

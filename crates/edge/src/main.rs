@@ -1,30 +1,19 @@
-//! Claude Tunnel Edge daemon (M5.1a).
+//! Claude Tunnel Edge daemon (M5.4c).
 //!
-//! Reads [`EdgeConfig`] from the environment, binds the QUIC endpoint to the
-//! configured listen address, and accepts connections. Rendezvous + relay
-//! orchestration (pairing Client and Agent connections via the registry) is
-//! M5.1b; this skeleton makes the Edge a runnable container node for the testbed.
+//! Reads [`EdgeConfig`] from the environment, writes its certificate to a shared
+//! path (so Agents/Clients can trust it), and runs the serve loop.
 
 use ct_edge::config::EdgeConfig;
-use ct_edge::transport::build_server_endpoint_at;
+use ct_edge::serve::run_edge;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = EdgeConfig::from_env()?;
+    let cert_out =
+        std::env::var("CT_EDGE_CERT_OUT").unwrap_or_else(|_| "/shared/edge-cert.der".to_string());
     eprintln!(
-        "ct-edge: listening on {} (pow_difficulty={})",
-        config.listen, config.pow_difficulty
+        "ct-edge: listening on {} (pow_difficulty={}, cert_out={})",
+        config.listen, config.pow_difficulty, cert_out
     );
-
-    let (endpoint, _cert) = build_server_endpoint_at(config.listen)?;
-
-    while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(async move {
-            if let Ok(conn) = incoming.await {
-                eprintln!("ct-edge: accepted connection from {}", conn.remote_address());
-            }
-        });
-    }
-
-    Ok(())
+    run_edge(&config, &cert_out).await
 }
