@@ -17,7 +17,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 
 **🎯 Milestone 2 complete** (relay-first path): P2.1 ✅ (Tunnel Registry) · P2.2 ✅ (Capability register) · P2.3 ✅ (P2.3a token resolution) · P2.4 ✅ (P2.4a relay primitive + P2.4b QUIC relay). Deferred: NAT hole-punching (P2P direct path), full end-to-end wiring.
 
-**Milestone 3** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ (Noise static keypair + Origin Identity) · P3.2 ⏳ (Noise handshake) · P3.3 (Noise over QUIC) · P3.4 (Capability import).
+**Milestone 3** (Noise Client↔Origin E2E, SPEC §10 item 3): P3.1 ✅ (Noise static keypair + Origin Identity) · P3.2 ✅ (Noise_IK handshake + E2E encrypt/decrypt, wrong-pin rejected) · P3.3 ⏳ (Noise over QUIC) · P3.4 (Capability import).
 
 ## Cycle log
 
@@ -40,6 +40,7 @@ Driven by the `/loop` process (`DEVELOPMENT-PROCESS.md` D1–D8): one Task Packe
 - **Cycle 17 — P2.4a**: decomposed P2.4. P2.4a: `ct-edge::relay::relay(a, b)` — provider-blind bidirectional byte relay via `tokio::io::copy_bidirectional` (never inspects bytes). Deterministic test with in-memory `duplex` streams: `c2a`/`a2c` cross correctly, byte counts (3,3). Added tokio `io-util`. Full workspace 43 tests green. Committed.
 - **Cycle 18 — P2.4b**: `ct-edge::relay::relay_quic` joins each `(RecvStream, SendStream)` via `tokio::io::join` and relays through the P2.4a primitive. First QUIC integration test (echo + close) was racy (`ConnectionLost` on teardown) → **fixed** by simplifying to a deterministic one-directional client→agent relay test. **P2.4 done → Milestone 2 relay-first path complete.** Full workspace 44 tests green. Committed.
 - **Cycle 19 — P3.1**: extended the DAG to Milestone 3 (Noise E2E). P3.1: `ct-common::noise` — `generate_static_keypair()` (Noise X25519 via `snow`, params `Noise_IK_25519_ChaChaPoly_BLAKE2s`); public half is the Origin Identity. Tests: 32-byte keys, distinct pairs, public↔OriginIdentity. Full workspace 47 tests green. Committed.
+- **Cycle 20 — P3.2**: `client_handshake` (initiator, pins Origin public) + `origin_handshake` (responder) build Noise_IK states. Tests: full 2-message handshake establishes, transport-mode encrypt/decrypt both directions round-trips, and a client pinning the wrong Origin key fails the handshake. The provider-blind E2E crypto core. Full workspace 49 tests green. Committed.
 
 ## Verification method
 
