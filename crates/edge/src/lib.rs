@@ -1,6 +1,7 @@
 //! Claude Tunnel Edge — operator-run, public. Coordinates Rendezvous and relays
 //! ciphertext only as fallback; never in the trust path. See ADR-0004/0015.
 
+pub mod auth;
 pub mod transport;
 
 /// Stable crate identifier, used by the P0.1 smoke test.

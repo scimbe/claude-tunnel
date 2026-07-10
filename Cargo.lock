@@ -120,6 +120,7 @@ dependencies = [
 name = "ct-common"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
  "serde",
  "serde_json",
 ]
@@ -138,6 +139,7 @@ name = "ct-edge"
 version = "0.0.0"
 dependencies = [
  "ct-common",
+ "ct-control-plane",
  "quinn",
  "rcgen",
  "rustls",

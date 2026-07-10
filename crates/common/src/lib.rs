@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod credential;
+
 /// Stable crate identifier, used by downstream smoke tests.
 pub const CRATE_NAME: &str = "ct-common";
 
