@@ -13,7 +13,7 @@ use rustls::pki_types::CertificateDer;
 use std::io;
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::io::{join, AsyncRead, AsyncWrite};
+use tokio::io::{join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -112,6 +112,36 @@ pub async fn client_tunnel_noise(
     // The stream is now bridged to the Agent; run Noise over it.
     let response = client_noise_exchange(&mut send, &mut recv, client_private, cap, payload).await?;
     send.finish()?;
+    Ok(response)
+}
+
+/// Tunnel `payload` to the Origin over a **TCP-fallback** stream (M12.2c): when
+/// UDP/QUIC is blocked, the Client connects to the Edge via TLS-TCP and runs the
+/// same `'C'` rendezvous + Noise exchange over that single byte stream. Generic
+/// over the stream so it works with a `tokio-rustls` client TLS stream.
+pub async fn client_tunnel_noise_tcp<T>(
+    mut stream: T,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<Vec<u8>, BoxError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    // 'C' rendezvous over the single stream.
+    stream.write_all(b"C").await?;
+    let mut chal = [0u8; 17];
+    stream.read_exact(&mut chal).await?;
+    let challenge = Challenge {
+        nonce: chal[..16].try_into().unwrap(),
+        difficulty: chal[16],
+    };
+    stream.write_all(&build_request(&challenge, token)).await?;
+
+    // Noise over the same stream (split into read/write halves).
+    let (mut r, mut w) = split(stream);
+    let response = client_noise_exchange(&mut w, &mut r, client_private, cap, payload).await?;
     Ok(response)
 }
 

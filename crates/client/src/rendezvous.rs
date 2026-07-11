@@ -714,6 +714,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_noise_tunnels_over_tcp_fallback() {
+        // M12.2c: the Client's UDP is blocked, so it tunnels over TLS-TCP; the
+        // Edge relays it to the QUIC Agent, Noise E2E to the Origin.
+        use crate::transport::client_tunnel_noise_tcp;
+        use ct_agent::serve::serve_noise_stream;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::{register_agent, serve_tcp_connection};
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{
+            build_client_endpoint, build_server_endpoint_with_cert, build_tcp_tls_listener_at,
+            tcp_tls_connect,
+        };
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let token = RoutingToken([0x77; 32]);
+        let challenge = Challenge {
+            nonce: [0x55; 16],
+            difficulty: 8,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        // Streaming echo Origin.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = l.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, qcert) = build_server_endpoint_with_cert().expect("quic edge");
+        let qaddr = server.local_addr().unwrap();
+        let (tcp_listener, acceptor, tcert) =
+            build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into()).await.expect("tcp edge");
+        let taddr = tcp_listener.local_addr().unwrap();
+
+        // QUIC edge: register the Agent.
+        let state_q = state.clone();
+        let quic_edge = tokio::spawn(async move {
+            let ac = server.accept().await.unwrap().await.unwrap();
+            register_agent(&ac, &state_q).await.map_err(|e| e.to_string())?;
+            ac.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent: register (QUIC), serve the relayed stream as Noise responder.
+        let aep = build_client_endpoint(qcert).expect("agent ep");
+        let aconn = aep.connect(qaddr, "localhost").unwrap().await.unwrap();
+        let (mut rs, mut rr) = aconn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let opriv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let (s, r) = aconn.accept_bi().await.unwrap();
+            let _ = serve_noise_stream(s, r, origin_addr, &opriv).await;
+            aconn.closed().await;
+        });
+
+        // TLS-TCP edge: serve the fallback client.
+        let state_t = state.clone();
+        let chal_t = challenge.clone();
+        let tcp_edge = tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t).await;
+        });
+
+        // Client over TLS-TCP: Noise tunnel to the Origin.
+        let client = tcp_tls_connect(taddr, tcert).await.expect("tcp connect");
+        let resp = client_tunnel_noise_tcp(client, &token, &cap, &client_kp.private, b"tcp-noise")
+            .await
+            .expect("tcp noise tunnel");
+        assert_eq!(resp, b"tcp-noise", "Noise E2E round-trips over the TCP fallback");
+
+        agent.abort();
+        quic_edge.abort();
+        tcp_edge.abort();
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
