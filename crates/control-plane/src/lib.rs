@@ -4,6 +4,7 @@
 
 pub mod credential;
 pub mod enrollment;
+pub mod http;
 pub mod issuance;
 pub mod registry;
 
