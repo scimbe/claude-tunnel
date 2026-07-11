@@ -139,10 +139,10 @@ pub async fn run_agent(
     let conn = dial_quic(config.edge, edge_cert).await?;
     register_tunnel(&conn, &token).await?;
     loop {
-        let (mut send, mut recv) = conn.accept_bi().await?;
+        let (send, recv) = conn.accept_bi().await?;
         let origin = config.origin;
         tokio::spawn(async move {
-            let _ = serve_noise_bridge(&mut send, &mut recv, origin, &origin_private).await;
+            let _ = serve_noise_stream(send, recv, origin, &origin_private).await;
         });
     }
 }
