@@ -337,7 +337,12 @@ Minimal technical model; the funded-adversary sybil economics stay an open risk
   `ct-control-plane::accounts::Ledger` with opaque random `AccountId`,
   `open_account`/`balance`/`credit`/`debit`; insufficient debit refused without
   mutation, saturating top-ups. Unit-tested.
-- **M15.2** Capability/token issuance gated by credit balance.
+- **M15.2** ✅ Capability/token issuance gated by credit balance —
+  `ct-control-plane::billing::issue_token_for_payment(ledger, account, price)`:
+  debits first, so insufficient credit (or unknown account) mints no token and
+  leaves the balance unchanged; on success debits and returns a random
+  `RoutingToken`. `TOKEN_PRICE` default. Unit-tested (funded, zero-balance
+  denied, run-until-exhausted with distinct tokens, unknown account).
 - **M15.3** Crypto-payment intake stub (credit top-up).
 - **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
 
