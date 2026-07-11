@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-use quinn::{RecvStream, SendStream};
+use quinn::{Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{copy_bidirectional, join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -194,6 +194,32 @@ where
     tokio::select! {
         r = to_origin => r?,
         r = to_client => r?,
+    }
+    Ok(())
+}
+
+/// Serve the Agent's **direct-path** listener (M11.4b-iii): accept direct Client
+/// connections (which bypass the Edge relay) and serve each one as the Origin's
+/// Noise responder — streaming for TCP, datagram-preserving for UDP. Loops until
+/// the listener closes.
+pub async fn serve_direct(
+    listener: Endpoint,
+    origin: SocketAddr,
+    origin_private: [u8; 32],
+    proto: OriginProto,
+) -> Result<(), BoxError> {
+    while let Some(incoming) = listener.accept().await {
+        tokio::spawn(async move {
+            if let Ok(conn) = incoming.await {
+                if let Ok((send, recv)) = conn.accept_bi().await {
+                    let _ = match proto {
+                        OriginProto::Tcp => serve_noise_stream(send, recv, origin, &origin_private).await,
+                        OriginProto::Udp => serve_noise_udp(send, recv, origin, &origin_private).await,
+                    };
+                }
+                conn.closed().await;
+            }
+        });
     }
     Ok(())
 }
@@ -451,6 +477,55 @@ mod tests {
         i_write.shutdown().await.unwrap();
         agent.await.unwrap().unwrap();
         origin.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_direct_bridges_a_direct_connection() {
+        // M11.4b-iii: serve_direct accepts a direct Client connection and serves
+        // it as the Noise responder straight to the Origin (no Edge).
+        use crate::transport::build_direct_listener_at;
+        use ct_common::noise::{client_handshake_for, frame, generate_static_keypair, read_frame};
+        use ct_common::{Capability, OriginIdentity, RoutingToken};
+        use std::net::Ipv4Addr;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let (origin_addr, origin) = echo_origin().await;
+        let (listener, cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let laddr = listener.local_addr().expect("laddr");
+        let opriv = origin_kp.private;
+        let srv = tokio::spawn(async move {
+            let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp).await;
+        });
+
+        // Inline Client: connect directly to the listener, handshake, one payload.
+        let client = ct_edge::transport::build_client_endpoint(cert).expect("client");
+        let conn = client.connect(laddr, "localhost").expect("cfg").await.expect("conn");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        send.write_all(&frame(&buf[..n])).await.unwrap();
+        let m2 = read_frame(&mut recv).await.unwrap();
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let mut transport = hs.into_transport_mode().unwrap();
+        let n = transport.write_message(b"direct-serve", &mut buf).unwrap();
+        send.write_all(&frame(&buf[..n])).await.unwrap();
+        let resp = read_frame(&mut recv).await.unwrap();
+        let n = transport.read_message(&resp, &mut tmp).unwrap();
+        assert_eq!(&tmp[..n], b"direct-serve", "serve_direct bridged the direct connection to the origin");
+
+        conn.close(0u32.into(), b"done");
+        srv.abort();
+        let _ = origin.await;
     }
 
     #[tokio::test]
