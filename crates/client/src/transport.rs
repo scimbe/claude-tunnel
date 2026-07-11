@@ -226,6 +226,29 @@ pub async fn client_tunnel_udp(
     Ok(())
 }
 
+/// Ask the Edge for the Agent's peer candidate for `token` (M11.3a): send a `'P'`
+/// query and parse the length-prefixed UTF-8 address reply (length 0 = none).
+/// Used to attempt a direct P2P path before falling back to the Edge relay.
+pub async fn query_peer_candidate(
+    conn: &Connection,
+    token: &RoutingToken,
+) -> Result<Option<SocketAddr>, BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(b"P").await?;
+    send.write_all(&token.0).await?;
+    send.finish()?;
+    let resp = recv.read_to_end(64).await?;
+    if resp.is_empty() || resp[0] == 0 {
+        return Ok(None);
+    }
+    let len = resp[0] as usize;
+    if resp.len() < 1 + len {
+        return Err("truncated peer-candidate reply".into());
+    }
+    let addr = std::str::from_utf8(&resp[1..1 + len])?.parse()?;
+    Ok(Some(addr))
+}
+
 /// UDP self-test (M10.4): bind a local app UDP socket, send `payload` as one
 /// datagram through [`client_tunnel_udp`] to the Origin, and return the echoed
 /// datagram. The tunnel runs concurrently and is torn down once the echo arrives.

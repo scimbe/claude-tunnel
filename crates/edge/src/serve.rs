@@ -98,6 +98,24 @@ pub async fn serve_connection(
             relay_quic(send, recv, agent_send, agent_recv).await?;
             Ok(())
         }
+        b'P' => {
+            // Peer-candidate query (M11.3a): reply with the Agent's recorded
+            // candidate for `token` as a length-prefixed UTF-8 address (len 0 =
+            // none). Separate from the 'C' relay flow, so it changes no data path.
+            let mut token = [0u8; 32];
+            recv.read_exact(&mut token).await?;
+            let s = state
+                .candidate(&RoutingToken(token))
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let bytes = s.as_bytes();
+            send.write_all(&[bytes.len() as u8]).await?;
+            if !bytes.is_empty() {
+                send.write_all(bytes).await?;
+            }
+            send.finish()?;
+            Ok(())
+        }
         other => Err(format!("unknown role byte: {other}").into()),
     }
 }

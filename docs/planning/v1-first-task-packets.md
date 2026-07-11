@@ -254,10 +254,17 @@ Mesh Plane promises "any TCP/UDP".
 - **M11.1** ✅ `EdgeState` records each Agent's Edge-observed peer candidate
   (reflexive addr) at registration; `register_with_candidate` / `candidate`.
   (Protocol wiring — Edge sends candidate to Client — is M11.2.)
-- **M11.2** UDP hole-punching attempt; direct QUIC path when it succeeds.
-- **M11.3** Fallback to Edge relay when punching fails (symmetric NAT).
-- **E2E:** docker testbed with a NAT container — direct path established when
-  possible; relay fallback under emulated symmetric NAT; both carry the tunnel.
+- **M11.2** ✅ Record candidate on the live registration path (`register_agent`
+  + `serve_connection` `'A'` → `register_with_candidate(conn.remote_address())`).
+- **M11.3** Direct P2P path. **Decomposed** (hole-punch hard/uncertain):
+  - **M11.3a** `'P'` peer-candidate query verb (Client asks the Edge for the
+    Agent's candidate; separate from the `'C'` relay flow — non-breaking).
+  - **M11.3b** Agent direct-path QUIC listener; advertise its address.
+  - **M11.3c** Client attempts a direct QUIC connection to the candidate.
+- **M11.4** Fallback to Edge relay when the direct path fails; NAT-testbed E2E.
+  NOTE: the flat Docker bridge has no NAT → the direct path trivially succeeds
+  there; true simultaneous-open hole-punching needs emulated NAT (M11.4) and may
+  hit testbed limits — will be reported honestly if so.
 
 ## Milestone 12 — HTTP/2-over-TCP fallback transport (ADR-0004)
 - **M12.1** Agent/Client probe UDP reachability; select TCP transport when blocked.

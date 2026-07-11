@@ -393,6 +393,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_queries_agent_peer_candidate() {
+        // M11.3a: an Agent registers (Edge records its candidate); a Client then
+        // queries the Edge with 'P' and receives the Agent's candidate address.
+        use crate::transport::query_peer_candidate;
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+
+        let token = RoutingToken([0x5C; 32]);
+        let challenge = Challenge {
+            nonce: [0x22; 16],
+            difficulty: 8,
+        };
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&agent_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&client_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            client_conn.closed().await; // hold until the client reads the reply + closes
+            Ok::<(), String>(())
+        });
+
+        // Agent registers ('A' | token) so the Edge records its candidate.
+        let aep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let aconn = aep.connect(addr, "localhost").expect("cfg").await.expect("agent conn");
+        let (mut rs, mut rr) = aconn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+
+        // Client queries the Agent's candidate.
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let cand = query_peer_candidate(&conn, &token)
+            .await
+            .expect("candidate query");
+        assert!(cand.is_some(), "client receives the agent's peer candidate");
+
+        conn.close(0u32.into(), b"done");
+        drop(aconn);
+        let _ = edge.await;
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
