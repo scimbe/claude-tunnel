@@ -393,14 +393,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_queries_agent_peer_candidate() {
-        // M11.3a: an Agent registers (Edge records its candidate); a Client then
-        // queries the Edge with 'P' and receives the Agent's candidate address.
-        use crate::transport::query_peer_candidate;
+    async fn client_queries_advertised_direct_endpoint() {
+        // M11.4b-ii: an Agent advertises its direct-path listener ('D'); a Client
+        // queries the Edge ('P') and receives that (addr, cert).
+        use crate::transport::query_direct_endpoint;
+        use ct_agent::transport::{advertise_direct_listener, build_direct_listener_at};
         use ct_edge::serve::serve_connection;
         use ct_edge::state::EdgeState;
-        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ct_edge::transport::build_server_endpoint_with_cert;
         use quinn::Connection;
+        use std::net::Ipv4Addr;
         use std::sync::Arc;
 
         let token = RoutingToken([0x5C; 32]);
@@ -412,6 +414,11 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
 
+        // The values the Agent advertises.
+        let adv_addr: std::net::SocketAddr = "10.5.0.4:40001".parse().unwrap();
+        let (_ep, adv_cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
+
         let state_e = state.clone();
         let chal_e = challenge.clone();
         let edge = tokio::spawn(async move {
@@ -419,32 +426,32 @@ mod tests {
             serve_connection(&agent_conn, &state_e, &chal_e)
                 .await
                 .map_err(|e| e.to_string())?;
+            agent_conn.closed().await;
             let client_conn = server.accept().await.unwrap().await.unwrap();
             serve_connection(&client_conn, &state_e, &chal_e)
                 .await
                 .map_err(|e| e.to_string())?;
-            client_conn.closed().await; // hold until the client reads the reply + closes
+            client_conn.closed().await;
             Ok::<(), String>(())
         });
 
-        // Agent registers ('A' | token) so the Edge records its candidate.
-        let aep = build_client_endpoint(cert.clone()).expect("agent ep");
-        let aconn = aep.connect(addr, "localhost").expect("cfg").await.expect("agent conn");
-        let (mut rs, mut rr) = aconn.open_bi().await.unwrap();
-        rs.write_all(b"A").await.unwrap();
-        rs.write_all(&token.0).await.unwrap();
-        rs.finish().unwrap();
-        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
-
-        // Client queries the Agent's candidate.
-        let conn = dial_edge(addr, cert).await.expect("client dial");
-        let cand = query_peer_candidate(&conn, &token)
+        // Agent advertises its direct-path listener ('D').
+        let aconn = dial_edge(addr, cert.clone()).await.expect("agent dial");
+        advertise_direct_listener(&aconn, &token, adv_addr, &adv_cert)
             .await
-            .expect("candidate query");
-        assert!(cand.is_some(), "client receives the agent's peer candidate");
+            .expect("advertise");
+        aconn.close(0u32.into(), b"done");
+
+        // Client queries the advertised endpoint ('P').
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let ep = query_direct_endpoint(&conn, &token)
+            .await
+            .expect("direct-endpoint query");
+        let (got_addr, got_cert) = ep.expect("endpoint advertised");
+        assert_eq!(got_addr, adv_addr, "advertised address returned");
+        assert_eq!(got_cert, adv_cert, "advertised cert returned");
 
         conn.close(0u32.into(), b"done");
-        drop(aconn);
         let _ = edge.await;
     }
 

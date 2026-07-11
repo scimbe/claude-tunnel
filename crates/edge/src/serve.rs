@@ -5,6 +5,7 @@
 //! so a later Client rendezvous for that token can be routed to it. The Client
 //! route→relay path is exercised end to end in the M5.6 testbed smoke.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::config::EdgeConfig;
@@ -98,20 +99,43 @@ pub async fn serve_connection(
             relay_quic(send, recv, agent_send, agent_recv).await?;
             Ok(())
         }
-        b'P' => {
-            // Peer-candidate query (M11.3a): reply with the Agent's recorded
-            // candidate for `token` as a length-prefixed UTF-8 address (len 0 =
-            // none). Separate from the 'C' relay flow, so it changes no data path.
+        b'D' => {
+            // Agent advertises its direct-path listener (M11.4b-ii):
+            // token(32) | addr_len(1) | addr | cert_len(2 BE) | cert.
             let mut token = [0u8; 32];
             recv.read_exact(&mut token).await?;
-            let s = state
-                .candidate(&RoutingToken(token))
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            let bytes = s.as_bytes();
-            send.write_all(&[bytes.len() as u8]).await?;
-            if !bytes.is_empty() {
-                send.write_all(bytes).await?;
+            let mut al = [0u8; 1];
+            recv.read_exact(&mut al).await?;
+            let mut addr_buf = vec![0u8; al[0] as usize];
+            recv.read_exact(&mut addr_buf).await?;
+            let mut cl = [0u8; 2];
+            recv.read_exact(&mut cl).await?;
+            let mut cert = vec![0u8; u16::from_be_bytes(cl) as usize];
+            recv.read_exact(&mut cert).await?;
+            let addr: SocketAddr = std::str::from_utf8(&addr_buf)?.parse()?;
+            state.advertise_direct(RoutingToken(token), addr, cert);
+            send.write_all(b"OK").await?;
+            send.finish()?;
+            Ok(())
+        }
+        b'P' => {
+            // Client queries the Agent's advertised direct endpoint (M11.4b-ii):
+            // reply `[0]` if none, else `[1] addr_len(1) addr cert_len(2 BE) cert`.
+            // Separate from the 'C' relay flow — it changes no data path.
+            let mut token = [0u8; 32];
+            recv.read_exact(&mut token).await?;
+            match state.direct_endpoint(&RoutingToken(token)) {
+                Some((addr, cert)) => {
+                    let a = addr.to_string();
+                    let ab = a.as_bytes();
+                    send.write_all(&[1u8, ab.len() as u8]).await?;
+                    send.write_all(ab).await?;
+                    send.write_all(&(cert.len() as u16).to_be_bytes()).await?;
+                    send.write_all(&cert).await?;
+                }
+                None => {
+                    send.write_all(&[0u8]).await?;
+                }
             }
             send.finish()?;
             Ok(())

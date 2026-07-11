@@ -46,6 +46,34 @@ pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), Bo
     build_direct_listener_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
 }
 
+/// Advertise the Agent's direct-path listener to the Edge (M11.4b-ii): send a
+/// `'D'` message — `token(32) | addr_len(1) | addr | cert_len(2 BE) | cert` — so
+/// Clients querying with `'P'` can discover and connect to it directly.
+pub async fn advertise_direct_listener(
+    conn: &Connection,
+    token: &RoutingToken,
+    addr: SocketAddr,
+    cert: &CertificateDer<'_>,
+) -> Result<(), BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(b"D").await?;
+    send.write_all(&token.0).await?;
+    let a = addr.to_string();
+    let ab = a.as_bytes();
+    send.write_all(&[ab.len() as u8]).await?;
+    send.write_all(ab).await?;
+    let cb = cert.as_ref();
+    send.write_all(&(cb.len() as u16).to_be_bytes()).await?;
+    send.write_all(cb).await?;
+    send.finish()?;
+    let ack = recv.read_to_end(8).await?;
+    if ack == b"OK" {
+        Ok(())
+    } else {
+        Err("direct-listener advertisement rejected".into())
+    }
+}
+
 /// Transport the Agent uses to reach the Edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {

@@ -283,27 +283,38 @@ pub async fn client_tunnel_p2p_or_relay(
     Ok((false, resp))
 }
 
-/// Ask the Edge for the Agent's peer candidate for `token` (M11.3a): send a `'P'`
-/// query and parse the length-prefixed UTF-8 address reply (length 0 = none).
-/// Used to attempt a direct P2P path before falling back to the Edge relay.
-pub async fn query_peer_candidate(
+/// Ask the Edge for the Agent's advertised direct endpoint for `token`
+/// (M11.4b-ii): send a `'P'` query and parse the reply `[0]` (none) or
+/// `[1] addr_len(1) addr cert_len(2 BE) cert` into `(addr, cert)`. Used to
+/// attempt the direct P2P path before falling back to the Edge relay.
+pub async fn query_direct_endpoint(
     conn: &Connection,
     token: &RoutingToken,
-) -> Result<Option<SocketAddr>, BoxError> {
+) -> Result<Option<(SocketAddr, CertificateDer<'static>)>, BoxError> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(b"P").await?;
     send.write_all(&token.0).await?;
     send.finish()?;
-    let resp = recv.read_to_end(64).await?;
+    let resp = recv.read_to_end(4096).await?;
     if resp.is_empty() || resp[0] == 0 {
         return Ok(None);
     }
-    let len = resp[0] as usize;
-    if resp.len() < 1 + len {
-        return Err("truncated peer-candidate reply".into());
+    let truncated = || -> BoxError { "truncated direct-endpoint reply".into() };
+    if resp.len() < 2 {
+        return Err(truncated());
     }
-    let addr = std::str::from_utf8(&resp[1..1 + len])?.parse()?;
-    Ok(Some(addr))
+    let addr_end = 2 + resp[1] as usize;
+    if resp.len() < addr_end + 2 {
+        return Err(truncated());
+    }
+    let addr: SocketAddr = std::str::from_utf8(&resp[2..addr_end])?.parse()?;
+    let clen = u16::from_be_bytes([resp[addr_end], resp[addr_end + 1]]) as usize;
+    let cert_start = addr_end + 2;
+    if resp.len() < cert_start + clen {
+        return Err(truncated());
+    }
+    let cert = CertificateDer::from(resp[cert_start..cert_start + clen].to_vec());
+    Ok(Some((addr, cert)))
 }
 
 /// UDP self-test (M10.4): bind a local app UDP socket, send `payload` as one
