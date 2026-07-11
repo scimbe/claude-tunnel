@@ -7,8 +7,8 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use crate::transport::{client_tunnel, dial_edge};
-use ct_common::RoutingToken;
+use crate::transport::{client_tunnel_noise, dial_edge};
+use ct_common::Capability;
 use rustls::pki_types::CertificateDer;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -54,17 +54,18 @@ pub fn summarize(samples: &[f64]) -> Option<Summary> {
     })
 }
 
-/// One fresh-connection round-trip: dial → tunnel `payload` → verify echo,
-/// returning the elapsed time in milliseconds.
+/// One fresh-connection Noise round-trip: dial → `client_tunnel_noise` → verify
+/// echo, returning the elapsed time in milliseconds (M8.4c-ii).
 async fn run_once(
     edge_addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
-    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
     payload: &[u8],
 ) -> Result<f64, BoxError> {
     let start = Instant::now();
     let conn = dial_edge(edge_addr, edge_cert).await?;
-    let response = client_tunnel(&conn, token, payload).await?;
+    let response = client_tunnel_noise(&conn, &cap.token, cap, client_private, payload).await?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     conn.close(0u32.into(), b"done");
     if response == payload {
@@ -74,18 +75,19 @@ async fn run_once(
     }
 }
 
-/// Run `iterations` fresh-connection round-trips, returning per-iteration latency
-/// in milliseconds. Failed iterations are skipped.
+/// Run `iterations` fresh-connection Noise round-trips, returning per-iteration
+/// latency in milliseconds. Failed iterations are skipped.
 pub async fn run_bench(
     edge_addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
-    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
     payload: &[u8],
     iterations: usize,
 ) -> Vec<f64> {
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        if let Ok(ms) = run_once(edge_addr, edge_cert.clone(), token, payload).await {
+        if let Ok(ms) = run_once(edge_addr, edge_cert.clone(), cap, client_private, payload).await {
             samples.push(ms);
         }
     }
@@ -146,21 +148,51 @@ mod tests {
 
     #[tokio::test]
     async fn run_bench_measures_iterations() {
+        use ct_agent::serve::serve_noise_bridge;
+        use ct_common::noise::generate_static_keypair;
         use ct_common::pow::Challenge;
+        use ct_common::{OriginIdentity, RoutingToken};
         use ct_edge::serve::serve_connection;
         use ct_edge::state::EdgeState;
         use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
         use quinn::Connection;
         use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let token = RoutingToken([6u8; 32]);
         let challenge = Challenge {
             nonce: [0x44; 16],
             difficulty: 6,
         };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // Multi-accept TCP echo Origin (one connection per bench iteration).
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = origin_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let _ = sock.read_to_end(&mut buf).await;
+                    let _ = sock.write_all(&buf).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
         let state = Arc::new(EdgeState::<Connection>::new());
         let (server, cert) = build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
 
         // Edge: serve every incoming connection.
         let state_e = state.clone();
@@ -178,7 +210,7 @@ mod tests {
             }
         });
 
-        // Agent: register, then echo every relayed stream.
+        // Agent: register, then serve every relayed stream as the Noise responder.
         let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
         let agent_conn = agent_ep
             .connect(addr, "localhost")
@@ -190,21 +222,22 @@ mod tests {
         rs.write_all(&token.0).await.unwrap();
         rs.finish().unwrap();
         assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
         let agent_task = tokio::spawn(async move {
             while let Ok((mut s, mut r)) = agent_conn.accept_bi().await {
+                let priv_ = origin_priv;
                 tokio::spawn(async move {
-                    let d = r.read_to_end(4096).await.unwrap_or_default();
-                    let _ = s.write_all(&d).await;
-                    let _ = s.finish();
+                    let _ = serve_noise_bridge(&mut s, &mut r, origin_addr, &priv_).await;
                 });
             }
         });
 
-        let samples = run_bench(addr, cert, &token, b"ping", 3).await;
-        assert_eq!(samples.len(), 3, "three successful round-trips measured");
+        let samples = run_bench(addr, cert, &cap, &client_kp.private, b"ping", 3).await;
+        assert_eq!(samples.len(), 3, "three successful Noise round-trips measured");
         assert!(summarize(&samples).is_some());
 
         agent_task.abort();
         edge.abort();
+        origin.abort();
     }
 }

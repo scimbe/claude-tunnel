@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use ct_client::bench::{csv_row, run_bench, summarize};
 use ct_client::config::ClientConfig;
-use ct_client::transport::{client_tunnel, dial_edge, load_cert};
+use ct_client::transport::{client_tunnel_noise, dial_edge, load_cert};
+use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
 
 #[tokio::main]
@@ -48,9 +49,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let edge_addr: SocketAddr = cap.edge_addr.parse()?;
 
+    // The Client's ephemeral Noise static key (its static key is not pinned by
+    // the Origin in Noise_IK, so a fresh one per run is fine).
+    let client_kp = generate_static_keypair();
+
     // Bench mode: run N round-trips and emit a labeled CSV row.
     if iterations > 1 {
-        let samples = run_bench(edge_addr, edge_cert, &cap.token, payload.as_bytes(), iterations).await;
+        let samples = run_bench(
+            edge_addr,
+            edge_cert,
+            &cap,
+            &client_kp.private,
+            payload.as_bytes(),
+            iterations,
+        )
+        .await;
         let summary = summarize(&samples).ok_or("bench produced no samples")?;
         let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();
         let loss = std::env::var("CT_BENCH_LOSS").unwrap_or_default();
@@ -63,9 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Single-tunnel mode: verify the round-trip.
+    // Single-tunnel mode: verify the Noise round-trip.
     let conn = dial_edge(edge_addr, edge_cert).await?;
-    let response = client_tunnel(&conn, &cap.token, payload.as_bytes()).await?;
+    let response =
+        client_tunnel_noise(&conn, &cap.token, &cap, &client_kp.private, payload.as_bytes()).await?;
     println!(
         "ct-client: sent {:?}, received {:?}",
         payload,
