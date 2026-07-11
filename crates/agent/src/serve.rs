@@ -6,12 +6,14 @@
 //! Origin, which terminates the Noise session (P3). The Agent never inspects
 //! them beyond forwarding.
 
+use std::io;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use quinn::{RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{copy_bidirectional, join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::AgentConfig;
 use crate::transport::{dial_quic, register_tunnel};
@@ -123,6 +125,76 @@ where
     let tcp = TcpStream::connect(origin).await?;
     let cipher = join(recv, send);
     noise_pump(transport, cipher, tcp).await?;
+    Ok(())
+}
+
+/// Serve one relayed stream as the Origin's Noise responder bridging to a **UDP**
+/// Origin (M10.1). One Noise frame carries exactly one UDP datagram, so the
+/// tunnel's framing preserves datagram boundaries: each decrypted frame is `send`
+/// as a datagram to the Origin, and each datagram `recv`d from the Origin is
+/// encrypted back as one frame. Runs until the Client closes the tunnel.
+pub async fn serve_noise_udp<S, R>(
+    mut send: S,
+    mut recv: R,
+    origin: SocketAddr,
+    origin_private: &[u8; 32],
+) -> Result<(), BoxError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut hs = origin_handshake(origin_private)?;
+    let mut hbuf = vec![0u8; 65535];
+    let mut htmp = vec![0u8; 65535];
+    let m1 = read_frame(&mut recv).await?;
+    hs.read_message(&m1, &mut htmp)?;
+    let n = hs.write_message(&[], &mut hbuf)?;
+    send.write_all(&frame(&hbuf[..n])).await?;
+    send.flush().await?;
+    let transport = hs.into_transport_mode()?;
+
+    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    udp.connect(origin).await?;
+
+    let ts = Mutex::new(transport);
+    // `e` is inferred as snow::Error from the map_err call sites (naming it would
+    // need snow as a direct dep, which ct-agent gets only transitively).
+    let noise_err = |e| io::Error::new(io::ErrorKind::Other, format!("{e}"));
+
+    // Client -> decrypt frame -> UDP datagram to Origin.
+    let to_origin = async {
+        let mut tmp = vec![0u8; 65535];
+        loop {
+            let fr = match read_frame(&mut recv).await {
+                Ok(f) => f,
+                Err(_) => break, // tunnel closed
+            };
+            let len = ts.lock().unwrap().read_message(&fr, &mut tmp).map_err(noise_err)?;
+            udp.send(&tmp[..len]).await?;
+        }
+        Ok::<(), io::Error>(())
+    };
+
+    // Origin datagram -> encrypt -> frame to Client.
+    let to_client = async {
+        let mut dgram = vec![0u8; 65535];
+        let mut ct = vec![0u8; 65535 + 256];
+        loop {
+            let n = udp.recv(&mut dgram).await?;
+            let len = ts.lock().unwrap().write_message(&dgram[..n], &mut ct).map_err(noise_err)?;
+            send.write_all(&frame(&ct[..len])).await?;
+            send.flush().await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    // The Client closing the tunnel ends `to_origin`; UDP has no EOF, so
+    // `to_client` only ends on error — whichever finishes first tears down.
+    tokio::select! {
+        r = to_origin => r?,
+        r = to_client => r?,
+    }
     Ok(())
 }
 
@@ -315,6 +387,61 @@ mod tests {
         assert_eq!(got, expected, "100 KB streams through serve_noise_stream to the echo Origin");
         writer.await.unwrap();
         pump.await.unwrap().unwrap();
+        agent.await.unwrap().unwrap();
+        origin.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_noise_udp_bridges_datagrams_to_origin() {
+        use ct_common::noise::{client_handshake_for, frame, generate_static_keypair, read_frame};
+        use ct_common::{Capability, OriginIdentity, RoutingToken};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UdpSocket;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        // UDP echo Origin.
+        let origin_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_sock.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let mut b = vec![0u8; 65535];
+            while let Ok((n, peer)) = origin_sock.recv_from(&mut b).await {
+                let _ = origin_sock.send_to(&b[..n], peer).await;
+            }
+        });
+
+        let (ini_cipher, agent_cipher) = tokio::io::duplex(64 * 1024);
+        let origin_priv = origin_kp.private;
+        let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let agent =
+            tokio::spawn(async move { serve_noise_udp(a_write, a_read, origin_addr, &origin_priv).await });
+
+        // Initiator: handshake, then send discrete datagrams and read echoes.
+        let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        i_write.write_all(&frame(&buf[..n])).await.unwrap();
+        let m2 = read_frame(&mut i_read).await.unwrap();
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let mut transport = hs.into_transport_mode().unwrap();
+
+        for msg in [b"one".as_slice(), b"two", b"a-longer-datagram-payload"] {
+            let n = transport.write_message(msg, &mut buf).unwrap();
+            i_write.write_all(&frame(&buf[..n])).await.unwrap();
+            let fr = read_frame(&mut i_read).await.unwrap();
+            let n = transport.read_message(&fr, &mut tmp).unwrap();
+            assert_eq!(&tmp[..n], msg, "UDP datagram boundary + content preserved through the tunnel");
+        }
+
+        drop(i_write); // close the tunnel → serve_noise_udp returns
         agent.await.unwrap().unwrap();
         origin.abort();
     }
