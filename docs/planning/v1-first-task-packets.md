@@ -167,7 +167,9 @@ Prereq: the library crates need runnable **binaries** (the deferred end-to-end w
 ## Milestone 7 — BA thesis (German, HAW-konform, Docker/texlive)
 
 - **M7.1** LaTeX scaffold: Titelblatt, Eidesstattliche Erklärung, Abstract (DE+EN), Gliederung, BibLaTeX; compiled to PDF via a **texlive Docker image**.
-- **M7.2** Einleitung + Grundlagen (ZK-Tunnel, Noise, QUIC, PoW).
+- **M7.2** Einleitung + Grundlagen (ZK-Tunnel, Noise, QUIC, PoW). **Decomposed** (two full chapters > one pass):
+  - **M7.2a** Einleitung: Motivation/Problemstellung, Zielsetzung, Forschungsfragen, Aufbau (aus SPEC §1–3/§9, ADR-0001/0002/0011).
+  - **M7.2b** Grundlagen: providerblinde Relays, Noise (`Noise_IK`), QUIC-Transport, Proof-of-Work (aus ADR-0004/0013/0018, CONTEXT.md).
 - **M7.3** Architektur (aus ADRs/CONTEXT/SPEC).
 - **M7.4** Implementierung (aus crates).
 - **M7.5** Evaluation (aus M6-Ergebnissen + Plots).

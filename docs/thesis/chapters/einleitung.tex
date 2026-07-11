@@ -1,14 +1,71 @@
 \chapter{Einleitung}
 \label{ch:einleitung}
 
-Zensurresistente Kommunikation erfordert Infrastruktur, die selbst dann
-vertrauenswürdig bleibt, wenn der Betreiber des Relays kompromittiert oder zur
-Kooperation gezwungen wird. Kommerzielle Tunneldienste terminieren den Verkehr
-typischerweise beim Anbieter und können ihn dort einsehen. Diese Arbeit verfolgt
-den entgegengesetzten Ansatz: ein \emph{providerblindes} Relay, das ausschließlich
-Chiffretext weiterleitet und selbst keinen Klartext sieht. Als Transport dient
-QUIC~\cite{rfc9000,rfc9001}; die Ende-zu-Ende-Sicherheit stellt das
-Noise-Protokoll~\cite{noiseprotocol} her.
+\section{Motivation und Problemstellung}
+\label{sec:motivation}
 
-Dieses Kapitel wird in Paket~M7.2 ausgearbeitet (Motivation, Zielsetzung,
-Forschungsfragen, Aufbau der Arbeit).
+Dienste hinter NAT oder Firewalls für entfernte Nutzer erreichbar zu machen,
+ist ein alltäglicher Bedarf; die verbreiteten Tunneldienste lösen ihn jedoch um
+den Preis des Vertrauens: Der Verkehr wird beim Anbieter terminiert, sodass
+dieser den Klartext einsehen und die Verbindung auf Zuruf kappen kann. Für
+Nutzer mit einem Schutzbedarf gegen Zensur ist ein Anbieter, der den Datenverkehr
+\emph{sehen} oder \emph{unterbrechen} kann, jedoch selbst ein Angriffspunkt.
+
+Diese Arbeit verfolgt den entgegengesetzten Entwurf: einen
+\emph{providerblinden} (zero-knowledge) Tunnel, bei dem der Betreiber
+bewusst aus drei Dingen herausgehalten wird -- dem \emph{Inhalt} (die
+Nutzlast-Verschlüsselung terminiert erst am kundeneigenen Origin, nie beim
+Betreiber), dem \emph{Vertrauen} (die Schlüssel sind kundenverankert, es gibt
+keine betreiberseitige PKI) und, soweit möglich, dem \emph{Datenpfad} selbst.
+Die Zero-Knowledge-Eigenschaft ist dabei bewusst auf die \emph{Nutzlast}
+begrenzt: Strukturelle Metadaten wie die Existenz eines Tunnels oder -- im
+Relay-Fall -- grobe Zeit- und Volumenzähler bleiben sichtbar. Durchsetzung
+reduziert sich auf einen einzigen, groben Hebel (Terminierung eines Tokens),
+der nur an einer eng definierten \emph{rechtlichen Grenze} greift.
+
+Aus dieser Haltung ergibt sich ein Spannungsfeld: Providerblindheit und
+Zensurresistenz erkauft man sich mit zusätzlichen Vermittlungsschritten
+(Rendezvous, Relay) und kryptographischem Aufwand. Ob und in welchem Umfang
+diese Schutzziele die Latenz eines Tunnels belasten, ist die zentrale empirische
+Frage dieser Arbeit.
+
+\section{Zielsetzung}
+\label{sec:zielsetzung}
+
+Ziel der Arbeit ist der Entwurf, die prototypische Implementierung und die
+emulationsbasierte Evaluation eines solchen Tunnels. Der Prototyp ist in Rust auf
+Basis von QUIC umgesetzt und realisiert den providerblinden Relay-Pfad
+Client~$\rightarrow$~Edge~$\rightarrow$~Agent~$\rightarrow$~Origin mit einem
+Proof-of-Work-gestützten, ratenbegrenzten Rendezvous. Die Noise-basierte
+Ende-zu-Ende-Verschlüsselung ist als kryptographischer Baustein umgesetzt. Die
+Bewertung erfolgt in einem vollständig Docker-basierten Testbett, in dem
+Netzbedingungen (Verzögerung, Paketverlust, Bandbreite) mit \texttt{tc netem}
+emuliert und die Roundtrip-Latenz reproduzierbar vermessen werden.
+
+\section{Forschungsfragen}
+\label{sec:forschungsfragen}
+
+Die Arbeit gliedert sich an drei Forschungsfragen:
+
+\begin{description}
+  \item[FF1 -- Realisierbarkeit.] Lässt sich ein providerblinder,
+    zensurresistenter Tunnel aus etablierten Bausteinen -- QUIC als Transport,
+    Noise für die Ende-zu-Ende-Sicherheit, Proof-of-Work als Zugangsschutz --
+    schlüssig entwerfen und implementieren?
+  \item[FF2 -- Latenz-Overhead.] Welchen Grund-Overhead verursacht der
+    providerblinde Vermittlungspfad (Verbindungsaufbau, PoW-Rendezvous,
+    Mehrsprung-Relay) gegenüber einer direkten Verbindung?
+  \item[FF3 -- Verhalten unter Netzbedingungen.] Wie skaliert die
+    Tunnel-Roundtrip-Latenz mit Netzverzögerung und Paketverlust?
+\end{description}
+
+\section{Aufbau der Arbeit}
+\label{sec:aufbau}
+
+Kapitel~\ref{ch:grundlagen} führt die technischen Grundlagen ein
+(providerblinde Relays, Noise, QUIC, Proof-of-Work). Kapitel~\ref{ch:architektur}
+beschreibt den Systementwurf und dessen Entwurfsentscheidungen.
+Kapitel~\ref{ch:implementierung} dokumentiert die Umsetzung des Prototyps.
+Kapitel~\ref{ch:evaluation} stellt das Testbett und die Messergebnisse vor und
+beantwortet FF2 und FF3. Kapitel~\ref{ch:fazit} fasst die Ergebnisse zusammen
+und gibt einen Ausblick auf die offenen Punkte.
