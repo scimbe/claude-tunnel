@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use ct_agent::capability::mint_capability;
 use ct_agent::config::AgentConfig;
+use ct_agent::origin::OriginKey;
 use ct_agent::serve::run_agent;
 use ct_agent::transport::load_cert;
-use ct_common::OriginIdentity;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -30,8 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Mint a Capability (Origin Identity is a placeholder until Noise E2E, P3).
-    let cap = mint_capability(OriginIdentity([0u8; 32]), config.edge.to_string());
+    // Mint a Capability carrying the real Origin Identity (M8.1). The Agent is
+    // custodian of the Origin static Noise keypair; only its public half travels
+    // in the Capability. The private half stays here to terminate the E2E
+    // handshake (M8.3).
+    let origin_key = OriginKey::generate();
+    let cap = mint_capability(origin_key.origin_identity(), config.edge.to_string());
     std::fs::write(&cap_out, cap.encode())?;
     eprintln!(
         "ct-agent: edge={} origin={} capability -> {}",

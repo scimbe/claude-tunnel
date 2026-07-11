@@ -181,3 +181,19 @@ Prereq: the library crates need runnable **binaries** (the deferred end-to-end w
 - **Readiness gate (D2):** each packet's acceptance tests + stubs must resolve against its bundle before a Haiku agent is assigned; P1.4 is the first likely **decompose** candidate.
 - **Escalation (D6/HITL):** nothing here should hit an unsourceable gap — all context exists in the ADRs. The first genuine escalations are more likely in Milestone 5 (billing/PoW) where the backlog risks (jurisdiction, billing-sybil) are unresolved.
 - **Frozen tests (D4):** the acceptance tests above are authored by the strong model and are immutable to the executing Haiku.
+
+## Milestone 8 — Noise E2E on the live data path (DAG extension, SPEC §8)
+
+The prototype's live path currently relays plaintext. M8 wires the Noise_IK
+Client↔Origin session (building blocks already in `ct-common::noise`) onto it,
+so the Edge relays only ciphertext. Decomposed:
+
+- **M8.1** Agent holds the Origin static Noise keypair (custodian) and mints the
+  Capability with the real OriginIdentity (replacing the `[0u8;32]` placeholder).
+- **M8.2** Client-side Noise initiator over the tunnel stream (framed handshake +
+  encrypted payload), pinning the Capability's Origin Identity.
+- **M8.3** Agent-side Noise responder + plaintext bridge: decrypt client frames →
+  local Origin TCP → encrypt replies.
+- **M8.4** E2E integration test through a real Edge+Agent proving the Edge relays
+  only ciphertext (relayed bytes ≠ plaintext) and the Client gets the echo back.
+- **Verification:** cargo test green each packet; M8.4 asserts provider-blindness.
