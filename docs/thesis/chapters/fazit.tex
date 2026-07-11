@@ -1,7 +1,57 @@
 \chapter{Fazit und Ausblick}
 \label{ch:fazit}
 
-Dieses Kapitel fasst die Ergebnisse zusammen und gibt einen Ausblick. Es wird in
-Paket~M7.6 ausgearbeitet und greift die offenen Risiken aus dem Backlog
-(\texttt{docs/BACKLOG.md}) auf: Jurisdiktion, Sybil-Resistenz der Abrechnung
-sowie Missbrauchsprävention.
+\section{Zusammenfassung}
+\label{sec:zusammenfassung}
+
+Diese Arbeit hat einen providerblinden, zensurresistenten Netzwerktunnel
+entworfen, prototypisch in Rust auf Basis von QUIC implementiert und in einem
+vollständig containerisierten Testbett unter emulierten Netzbedingungen
+evaluiert. Gemessen an den drei Forschungsfragen ergibt sich folgendes Bild.
+
+\paragraph{FF1 -- Realisierbarkeit.} Ein providerblinder Tunnel lässt sich aus
+etablierten Bausteinen schlüssig zusammensetzen. Der Prototyp realisiert den
+providerblinden Vermittlungspfad Client$\rightarrow$Edge$\rightarrow$Agent$\rightarrow$Origin
+mit einem PoW-gestützten, ratenbegrenzten Rendezvous über einen einheitlichen
+QUIC-Transport mit Rollen-Dispatch am Edge; die kryptographischen Bausteine --
+Noise-Handshake, signierte Credentials, Proof-of-Work, Ratenbegrenzung -- sind
+in \texttt{ct-common} umgesetzt und durch 94 automatisierte Tests, bis hin zu
+End-to-End-Roundtrips über echtes QUIC, abgesichert. Die Realisierbarkeit ist
+damit für Architektur und Kernmechanismen belegt; als offener Integrationsschritt
+verbleibt, die Noise-Ende-zu-Ende-Sitzung auf dem Live-Datenpfad zu verankern
+(Abschnitt~\ref{sec:ausblick}).
+
+\paragraph{FF2 und FF3 -- Latenz.} Der Eigen-Overhead des Tunnels ist im
+unbelasteten Fall gering (Mittel 6{,}8\,ms) und skaliert linear mit der
+Netzverzögerung ($\text{RT} \approx 6{,}8 + 4{,}2 \cdot d$); der Faktor erklärt
+sich aus dem mehrfachen Queren der verzögerten Strecke pro Roundtrip. Paketverlust
+von 2\,\% wirkt sich erst bei großer Umlaufzeit spürbar aus und dort primär im
+Tail (p95 bei 50\,ms um rund 18\,\% erhöht), nicht im Median. Die Schutzziele
+Providerblindheit und Zensurresistenz sind also mit einem berechenbaren, im
+Wesentlichen von der Netzstrecke dominierten Latenzaufschlag vereinbar.
+
+\section{Ausblick}
+\label{sec:ausblick}
+
+\paragraph{Prototyp.} Der nächste Schritt ist die Verankerung der
+Noise-Ende-zu-Ende-Sitzung auf dem Live-Pfad sowie der \emph{direkte}
+Peer-to-Peer-Datenpfad mit NAT-Hole-Punching und Edge-Relay nur als Rückfall --
+im aktuellen Prototyp läuft der Verkehr stets über das Relay. Hinzu kommen der
+HTTP/2-über-TCP-Rückfall für blockiertes UDP sowie eine belastbarere Evaluation:
+größere Stichproben, symmetrische und bidirektionale Impairment,
+Bandbreitenbegrenzung und ein Keep-Alive-Datenpfad neben dem
+Frisch-Verbindungsaufbau.
+
+\paragraph{Offene Risiken.} Unabhängig von der Technik bleiben drei Fragen
+offen, die über die Betreibbarkeit der Zensurresistenz-Haltung entscheiden: die
+abrechnungsseitige Sybil-/Missbrauchsresistenz (Proof-of-Work deckt Fluten, aber
+keinen finanzierten Angreifer ab), die Wahl von Jurisdiktion, Hosting und
+Zahlungswegen sowie ein konkreter operativer Prozess für die einzige
+Durchsetzungsgrundlage an der rechtlichen Grenze.
+
+\paragraph{Zurückgestellte Funktionen.} Über die v1 hinaus vorgesehen sind die
+Browser-Plane (anonymer Browserzugang per SNI-Passthrough), vollständige
+Selbst-Hostbarkeit und dezentrale Koordination, Agent-Redundanz sowie
+komfortable Abläufe für die Schlüsselrotation. Diese Punkte sind im Backlog des
+Projekts festgehalten und bewusst von der v1 getrennt, um den Kern -- einen
+belegbar providerblinden Tunnel -- zuerst tragfähig zu machen.
