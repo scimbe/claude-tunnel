@@ -93,19 +93,22 @@ where
 }
 
 /// Run the Agent: dial the Edge, register the tunnel for `token`, then serve each
-/// relayed stream to the local Origin. Loops until the connection closes.
+/// relayed stream as the Origin's Noise responder, bridging plaintext to the
+/// local Origin (M8.4c-i). `origin_private` is the Agent-held Origin static key.
+/// Loops until the connection closes.
 pub async fn run_agent(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
+    origin_private: [u8; 32],
 ) -> Result<(), BoxError> {
     let conn = dial_quic(config.edge, edge_cert).await?;
     register_tunnel(&conn, &token).await?;
     loop {
-        let (send, recv) = conn.accept_bi().await?;
+        let (mut send, mut recv) = conn.accept_bi().await?;
         let origin = config.origin;
         tokio::spawn(async move {
-            let _ = serve_stream_to_origin(send, recv, origin).await;
+            let _ = serve_noise_bridge(&mut send, &mut recv, origin, &origin_private).await;
         });
     }
 }
@@ -218,43 +221,67 @@ mod tests {
 
     #[tokio::test]
     async fn run_agent_registers_and_serves_relayed_streams() {
+        use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
+        use ct_common::{Capability, OriginIdentity};
         use ct_edge::state::EdgeState;
         use quinn::Connection;
         use std::sync::Arc;
 
         let (origin_addr, origin) = echo_origin().await;
 
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let token = RoutingToken([3u8; 32]);
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
         let state = Arc::new(EdgeState::<Connection>::new());
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let edge_addr = server.local_addr().expect("addr");
-        let token = RoutingToken([3u8; 32]);
 
-        // Edge: accept the Agent, register it, then relay a stream and read the echo.
+        // Edge: accept the Agent, register it, then act as the Noise initiator
+        // over a relayed stream and return the decrypted echo.
         let state_e = state.clone();
+        let cap_e = cap.clone();
+        let client_priv = client_kp.private;
         let edge = tokio::spawn(async move {
             let agent_conn = server.accept().await.unwrap().await.unwrap();
             ct_edge::serve::register_agent(&agent_conn, &state_e)
                 .await
                 .map_err(|e| e.to_string())?;
             let (mut send, mut recv) = agent_conn.open_bi().await.unwrap();
-            send.write_all(b"ping").await.unwrap();
-            send.finish().unwrap();
-            let got = recv.read_to_end(64).await.unwrap();
-            Ok::<Vec<u8>, String>(got)
+
+            let mut hs = client_handshake_for(&client_priv, &cap_e).map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; 65535];
+            let mut tmp = vec![0u8; 65535];
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            send.write_all(&frame(&buf[..n])).await.unwrap();
+            let m2 = read_frame(&mut recv).await.map_err(|e| e.to_string())?;
+            hs.read_message(&m2, &mut tmp).unwrap();
+            let mut transport = hs.into_transport_mode().unwrap();
+            let n = transport.write_message(b"ping", &mut buf).unwrap();
+            send.write_all(&frame(&buf[..n])).await.unwrap();
+            let resp_ct = read_frame(&mut recv).await.map_err(|e| e.to_string())?;
+            let n = transport.read_message(&resp_ct, &mut tmp).unwrap();
+            Ok::<Vec<u8>, String>(tmp[..n].to_vec())
         });
 
-        // Agent: run the full loop (dial → register → accept-and-serve).
+        // Agent: run the full loop (dial → register → accept-and-serve-noise).
         let config = AgentConfig {
             edge: edge_addr,
             origin: origin_addr,
         };
         let token_a = token.clone();
+        let origin_priv = origin_kp.private;
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&config, cert, token_a).await;
+            let _ = run_agent(&config, cert, token_a, origin_priv).await;
         });
 
         let echoed = edge.await.unwrap().unwrap();
-        assert_eq!(echoed, b"ping", "relayed stream reaches origin and echoes back");
+        assert_eq!(echoed, b"ping", "Noise-relayed stream reaches origin and echoes back");
         assert!(state.is_known(&token), "agent registered its tunnel");
         agent.abort();
         let _ = origin.await;

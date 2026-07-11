@@ -200,6 +200,11 @@ so the Edge relays only ciphertext. Decomposed:
     `serve_noise_bridge` → real TCP echo Origin → back, Noise-encrypted.
   - **M8.4b** provider-blind assertion: a tapping relay (byte-identical to the
     Edge's `relay_quic`) proves the relayed bytes ≠ plaintext.
-  - **M8.4c** rewire the live path — `run_agent`/agent+client `main`/bench onto
-    Noise; verify the docker-compose smoke path still round-trips.
+  - **M8.4c** rewire the live path onto Noise. **Decomposed**:
+    - **M8.4c-i** `run_agent` serves relayed streams via `serve_noise_bridge`
+      (takes the Origin private); agent `main` threads `origin_key.private_bytes()`;
+      its integration test becomes a Noise initiator.
+    - **M8.4c-ii** client `main` + bench use `client_tunnel_noise`.
+    - **M8.4c-iii** docker-compose smoke: the containerized round-trip still
+      succeeds over the encrypted path.
 - **Verification:** cargo test green each packet; M8.4 asserts provider-blindness.

@@ -42,5 +42,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.edge, config.origin, cap_out
     );
 
-    run_agent(&config, edge_cert, cap.token).await
+    run_agent(&config, edge_cert, cap.token, origin_key.private_bytes()).await
 }
