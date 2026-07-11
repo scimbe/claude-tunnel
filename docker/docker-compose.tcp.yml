@@ -1,0 +1,14 @@
+# TCP-fallback overlay for the testbed (M12.3c): block the Client's outbound UDP
+# to the Edge so its QUIC probe fails and it falls back to the TLS-TCP transport.
+# The Agent still reaches the Edge over QUIC, so the Edge relays a TCP client to a
+# QUIC agent (cross-transport).
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.tcp.yml \
+#       up --build --abort-on-container-exit --exit-code-from client
+#
+# Expected: ct-client reports "round-trip OK (via=tcp)" and exits 0.
+services:
+  client:
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "iptables -A OUTPUT -p udp -d 10.5.0.2 -j DROP; exec /usr/local/bin/netem-entrypoint.sh ct-client"
