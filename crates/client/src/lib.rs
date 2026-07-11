@@ -4,6 +4,7 @@
 //! the Origin over Noise E2E (ADR-0013; the Noise session is P3). M5.3a provides
 //! the dial + rendezvous; the data path to the Origin is M5.3b.
 
+pub mod bench;
 pub mod config;
 pub mod rendezvous;
 pub mod transport;

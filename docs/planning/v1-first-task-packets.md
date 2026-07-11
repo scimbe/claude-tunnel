@@ -158,6 +158,7 @@ Prereq: the library crates need runnable **binaries** (the deferred end-to-end w
 ## Milestone 6 — Performance evaluation
 
 - **M6.1** Rust bench harness: handshake latency, connection setup, throughput, relay overhead.
+  > **Decomposed (cycle 45):** M6.1a (`ct-client::bench::summarize` — mean/min/max/p50/p95 over latency samples, pure + tested) · M6.1b (round-trip latency runner + client bench mode emitting CSV).
 - **M6.2** netem sweep (delay/loss/bandwidth matrix) → metrics to CSV.
 - **M6.3** Plots from CSV (matplotlib in a python container).
 - **M6.4** Results tables + analysis.
