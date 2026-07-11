@@ -1,7 +1,116 @@
 \chapter{Implementierung}
 \label{ch:implementierung}
 
-Dieses Kapitel dokumentiert die Umsetzung des Prototyps in Rust (Crates
-\texttt{ct-common}, \texttt{ct-edge}, \texttt{ct-agent}, \texttt{ct-client}) und
-wird in Paket~M7.4 ausgearbeitet: QUIC-Transport, Noise-Handshake,
-PoW-Rendezvous, Routing und Relay sowie das Docker-Testbett.
+Dieses Kapitel dokumentiert den Prototyp: den Aufbau des Rust-Workspace
+(Abschnitt~\ref{sec:workspace}), die kryptographischen Bausteine
+(Abschnitt~\ref{sec:bausteine}), das Rollen-Dispatch am Edge
+(Abschnitt~\ref{sec:impl-dispatch}) sowie Agent und Client
+(Abschnitt~\ref{sec:impl-agentclient}).
+
+\section{Aufbau des Workspace}
+\label{sec:workspace}
+
+Der Prototyp ist ein Rust-Cargo-Workspace aus fünf Crates
+(Tabelle~\ref{tab:crates}). Der Datenpfad ist bewusst in Rust umgesetzt --
+speichersicher ohne Garbage-Collector, mit ausgereiften Bibliotheken für die
+benötigten Bausteine: \texttt{quinn} für QUIC, \texttt{rustls} (mit dem
+\texttt{ring}-Provider) für die Transportsicherung, \texttt{snow} für den
+Noise-Handshake, \texttt{ed25519-dalek} für Signaturen, \texttt{sha2} für den
+Proof-of-Work, \texttt{rcgen} für selbstsignierte Zertifikate und \texttt{tokio}
+als asynchrone Laufzeit.
+
+\begin{table}[t]
+  \centering
+  \caption{Crates des Workspace und ihre Rolle.}
+  \label{tab:crates}
+  \begin{tabular}{l p{8.6cm}}
+    \toprule
+    Crate & Rolle \\
+    \midrule
+    \texttt{ct-common} & Gemeinsame Typen: Capability, Credential, Noise, PoW, Ratenbegrenzung \\
+    \texttt{ct-edge} & Edge-Daemon: Registry, Rollen-Dispatch, Relay \\
+    \texttt{ct-agent} & Agent-Daemon: Tunnel-Registrierung, Weiterleitung zum Origin \\
+    \texttt{ct-client} & Client-Werkzeug: Rendezvous, Tunnel, Bench-Modus \\
+    \texttt{ct-control-plane} & Dünne Steuerkomponente: Enrollment, Registry, Ausstellung \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Kryptographische Bausteine (\texttt{ct-common})}
+\label{sec:bausteine}
+
+\texttt{ct-common} bündelt die geteilten Typen. Eine \texttt{Capability}
+(Routing-Token, Origin Identity, Edge-Adresse) besitzt eine handgeschriebene
+binäre Kodierung mit definierter Fehlerbehandlung (\texttt{MalformedCapability})
+statt einer generischen Serialisierung, um das Wire-Format kontrolliert zu
+halten. Der Proof-of-Work ist bewusst asymmetrisch: Das Prüfen kostet einen
+einzigen Hash, das Lösen wächst exponentiell mit der Schwierigkeit
+(Listing~\ref{lst:pow}). Hinzu kommen der Noise-Handshake (Client- und
+Origin-Seite über \texttt{snow}), die signierten Credentials
+(\texttt{ed25519-dalek}) und eine Fenster-basierte Ratenbegrenzung pro Token.
+
+\begin{lstlisting}[caption={Asymmetrischer Proof-of-Work: Prüfen ist billig, Lösen teuer (\texttt{ct-common::pow}).},label={lst:pow}]
+// Verify: ein einziger Hash.
+pub fn verify(challenge: &Challenge, solution: u64) -> bool {
+    leading_zero_bits(&hash(&challenge.nonce, solution))
+        >= challenge.difficulty as u32
+}
+
+// Solve: Brute force, Kosten ~2^difficulty.
+pub fn solve(challenge: &Challenge) -> u64 {
+    let mut solution = 0u64;
+    loop {
+        if verify(challenge, solution) { return solution; }
+        solution += 1;
+    }
+}
+\end{lstlisting}
+
+\section{Rollen-Dispatch am Edge (\texttt{ct-edge})}
+\label{sec:impl-dispatch}
+
+Der Kern des Edge ist die Routine \texttt{serve\_connection}
+(Listing~\ref{lst:dispatch}): Sie liest ein erstes Rollen-Byte und verzweigt.
+Ein Agent (\texttt{'A'}) meldet sein Token an und wird in die Registry
+(\texttt{EdgeState}) eingetragen; ein Client (\texttt{'C'}) erhält die
+PoW-Challenge, sein Request wird geprüft, das Token zur Agent-Verbindung
+aufgelöst und beide QUIC-Ströme werden byteweise gekoppelt. Der Edge hält damit
+nur die Abbildung Token~$\rightarrow$~Verbindung und sieht nie den Klartext.
+
+\begin{lstlisting}[caption={Rollen-Dispatch am Edge (gekürzt, \texttt{ct-edge::serve}).},label={lst:dispatch}]
+match role[0] {
+    b'A' => {                    // Agent: Tunnel registrieren
+        recv.read_exact(&mut token).await?;
+        state.register(RoutingToken(token), conn.clone());
+        send.write_all(b"OK").await?;
+    }
+    b'C' => {                    // Client: PoW-Rendezvous, dann Relay
+        send.write_all(&challenge_bytes).await?;
+        recv.read_exact(&mut req).await?;
+        let token = check_request(challenge, &req)?;   // PoW pruefen
+        let agent = state.route(&token).ok_or("no agent")?;
+        let (a_send, a_recv) = agent.open_bi().await?;
+        relay_quic(send, recv, a_send, a_recv).await?; // koppeln
+    }
+    other => return Err(format!("unknown role: {other}").into()),
+}
+\end{lstlisting}
+
+\section{Agent und Client}
+\label{sec:impl-agentclient}
+
+Der Agent (\texttt{ct-agent}) wählt ausgehend zum Edge, registriert seinen
+Tunnel (\texttt{'A'}) und überbrückt anschließend jeden vom Edge
+weitergeleiteten QUIC-Strom mittels \texttt{copy\_bidirectional} auf eine
+TCP-Verbindung zum lokalen Origin. Der Client (\texttt{ct-client}) wählt den
+Edge, durchläuft das PoW-Rendezvous (\texttt{'C'}), tunnelt seine Nutzlast und
+verifiziert die Antwort; ein zusätzlicher Bench-Modus misst die
+Roundtrip-Latenz über mehrere Iterationen und dient als Datenquelle der
+Evaluation (Kapitel~\ref{ch:evaluation}). Alle drei Binaries beziehen ihre
+Konfiguration aus Umgebungsvariablen und koordinieren sich im Testbett über ein
+geteiltes Volume (Edge-Zertifikat, Capability).
+
+Die Umsetzung ist testgetrieben entstanden: Der Workspace umfasst 94
+automatisierte Tests -- von den reinen Kodierungs- und PoW-Funktionen bis zu
+Integrationstests, die einen vollständigen Client$\rightarrow$Edge$\rightarrow$Agent-Roundtrip
+über echtes QUIC ausführen.
