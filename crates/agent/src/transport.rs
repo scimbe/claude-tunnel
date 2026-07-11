@@ -8,6 +8,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::path::Path;
 
@@ -91,6 +92,20 @@ pub fn select_transport(udp_reachable: bool) -> Transport {
     } else {
         Transport::TcpFallback
     }
+}
+
+/// Probe whether outbound QUIC/UDP to `edge` works (M12.1): attempt a QUIC
+/// handshake within `timeout`. Returns `true` if it connects — the input to
+/// [`select_transport`] (QUIC vs the TCP fallback when UDP is blocked).
+pub async fn probe_udp_reachable(
+    edge: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, dial_quic(edge, edge_cert)).await,
+        Ok(Ok(_))
+    )
 }
 
 fn install_crypto_provider() {
@@ -206,6 +221,35 @@ mod tests {
     #[test]
     fn falls_back_to_tcp_when_udp_blocked() {
         assert_eq!(select_transport(false), Transport::TcpFallback);
+    }
+
+    #[tokio::test]
+    async fn probe_reachable_edge_selects_quic() {
+        let (server, cert) =
+            ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let accept = tokio::spawn(async move {
+            if let Some(inc) = server.accept().await {
+                let _ = inc.await;
+            }
+        });
+        let reachable = probe_udp_reachable(addr, cert, Duration::from_secs(2)).await;
+        assert!(reachable, "QUIC to a live edge is reachable");
+        assert_eq!(select_transport(reachable), Transport::Quic);
+        accept.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_dead_udp_selects_tcp_fallback() {
+        // Nothing listening at this UDP address → probe times out.
+        let (_ep, cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let reachable = probe_udp_reachable(dead_addr, cert, Duration::from_millis(400)).await;
+        assert!(!reachable, "blocked UDP is not reachable");
+        assert_eq!(select_transport(reachable), Transport::TcpFallback);
     }
 
     #[tokio::test]
