@@ -17,6 +17,9 @@ use ct_common::RoutingToken;
 pub struct EdgeState<H> {
     agents: Mutex<HashMap<RoutingToken, H>>,
     candidates: Mutex<HashMap<RoutingToken, SocketAddr>>,
+    /// Agent-advertised direct-path listener: (address, cert DER) a Client can
+    /// connect to directly, bypassing the Edge relay (M11.4b).
+    direct: Mutex<HashMap<RoutingToken, (SocketAddr, Vec<u8>)>>,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -24,7 +27,19 @@ impl<H: Clone> EdgeState<H> {
         Self {
             agents: Mutex::new(HashMap::new()),
             candidates: Mutex::new(HashMap::new()),
+            direct: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
+    /// the address and cert DER a Client uses to connect directly.
+    pub fn advertise_direct(&self, token: RoutingToken, addr: SocketAddr, cert: Vec<u8>) {
+        self.direct.lock().unwrap().insert(token, (addr, cert));
+    }
+
+    /// The Agent's advertised direct-path `(addr, cert)` for `token`, if any.
+    pub fn direct_endpoint(&self, token: &RoutingToken) -> Option<(SocketAddr, Vec<u8>)> {
+        self.direct.lock().unwrap().get(token).cloned()
     }
 
     /// Register (or replace) the Agent tunnel serving `token`.
@@ -49,10 +64,11 @@ impl<H: Clone> EdgeState<H> {
         self.agents.lock().unwrap().get(token).cloned()
     }
 
-    /// Remove the Agent tunnel (and its candidate) for `token`.
+    /// Remove the Agent tunnel (and its candidate + direct endpoint) for `token`.
     pub fn remove(&self, token: &RoutingToken) {
         self.agents.lock().unwrap().remove(token);
         self.candidates.lock().unwrap().remove(token);
+        self.direct.lock().unwrap().remove(token);
     }
 
     /// Whether `token` currently has a live Agent tunnel.
@@ -121,5 +137,24 @@ mod tests {
         state.register_with_candidate(token(3), 1u32, cand);
         state.remove(&token(3));
         assert_eq!(state.candidate(&token(3)), None);
+    }
+
+    #[test]
+    fn advertise_and_look_up_direct_endpoint() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        state.advertise_direct(token(4), addr, vec![1, 2, 3, 4]);
+        assert_eq!(state.direct_endpoint(&token(4)), Some((addr, vec![1, 2, 3, 4])));
+        assert_eq!(state.direct_endpoint(&token(5)), None, "unknown → None");
+    }
+
+    #[test]
+    fn remove_drops_direct_endpoint() {
+        let state = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        state.advertise_direct(token(6), addr, vec![9, 9]);
+        state.register(token(6), 1u32);
+        state.remove(&token(6));
+        assert_eq!(state.direct_endpoint(&token(6)), None);
     }
 }
