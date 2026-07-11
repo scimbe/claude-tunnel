@@ -361,8 +361,12 @@ Minimal technical model; the funded-adversary sybil economics stay an open risk
     test: open → broke=402 → intent → confirm → buy token; replay confirm 409.
 - **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
   - Live-service HTTP E2E (account → top-up → gated issuance → token, zero-balance
-    denied) is ✅ (M15.4b). The remaining "→ tunnel" clause is **M15.5**: a compose
-    smoke that carries a billing-issued token through an actual tunnel.
+    denied) is ✅ (M15.4b).
+  - **M15.5** ✅ money→tunnel E2E (`billing_issued_token_establishes_a_tunnel`):
+    the token issued through the paid control-plane flow establishes a real Noise
+    tunnel (edge relay + agent bridge + echo origin); a zero-balance account is
+    denied the token. **Milestone 15 complete — all v1 feature milestones
+    (M9–M15) done.**
 
 **Definition of done (full product):** every milestone above green, the whole
 docker-compose topology runs the full stack, and a top-level E2E suite exercises

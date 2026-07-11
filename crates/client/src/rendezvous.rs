@@ -35,6 +35,131 @@ mod tests {
     use super::*;
     use crate::transport::{client_exchange, dial_edge};
 
+    /// M15.5 — the full v1 money→tunnel path: the routing token that establishes
+    /// the tunnel is issued through the *paid* control-plane flow (open account →
+    /// top-up → credit-gated issuance), and a zero-balance account is denied a
+    /// token (so it gets no tunnel). Ties M15 (accounts/payment/billing) to the
+    /// real Noise tunnel (edge relay + agent bridge + origin).
+    #[tokio::test]
+    async fn billing_issued_token_establishes_a_tunnel() {
+        use crate::transport::client_tunnel_noise;
+        use ct_agent::serve::serve_noise_bridge;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_control_plane::client::ControlPlaneClient;
+        use ct_control_plane::enrollment::Enrollment;
+        use ct_control_plane::http::{control_plane_router, BillingState};
+        use ct_control_plane::registry::TunnelRegistry;
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // --- Billing service: buy the tunnel token through the paid flow. ---
+        let enr = Arc::new(Mutex::new(Enrollment::new()));
+        let reg = Arc::new(Mutex::new(TunnelRegistry::new()));
+        let bill = Arc::new(Mutex::new(BillingState::default()));
+        let cp_app = control_plane_router(enr, reg, bill);
+        let cp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cp_addr = cp_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(cp_listener, cp_app).await.unwrap() });
+        let cp = ControlPlaneClient::new(format!("http://{cp_addr}"));
+
+        // A zero-balance account is denied a token → it could never tunnel.
+        let broke = cp.open_account().await.unwrap();
+        assert!(
+            cp.buy_token(&broke, 1).await.is_err(),
+            "zero-balance account is denied a token"
+        );
+
+        // A funded account tops up and buys the routing token we will tunnel with.
+        let account = cp.open_account().await.unwrap();
+        let payment = cp.create_payment_intent(&account, 5).await.unwrap();
+        cp.confirm_payment(&payment).await.unwrap();
+        let token = cp.buy_token(&account, 1).await.unwrap();
+
+        // --- Establish the real Noise tunnel using that paid token. ---
+        let challenge = Challenge {
+            nonce: [0x55; 16],
+            difficulty: 8,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // Real TCP echo Origin — sees only plaintext.
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = origin_listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.unwrap();
+            sock.write_all(&buf).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&agent_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&client_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            client_conn.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent: register the paid token, then serve the relayed Noise stream.
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut ra_send, mut ra_recv) = agent_conn.open_bi().await.unwrap();
+        ra_send.write_all(b"A").await.unwrap();
+        ra_send.write_all(&token.0).await.unwrap();
+        ra_send.finish().unwrap();
+        assert_eq!(ra_recv.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let agent_task = tokio::spawn(async move {
+            let (mut s, mut r) = agent_conn.accept_bi().await.unwrap();
+            serve_noise_bridge(&mut s, &mut r, origin_addr, &origin_priv)
+                .await
+                .unwrap();
+            s.finish().unwrap();
+            agent_conn.closed().await;
+        });
+
+        // Client: Noise-tunnel through the edge to the origin using the paid token.
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let resp = client_tunnel_noise(&conn, &token, &cap, &client_kp.private, b"paid-payload")
+            .await
+            .expect("client noise tunnel");
+        assert_eq!(
+            resp, b"paid-payload",
+            "a billing-issued token establishes a working Noise tunnel end to end"
+        );
+        conn.close(0u32.into(), b"done");
+        agent_task.abort();
+        let _ = edge.await;
+        let _ = origin.await;
+    }
+
     #[tokio::test]
     async fn client_tunnels_data_to_agent_through_edge() {
         use crate::transport::client_tunnel;

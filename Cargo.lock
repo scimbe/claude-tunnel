@@ -282,8 +282,10 @@ dependencies = [
 name = "ct-client"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "ct-agent",
  "ct-common",
+ "ct-control-plane",
  "ct-edge",
  "quinn",
  "rustls",
