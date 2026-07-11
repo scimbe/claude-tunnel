@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use ct_control_plane::enrollment::Enrollment;
-use ct_control_plane::http::control_plane_router;
+use ct_control_plane::http::{control_plane_router, BillingState};
 use ct_control_plane::registry::TunnelRegistry;
 
 #[tokio::main]
@@ -18,7 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let enrollment = Arc::new(Mutex::new(Enrollment::new()));
     let registry = Arc::new(Mutex::new(TunnelRegistry::new()));
-    let app = control_plane_router(enrollment, registry);
+    let billing = Arc::new(Mutex::new(BillingState::default()));
+    let app = control_plane_router(enrollment, registry, billing);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("ct-control-plane: listening on {listen}");

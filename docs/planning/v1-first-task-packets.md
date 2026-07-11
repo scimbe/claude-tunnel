@@ -355,9 +355,14 @@ Minimal technical model; the funded-adversary sybil economics stay an open risk
     one lock): `POST /accounts/open`, `POST /payment/intent`,
     `POST /payment/confirm` (409 already-confirmed), `POST /billing/issue` (402
     insufficient credit). Oneshot-tested end to end.
-  - **M15.4b** merge `billing_router` into `control_plane_router` + `main` +
-    `ControlPlaneClient` methods, so the flow is reachable on the live service.
+  - **M15.4b** ✅ merged `billing_router` into `control_plane_router` (+ `main` +
+    `BillingState`) and added `ControlPlaneClient` methods (`open_account`,
+    `create_payment_intent`, `confirm_payment`, `buy_token`). Live-service E2E
+    test: open → broke=402 → intent → confirm → buy token; replay confirm 409.
 - **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
+  - Live-service HTTP E2E (account → top-up → gated issuance → token, zero-balance
+    denied) is ✅ (M15.4b). The remaining "→ tunnel" clause is **M15.5**: a compose
+    smoke that carries a billing-issued token through an actual tunnel.
 
 **Definition of done (full product):** every milestone above green, the whole
 docker-compose topology runs the full stack, and a top-level E2E suite exercises

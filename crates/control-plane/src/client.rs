@@ -127,6 +127,59 @@ impl ControlPlaneClient {
         let body: ResolveBody = resp.json().await?;
         Ok((TenantId(body.tenant), AgentId(body.agent)))
     }
+
+    /// `POST /accounts/open` — open a fresh pseudonymous account (M15.4b).
+    pub async fn open_account(&self) -> CpResult<[u8; 32]> {
+        let resp = self
+            .http
+            .post(format!("{}/accounts/open", self.base))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: AccountBody = resp.json().await?;
+        hex_decode_32(&body.account).ok_or(CpError::Malformed)
+    }
+
+    /// `POST /payment/intent` — register a prepaid top-up intent; returns the
+    /// opaque payment id to confirm.
+    pub async fn create_payment_intent(&self, account: &[u8; 32], credits: u64) -> CpResult<[u8; 32]> {
+        let resp = self
+            .http
+            .post(format!("{}/payment/intent", self.base))
+            .json(&serde_json::json!({ "account": hex_encode(account), "credits": credits }))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: PaymentBody = resp.json().await?;
+        hex_decode_32(&body.payment).ok_or(CpError::Malformed)
+    }
+
+    /// `POST /payment/confirm` — confirm a payment; returns the new balance.
+    pub async fn confirm_payment(&self, payment: &[u8; 32]) -> CpResult<u64> {
+        let resp = self
+            .http
+            .post(format!("{}/payment/confirm", self.base))
+            .json(&serde_json::json!({ "payment": hex_encode(payment) }))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: BalanceBody = resp.json().await?;
+        Ok(body.balance)
+    }
+
+    /// `POST /billing/issue` — buy a routing token, charging `price` credits to
+    /// the account. A [`CpError::Status`] (402) means insufficient credit.
+    pub async fn buy_token(&self, account: &[u8; 32], price: u64) -> CpResult<RoutingToken> {
+        let resp = self
+            .http
+            .post(format!("{}/billing/issue", self.base))
+            .json(&serde_json::json!({ "account": hex_encode(account), "price": price }))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: TokenBody = resp.json().await?;
+        Ok(RoutingToken(hex_decode_32(&body.token).ok_or(CpError::Malformed)?))
+    }
 }
 
 /// Map a non-success status to [`CpError::Status`].
@@ -146,6 +199,18 @@ struct TokenBody {
 #[derive(Deserialize)]
 struct TenantBody {
     tenant: String,
+}
+#[derive(Deserialize)]
+struct AccountBody {
+    account: String,
+}
+#[derive(Deserialize)]
+struct PaymentBody {
+    payment: String,
+}
+#[derive(Deserialize)]
+struct BalanceBody {
+    balance: u64,
 }
 #[derive(Deserialize)]
 struct ResolveBody {
@@ -176,9 +241,21 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use crate::enrollment::Enrollment;
-    use crate::http::control_plane_router;
+    use crate::http::{control_plane_router, BillingState};
     use crate::registry::TunnelRegistry;
     use std::sync::{Arc, Mutex};
+
+    /// Spawn the full control-plane router on an ephemeral port; returns its base URL.
+    async fn spawn_service() -> String {
+        let enr = Arc::new(Mutex::new(Enrollment::new()));
+        let reg = Arc::new(Mutex::new(TunnelRegistry::new()));
+        let bill = Arc::new(Mutex::new(BillingState::default()));
+        let app = control_plane_router(enr, reg, bill);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
 
     /// Full E2E against a *running* service over a real TCP socket: an Agent
     /// enrolls (issue → redeem) and registers its tunnel, then a Client
@@ -188,7 +265,7 @@ mod tests {
         // Spin up the real service on an ephemeral port.
         let enr = Arc::new(Mutex::new(Enrollment::new()));
         let reg = Arc::new(Mutex::new(TunnelRegistry::new()));
-        let app = control_plane_router(enr, reg);
+        let app = control_plane_router(enr, reg, Arc::new(Mutex::new(BillingState::default())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // The listener is already bound, so connections queue even before serve
@@ -227,7 +304,7 @@ mod tests {
     async fn redeem_reuse_surfaces_a_status_error() {
         let enr = Arc::new(Mutex::new(Enrollment::new()));
         let reg = Arc::new(Mutex::new(TunnelRegistry::new()));
-        let app = control_plane_router(enr, reg);
+        let app = control_plane_router(enr, reg, Arc::new(Mutex::new(BillingState::default())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -240,5 +317,31 @@ mod tests {
         // Single-use: the second redemption is rejected (409) as a Status error.
         let second = cp.redeem(&join, &agent, &[1u8; 32]).await;
         assert!(matches!(second, Err(CpError::Status(_))), "join token is single-use");
+    }
+
+    /// The full M15 billing flow over a real socket: open account → a broke
+    /// account is denied a token (402) → top up (intent + confirm) → buy a token.
+    #[tokio::test]
+    async fn client_drives_account_topup_and_gated_issuance() {
+        let cp = ControlPlaneClient::new(spawn_service().await);
+
+        let account = cp.open_account().await.unwrap();
+
+        // Broke: buying a token is refused with a status error (402).
+        let broke = cp.buy_token(&account, 1).await;
+        assert!(matches!(broke, Err(CpError::Status(_))), "zero-balance issuance denied");
+
+        // Top up 3 credits via an intent + confirmation.
+        let payment = cp.create_payment_intent(&account, 3).await.unwrap();
+        let balance = cp.confirm_payment(&payment).await.unwrap();
+        assert_eq!(balance, 3, "confirmed payment credited the account");
+
+        // Now issuance succeeds and returns a routing token.
+        let token = cp.buy_token(&account, 1).await.unwrap();
+        assert_ne!(token.0, [0u8; 32], "a real routing token was issued");
+
+        // Confirming the same payment again is rejected (idempotent, 409).
+        let replay = cp.confirm_payment(&payment).await;
+        assert!(matches!(replay, Err(CpError::Status(_))), "confirmation is single-use");
     }
 }
