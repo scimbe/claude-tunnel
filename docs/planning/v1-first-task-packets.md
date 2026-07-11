@@ -343,7 +343,14 @@ Minimal technical model; the funded-adversary sybil economics stay an open risk
   leaves the balance unchanged; on success debits and returns a random
   `RoutingToken`. `TOKEN_PRICE` default. Unit-tested (funded, zero-balance
   denied, run-until-exhausted with distinct tokens, unknown account).
-- **M15.3** Crypto-payment intake stub (credit top-up).
+- **M15.3** ✅ Crypto-payment intake stub (credit top-up) —
+  `ct-control-plane::payment::PaymentIntake`: `create_intent(account, credits)`
+  → opaque `PaymentId`; `confirm_payment(id, ledger)` credits the account,
+  idempotent (a replayed confirmation returns `AlreadyConfirmed`, no
+  double-credit). Unit-tested + a mini-E2E (open → top-up → gated issuance).
+- **M15.4** accounts/payment HTTP endpoints on the control-plane service
+  (open account, create+confirm payment, buy token) — wires M15.1–3 to the wire
+  like M13 did for enrollment/registry.
 - **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
 
 **Definition of done (full product):** every milestone above green, the whole

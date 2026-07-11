@@ -9,6 +9,7 @@ pub mod credential;
 pub mod enrollment;
 pub mod http;
 pub mod issuance;
+pub mod payment;
 pub mod registry;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
