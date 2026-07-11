@@ -201,6 +201,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_streams_bidirectionally_through_edge() {
+        // Full streaming path: Client app <-> noise_pump <-> Edge relay <->
+        // agent serve_noise_stream <-> real streaming TCP echo Origin. A 150 KB
+        // (multi-frame) payload travels both ways through the real Edge.
+        use crate::transport::client_tunnel_stream;
+        use ct_agent::serve::serve_noise_stream;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let token = RoutingToken([0x9A; 32]);
+        let challenge = Challenge {
+            nonce: [0x66; 16],
+            difficulty: 8,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // Streaming TCP echo Origin.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        // Edge: serve the Agent (register) then the Client (rendezvous+route+relay).
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&agent_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&client_conn, &state_e, &chal_e)
+                .await
+                .map_err(|e| e.to_string())?;
+            client_conn.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent: register, then stream the relayed connection to the Origin.
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut rs, mut rr) = agent_conn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let agent_task = tokio::spawn(async move {
+            let (s, r) = agent_conn.accept_bi().await.unwrap();
+            let _ = serve_noise_stream(s, r, origin_addr, &origin_priv).await;
+            agent_conn.closed().await;
+        });
+
+        // Client: stream a 150 KB payload through the tunnel and read the echo.
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let (app_local, app_remote) = tokio::io::duplex(1024 * 1024);
+        let expected: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+        let (mut ar, mut aw) = tokio::io::split(app_remote);
+        let payload = expected.clone();
+        let writer = async move {
+            aw.write_all(&payload).await.unwrap();
+            aw.shutdown().await.unwrap();
+        };
+        let reader = async move {
+            let mut got = Vec::new();
+            ar.read_to_end(&mut got).await.unwrap();
+            got
+        };
+        let (cres, _, got) = tokio::join!(
+            client_tunnel_stream(&conn, &token, &cap, &client_kp.private, app_local),
+            writer,
+            reader,
+        );
+        cres.expect("client stream ok");
+        assert_eq!(got, expected, "150 KB streams both ways through the real Edge");
+
+        conn.close(0u32.into(), b"done");
+        agent_task.abort();
+        let _ = edge.await;
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
