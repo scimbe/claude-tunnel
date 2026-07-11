@@ -130,6 +130,25 @@ pub async fn tcp_tls_connect(
     Ok(connector.connect(server_name, tcp).await?)
 }
 
+/// Build both Edge listeners sharing one self-signed cert (M12.3a): a QUIC
+/// endpoint on `quic_addr` (UDP) and a TLS-TCP listener on `tcp_addr` (the
+/// fallback). Clients trust the single returned cert for either transport.
+pub async fn build_dual_edge(
+    quic_addr: SocketAddr,
+    tcp_addr: SocketAddr,
+) -> Result<(Endpoint, TcpListener, TlsAcceptor, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = self_signed()?;
+    let quic_cfg = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.clone_key())?;
+    let endpoint = Endpoint::server(quic_cfg, quic_addr)?;
+    let tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+    let listener = TcpListener::bind(tcp_addr).await?;
+    Ok((endpoint, listener, acceptor, cert))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +176,39 @@ mod tests {
         client.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"tcp-fallback", "TLS-over-TCP stream round-trips");
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dual_edge_serves_quic_and_tcp_with_one_cert() {
+        // M12.3a: one self-signed cert works for both the QUIC endpoint and the
+        // TLS-TCP fallback listener.
+        let loop_v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let (endpoint, tcp_listener, acceptor, cert) =
+            build_dual_edge(loop_v4, loop_v4).await.expect("dual edge");
+        let qaddr = endpoint.local_addr().unwrap();
+        let taddr = tcp_listener.local_addr().unwrap();
+
+        // QUIC side: accept + handshake.
+        let quic = tokio::spawn(async move {
+            if let Some(inc) = endpoint.accept().await {
+                let _ = inc.await;
+            }
+        });
+        // TCP side: accept + TLS handshake.
+        let tcp = tokio::spawn(async move {
+            let (s, _) = tcp_listener.accept().await.unwrap();
+            let _ = acceptor.accept(s).await;
+        });
+
+        let qclient = build_client_endpoint(cert.clone()).unwrap();
+        let qconn = qclient.connect(qaddr, "localhost").unwrap().await;
+        assert!(qconn.is_ok(), "QUIC connects with the shared cert");
+
+        let tclient = tcp_tls_connect(taddr, cert).await;
+        assert!(tclient.is_ok(), "TLS-TCP connects with the shared cert");
+
+        let _ = quic.await;
+        let _ = tcp.await;
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::config::EdgeConfig;
 use crate::relay::{relay, relay_quic};
 use crate::state::EdgeState;
-use crate::transport::{build_server_endpoint_at, save_cert};
+use crate::transport::{build_dual_edge, save_cert};
 use ct_common::pow::{check_request, Challenge};
 use ct_common::RoutingToken;
 use quinn::{Connection, RecvStream, SendStream};
@@ -186,13 +186,34 @@ where
 /// (shared volume), and serve each incoming connection via [`serve_connection`]
 /// with a fresh per-connection PoW challenge.
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
-    let (endpoint, cert) = build_server_endpoint_at(config.listen)?;
+    // Listen on both QUIC (primary) and TLS-TCP (fallback) with one shared cert.
+    let (endpoint, tcp_listener, acceptor, cert) =
+        build_dual_edge(config.listen, config.listen).await?;
     save_cert(cert_out, &cert)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
+    let difficulty = config.pow_difficulty;
+
+    // TCP fallback accept loop (for Clients whose outbound UDP is blocked).
+    let state_tcp = state.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = tcp_listener.accept().await {
+            let acceptor = acceptor.clone();
+            let state = state_tcp.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(tcp).await {
+                    let mut nonce = [0u8; 16];
+                    rand::rngs::OsRng.fill_bytes(&mut nonce);
+                    let challenge = Challenge { nonce, difficulty };
+                    let _ = serve_tcp_connection(tls, &state, &challenge).await;
+                }
+            });
+        }
+    });
+
+    // QUIC accept loop (primary).
     while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
-        let difficulty = config.pow_difficulty;
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
                 let mut nonce = [0u8; 16];
