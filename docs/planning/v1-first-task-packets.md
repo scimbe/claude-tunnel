@@ -322,8 +322,11 @@ Turn the in-memory `ct-control-plane` library into a running service.
     `run_agent` spawns it when `CT_AGENT_METRICS_LISTEN` is set
     (`AgentConfig.metrics_listen`). Tested via `tower::oneshot` + a real-socket
     scrape.
-  - **M14.2b** compose scrape: agent exposes `/metrics`, a scrape hits it in the
-    testbed and sees counters move on tunnel activity.
+  - **M14.2b** ✅ compose scrape overlay (`docker-compose.metrics.yml`): agent
+    exposes `/metrics`, the client runs the tunnel then `metrics_probe` scrapes
+    the agent and confirms `ct_tunnels_opened_total >= 1`. Live: `metrics probe
+    OK: ct_tunnels_opened_total=1 ct_bytes_to_origin_total=12`, `COMPOSE_EXIT=0`.
+    **Milestone 14 complete.**
 - **E2E:** metrics endpoint scraped in the testbed; counters increment on
   tunnel activity.
 

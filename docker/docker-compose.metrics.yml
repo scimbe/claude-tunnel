@@ -1,0 +1,19 @@
+# Observability smoke (M14.2b): the Agent exposes its Prometheus /metrics
+# endpoint, the Client drives one tunnel, and a probe scrapes the endpoint to
+# confirm the counters moved (ct_tunnels_opened_total >= 1). Overlay on the base
+# topology:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.metrics.yml \
+#       up --build --abort-on-container-exit --exit-code-from client
+#
+# The Client service runs the tunnel and then the probe in the same container
+# (`ct-client && metrics_probe`), so its exit code is the probe's verdict and
+# the client's own exit doesn't abort the run before the scrape happens.
+services:
+  agent:
+    environment:
+      CT_AGENT_METRICS_LISTEN: "0.0.0.0:9100"
+
+  client:
+    command: ["sh", "-c", "ct-client && metrics_probe"]
+    environment:
+      CT_AGENT_METRICS_ADDR: "10.5.0.4:9100"
