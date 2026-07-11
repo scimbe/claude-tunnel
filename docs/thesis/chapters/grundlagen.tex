@@ -1,8 +1,83 @@
 \chapter{Grundlagen}
 \label{ch:grundlagen}
 
-Dieses Kapitel führt die technischen Grundlagen ein und wird in Paket~M7.2
-ausgearbeitet: Zero-Knowledge- bzw.\ providerblinde Relays, das
-Noise-Protokoll~\cite{noiseprotocol} (Handshake \texttt{Noise\_IK}), QUIC als
-Transport~\cite{rfc9000,rfc9001} sowie Proof-of-Work als
-Zugangsschutz~\cite{back2002hashcash}.
+Dieses Kapitel führt die vier technischen Bausteine ein, auf denen der Entwurf
+aufsetzt: das Prinzip providerblinder Relays (Abschnitt~\ref{sec:providerblind}),
+QUIC als Transport (Abschnitt~\ref{sec:quic}), das Noise-Protokoll für die
+Ende-zu-Ende-Sicherheit (Abschnitt~\ref{sec:noise}) und Proof-of-Work als
+Zugangsschutz (Abschnitt~\ref{sec:pow}).
+
+\section{Providerblinde Relays und das Zero-Knowledge-Prinzip}
+\label{sec:providerblind}
+
+Ein \emph{Relay} vermittelt Verkehr zwischen zwei Endpunkten, ohne selbst
+Endpunkt zu sein. Klassische Tunneldienste terminieren die Verschlüsselung beim
+Betreiber; dieser kann den Klartext lesen und ist damit sowohl ein
+Vertrauensanker als auch ein Angriffs- und Druckpunkt. Ein \emph{providerblindes}
+Relay kehrt diese Eigenschaft um: Es leitet ausschließlich Chiffretext weiter und
+besitzt keinen Schlüssel, mit dem sich die Nutzlast entschlüsseln ließe. Die
+Verschlüsselung terminiert erst am kundeneigenen Ziel (\emph{Origin}).
+
+Die Zero-Knowledge-Eigenschaft ist dabei präzise auf die \emph{Nutzlast}
+begrenzt. Der Betreiber kann weder Inhalt lesen oder verändern noch das
+Origin-Schlüsselmaterial erlangen; sichtbar bleiben ihm hingegen strukturelle
+\emph{Metadaten}: dass ein Tunnel existiert, die Koordinationsereignisse des
+Rendezvous sowie -- nur im Relay-Fall -- grobe Zeit- und Volumenzähler. Adressiert
+wird ein Tunnel nicht über einen Hostnamen, sondern über ein opakes
+\emph{Routing-Token}, sodass dem Betreiber auch das Vermittlungsziel verborgen
+bleibt. Diese Trennung von blinder Nutzlast und sichtbaren Metadaten ist der
+konzeptionelle Kern der Arbeit.
+
+\section{QUIC als Transport}
+\label{sec:quic}
+
+QUIC ist ein UDP-basiertes, gesichertes Transportprotokoll~\cite{rfc9000}, dessen
+Sicherheitsschicht auf TLS\,1.3 aufsetzt~\cite{rfc9001}. Für einen Tunnel ist es
+aus mehreren Gründen geeignet: Es multiplext mehrere Ströme über eine Verbindung
+ohne wechselseitiges Head-of-Line-Blocking unter Paketverlust, es unterstützt
+Verbindungsmigration bei wechselnden IP-Adressen und es erlaubt einen schnellen
+Verbindungsaufbau. Im hier verfolgten Entwurf baut der Agent die Verbindung
+\emph{ausgehend} zum Edge auf, sodass auf der Kundenseite keine eingehenden Ports
+geöffnet werden müssen; eine Client-Verbindung bildet sich auf einen QUIC-Strom
+ab. Wo ausgehendes UDP/443 blockiert ist, ist ein Rückfall auf HTTP/2 über
+TCP/443 vorgesehen. Die innere, providerblinde Sitzung
+(Abschnitt~\ref{sec:noise}) läuft byteweise über diesen Transport und ist von der
+QUIC-eigenen TLS-Sicherung des Agent$\leftrightarrow$Edge-Abschnitts
+unabhängig.
+
+\section{Das Noise-Protokoll}
+\label{sec:noise}
+
+Die Ende-zu-Ende-Sicherheit zwischen Client und Origin stellt das
+Noise-Protokoll-Framework~\cite{noiseprotocol} her -- konkret ein Muster vom Typ
+\texttt{Noise\_IK} mit statischen X25519-Schlüsselpaaren. Der Client kennt und
+\emph{pinnt} den statischen öffentlichen Schlüssel des Origin (die
+\emph{Origin Identity}); beide Seiten authentisieren sich über ihre statischen
+Schlüssel. Das Ergebnis ist ein gegenseitig authentisierter, vorwärtsgeheimer
+Kanal \emph{ohne} Zertifizierungsstelle oder PKI. Gerade das Fehlen eines
+externen Ausstellers ist für die Zensurresistenz wesentlich: Es gibt keine
+Instanz, die zur Sperrung oder zum Ausstellen falscher Identitäten gedrängt
+werden könnte. Die Noise-Sitzung ist ein \emph{innerer} Handshake über den
+QUIC-Strom und damit unabhängig von der Transportsicherung. Der Preis dieser
+Entkopplung ist, dass die Schlüsselverteilung in der Verantwortung des Kunden
+liegt: Clients müssen die Origin Identity außerhalb des Bandes erhalten, und der
+Schlüsseltausch (Rotation) ist eine explizite Operation ohne
+Ablauf-/Erneuerungsautomatik.
+
+\section{Proof-of-Work als Zugangsschutz}
+\label{sec:pow}
+
+Da der Betreiber providerblind ist und bewusst auf WAF, Abuse-Feeds und
+Identitätsprüfung (KYC) verzichtet, fehlen ihm die üblichen Hebel gegen
+Denial-of-Service und Sybil-Angriffe. Als Ersatz dient ein gestaffeltes Schema,
+dessen Kern ein \emph{Proof-of-Work} (PoW) ist~\cite{back2002hashcash}: Teure
+Operationen -- eine Rendezvous-Anfrage oder das Belegen eines Relay-Platzes --
+erfordern den Nachweis einer verrichteten Rechenarbeit, typischerweise das Finden
+einer Nonce, deren Hash eine geforderte Schwierigkeit erfüllt. Ergänzt wird der
+Nachweis durch \emph{Ratenbegrenzung} pro Token sowie durch Kapazitätsreserven.
+Der PoW ist zugleich der primäre Sybil-Schutz in Abwesenheit von KYC. Seine
+Grenze ist bekannt und wird in dieser Arbeit nicht ausgeblendet: Die
+Schwierigkeit muss Fluten abschrecken, ohne legitime Nutzung zu behindern, und
+ein hinreichend finanzierter Angreifer kann die Kosten schlicht bezahlen --
+missbrauchs- und abrechnungsseitige Sybil-Resistenz bleibt ein offener Punkt
+(Kapitel~\ref{ch:fazit}).
