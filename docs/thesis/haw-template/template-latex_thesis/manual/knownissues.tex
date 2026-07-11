@@ -1,0 +1,66 @@
+% !TEX root = ./manual.tex
+%%
+% Maintainer
+% @author Thomas Lehmann
+%
+\section{Bekannte Probleme}\label{sec:knownissues}\index{Bugs}
+Derzeit sind folgende Problem bekannt, zu denen nur Work Arounds existieren.
+
+\subsection{Overleaf: Glossar wird nicht erzeugt }\label{sec:knownissues:overleaf_glossary}
+Es wird kein Glossary erzeugt. Hierzu gibt es zwei Workarounds:
+\begin{enumerate} 
+	\item Die Master-Datei und alle zugehörigen Dateien sollten im Root-Ordner liegen. Somit müssen alle Dateien/Ordner um eine Ebene nach oben verschoben werden, sodass die Master-Datei im Root-Ordner liegt.
+    \item Es muss die Make-Datei von Overleaf durch eine eigene Make-Datei im Root-Ordner ergänzt werden. Der Name der Datei ist \texttt{latexmkrc}, siehe \url{https://www.overleaf.com/learn/latex/Articles/How_to_use_latexmkrc_with_Overleaf}. Die Datei muss dann nachfolgende Anweisungen enthalten.
+\end{enumerate}
+    
+\texttt{latexmkrc}:
+\footnotesize{
+\begin{verbatim} 
+add_cus_dep('glo', 'gls', 0, 'makeglo2gls');
+sub makeglo2gls {
+    system("makeindex -s '$_[0]'.ist -t '$_[0]'.glg -o '$_[0]'.gls '$_[0]'.glo");
+}
+
+add_cus_dep('slo', 'sls', 0, 'makeglo2sls');
+sub makeglo2sls {
+    system("makeindex -s '$_[0]'.ist -t '$_[0]'.slg -o '$_[0]'.sls '$_[0]'.slo");
+}
+
+add_cus_dep('acn', 'acr', 0, 'makeacn2acr');
+sub makeacn2acr {
+    system("makeindex -s \"$_[0].ist\" -t \"$_[0].alg\" -o \"$_[0].acr\" \"$_[0].acn\"");
+}
+\end{verbatim}
+}
+
+Hinweis: Einige PDF-Viewer stellen das senkrechte Hochzeichen als schräges Hochkomma dar, wodurch copy-past des Scripts nicht funktioniert. Zeichen per suchen-und-ersetzen austauschen.
+
+\subsection{Overleaf: Glossar-Fonts}\label{sec:knownissues:overleaf_fonts}
+
+Einige Fonts funktionieren nicht. Hier hilft derzeit nur das lokale übersetzen mit einem Standard-LaTeX-Paket.
+
+\subsection{Glossar wird nicht erstellt}
+Das Kapitel mit den Glossareinträgen bleibt leer.
+
+Lösung: Hier gibt es zwei mögliche Ursachen. Zum einen wird das Kommando makeglossarie von der verwendeten IDE nicht aufgerufen. Dann muss dieser Schritt in der Shell über die Kommandozeileneingabe ausgeführt werden. Die zweite Ursache kann sein, dass makeglossaries Perl benötigt, welches evtl. nicht automatisch installiert wurde. Das Fehlen von Perl macht sich beim Aufruf von makeglossaries als explizite Fehlermeldung bemerkbar.
+
+Eine weitere Möglichkeit ist, dass in Dokument die Einträge aus dem Glossar nicht verwendet werden und somit das Glossar nicht nötig ist. Dann bleibt es ggf. leer.
+
+Unter Overleaf wird das Glossary auch nicht automatisch erzeugt, siehe Abschnitt \ref{sec:knownissues:overleaf_glossary}. 
+
+\subsection{Font-Größe auf dem Deckblatt}
+Die Font-Größe auf dem Deckblatt passt sich automatisch an. Dabei wird eine Heuristik eingesetzt. Somit kann es passieren, dass die Font-Größe nicht optimal ist.
+
+Lösung: Die Font-Größe muss direkt in der Datei coverpage.tex gesetzt werden.
+
+\subsection{Lorem Ipsum}
+Bei einigen \LaTeX -Distributionen fehlt das Paket lipsum, welches Beispieltexte für das Beispiel liefert. Aufgetreten auf  Ubuntu 18 Systemen.
+
+Lösung: Das Paket aus dem Style-File durch löschen der Zeile herausnehmen. Das Beispiel kann dann nicht verwendet werden. Auf das Template hat es keinen Einfluss.
+
+\subsection{Literaturverzeichnis wird aus IDE nicht erstellt}
+Einige IDEs für \LaTeX haben das Bibliothekssystem Biber statt BibTex eingestellt. Dann wird im Compil-Vorgang kein Literaturverzeichnis erzeugt. Compil-Vorgang muss in der IDE angepasst oder in der Shell manuell ausgeführt werden.
+
+\subsection{Font-Warnings}
+Ein großteil der Font-Warnings werden durch das Paket \texttt{hyphenat} verursacht und können ignoriert werden. Bei anderen Font-Warnings ist die genaue Ursache noch unbekannt; echte Problem sind derzeit nicht bekannt.
+

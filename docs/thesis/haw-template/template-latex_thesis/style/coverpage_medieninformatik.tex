@@ -1,0 +1,92 @@
+% !TEX root = ../thesis.tex
+%
+% cover page Medieninformatik
+% @author Thomas Lehmann
+% bases on work by unknown
+%
+
+\thispagestyle{empty}
+% In dieser Umgebung wird die Titelseite separat vom restlichen Text gesetzt
+\begin{titlepage}
+  % andere Seitenränder als im Rest der Arbeit
+  \newgeometry{lmargin=2cm,tmargin=7mm,rmargin=5mm,bmargin=1cm}
+  % die "Hausfarbe" der HAW; diese und die folgenden Einstellungen sind lokal
+  % und gelten nur innerhalb der Umgebung "titlepage"
+  %\color{haw}
+  % Blocksatz für die Titelseite deaktivieren
+  \raggedright
+  % Logo rechtsbündig setzen
+  \hfill\includegraphics[width=7cm]{../style/HAW_Marke_RGB_300dpi}\\
+
+  % vertikaler Abstand
+  \vspace{5cm}
+
+  % Wahl der "Hausschrift" Open Sans der HAW, die als Schrift auf Ihrem
+  % Rechner installiert sein muss
+  %\setmainfont{Open Sans}
+  % etwas kleiner als üblich
+  {\fontfamily{phv}\selectfont
+  \fontsize{10pt}{10pt}
+  % fett und in Majuskeln
+  \textcolor{haw}{\textbf{BACHELORARBEIT}}
+  }
+  % vertikaler Abstand
+  \vspace{8mm}
+
+  % der Titel der Arbeit als "Seite in der Seite"; natürlich müssen Sie hier
+  % Ihren Titel eintragen
+  \begin{minipage}{0.8\linewidth}
+    % Wahle der zweiten "Hausschrift" der HAW, die ebenfalls auf Ihrem Rechner
+    % bereits vorhanden sein muss
+    %\setmainfont{Martel Heavy}
+    % ziemlich große Schrift
+    {
+    \fontfamily{cmr}
+    \ICDTitleFontSize
+    \selectfont
+    % [1mm] steht jeweils für einen etwas größeren Durchschuss
+    \textcolor{haw}{\textbf{\IthesisTitle}}\\
+    % am Ende noch ein waagerechter Strich, das CD will es so...
+    \textcolor{haw}{\,\rule{11mm}{1.2mm}}
+    }
+  \end{minipage}
+
+  % vertikaler Abstand, überraschenderweise
+  \vspace{1cm}
+  
+  {\fontfamily{phv}\selectfont
+  \fontsize{10pt}{10pt}
+  
+  % hier korrektes Datum und Ihren Namen eingeben
+  \textcolor{haw}{vorgelegt am \ISubDate \\
+  \IthesisAuthor}
+
+  % letzter vertikaler Abstand für heute
+  \vspace{5cm}
+
+  % noch eine "Seite in der Seite", etwas nach rechts geschoben
+  \hspace*{37mm}
+  \begin{minipage}{0.5\linewidth}
+    % Namen und Titel der beiden Prüfer eintragen
+    \textcolor{haw}{
+    \begin{tabular}{@{}ll}
+      Erstprüferin: & \IfirstSv\\[-.3mm]
+      Zweitprüfer: & \IsecondSv \\
+    \end{tabular}\\
+    }
+    % noch ein horizontaler Strich
+    \textcolor{haw}{\,\rule{9mm}{1mm}\\[1.5mm]}
+
+    \textcolor{haw}{
+    \textbf{HOCHSCHULE FÜR ANGEWANDTE}\\
+    \textbf{WISSENSCHAFTEN HAMBURG}\\
+    Fakultät Informatik und Digitale Gesellschaft\\
+    Finkenau 35\\
+    22081 Hamburg}
+  \end{minipage}
+  }
+  
+  % setzt die Geometrie wieder auf die Standardwerte zurück
+  \restoregeometry
+\end{titlepage}
+\cleardoublepage

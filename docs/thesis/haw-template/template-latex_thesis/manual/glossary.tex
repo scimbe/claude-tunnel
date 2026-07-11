@@ -1,0 +1,9 @@
+% !TEX root = ./manual.tex
+%%
+% Glossary, Symbols und Abkürzungen
+% @author Thomas Lehmann
+%
+\section{Abkürzungen, Symbole und Glossar}
+In dem Template ist das Erstellen eines Abkürzungsverzeichnis, eines Symbolverzeichnis und eines Glossars vorgesehen. Hierfür wird das \texttt{glossaries}-Paket\citep{GlossariesPackage} verwendet. Die Abkürzungen, Symboldefinitionen und Glossareinträge werden in der extra Datei \path{glossaries.tex} erstellt. 
+
+Zu beachten ist, beim Durchlauf von PDFLaTeX werden zunächst temporäre Dateien erstellt. Danach muss in der Kommandozeile der Aufruf \texttt{makeglossaries thesis} erfolgen. Nun werden die eigentlichen Einträge erzeugt und beim nächsten Lauf von PDFLaTeX eingebunden. 

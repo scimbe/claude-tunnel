@@ -1,0 +1,310 @@
+% !TEX root = ../thesis.tex
+% Commands for configurations
+%
+% @author: Thomas Lehmann
+
+\RequirePackage{ifthen}
+
+% Configuration values
+\newcommand{\firstSupervisor}[1]{\newcommand{\IfirstSv}{#1}}
+\newcommand{\secondSupervisor}[1]{\newcommand{\IsecondSv}{#1}}
+\newcommand{\submissionDate}[1]{\newcommand{\ISubDate}{#1}}
+
+% Which regulations (APSO-INGI/APSO-BMT)
+\newcommand{\FakPO}[1]{\newcommand{\IfacultyRegulations}{#1}}
+\newcommand{\PO}[1]{\newcommand{\IcurriculumRegulations}{#1}}
+
+% Title and author
+\newcommand{\thesisTitle}[1]{\newcommand{\IthesisTitle}{#1}}
+\newcommand{\thesisTitleEN}[1]{\newcommand{\IthesisTitleEN}{#1}}
+\newcommand{\thesisAuthor}[1]{\newcommand{\IthesisAuthor}{#1}}
+
+% English language support
+\newcommand{\fullenglish}[1]
+{
+  \ifthenelse{\equal{#1}{yes}} 
+  {
+    \RequirePackage[english]{babel}     % English spell checking
+    \newcommand{\ILanguageEN}{}
+  }
+  {
+    \RequirePackage[ngerman]{babel}     % New german spell checking
+  }
+}
+
+% constant commands
+\newcommand{\ITocEntryStatement}{
+  \ifdefined\ILanguageEN
+    \addcontentsline{toc}{chapter}{Declaration of Authorship}
+  \else
+    \addcontentsline{toc}{chapter}{Selbstständigkeitserklärung}  
+  \fi
+  }
+
+%% selectable text replacements
+\newcommand{\NDA}[1]
+{
+  \ifdefined\ILanguageEN
+    \ifthenelse{\equal{#1}{yes}} {\newcommand{\IthesisNDAFull}{STRICTLY CONFIDENTIAL}} {\newcommand{\IthesisNDAFull}{}}
+  \else
+    \ifthenelse{\equal{#1}{yes}}{\newcommand{\IthesisNDAFull}{STRENG VERTRAULICH}}{\newcommand{\IthesisNDAFull}{}}
+  \fi
+}
+
+%% coverpage
+\newcommand{\Cover}[1]
+{
+  \ifthenelse{\equal{#1}{Std2018}} {\newcommand{\ICoverPage}{\input{../style/coverpage}}}{}
+  \ifthenelse{\equal{#1}{Std2018_green}} {\newcommand{\ICoverPage}{\input{../style/coverpage_green}}}{}
+  \ifthenelse{\equal{#1}{CD2017}} {
+    \newcommand{\ICoverPage}{\input{../style/coverpageCD2017}}
+    \newcommand{\ICDLogo}{\includegraphics[scale=0.5]{../style/HAW_Marke_schwarz}}
+    \ifdefined\ILanguageEN
+      \newcommand{\ICDBottomLogo}{
+          % Bottom Logo
+        \begin{textblock*}{\textwidth}(140mm,249mm)
+          \begin{minipage}[b][0cm][t]{\textwidth}
+            \fontfamily{fos}
+            \fontsize{9pt}{9pt}
+            \selectfont
+            \begin{picture}(10, 2)(2, -10)
+              \linethickness{0.9mm} 
+              \line(3,0){30}
+            \end{picture}
+            \vspace{-5mm}
+            \begin{flushleft}
+              \textbf{HOCHSCHULE FÜR ANGEWANDTE\\WISSENSCHAFTEN HAMBURG}
+            \end{flushleft}
+            \fontsize{9pt}{8pt}
+            \selectfont
+            \vspace{-6mm}
+            \begin{flushleft}
+              \textbf{Hamburg University of Applied Sciences}
+            \end{flushleft}
+          \end{minipage}
+        \end{textblock*}
+      }
+    \else
+      \newcommand{\ICDBottomLogo}{
+        % Bottom Logo
+        \begin{textblock*}{\textwidth}(140mm,249mm)
+          \begin{minipage}[b][0cm][t]{\textwidth}
+            \fontfamily{opensans}
+            \fontsize{9pt}{9pt}
+            \selectfont
+            \begin{picture}(10, 2)(2, -10)
+              \linethickness{0.9mm}
+              \line(3,0){30}
+            \end{picture}
+            \vspace{-5mm}
+            \begin{flushleft}
+              \textbf{HOCHSCHULE FÜR ANGEWANDTE\\WISSENSCHAFTEN HAMBURG}
+            \end{flushleft}
+            \fontsize{9pt}{8pt}
+            \selectfont
+            \vspace{-6mm}
+            \begin{flushleft}
+              \textbf{Hamburg University of Applied Sciences}
+            \end{flushleft}
+          \end{minipage}
+        \end{textblock*}
+      }
+    \fi
+    } 
+    {}
+  \ifthenelse{\equal{#1}{CD2017NoLogo}} {
+    \newcommand{\ICoverPage}{\input{../style/coverpageCD2017}}
+    \newcommand{\ICDLogo}{}
+    \newcommand{\ICDBottomLogo}{}} {}
+}
+
+\newcommand{\ListOfFigures}[1]
+{
+  \ifthenelse{\equal{#1}{yes}}
+  {\newcommand{\IListOfFigures}{
+    \listoffigures
+  }}
+  {\newcommand{\IListOfFigures}{}}
+}
+
+\newcommand{\ListOfTables}[1]
+{
+  \ifthenelse{\equal{#1}{yes}}
+  {\newcommand{\IListOfTables}{
+    \listoftables
+  }}
+  {\newcommand{\IListOfTables}{}}
+}
+
+\newcommand{\ListOfAccronyms}[1]
+{
+  \ifthenelse{\equal{#1}{yes}}
+  {
+    \ifdefined\ILanguageEN
+      \newcommand{\IListOfAccronyms}{
+        \printglossary[type=\acronymtype, title=Abbreviations]
+      }
+    \else
+      \newcommand{\IListOfAccronyms}{
+        \printglossary[type=\acronymtype, title=Abkürzungen]
+      }
+    \fi
+  }
+  {
+    \newcommand{\IListOfAccronyms}{}
+  }
+}
+
+\newcommand{\ListOfSymbols}[1]
+{
+  \ifthenelse{\equal{#1}{yes}}
+  {
+    \ifdefined\ILanguageEN
+      \newcommand{\IListOfSymbols}{
+        \printglossary[type=symbols, title=Symbols]
+      }
+    \else
+      \newcommand{\IListOfSymbols}{
+        \printglossary[type=symbols, title=Symbolverzeichnis]
+      }
+    \fi
+  }
+  {
+    \newcommand{\IListOfSymbols}{}
+  }
+}
+
+\newcommand{\Glossary}[1]
+{
+  \ifthenelse{\equal{#1}{yes}}
+  {
+    \ifdefined\ILanguageEN
+      \newcommand{\IGlossary}{
+        \printglossary[title=Glossary]
+      }
+    \else
+      \newcommand{\IGlossary}{
+        \printglossary[title=Glossar]
+      }
+    \fi
+  }
+  {\newcommand{\IGlossary}{}}
+}
+
+\newcommand{\studycourse}[1]
+{
+  \ifdefined\ILanguageEN
+    \ifthenelse{\equal{#1}{INF_ITS}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science Informatik Technischer Systeme}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{INF_AI}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science Angewandte Informatik}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{INF_WI}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science Wirtschaftsinformatik}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{INF_ECS}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science European Computer Science}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{EMI_EI}}{\thesisKind{Bachelor}\faculty{EMI}\newcommand{\IstudyCourseName}{Bachelor of Science Elektrotechnik und Informationstechnik}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_REE}}{\thesisKind{Bachelor}\faculty{EMI}\newcommand{\IstudyCourseName}{Bachelor of Science Regenerative Energiesysteme und Energiemanagement – Elektro- und Informationstechnik}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_IE}}{\thesisKind{Bachelor}\faculty{EMI}\newcommand{\IstudyCourseName}{Bachelor of Science Information Engineering}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{BMP}}{\thesisKind{Bachelor}\faculty{MP}\newcommand{\IstudyCourseName}{Bachelor of Science Mechanical Engineering - Development and Design}\newcommand{\Istatement}{\input{../style/statement_fuf}}}{}
+    \ifthenelse{\equal{#1}{BMP-hp}}{\thesisKind{Internship}\faculty{MP}\newcommand{\IstudyCourseName}{Bachelor of Science Mechanical Engineering - Development and Design}\newcommand{\Istatement}{\input{../style/statement}}\newcommand{\IisInternshipReport}{}}{}
+    \ifthenelse{\equal{#1}{BMT}}{\thesisKind{Bachelor}\faculty{FF}\newcommand{\IstudyCourseName}{Bachelor of Science Mechatronik}\newcommand{\Istatement}{\input{../style/statement_fuf}}}{}
+    \ifthenelse{\equal{#1}{BMT-st}}{\thesisKind{Study}\faculty{FF}\newcommand{\IstudyCourseName}{Bachelor of Science Mechatronik}\newcommand{\Istatement}{\input{../style/statement_fuf}}\newcommand{\IisTermPaper}{}}{}
+    \ifthenelse{\equal{#1}{BMT-hp}}{\thesisKind{Internship}\faculty{FF}\newcommand{\IstudyCourseName}{Bachelor of Science Mechatronik}\newcommand{\Istatement}{\input{../style/statement}}\newcommand{\IisInternshipReport}{}}{}
+    \ifthenelse{\equal{#1}{INF_MaI}}{\thesisKind{Master}\faculty{INF}\newcommand{\IstudyCourseName}{Master of Science Informatik}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_MaA}}{\thesisKind{Master}\faculty{EMI}\newcommand{\IstudyCourseName}{Master of Science Automation}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_MaICE}}{\thesisKind{Master}\faculty{EMI}\newcommand{\IstudyCourseName}{Master of Science Information and Communications Engineering}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_MaMS}}{\thesisKind{Master}\faculty{MES}\newcommand{\IstudyCourseName}{Master of Science Microelectronic Systems}\newcommand{\Istatement}{\input{../style/statement}}}{}
+  \else
+    \ifthenelse{\equal{#1}{INF_ITS}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science Informatik Technischer Systeme}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{INF_AI}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science Angewandte Informatik}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{INF_WI}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science Wirtschaftsinformatik}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{INF_ECS}}{\thesisKind{Bachelor}\faculty{INF}\newcommand{\IstudyCourseName}{Bachelor of Science European Computer Science}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{EMI_EI}}{\thesisKind{Bachelor}\faculty{EMI}\newcommand{\IstudyCourseName}{Bachelor of Science Elektrotechnik und Informationstechnik}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_REE}}{\thesisKind{Bachelor}\faculty{EMI}\newcommand{\IstudyCourseName}{Bachelor of Science Regenerative Energiesysteme und Energiemanagement – Elektro- und Informationstechnik}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_IE}}{\thesisKind{Bachelor}\faculty{EMI}\newcommand{\IstudyCourseName}{Bachelor of Science Information Engineering}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{BMP}}{\thesisKind{Bachelor}\faculty{MP}\newcommand{\IstudyCourseName}{Bachelor of Science Mechanical Engineering - Development and Design}\newcommand{\Istatement}{\input{../style/statement_fuf}}}{}
+    \ifthenelse{\equal{#1}{BMP-hp}}{\thesisKind{Internship}\faculty{MP}\newcommand{\IstudyCourseName}{Bachelor of Science Mechanical Engineering - Development and Design}\newcommand{\Istatement}{\input{../style/statement}}\newcommand{\IisInternshipReport}{}}{}
+    \ifthenelse{\equal{#1}{BMT}}{\thesisKind{Bachelor}\faculty{FF}\newcommand{\IstudyCourseName}{Bachelor of Science Mechatronik}\newcommand{\Istatement}{\input{../style/statement_fuf}}}{}
+    \ifthenelse{\equal{#1}{BMT-st}}{\thesisKind{Study}\faculty{FF}\newcommand{\IstudyCourseName}{Bachelor of Science Mechatronik}\newcommand{\Istatement}{\input{../style/statement_fuf}}\newcommand{\IisTermPaper}{}}{}
+    \ifthenelse{\equal{#1}{BMT-hp}}{\thesisKind{Internship}\faculty{FF}\newcommand{\IstudyCourseName}{Bachelor of Science Mechatronik}\newcommand{\Istatement}{\input{../style/statement}}\newcommand{\IisInternshipReport}{}}{}
+    \ifthenelse{\equal{#1}{INF_MaI}}{\thesisKind{Master}\faculty{INF}\newcommand{\IstudyCourseName}{Master of Science Informatik}\newcommand{\Istatement}{\input{../style/statement_inf}}}{}
+    \ifthenelse{\equal{#1}{EMI_MaA}}{\thesisKind{Master}\faculty{EMI}\newcommand{\IstudyCourseName}{Master of Science Automatisierung}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_MaICE}}{\thesisKind{Master}\faculty{EMI}\newcommand{\IstudyCourseName}{Master of Science Information and Communications Engineering}\newcommand{\Istatement}{\input{../style/statement}}}{}
+    \ifthenelse{\equal{#1}{EMI_MaMS}}{\thesisKind{Master}\faculty{MES}\newcommand{\IstudyCourseName}{Master of Science Microelectronic Systems}\newcommand{\Istatement}{\input{../style/statement}}}{}
+  \fi
+}
+
+\newcommand{\faculty}[1]
+{
+    \ifthenelse{\equal{#1}{INF}}{
+      \newcommand{\IthesisFacultyFull}{Fakultät Informatik und Digitale Gesellschaft}
+      \newcommand{\ICDthesisFacultyFull}{FAKULTÄT INFORMATIK UND DIGITALE GESELLSCHAFT}
+      \newcommand{\IthesisFacultyFullEN}{Faculty of Computer Science and Digital Society}
+      \newcommand{\ICDthesisFacultyFullEN}{FACULTY OF COMPUTER SCIENCE AND DIGITAL SOCIETY}
+    }{}
+    \ifthenelse{\equal{#1}{EMI}}{
+      \newcommand{\IthesisFacultyFull}{Fakultät Elektro-, Medien- und Informationstechnik}
+      \newcommand{\ICDthesisFacultyFull}{FAKULTÄT ELEKTRO-, MEDIEN- UND INFORMATIONSTECHNIK}
+      \newcommand{\IthesisFacultyFullEN}{Faculty of Electrical Engineering, Media and Information Technology}
+      \newcommand{\ICDthesisFacultyFullEN}{FACULTY OF ELECTRICAL ENGINEERING, MEDIA AND INFORMATION TECHNOLOGY}
+    }{}
+    \ifthenelse{\equal{#1}{MP}}{
+      \newcommand{\IthesisFacultyFull}{Fakultät Technik und Informatik}
+      \newcommand{\ICDthesisFacultyFull}{FAKULTÄT TECHNIK UND INFORMATIK}
+      \newcommand{\IthesisFacultyFullEN}{Faculty of Engineering and Computer Science}
+      \newcommand{\ICDthesisFacultyFullEN}{FACULTY OF ENGINEERING AND COMPUTER SCIENCE}
+    }{}
+    \ifthenelse{\equal{#1}{FF}}{
+      \newcommand{\IthesisFacultyFull}{Fakultät Technik und Informatik}
+      \newcommand{\ICDthesisFacultyFull}{FAKULTÄT TECHNIK UND INFORMATIK}
+      \newcommand{\IthesisFacultyFullEN}{Faculty of Engineering and Computer Science}
+      \newcommand{\ICDthesisFacultyFullEN}{FACULTY OF ENGINEERING AND COMPUTER SCIENCE}
+    }{}
+    \ifthenelse{\equal{#1}{MES}}{
+      \newcommand{\IthesisFacultyFull}{Fakultät Technik und Informatik}
+      \newcommand{\ICDthesisFacultyFull}{FAKULTÄT TECHNIK UND INFORMATIK}
+      \newcommand{\IthesisFacultyFullEN}{Faculty of Engineering and Computer Science}
+      \newcommand{\ICDthesisFacultyFullEN}{FACULTY OF ENGINEERING AND COMPUTER SCIENCE}
+    }{}
+}
+
+\newcommand{\keywordsDE}[1]{\newcommand{\IkeyWordsDE}{#1}}
+\newcommand{\keywordsEN}[1]{\newcommand{\IkeyWordsEN}{#1}}
+
+\newcommand{\thesisKind}[1]
+{
+  \ifthenelse{\equal{#1}{Master}}{
+    \newcommand{\IthesisKind}{Masterarbeit}
+    \newcommand{\IthesisKindDE}{Masterarbeit}\newcommand{\IthesisKindEN}{Master thesis}
+    \newcommand{\IthesisExaminationDE}{Masterprüfung}\newcommand{\IthesisExaminationEN}{Master´s degree}
+    \newcommand{\ICDthesisKind}{MASTER THESIS}}{}
+  \ifthenelse{\equal{#1}{Bachelor}}{
+    \newcommand{\IthesisKind}{Bachelorarbeit}
+    \newcommand{\IthesisKindDE}{Bachelorarbeit}\newcommand{\IthesisKindEN}{Bachelor thesis}
+    \newcommand{\IthesisExaminationDE}{Bachelorprüfung}\newcommand{\IthesisExaminationEN}{Bachelor´s degree}
+    \newcommand{\ICDthesisKind}{BACHELOR THESIS}}{}
+  \ifthenelse{\equal{#1}{Study}}{
+    \newcommand{\IthesisKind}{Studienarbeit}
+    \newcommand{\IthesisKindDE}{Studienarbeit}\newcommand{\IthesisKindEN}{Term paper}
+    \newcommand{\IthesisExaminationDE}{Bachelorprüfung}\newcommand{\IthesisExaminationEN}{Bachelor´s degree}
+    \newcommand{\ICDthesisKind}{STUDIENARBEIT}}{}
+  \ifthenelse{\equal{#1}{Internship}}{
+    \newcommand{\IthesisKind}{Bericht Hauptpraktikum}
+    \newcommand{\IthesisKindDE}{Bericht Hauptpraktikum}\newcommand{\IthesisKindEN}{report intership}
+    \newcommand{\IthesisExaminationDE}{Hauptpraktikum}\newcommand{\IthesisExaminationEN}{Hauptpraktikum}
+    \newcommand{\ICDthesisKind}{HAUPTPRAKTIKUM}}{}
+}
+
+\newcommand{\ITextBlockSupervisionOnCover}{}   % not required for BA-Template, just for term paper
+
+\newcommand{\abstractDE}[1]{\newcommand{\IabstractDE}{#1}}
+\newcommand{\abstractEN}[1]{\newcommand{\IabstractEN}{#1}}
+
+% automatic adaption of the font size on cover page.
+\newcommand{\ITitleFontSize}
+{
+  \newlength{\myl}
+  \settowidth{\myl}{\IthesisTitle}
+  \ifthenelse{\myl>750}{\fontsize{16pt}{14pt}  % Value 750 is experimental
+    }{\fontsize{18pt}{20pt}
+    }
+}
+\newcommand{\ICDTitleFontSize}{
+  \fontsize{28pt}{25pt}
+}

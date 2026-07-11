@@ -291,3 +291,37 @@ Minimal technical model; the funded-adversary sybil economics stay an open risk
 **Definition of done (full product):** every milestone above green, the whole
 docker-compose topology runs the full stack, and a top-level E2E suite exercises
 the product end to end under netem. Then refresh the thesis to match.
+
+---
+
+# BA-Thesis — Neugestaltung (User-Direktive, Zyklus 75)
+
+> Die bisherige Thesis (M7, 21 S., in `docs/thesis/thesis.tex`) ist zu flach und
+> nutzt nicht die offizielle Vorlage. Sie wird **ersetzt**. Neue Vorgaben:
+> - **Offizielle HAW-Vorlage** (Thomas Lehmann) — heruntergeladen und extrahiert
+>   nach `docs/thesis/haw-template/` (Quelle:
+>   `https://thomas-lehmann.inf.haw-hamburg.de/batemplate/template-latex_std.zip`;
+>   `style/thesisstyle.sty`, `coverpage_*.tex`, HAW-Logos, `configuration.tex`).
+> - **Tiefe & Umfang: ca. 64 Seiten** (nicht 21). Deutlich ausführlichere,
+>   besser formulierte Analysen.
+> - **Reihenfolge**: erst das **Produkt fertigstellen** (M11–M15), *dann* die
+>   Experimente/Parameterstudie am fertigen Produkt — d.h. die Thesis-Arbeiten
+>   ans **Ende** hängen, um eine geeignete Parameterstudie durchzuführen.
+
+## Milestone 16 — Umfassende Parameterstudie (nach M15, am fertigen Produkt)
+- Große `tc netem`-Matrix (Delay × Loss × Bandbreite), hohe Iterationszahl je
+  Bedingung (statistisch belastbar: Mittel, CI, p50/p95/p99), Warmup/Wiederholung.
+- Vergleich der Betriebsarten: TCP-Stream vs. UDP vs. One-shot; Einfluss der
+  PoW-Schwierigkeit; Handshake- vs. Datenphase; ggf. P2P-Direktpfad vs. Relay.
+- Reproduzierbar via `scripts/sweep.sh` (erweitert) → CSV + Plots + Tabellen unter
+  `docs/thesis/data/`, mit Beschreibung von Aufbau, Störgrößen und Methodik.
+
+## Milestone 17 — Tiefe BA-Thesis (ersetzt M7, HAW-Vorlage, ~64 S.)
+- Aufsetzen auf `docs/thesis/haw-template/` (Coverpage, Konfiguration, Glossar,
+  BibLaTeX), texlive-in-Docker-Build.
+- Kapitel deutlich ausgearbeitet: Einleitung/Motivation, **Related Work**,
+  Grundlagen (ZK/providerblind, Noise, QUIC, PoW, NAT-Traversal), Anforderungen &
+  Bedrohungsmodell, Architektur (aus ADRs), Implementierung (aus allen Crates,
+  inkl. Streaming/UDP/P2P), **Evaluation mit der Parameterstudie (M16)**,
+  Diskussion/Limitierungen, Fazit & Ausblick, Anhang.
+- **Verification**: kompiliert sauber im texlive-Container; Seitenumfang ~64.

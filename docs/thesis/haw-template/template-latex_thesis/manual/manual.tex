@@ -1,0 +1,47 @@
+\documentclass[11pt,  % 11 Punkt Schrift
+  a4paper,            % DIN A4
+  oneside,            % einseitiger Druck
+  BCOR=5mm,           % Bindungskorrektur
+  parskip=half,       % Halber Abstand zwischen Absätzen
+]{scrreprt}
+\usepackage{../style/thesisstyle}
+
+% Manual soll einen Index haben
+\usepackage{makeidx}      % kein Index im Standard-Style
+\makeindex                % Index erstellen
+
+\begin{document}
+\hyphenation{Ba-che-lor-the-sis Mas-ter-the-sis Source-Code-Ab-schnit-te}
+
+% Table of contents here
+%\pagenumbering{roman}
+\tableofcontents
+
+% PDF Metadata
+\hypersetup{
+pdftitle={Template Manual},
+pdfauthor={Thomas Lehmann}
+}
+
+% Chapters
+\clearpage
+\pagenumbering{arabic}
+\input{intro}
+\input{wheretofindwhat}
+\input{firststeps}
+\input{configurations}
+\input{glossary}
+\input{citation}
+\input{maintainer}
+\input{additionalpackages}
+\input{convenience}
+\input{knownissues}
+\input{languages}
+
+% Index für das Dokument hier erstellen
+\printindex
+
+%\bibliographystyle{plain}
+\bibliographystyle{dinat}
+\bibliography{literature}
+\end{document}

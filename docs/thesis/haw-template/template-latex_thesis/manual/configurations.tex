@@ -1,0 +1,80 @@
+% !TEX root = ./manual.tex
+%%
+% configurations
+% @author Thomas Lehmann
+%
+\section{Konfiguration des Templates}\label{sec:configuraitions}
+Das Template muss für die eigene Arbeit angepasst werden. Alle Einstellungen sind in der Datei \texttt{configuration/configuration.tex} vorzunehmen. Die Einstellungsmöglichkeiten und ihre Auswirkungen sind im folgenden aufgelistet.
+
+\paragraph{Betreuer}\index{Einstellungen!firstSupervisor}\index{Einstellungen!secondSupervisor} Der Betreuer (Erstgutachter) und der Zweitgutachter werden über den Parameter der Kommandos \texttt{\textbackslash firstSupervisor\{\}} und entsprechend mit dem Kommando \texttt{\textbackslash secondSupervisor\{\}} eingestellt. Hier sind die beiden Default-Namen gegen die Namen der Gutachter auszutauschen.
+
+\paragraph{Titel der Arbeit}\index{Einstellungen!thesisTitle} Der eigentliche Titel der Arbeit wird im Parameter des Kommandos \texttt{\textbackslash thesisTitle\{\}} angegeben. Ist der Titel länger und bildet drei Zeilen, so muss die Formatierung der Titelseite angepasst werden. Der Titel ist für die Abstract-Page auch in Englisch über das Kommando \texttt{\textbackslash thesisTitleEN\{\}} anzugeben.
+
+\paragraph{Keywords}\index{Einstellungen!Keywords} Für die Arbeit sind Schlüsselwörter in Englisch über Parameter des Kommandos \texttt{\textbackslash keywordsEN\{\}} und in Deutsch über das Kommando \texttt{\textbackslash keywordsDE\{\}} anzugeben. Die Begriffe werden auf der Abstact-Page eingefügt.
+
+\paragraph{Abstract}\index{Einstellungen!Abstract} Für die Arbeit ist eine Zusammenfassung in Deutsch und in Englisch zu erstellen. Mit dem Kommando \texttt{\textbackslash abstractEN\{\}} ist die englische Zusammenfassung und mit dem Kommando \texttt{\textbackslash abstractDE\{\}} ist die
+deutsche Zusammenfassung anzugeben.
+
+\paragraph{Autor}\index{Einstellungen!thesisAuthor} Der Autor wird im Parameter des Kommandos \texttt{\textbackslash thesisAutor\{\}} angegeben. Hier ist entsprechend der eigene Name einzusetzen.
+
+\paragraph{Abgabedatum}\index{Einstellungen!submissiondate} Hier ist das Datum der Abgabe, so wie es im Dokument stehen soll, als Text im Parameter des Kommandos \texttt{\textbackslash submissionDate\{\}} anzugeben.
+
+\paragraph{Non-Disclosure Agreement/Geheimhaltung}\index{Einstellungen!NDA} Ist die Arbeit Geheim, d.~h. es besteht ein Geheimhaltungsvertrag (NDA), so ist das Kommando \texttt{\textbackslash NDA\{yes\}} auszukommentieren. Ein entsprechender Vermerk erscheint dann auf dem Titelblatt. Ist die Arbeit nicht geheim, so ist \texttt{\textbackslash NDA\{no\}} auszukommentieren.
+
+\paragraph{Cover-Page} Das Deckblatt ist über das Kommando
+\texttt{\textbackslash Cover\{\}} mit entsprechendem Parameter
+auszuwählen. Als Parameter sind zulässig:
+
+\begin{center}
+  \begin {tabular}{ll}
+    Parameter & Cover Page \\
+    \hline
+    \texttt{Std2018} & Nachfolger des ''grünen Balkens'' \\
+    \texttt{CD2017} & Corporate Design HAW Stand 2017 \\
+    \texttt{CD2017NoLogo} & Corporate Design ohne Logos \\
+  \end{tabular}
+\end{center}
+
+\paragraph{Abbildungsverzeichnis} Wird kein Abbildungsverzeichnis benötigt, so ist der Parameter für das Kommando \texttt{\textbackslash ListOfFigures} auf \texttt{no} zu setzen.
+
+\paragraph{Tabellenverzeichnis} Wird kein Tabellenverzeichnis benötigt, so ist der Parameter für das Kommando \texttt{\textbackslash ListOfTables} auf \texttt{no} zu setzen.
+
+\paragraph{Akronymverzeichnis} Wird kein Akronymverzeichnis benötigt, so ist der Parameter für das Kommando \texttt{\textbackslash ListOfAccronym} auf \texttt{no} zu setzen. Beim Erstellen des PDFs muss als zusätzlicher Kompileschritt \texttt{makeglossaries} ausgeführt werden.
+
+\paragraph{Symbolverzeichnis} Wird kein Symbolverzeichnis benötigt, so ist der Parameter für das Kommando \texttt{\textbackslash ListOfSymbols} auf \texttt{no} zu setzen. Beim Erstellen des PDFs muss als zusätzlicher Kompileschritt \texttt{makeglossaries} ausgeführt werden.
+
+\paragraph{Glossary} Wird kein Glossary an Ende benötigt, so ist der Parameter für das Kommando \texttt{\textbackslash Glossary} auf \texttt{no} zu setzen. Beim Erstellen des PDFs muss als zusätzlicher Kompileschritt \texttt{makeglossaries} ausgeführt werden.
+
+\paragraph{Studiengang} Der Studiengang ist über das Kommando
+\texttt{\textbackslash studycourse\{\}} mit entsprechendem Parameter
+auszuwählen. Als Parameter sind zulässig:
+
+\begin{center}
+  \begin {tabular}{ll}
+    Parameter & Studiengang \\
+    \hline
+    \texttt{INF\_ITS} & Bachelor Informatik Technischer Systeme \\
+    \texttt{INF\_AI} & Bachelor Angewandte Informatik \\
+    \texttt{INF\_WI} & Bachelor Wirtschaftsinformatik \\
+    \texttt{INF\_ECS} & Bachelor European Computer Science \\
+    \texttt{EMI\_EI} & Bachelor Elektrotechnik und Informationstechnik \\
+    \texttt{EMI\_REE} & Bachelor Regenerative Energiesysteme und Energiemanagement \\
+    \texttt{EMI\_IE} & Bachelor Information Engineering \\
+    \texttt{BPM} & Bachelor Maschinenbau und Produktion \\
+    \texttt{BPM-hp} & Bachelor Maschinenbau und Produktion (Hauptpraktikum)\\
+    \texttt{BMT} & Bachelor Mechatronik \\
+    \texttt{BMT-st} & Bachelor Mechatronik (Studienarbeit)\\
+    \texttt{BMT-hp} & Bachelor Mechatronik (Hauptpraktikum)\\
+    \texttt{INF\_MaI} & Master Informatik \\
+    \texttt{EMI\_MaA} & Master Automatisierung \\
+    \texttt{EMI\_MaICE} & Master Information and Communication Engineering \\
+    \texttt{EMI\_MaMS} & Master Microelectronic Systems \\
+  \end{tabular}
+\end{center}
+
+\section{Konfiguration im \LaTeX -Code}\label{sec:codechanges}
+Für einige Anpassungen müssen direkt eine Änderungen im \LaTeX -Code vorgenommen werden. 
+
+Soll eine Liste von Listings eingefügt werden, so ist die Zeile in der Datei \texttt{thesis.tex} auszukommentieren und das Paket \texttt{listings} in der Paketlist hinzuzufügen.
+
+Soll die Arbeit im einseitigen Layout erstellt werden, so ist in der Datei \texttt{thesis.tex} in der Parameterliste die Option \texttt{twoside}auszukommentieren.
