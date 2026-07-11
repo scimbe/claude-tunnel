@@ -283,7 +283,15 @@ Mesh Plane promises "any TCP/UDP".
 Turn the in-memory `ct-control-plane` library into a running service.
 - **M13.1** HTTP service exposing enrollment (issue/redeem join token).
 - **M13.2** Tunnel-registry + rendezvous endpoints over the wire.
-- **M13.3** Dockerized control-plane container in the compose topology.
+- **M13.3** Service binary (`ct-control-plane`) + merged enrollment+registry router.
+- **M13.4** Dockerized control-plane container in the compose topology + E2E.
+  Decomposed (too big for one gate-green pass — needs an HTTP client the
+  Agent/Client can drive, plus a compose overlay):
+  - **M13.4a** ✅ `ControlPlaneClient` (reqwest) — issue/redeem/register/resolve
+    against the *running* service; integration test drives the full flow over a
+    real TCP socket (`axum::serve` on an ephemeral port).
+  - **M13.4b** compose overlay (`docker-compose.controlplane.yml`): control-plane
+    container + Agent enrolls/registers against it live, Client resolves — smoke.
 - **E2E:** Agent enrolls against the running service, registers its tunnel, and
   a Client resolves + connects — all through the containerized control plane.
 
