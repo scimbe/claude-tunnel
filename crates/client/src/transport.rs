@@ -257,6 +257,22 @@ pub async fn client_tunnel_direct(
     Ok(response)
 }
 
+/// Auto P2P tunnel (M11.4b-iv): discover the Agent's advertised direct endpoint
+/// from the Edge (`'P'`), then try the direct path, falling back to the Edge
+/// relay if none is advertised or the direct attempt fails. Returns
+/// `(used_direct, response)`.
+pub async fn client_tunnel_auto(
+    edge_conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<(bool, Vec<u8>), BoxError> {
+    let direct = query_direct_endpoint(edge_conn, token).await.ok().flatten();
+    client_tunnel_p2p_or_relay(edge_conn, token, cap, client_private, payload, direct, timeout).await
+}
+
 /// Try the **direct** P2P path first, else fall back to the **Edge relay**
 /// (M11.4). `direct` is the Agent's advertised `(candidate, cert)`; if it is
 /// `None`, or the direct connect/tunnel fails within `timeout`, the tunnel goes

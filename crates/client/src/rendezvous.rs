@@ -618,6 +618,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_auto_uses_direct_path_when_advertised() {
+        // M11.4b-iv: full auto P2P flow — the Agent advertises its direct
+        // listener; the Client discovers it via the Edge ('P') and connects
+        // straight to the Agent (used_direct=true), bypassing the relay.
+        use crate::transport::client_tunnel_auto;
+        use ct_agent::config::OriginProto;
+        use ct_agent::serve::serve_direct;
+        use ct_agent::transport::{advertise_direct_listener, build_direct_listener_at};
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::build_server_endpoint_with_cert;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let token = RoutingToken([0xD1; 32]);
+        let challenge = Challenge {
+            nonce: [0x33; 16],
+            difficulty: 8,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        // Streaming echo Origin.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = l.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        // Agent direct listener + serve_direct loop.
+        let (listener, agent_cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let laddr = listener.local_addr().expect("laddr");
+        let opriv = origin_kp.private;
+        let direct_srv =
+            tokio::spawn(async move { let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp).await; });
+
+        // Edge: serve the Agent's 'D' advertise, then the Client's 'P' query.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let ac = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&ac, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            ac.closed().await;
+            let cc = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&cc, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            cc.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent advertises its listener to the Edge.
+        let adv = dial_edge(addr, cert.clone()).await.expect("agent dial");
+        advertise_direct_listener(&adv, &token, laddr, &agent_cert)
+            .await
+            .expect("advertise");
+        adv.close(0u32.into(), b"done");
+
+        // Client auto: discover + direct tunnel.
+        let cconn = dial_edge(addr, cert).await.expect("client dial");
+        let (used_direct, resp) = client_tunnel_auto(
+            &cconn,
+            &token,
+            &cap,
+            &client_kp.private,
+            b"auto-payload",
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("auto tunnel");
+        assert!(used_direct, "auto discovered + used the direct P2P path");
+        assert_eq!(resp, b"auto-payload", "direct tunnel delivered the payload");
+
+        cconn.close(0u32.into(), b"done");
+        direct_srv.abort();
+        let _ = edge.await;
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
