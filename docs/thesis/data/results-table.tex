@@ -1,0 +1,18 @@
+\begin{table}[t]
+  \centering
+  \caption{Tunnel-Roundtrip-Latenz unter emulierten Netzbedingungen (\texttt{tc netem}).}
+  \label{tab:latency}
+  \begin{tabular}{llrrrrrr}
+    \toprule
+    Verzögerung & Verlust & $n$ & Mittel & p50 & p95 & Min & Max \\
+     &  &  & (ms) & (ms) & (ms) & (ms) & (ms) \\
+    \midrule
+    0ms & 0\% & 5 & 6.8 & 6.6 & 7.9 & 5.8 & 7.9 \\
+    0ms & 2\% & 5 & 6.9 & 6.9 & 8.2 & 5.5 & 8.2 \\
+    20ms & 0\% & 5 & 92.7 & 88.7 & 109.2 & 88.1 & 109.2 \\
+    20ms & 2\% & 5 & 92.2 & 88.2 & 108.5 & 88.0 & 108.5 \\
+    50ms & 0\% & 5 & 217.9 & 207.5 & 260.4 & 205.5 & 260.4 \\
+    50ms & 2\% & 5 & 237.5 & 207.7 & 306.5 & 207.5 & 306.5 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
