@@ -1,12 +1,14 @@
-# Claude Tunnel testbed topology (M5.5a).
+# Claude Tunnel testbed topology (M5.5).
 #
-# Brings up edge + agent(+origin) + client on a static-IP network, coordinating
-# via a shared volume (edge writes its cert; agent writes the Capability). The
-# client tunnels a payload to the origin and exits 0 on a verified round-trip.
+# edge + agent(+origin) + client on a static-IP network, coordinating via a
+# shared volume. tc netem link impairment is configurable per node via env
+# (EDGE_/AGENT_/CLIENT_ DELAY|LOSS|RATE), applied by netem-entrypoint.sh.
 #
-# Run:
+# Run (unimpaired):
 #   docker compose -f docker/docker-compose.yml up --build \
 #       --abort-on-container-exit --exit-code-from client
+# Run with 30ms edge delay + 1% loss:
+#   EDGE_DELAY=30ms EDGE_LOSS=1% docker compose ... up ...
 
 name: ct-testbed
 
@@ -16,11 +18,17 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: ct-testbed
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
     command: ["ct-edge"]
     environment:
       CT_EDGE_LISTEN: "0.0.0.0:4433"
       CT_EDGE_POW_DIFFICULTY: "8"
       CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
+      CT_NETEM_DELAY: "${EDGE_DELAY:-}"
+      CT_NETEM_LOSS: "${EDGE_LOSS:-}"
+      CT_NETEM_RATE: "${EDGE_RATE:-}"
     volumes:
       - shared:/shared
     networks:
@@ -28,7 +36,6 @@ services:
         ipv4_address: 10.5.0.2
 
   origin:
-    # Pre-built socat image: ready instantly (no apk-install race with the client).
     image: alpine/socat:latest
     command: ["TCP-LISTEN:8080,reuseaddr,fork", "EXEC:/bin/cat"]
     networks:
@@ -37,12 +44,18 @@ services:
 
   agent:
     image: ct-testbed
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
     command: ["ct-agent"]
     environment:
       CT_AGENT_EDGE: "10.5.0.2:4433"
       CT_AGENT_ORIGIN: "10.5.0.3:8080"
       CT_AGENT_EDGE_CERT: "/shared/edge-cert.der"
       CT_AGENT_CAPABILITY_OUT: "/shared/capability.bin"
+      CT_NETEM_DELAY: "${AGENT_DELAY:-}"
+      CT_NETEM_LOSS: "${AGENT_LOSS:-}"
+      CT_NETEM_RATE: "${AGENT_RATE:-}"
     volumes:
       - shared:/shared
     depends_on:
@@ -54,11 +67,17 @@ services:
 
   client:
     image: ct-testbed
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
     command: ["ct-client"]
     environment:
       CT_CLIENT_EDGE_CERT: "/shared/edge-cert.der"
       CT_CLIENT_CAPABILITY: "/shared/capability.bin"
       CT_CLIENT_PAYLOAD: "hello-tunnel"
+      CT_NETEM_DELAY: "${CLIENT_DELAY:-}"
+      CT_NETEM_LOSS: "${CLIENT_LOSS:-}"
+      CT_NETEM_RATE: "${CLIENT_RATE:-}"
     volumes:
       - shared:/shared
     depends_on:
