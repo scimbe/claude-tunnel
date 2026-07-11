@@ -34,7 +34,9 @@ pub async fn register_agent(
     token.copy_from_slice(&hdr[1..33]);
     let token = RoutingToken(token);
 
-    state.register(token.clone(), conn.clone());
+    // Record the Agent's Edge-observed reflexive address as its peer candidate
+    // for P2P rendezvous (M11.2).
+    state.register_with_candidate(token.clone(), conn.clone(), conn.remote_address());
     send.write_all(b"OK").await?;
     send.finish()?;
     Ok(token)
@@ -72,7 +74,11 @@ pub async fn serve_connection(
         b'A' => {
             let mut token = [0u8; 32];
             recv.read_exact(&mut token).await?;
-            state.register(RoutingToken(token), conn.clone());
+            state.register_with_candidate(
+                RoutingToken(token),
+                conn.clone(),
+                conn.remote_address(),
+            );
             send.write_all(b"OK").await?;
             send.finish()?;
             Ok(())
@@ -162,6 +168,11 @@ mod tests {
         // The Edge registers before acking, so by the time we read OK the tunnel
         // is routable in the shared state.
         assert!(state.is_known(&token), "agent tunnel is now routable");
+        // And its Edge-observed peer candidate is recorded (M11.2).
+        assert!(
+            state.candidate(&token).is_some(),
+            "agent peer candidate recorded at registration"
+        );
         conn.close(0u32.into(), b"done");
         let _ = server_task.await;
     }
