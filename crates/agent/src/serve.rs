@@ -15,7 +15,7 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::{copy_bidirectional, join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, OriginProto};
 use crate::transport::{dial_quic, register_tunnel};
 use ct_common::noise::{frame, noise_pump, origin_handshake};
 use ct_common::RoutingToken;
@@ -210,11 +210,15 @@ pub async fn run_agent(
 ) -> Result<(), BoxError> {
     let conn = dial_quic(config.edge, edge_cert).await?;
     register_tunnel(&conn, &token).await?;
+    let proto = config.origin_proto;
     loop {
         let (send, recv) = conn.accept_bi().await?;
         let origin = config.origin;
         tokio::spawn(async move {
-            let _ = serve_noise_stream(send, recv, origin, &origin_private).await;
+            let _ = match proto {
+                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &origin_private).await,
+                OriginProto::Udp => serve_noise_udp(send, recv, origin, &origin_private).await,
+            };
         });
     }
 }
@@ -441,7 +445,10 @@ mod tests {
             assert_eq!(&tmp[..n], msg, "UDP datagram boundary + content preserved through the tunnel");
         }
 
-        drop(i_write); // close the tunnel → serve_noise_udp returns
+        // Close the tunnel so serve_noise_udp's reader hits EOF and returns.
+        // NOTE: `drop(i_write)` does NOT signal EOF while the split ReadHalf is
+        // alive (the DuplexStream stays open) — an explicit shutdown is required.
+        i_write.shutdown().await.unwrap();
         agent.await.unwrap().unwrap();
         origin.abort();
     }
@@ -500,6 +507,7 @@ mod tests {
         let config = AgentConfig {
             edge: edge_addr,
             origin: origin_addr,
+            origin_proto: OriginProto::Tcp,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
