@@ -208,3 +208,75 @@ so the Edge relays only ciphertext. Decomposed:
     - **M8.4c-iii** docker-compose smoke: the containerized round-trip still
       succeeds over the encrypted path.
 - **Verification:** cargo test green each packet; M8.4 asserts provider-blindness.
+
+---
+
+# Full-product roadmap (DAG extension → SPEC §8 v1 feature-completeness)
+
+> Goal (user directive): develop **and** test until **all** SPEC §8 v1 features run and
+> **all tests, especially E2E**, are green. Each milestone below lands with a frozen
+> E2E test through real components (Edge relay / containers) before it counts as done.
+> One packet per cycle; decompose any packet that exceeds a Haiku-sized pass.
+
+Gap analysis vs SPEC §8 (verified against crates): Noise E2E ✅, PoW gating ✅,
+credential auth ✅, relay path ✅. **Remaining:** general streaming data path,
+UDP, direct P2P + relay fallback, HTTP/2-over-TCP fallback, hosted control-plane
+service, agent-side observability, pseudonymous accounts + crypto payment.
+
+## Milestone 9 — General streaming data path
+The live Noise path is currently one request/response. Make it a full
+bidirectional, multi-message Noise stream so arbitrary TCP protocols tunnel.
+- **M9.1** Noise transport framing loop: continuous encrypt/decrypt of a
+  bidirectional byte stream (both directions concurrently) over one session.
+- **M9.2** Agent bridge = full-duplex copy between the Noise stream and the
+  Origin TCP socket (replace the one-shot bridge).
+- **M9.3** Client streaming API (send/recv over the live Noise session).
+- **E2E:** multi-message + large (>64 KiB, multi-frame) + interleaved
+  bidirectional payloads round-trip through the real Edge; ciphertext-only tap.
+
+## Milestone 10 — UDP origin support
+Mesh Plane promises "any TCP/UDP".
+- **M10.1** Agent bridges a Noise stream to a UDP Origin (datagram framing).
+- **M10.2** Client UDP tunnel mode.
+- **E2E:** a UDP echo Origin round-trips through the tunnel in the testbed.
+
+## Milestone 11 — Direct P2P path + relay fallback (ADR-0015)
+- **M11.1** Edge rendezvous exchanges peer candidates (addr/port) between
+  Client and Agent.
+- **M11.2** UDP hole-punching attempt; direct QUIC path when it succeeds.
+- **M11.3** Fallback to Edge relay when punching fails (symmetric NAT).
+- **E2E:** docker testbed with a NAT container — direct path established when
+  possible; relay fallback under emulated symmetric NAT; both carry the tunnel.
+
+## Milestone 12 — HTTP/2-over-TCP fallback transport (ADR-0004)
+- **M12.1** Agent/Client probe UDP reachability; select TCP transport when blocked.
+- **M12.2** Edge listens for the TCP transport and demuxes onto the same relay.
+- **E2E:** UDP-blocked testbed (drop UDP/443 via netem/iptables) → tunnel still
+  works over TCP.
+
+## Milestone 13 — Hosted control-plane service (ADR-0017)
+Turn the in-memory `ct-control-plane` library into a running service.
+- **M13.1** HTTP service exposing enrollment (issue/redeem join token).
+- **M13.2** Tunnel-registry + rendezvous endpoints over the wire.
+- **M13.3** Dockerized control-plane container in the compose topology.
+- **E2E:** Agent enrolls against the running service, registers its tunnel, and
+  a Client resolves + connects — all through the containerized control plane.
+
+## Milestone 14 — Agent-side observability (ADR-0016)
+- **M14.1** Prometheus/OpenTelemetry metrics in Agent + Client (tunnel counts,
+  bytes, handshake latency).
+- **M14.2** `/metrics` endpoint; compose scrape target.
+- **E2E:** metrics endpoint scraped in the testbed; counters increment on
+  tunnel activity.
+
+## Milestone 15 — Pseudonymous accounts + crypto payment (ADR-0012, SPEC §9)
+Minimal technical model; the funded-adversary sybil economics stay an open risk
+(`BACKLOG.md`) and are flagged, not hand-waved.
+- **M15.1** Pseudonymous account + prepaid-credit ledger (control plane).
+- **M15.2** Capability/token issuance gated by credit balance.
+- **M15.3** Crypto-payment intake stub (credit top-up).
+- **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
+
+**Definition of done (full product):** every milestone above green, the whole
+docker-compose topology runs the full stack, and a top-level E2E suite exercises
+the product end to end under netem. Then refresh the thesis to match.
