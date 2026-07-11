@@ -2,11 +2,86 @@
 \label{ch:evaluation}
 
 Dieses Kapitel wertet die Roundtrip-Latenz des Tunnels im Docker-Testbett unter
-emulierten Netzbedingungen (\texttt{tc netem}) aus. Es wird in Paket~M7.5 aus den
-Ergebnissen von Milestone~6 ausgearbeitet: der Messreihe
-(\texttt{docs/thesis/data/latency.csv}), der Ergebnistabelle
-(Tabelle~\ref{tab:latency}) und den Abbildungen \texttt{latency-vs-delay} sowie
-\texttt{latency-vs-loss}.
+emulierten Netzbedingungen aus und beantwortet damit die Forschungsfragen FF2
+(Latenz-Overhead) und FF3 (Verhalten unter Netzbedingungen).
 
-% Bereits generierte Ergebnistabelle aus Milestone 6 (scripts/tabulate.py).
+\section{Testbett und Methodik}
+\label{sec:testbett}
+
+Das Testbett ist vollständig containerisiert (Docker Compose): Edge, Agent,
+Origin (ein TCP-Echo-Dienst) und Client laufen auf einem statischen Netz. Die
+Link-Impairment wird mit \texttt{tc netem} auf der Egress-Schnittstelle des Edge
+gesetzt und ist über Umgebungsvariablen (Verzögerung, Verlust, Bandbreite)
+parametrisiert. Der Client misst im Bench-Modus je Bedingung $n=5$ vollständige
+Roundtrips -- Verbindungsaufbau, PoW-Rendezvous, Tunnel und Echo-Verifikation --
+jeweils mit \emph{frisch aufgebauter} QUIC-Verbindung.
+
+Die Auswertung ist vollständig reproduzierbar und ihrerseits containerisiert:
+\texttt{scripts/sweep.sh} fährt die Bedingungsmatrix ab und sammelt die Ergebnisse
+als CSV, \texttt{scripts/plot.sh} erzeugt die Abbildungen (Matplotlib in einem
+Python-Container) und \texttt{scripts/tabulate.py} die Tabelle. Vermessen wurde
+die Matrix Verzögerung $\in \{0, 20, 50\}$\,ms $\times$ Verlust $\in \{0, 2\}$\,\%.
+
+\section{Ergebnisse}
+\label{sec:ergebnisse}
+
+Tabelle~\ref{tab:latency} fasst alle Messpunkte zusammen;
+Abbildung~\ref{fig:latency-delay} zeigt die Latenz über der Verzögerung,
+Abbildung~\ref{fig:latency-loss} über dem Paketverlust.
+
+% Ergebnistabelle (generiert, scripts/tabulate.py).
 \input{data/results-table.tex}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.8\linewidth]{latency-vs-delay.png}
+  \caption{Tunnel-Roundtrip über der Edge-Verzögerung, je Verlustwert eine
+    Serie; der obere Fehlerbalken markiert das p95.}
+  \label{fig:latency-delay}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.8\linewidth]{latency-vs-loss.png}
+  \caption{Tunnel-Roundtrip über dem Paketverlust, je Verzögerungswert eine
+    Serie.}
+  \label{fig:latency-loss}
+\end{figure}
+
+\section{Diskussion}
+\label{sec:diskussion}
+
+\paragraph{FF2 -- Latenz-Overhead.} Ohne Netzverzögerung beträgt der
+Roundtrip im Mittel 6{,}8\,ms; dies ist der Eigenanteil des Tunnels aus
+QUIC-Handshake, PoW-Rendezvous und Mehrsprung-Relay. Über die Messpunkte
+(0\,ms~$\rightarrow$~6{,}8; 20\,ms~$\rightarrow$~92{,}7; 50\,ms~$\rightarrow$~217{,}9)
+skaliert die Latenz näherungsweise linear:
+$\text{RT} \approx 6{,}8 + 4{,}2 \cdot d$ mit $d$ = einseitige Edge-Verzögerung
+in Millisekunden. Der Faktor~$\approx$~4{,}2 spiegelt wider, dass jeder
+Anwendungs-Roundtrip die verzögerte Egress mehrfach quert (Verbindungsaufbau,
+Rendezvous und der Relay-Pfad Client$\rightarrow$Edge$\rightarrow$Agent$\rightarrow$Origin
+und zurück). Da pro Iteration frisch verbunden wird, trägt der Handshake einen
+festen Vielfachen der Umlaufzeit bei.
+
+\paragraph{FF3 -- Verhalten unter Paketverlust.} Bei niedriger Umlaufzeit
+(0\,ms, 20\,ms) ist ein Verlust von 2\,\% im Mittel nicht messbar
+(6{,}8$\rightarrow$6{,}9\,ms bzw.\ 92{,}7$\rightarrow$92{,}2\,ms, innerhalb der
+Streuung). Bei 50\,ms hingegen steigt der Mittelwert um rund 9\,\%
+(217{,}9$\rightarrow$237{,}5\,ms) und das p95 um rund 18\,\%
+(260{,}4$\rightarrow$306{,}5\,ms), während der Median nahezu unverändert bleibt
+(p50~$\approx$~207\,ms). Verlustbedingte Neuübertragungen wirken sich also
+proportional zur Umlaufzeit aus und zeigen sich primär im Tail (p95), nicht im
+Median.
+
+\section{Limitierungen}
+\label{sec:limitierungen}
+
+Die Ergebnisse sind unter drei Einschränkungen zu lesen. Erstens wirkt die
+Impairment nur auf der Edge-Egress und damit nicht symmetrisch; die absolute
+Latenz ist eine untere Schranke für eine voll bidirektional verzögerte Strecke.
+Zweitens dient $n=5$ hier der Demonstration der reproduzierbaren Mess-Pipeline,
+nicht einer statistisch belastbaren Aussage -- größere Stichproben und eine
+breitere Matrix (inklusive Bandbreitenbegrenzung) sind über dieselben Skripte
+unmittelbar zugänglich. Drittens überzeichnet der Frisch-Verbindungsaufbau je
+Iteration den Handshake-Anteil; ein Keep-Alive-Datenpfad läge niedriger. Diese
+Punkte greift der Ausblick (Kapitel~\ref{ch:fazit}) auf.
