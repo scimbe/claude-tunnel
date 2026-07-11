@@ -251,8 +251,9 @@ Mesh Plane promises "any TCP/UDP".
   `CT_AGENT_ORIGIN_PROTO=udp` + client `CT_CLIENT_MODE=udp` → round-trip OK.
 
 ## Milestone 11 — Direct P2P path + relay fallback (ADR-0015)
-- **M11.1** Edge rendezvous exchanges peer candidates (addr/port) between
-  Client and Agent.
+- **M11.1** ✅ `EdgeState` records each Agent's Edge-observed peer candidate
+  (reflexive addr) at registration; `register_with_candidate` / `candidate`.
+  (Protocol wiring — Edge sends candidate to Client — is M11.2.)
 - **M11.2** UDP hole-punching attempt; direct QUIC path when it succeeds.
 - **M11.3** Fallback to Edge relay when punching fails (symmetric NAT).
 - **E2E:** docker testbed with a NAT container — direct path established when
