@@ -200,6 +200,7 @@ dependencies = [
 name = "ct-client"
 version = "0.0.0"
 dependencies = [
+ "ct-agent",
  "ct-common",
  "ct-edge",
  "quinn",

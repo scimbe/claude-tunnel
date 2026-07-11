@@ -12,3 +12,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 ct-edge = { path = "../edge" }
+ct-agent = { path = "../agent" }

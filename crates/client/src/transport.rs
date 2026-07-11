@@ -4,8 +4,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::noise::client_noise_exchange;
 use ct_common::pow::{build_request, Challenge};
-use ct_common::RoutingToken;
+use ct_common::{Capability, RoutingToken};
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 
@@ -76,5 +77,34 @@ pub async fn client_tunnel(
     send.finish()?;
 
     let response = recv.read_to_end(64 * 1024).await?;
+    Ok(response)
+}
+
+/// Tunnel `payload` to the Origin over Noise E2E (M8.4a): open a stream, complete
+/// the PoW-gated rendezvous for `token`, then run the `Noise_IK` exchange
+/// (pinning `cap`'s Origin Identity) and return the decrypted response. The Edge
+/// only relays the resulting ciphertext frames.
+pub async fn client_tunnel_noise(
+    conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<Vec<u8>, BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(b"C").await?;
+
+    let mut chal = [0u8; 17];
+    recv.read_exact(&mut chal).await?;
+    let challenge = Challenge {
+        nonce: chal[..16].try_into().unwrap(),
+        difficulty: chal[16],
+    };
+    let req = build_request(&challenge, token);
+    send.write_all(&req).await?;
+
+    // The stream is now bridged to the Agent; run Noise over it.
+    let response = client_noise_exchange(&mut send, &mut recv, client_private, cap, payload).await?;
+    send.finish()?;
     Ok(response)
 }

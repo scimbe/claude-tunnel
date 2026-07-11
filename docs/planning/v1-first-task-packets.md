@@ -194,6 +194,12 @@ so the Edge relays only ciphertext. Decomposed:
   encrypted payload), pinning the Capability's Origin Identity.
 - **M8.3** Agent-side Noise responder + plaintext bridge: decrypt client frames →
   local Origin TCP → encrypt replies.
-- **M8.4** E2E integration test through a real Edge+Agent proving the Edge relays
-  only ciphertext (relayed bytes ≠ plaintext) and the Client gets the echo back.
+- **M8.4** E2E integration. **Decomposed** (wiring + tap + live mains > one pass):
+  - **M8.4a** `client_tunnel_noise` (rendezvous + Noise over one QUIC stream) +
+    functional E2E test: Client → real Edge `serve_connection` relay → Agent
+    `serve_noise_bridge` → real TCP echo Origin → back, Noise-encrypted.
+  - **M8.4b** provider-blind assertion: a tapping relay (byte-identical to the
+    Edge's `relay_quic`) proves the relayed bytes ≠ plaintext.
+  - **M8.4c** rewire the live path — `run_agent`/agent+client `main`/bench onto
+    Noise; verify the docker-compose smoke path still round-trips.
 - **Verification:** cargo test green each packet; M8.4 asserts provider-blindness.
