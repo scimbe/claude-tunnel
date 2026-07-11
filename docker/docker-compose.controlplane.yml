@@ -1,0 +1,41 @@
+# Hosted control-plane smoke (M13.4b): stands up the containerized
+# ct-control-plane service and drives it end to end from a second container —
+# enroll (issue -> redeem) -> register a tunnel -> resolve it — proving the
+# in-memory library now runs as a hosted service (ADR-0017).
+#
+# Standalone (not an overlay on the base topology — the smoke only needs the
+# control plane + the self-test driver):
+#   docker compose -f docker/docker-compose.controlplane.yml up --build \
+#       --abort-on-container-exit --exit-code-from selftest
+
+name: ct-controlplane-smoke
+
+services:
+  control-plane:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ct-testbed
+    command: ["ct-control-plane"]
+    environment:
+      CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
+    networks:
+      cp-net:
+        ipv4_address: 10.6.0.2
+
+  selftest:
+    image: ct-testbed
+    command: ["cp_selftest"]
+    environment:
+      CT_CONTROL_PLANE_URL: "http://10.6.0.2:8090"
+    depends_on:
+      - control-plane
+    networks:
+      cp-net:
+        ipv4_address: 10.6.0.3
+
+networks:
+  cp-net:
+    ipam:
+      config:
+        - subnet: 10.6.0.0/24

@@ -290,8 +290,10 @@ Turn the in-memory `ct-control-plane` library into a running service.
   - **M13.4a** ✅ `ControlPlaneClient` (reqwest) — issue/redeem/register/resolve
     against the *running* service; integration test drives the full flow over a
     real TCP socket (`axum::serve` on an ephemeral port).
-  - **M13.4b** compose overlay (`docker-compose.controlplane.yml`): control-plane
-    container + Agent enrolls/registers against it live, Client resolves — smoke.
+  - **M13.4b** ✅ standalone compose (`docker-compose.controlplane.yml`):
+    control-plane container + `cp_selftest` driver enrolls→registers→resolves
+    against the running service. Live: `selftest OK`, `COMPOSE_EXIT=0`.
+    **Milestone 13 complete.**
 - **E2E:** Agent enrolls against the running service, registers its tunnel, and
   a Client resolves + connects — all through the containerized control plane.
 

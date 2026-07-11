@@ -18,6 +18,8 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/ct-edge /usr/local/bin/ct-edge
 COPY --from=builder /build/target/release/ct-agent /usr/local/bin/ct-agent
 COPY --from=builder /build/target/release/ct-client /usr/local/bin/ct-client
+COPY --from=builder /build/target/release/ct-control-plane /usr/local/bin/ct-control-plane
+COPY --from=builder /build/target/release/cp_selftest /usr/local/bin/cp_selftest
 COPY docker/netem-entrypoint.sh /usr/local/bin/netem-entrypoint.sh
 RUN chmod +x /usr/local/bin/netem-entrypoint.sh
 CMD ["ct-edge"]
