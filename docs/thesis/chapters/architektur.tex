@@ -1,7 +1,107 @@
 \chapter{Architektur}
 \label{ch:architektur}
 
-Dieses Kapitel beschreibt den Systementwurf (Client, Edge, Agent, Origin, Control
-Plane) und die zugrundeliegenden Entwurfsentscheidungen. Es wird in Paket~M7.3
-aus den Architecture Decision Records (\texttt{docs/adr}), dem Glossar
-(\texttt{CONTEXT.md}) und der Spezifikation (\texttt{docs/SPEC.md}) ausgearbeitet.
+Dieses Kapitel beschreibt den Systementwurf: die Komponenten und ihr
+Zusammenspiel (Abschnitt~\ref{sec:komponenten}), die tragenden Flüsse
+(Abschnitt~\ref{sec:fluesse}), das am Edge implementierte Rollen-Dispatch
+(Abschnitt~\ref{sec:dispatch}) und die wesentlichen Entwurfsentscheidungen
+(Abschnitt~\ref{sec:entscheidungen}).
+
+\section{Komponenten und Topologie}
+\label{sec:komponenten}
+
+Der Entwurf kennt vier Datenpfad-Rollen und eine Steuerkomponente
+(Abbildung~\ref{fig:architektur}):
+
+\begin{description}
+  \item[Origin.] Der private Dienst, den der Kunde exponieren will. Hier
+    terminiert die Verschlüsselung; das Origin-Schlüsselmaterial verlässt diesen
+    Bereich nie.
+  \item[Agent.] Die kundenbetriebene, rein ausgehend verbindende Software. Sie
+    ist Verwahrer des Origin-Schlüssels, prägt \emph{Capabilities} und leitet
+    Verkehr an den lokalen Origin weiter.
+  \item[Edge.] Der betreiberbetriebene, öffentlich erreichbare Knoten. Er
+    koordiniert das Rendezvous und leitet -- als Rückfall -- ausschließlich
+    Chiffretext weiter. Er kann nicht entschlüsseln und routet über ein opakes
+    Routing-Token.
+  \item[Client.] Der Endpunkt, der einen Origin erreichen möchte. Er hält eine
+    Capability und pinnt die Origin Identity.
+  \item[Control Plane.] Eine dünne, self-hosting-fähige Steuerkomponente für
+    Enrollment, Tunnel-Registry und Rendezvous-Endpunkt. Sie hält weder
+    Vertrauensmaterial noch Nutzlast.
+\end{description}
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      box/.style={draw, rounded corners, minimum width=1.9cm,
+                  minimum height=0.9cm, align=center},
+      >={Stealth[]}, node distance=1.4cm and 1.9cm]
+    \node[box] (client) {Client};
+    \node[box, right=of client] (edge) {Edge};
+    \node[box, right=of edge] (agent) {Agent};
+    \node[box, right=of agent] (origin) {Origin};
+    \node[box, above=of edge] (cp) {Control\\Plane};
+    \draw[->] (client) -- node[above,font=\small]{QUIC} (edge);
+    \draw[->] (edge) -- node[above,font=\small]{Relay} (agent);
+    \draw[->] (agent) -- node[above,font=\small]{TCP} (origin);
+    \draw[dashed,->] (cp) -- node[right,font=\small]{Rendezvous} (edge);
+    \draw[dashed,->] (client) to[bend right=28]
+      node[below,font=\small]{Noise Ende-zu-Ende (providerblind)} (origin);
+  \end{tikzpicture}
+  \caption{Komponenten und Datenpfad. Der Edge leitet nur Chiffretext weiter;
+    die Noise-Sitzung ist Ende-zu-Ende zwischen Client und Origin und für den
+    Edge undurchsichtig.}
+  \label{fig:architektur}
+\end{figure}
+
+\section{Schlüsselflüsse}
+\label{sec:fluesse}
+
+\begin{enumerate}
+  \item \textbf{Agent-Enrollment.} Ein einmaliges Join-Token bindet einen neu
+    erzeugten Agent-Identitätsschlüssel an einen Mandanten; im Betrieb
+    authentisiert sich der Agent über kurzlebiges mTLS.
+  \item \textbf{Capability-Minting.} Der Agent erzeugt eine selbsttragende
+    \emph{Capability} -- Routing-Token, Origin Identity und Edge-Adresse -- die
+    der Kunde außerhalb des Bandes an berechtigte Clients verteilt. Besitz
+    genügt, um einen Origin zu erreichen und zu authentisieren.
+  \item \textbf{Verbindungsaufbau.} Der Client legt seine Capability vor,
+    durchläuft ein PoW- und ratenbegrenztes Rendezvous am Edge, wird über sein
+    Routing-Token an den registrierten Agent geroutet und führt schließlich den
+    Noise-Handshake zum Origin, gepinnt auf die Origin Identity.
+  \item \textbf{Revocation.} Widerruf erfolgt durch Rotation des Tokens
+    und/oder des Origin-Schlüssels.
+\end{enumerate}
+
+\section{Rollen-Dispatch am Edge}
+\label{sec:dispatch}
+
+Der Prototyp bündelt die Edge-Logik in einer einzigen Routine, die pro
+eingehender Verbindung anhand eines ersten Rollen-Bytes verzweigt:
+
+\begin{description}
+  \item[Rolle \texttt{'A'} (Agent).] Der Agent meldet auf einem Kontrollstrom
+    sein Routing-Token an; der Edge trägt die Tunnel-Verbindung in die
+    Registry ein und quittiert. Das Token wird damit routbar.
+  \item[Rolle \texttt{'C'} (Client).] Der Client durchläuft das
+    PoW-Rendezvous, präsentiert sein Routing-Token, woraufhin der Edge die
+    passende Agent-Verbindung nachschlägt, einen Strom zu ihr öffnet und beide
+    Ströme byteweise koppelt (Relay).
+\end{description}
+
+Dieses Dispatch bildet die Trennung von Registrierung und Nutzung auf einem
+gemeinsamen QUIC-Transport ab und hält den Edge zustandsarm: Er kennt nur die
+Abbildung Token~$\rightarrow$~Agent-Verbindung, nie den Klartext.
+
+\section{Entwurfsentscheidungen}
+\label{sec:entscheidungen}
+
+Die Architektur folgt einigen bewusst getroffenen Entscheidungen, die in
+Architecture Decision Records festgehalten sind: ein providerblinder,
+Ende-zu-Ende-verschlüsselter Datenpfad; QUIC als Transport mit
+TCP-Rückfall; die Noise-basierte, PKI-freie Mesh-Authentisierung; ein
+einregionaler Edge um eine erststufige Tunnel-Registry; sowie eine dünne,
+self-hosting-fähige Control Plane, die weder Schlüssel noch Nutzlast sieht.
+Kapitel~\ref{ch:implementierung} zeigt, wie diese Entscheidungen in den Rust-Crates
+umgesetzt sind.
