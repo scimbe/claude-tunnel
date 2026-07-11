@@ -299,7 +299,12 @@ Turn the in-memory `ct-control-plane` library into a running service.
 
 ## Milestone 14 — Agent-side observability (ADR-0016)
 - **M14.1** Prometheus/OpenTelemetry metrics in Agent + Client (tunnel counts,
-  bytes, handshake latency).
+  bytes, handshake latency). Decomposed:
+  - **M14.1a** ✅ `ct-common::metrics` — dependency-free `Counter` +
+    `TunnelMetrics` (tunnels opened/failed, bytes each way, handshake
+    count+latency-sum) with Prometheus text rendering; unit-tested.
+  - **M14.1b** instrument the Agent/Client data path: increment the counters on
+    handshake + relayed bytes (share `Arc<TunnelMetrics>` through the tasks).
 - **M14.2** `/metrics` endpoint; compose scrape target.
 - **E2E:** metrics endpoint scraped in the testbed; counters increment on
   tunnel activity.

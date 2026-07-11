@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod credential;
+pub mod metrics;
 pub mod noise;
 pub mod pow;
 pub mod ratelimit;
