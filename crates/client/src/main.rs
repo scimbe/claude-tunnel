@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use ct_client::bench::{csv_row, run_bench, summarize};
 use ct_client::config::ClientConfig;
-use ct_client::transport::{client_tunnel_auto, client_tunnel_noise, dial_edge, udp_selftest, load_cert};
+use ct_client::transport::{
+    client_tunnel_auto, client_tunnel_noise, client_tunnel_noise_tcp, dial_edge, tcp_tls_connect,
+    udp_selftest, load_cert,
+};
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
 
@@ -131,17 +134,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Single-tunnel mode: verify the Noise round-trip.
-    let conn = dial_edge(edge_addr, edge_cert).await?;
-    let response =
-        client_tunnel_noise(&conn, &cap.token, &cap, &client_kp.private, payload.as_bytes()).await?;
+    // Single-tunnel mode: QUIC primary, TLS-TCP fallback when UDP is blocked.
+    // CT_CLIENT_FORCE_TCP forces the fallback (used by the UDP-blocked smoke).
+    let force_tcp = std::env::var("CT_CLIENT_FORCE_TCP").is_ok();
+    let quic_conn = if force_tcp {
+        None
+    } else {
+        match tokio::time::timeout(Duration::from_secs(2), dial_edge(edge_addr, edge_cert.clone()))
+            .await
+        {
+            Ok(Ok(conn)) => Some(conn),
+            _ => None,
+        }
+    };
+    let (response, via) = match quic_conn {
+        Some(conn) => {
+            let r = client_tunnel_noise(&conn, &cap.token, &cap, &client_kp.private, payload.as_bytes())
+                .await?;
+            (r, "quic")
+        }
+        None => {
+            let tls = tcp_tls_connect(edge_addr, edge_cert).await?;
+            let r = client_tunnel_noise_tcp(tls, &cap.token, &cap, &client_kp.private, payload.as_bytes())
+                .await?;
+            (r, "tcp")
+        }
+    };
     println!(
-        "ct-client: sent {:?}, received {:?}",
+        "ct-client: sent {:?}, received {:?} (via={via})",
         payload,
         String::from_utf8_lossy(&response)
     );
     if response == payload.as_bytes() {
-        eprintln!("ct-client: tunnel round-trip OK");
+        eprintln!("ct-client: tunnel round-trip OK (via={via})");
         Ok(())
     } else {
         Err("tunnel response mismatch".into())

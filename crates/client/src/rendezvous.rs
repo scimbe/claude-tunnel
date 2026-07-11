@@ -810,6 +810,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_tcp_tls_connects_and_echoes() {
+        // M12.3b: the Client's own TLS-TCP connector reaches the Edge's fallback
+        // listener and a byte stream round-trips.
+        use crate::transport::tcp_tls_connect;
+        use ct_edge::transport::build_tcp_tls_listener_at;
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (listener, acceptor, cert) =
+            build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into()).await.expect("listener");
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            tls.write_all(&buf[..n]).await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let mut client = tcp_tls_connect(addr, cert).await.expect("connect");
+        client.write_all(b"client-tcp").await.unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"client-tcp", "client TLS-TCP connector round-trips");
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");

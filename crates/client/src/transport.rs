@@ -14,7 +14,7 @@ use std::io;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -113,6 +113,24 @@ pub async fn client_tunnel_noise(
     let response = client_noise_exchange(&mut send, &mut recv, client_private, cap, payload).await?;
     send.finish()?;
     Ok(response)
+}
+
+/// Connect to the Edge's TCP+TLS fallback at `addr`, trusting `edge_cert`
+/// (M12.3b) — used when outbound UDP/QUIC is blocked.
+pub async fn tcp_tls_connect(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(edge_cert)?;
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let tcp = TcpStream::connect(addr).await?;
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?;
+    Ok(connector.connect(server_name, tcp).await?)
 }
 
 /// Tunnel `payload` to the Origin over a **TCP-fallback** stream (M12.2c): when
