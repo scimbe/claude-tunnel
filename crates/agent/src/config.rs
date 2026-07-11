@@ -38,6 +38,9 @@ pub struct AgentConfig {
     /// IP (with the listener's bound port) so Clients can connect directly,
     /// bypassing the Edge relay (M11.4b-v). `None` disables P2P (relay only).
     pub direct_advertise_ip: Option<IpAddr>,
+    /// If set, the Agent serves its Prometheus `/metrics` endpoint on this
+    /// address (M14.2). `None` disables the endpoint.
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 impl AgentConfig {
@@ -53,6 +56,7 @@ impl AgentConfig {
             origin,
             origin_proto: OriginProto::default(),
             direct_advertise_ip: None,
+            metrics_listen: None,
         })
     }
 
@@ -72,6 +76,14 @@ impl AgentConfig {
                 s.trim()
                     .parse::<IpAddr>()
                     .map_err(|e| format!("invalid CT_AGENT_DIRECT_ADVERTISE '{s}': {e}"))?,
+            ),
+            _ => None,
+        };
+        cfg.metrics_listen = match std::env::var("CT_AGENT_METRICS_LISTEN") {
+            Ok(s) if !s.trim().is_empty() => Some(
+                s.trim()
+                    .parse::<SocketAddr>()
+                    .map_err(|e| format!("invalid CT_AGENT_METRICS_LISTEN '{s}': {e}"))?,
             ),
             _ => None,
         };

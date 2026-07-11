@@ -264,15 +264,18 @@ dependencies = [
 name = "ct-agent"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "ct-common",
  "ct-control-plane",
  "ct-edge",
  "ed25519-dalek",
+ "http-body-util",
  "quinn",
  "rand 0.8.6",
  "rcgen",
  "rustls",
  "tokio",
+ "tower",
 ]
 
 [[package]]

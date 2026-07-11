@@ -4,6 +4,7 @@
 pub mod capability;
 pub mod config;
 pub mod identity;
+pub mod observe;
 pub mod origin;
 pub mod serve;
 pub mod transport;

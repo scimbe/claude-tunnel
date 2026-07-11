@@ -277,6 +277,15 @@ pub async fn run_agent(
     // so the counters aggregate across all tunnels this Agent carries.
     let metrics = Arc::new(TunnelMetrics::new());
 
+    // Optional Prometheus `/metrics` endpoint (M14.2): expose the shared metrics
+    // when configured. Runs alongside the serve loop.
+    if let Some(addr) = config.metrics_listen {
+        let mmetrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let _ = crate::observe::serve_metrics(addr, mmetrics).await;
+        });
+    }
+
     // Optional direct-path listener + advertisement (M11.4b-v): if an advertise
     // IP is configured, run a direct listener, tell the Edge about it (on a
     // separate short-lived connection), and serve direct Client connections.
@@ -660,6 +669,7 @@ mod tests {
             origin: origin_addr,
             origin_proto: OriginProto::Tcp,
             direct_advertise_ip: None,
+            metrics_listen: None,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;

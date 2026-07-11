@@ -316,7 +316,14 @@ Turn the in-memory `ct-control-plane` library into a running service.
       and the Origin socket wrapped in `Metered` for bytes each way. `run_agent`
       builds one shared `Arc<TunnelMetrics>` (signature unchanged). Test asserts
       the counters after a 100 KB round-trip. **M14.1 complete.**
-- **M14.2** `/metrics` endpoint; compose scrape target.
+- **M14.2** `/metrics` endpoint; compose scrape target. Decomposed:
+  - **M14.2a** ✅ `ct-agent::observe` — `metrics_router` (`GET /metrics` →
+    Prometheus text, `text/plain; version=0.0.4`) + `serve_metrics(addr, m)`;
+    `run_agent` spawns it when `CT_AGENT_METRICS_LISTEN` is set
+    (`AgentConfig.metrics_listen`). Tested via `tower::oneshot` + a real-socket
+    scrape.
+  - **M14.2b** compose scrape: agent exposes `/metrics`, a scrape hits it in the
+    testbed and sees counters move on tunnel activity.
 - **E2E:** metrics endpoint scraped in the testbed; counters increment on
   tunnel activity.
 

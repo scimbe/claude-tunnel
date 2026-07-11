@@ -12,7 +12,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 rcgen = "0.13"
+axum = "0.7"
 
 [dev-dependencies]
 ct-edge = { path = "../edge" }
 ct-control-plane = { path = "../control-plane" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
