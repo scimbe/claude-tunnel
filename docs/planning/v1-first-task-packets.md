@@ -305,6 +305,13 @@ Turn the in-memory `ct-control-plane` library into a running service.
     count+latency-sum) with Prometheus text rendering; unit-tested.
   - **M14.1b** instrument the Agent/Client data path: increment the counters on
     handshake + relayed bytes (share `Arc<TunnelMetrics>` through the tasks).
+    Decomposed:
+    - **M14.1b-i** ✅ `ct-common::metrics::Metered<S>` — a byte-counting
+      `AsyncRead`+`AsyncWrite` wrapper (drops around the Origin socket, no
+      change to `noise_pump`); `TunnelMetrics` counters are now `Arc<Counter>`
+      so one series can be handed to the wrapper. Unit-tested.
+    - **M14.1b-ii** wire `Metered` + handshake timing into `serve_noise_stream`
+      and `run_agent` (tunnels_opened/failed on success/error, latency, bytes).
 - **M14.2** `/metrics` endpoint; compose scrape target.
 - **E2E:** metrics endpoint scraped in the testbed; counters increment on
   tunnel activity.

@@ -7,8 +7,14 @@
 //! small and the exposition format is trivial, which keeps the data path and
 //! the dependency graph light.
 
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A monotonically increasing counter (Prometheus `counter`).
 ///
@@ -35,21 +41,22 @@ impl Counter {
 }
 
 /// Tunnel-activity metrics, shared behind an `Arc` by the data-path tasks and
-/// the `/metrics` endpoint.
-#[derive(Debug, Default)]
+/// the `/metrics` endpoint. Each counter is itself an `Arc` so a single series
+/// can be handed to a [`Metered`] stream wrapper independently of the others.
+#[derive(Debug, Default, Clone)]
 pub struct TunnelMetrics {
     /// Tunnels successfully established (handshake completed).
-    pub tunnels_opened: Counter,
+    pub tunnels_opened: Arc<Counter>,
     /// Tunnel attempts that failed before or during the handshake.
-    pub tunnels_failed: Counter,
+    pub tunnels_failed: Arc<Counter>,
     /// Bytes relayed from the client toward the origin.
-    pub bytes_to_origin: Counter,
+    pub bytes_to_origin: Arc<Counter>,
     /// Bytes relayed from the origin back to the client.
-    pub bytes_to_client: Counter,
+    pub bytes_to_client: Arc<Counter>,
     /// Completed handshakes (denominator for the latency average).
-    pub handshakes: Counter,
+    pub handshakes: Arc<Counter>,
     /// Cumulative handshake latency in milliseconds (numerator).
-    pub handshake_millis_total: Counter,
+    pub handshake_millis_total: Arc<Counter>,
 }
 
 impl TunnelMetrics {
@@ -115,10 +122,72 @@ fn render_counter(out: &mut String, name: &str, help: &str, value: u64) {
     ));
 }
 
+/// A byte-counting wrapper around a stream: bytes successfully read add to
+/// `read`, bytes successfully written add to `write`. Drop it around the Origin
+/// socket so the tunnel's throughput counters update without threading counts
+/// back out of the copy loop (M14.1b).
+///
+/// Transparent otherwise — it just forwards `poll_*` to the inner stream.
+pub struct Metered<S> {
+    inner: S,
+    read: Arc<Counter>,
+    write: Arc<Counter>,
+}
+
+impl<S> Metered<S> {
+    /// Wrap `inner`, counting reads into `read` and writes into `write`.
+    pub fn new(inner: S, read: Arc<Counter>, write: Arc<Counter>) -> Self {
+        Self { inner, read, write }
+    }
+
+    /// Recover the wrapped stream.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let n = buf.filled().len() - before;
+            self.read.add(n as u64);
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(n)) = &poll {
+            self.write.add(*n as u64);
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn counter_inc_add_get() {
@@ -154,6 +223,31 @@ mod tests {
         assert!(text.contains("\nct_handshake_millis_total 12\n"));
         // Untouched series still render at zero.
         assert!(text.contains("\nct_tunnels_failed_total 0\n"));
+    }
+
+    #[tokio::test]
+    async fn metered_counts_bytes_in_both_directions() {
+        let (near, far) = tokio::io::duplex(1024);
+        let read = Arc::new(Counter::default());
+        let write = Arc::new(Counter::default());
+        let mut m = Metered::new(near, Arc::clone(&read), Arc::clone(&write));
+        let (mut far_r, mut far_w) = tokio::io::split(far);
+
+        // Writes through the wrapper land on the far end and count as writes.
+        m.write_all(b"hello").await.unwrap();
+        m.flush().await.unwrap();
+        let mut got = [0u8; 5];
+        far_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello");
+        assert_eq!(write.get(), 5, "5 bytes written");
+        assert_eq!(read.get(), 0, "nothing read yet");
+
+        // Bytes sent from the far end count as reads through the wrapper.
+        far_w.write_all(b"abc").await.unwrap();
+        let mut rb = [0u8; 3];
+        m.read_exact(&mut rb).await.unwrap();
+        assert_eq!(&rb, b"abc");
+        assert_eq!(read.get(), 3, "3 bytes read");
     }
 
     #[test]
