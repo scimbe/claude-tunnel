@@ -275,7 +275,7 @@ mod tests {
         let origin_priv = origin_kp.private;
         let agent_task = tokio::spawn(async move {
             let (s, r) = agent_conn.accept_bi().await.unwrap();
-            let _ = serve_noise_stream(s, r, origin_addr, &origin_priv).await;
+            let _ = serve_noise_stream(s, r, origin_addr, &origin_priv, std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new())).await;
             agent_conn.closed().await;
         });
 
@@ -496,7 +496,7 @@ mod tests {
         let agent = tokio::spawn(async move {
             let conn = listener.accept().await.unwrap().await.unwrap();
             let (s, r) = conn.accept_bi().await.unwrap();
-            let _ = serve_noise_stream(s, r, origin_addr, &opriv).await;
+            let _ = serve_noise_stream(s, r, origin_addr, &opriv, std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new())).await;
             conn.closed().await;
         });
 
@@ -583,7 +583,7 @@ mod tests {
         let opriv = origin_kp.private;
         let agent = tokio::spawn(async move {
             let (s, r) = aconn.accept_bi().await.unwrap();
-            let _ = serve_noise_stream(s, r, origin_addr, &opriv).await;
+            let _ = serve_noise_stream(s, r, origin_addr, &opriv, std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new())).await;
             aconn.closed().await;
         });
 
@@ -667,7 +667,7 @@ mod tests {
         let laddr = listener.local_addr().expect("laddr");
         let opriv = origin_kp.private;
         let direct_srv =
-            tokio::spawn(async move { let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp).await; });
+            tokio::spawn(async move { let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp, std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new())).await; });
 
         // Edge: serve the Agent's 'D' advertise, then the Client's 'P' query.
         let state = Arc::new(EdgeState::<Connection>::new());
@@ -783,7 +783,7 @@ mod tests {
         let opriv = origin_kp.private;
         let agent = tokio::spawn(async move {
             let (s, r) = aconn.accept_bi().await.unwrap();
-            let _ = serve_noise_stream(s, r, origin_addr, &opriv).await;
+            let _ = serve_noise_stream(s, r, origin_addr, &opriv, std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new())).await;
             aconn.closed().await;
         });
 

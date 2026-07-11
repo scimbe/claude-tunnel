@@ -310,8 +310,12 @@ Turn the in-memory `ct-control-plane` library into a running service.
       `AsyncRead`+`AsyncWrite` wrapper (drops around the Origin socket, no
       change to `noise_pump`); `TunnelMetrics` counters are now `Arc<Counter>`
       so one series can be handed to the wrapper. Unit-tested.
-    - **M14.1b-ii** wire `Metered` + handshake timing into `serve_noise_stream`
-      and `run_agent` (tunnels_opened/failed on success/error, latency, bytes).
+    - **M14.1b-ii** ✅ wired `Metered` + handshake timing into
+      `serve_noise_stream`/`serve_direct`/`run_agent`: tunnels_opened on a
+      completed handshake, tunnels_failed on error, `observe_handshake` latency,
+      and the Origin socket wrapped in `Metered` for bytes each way. `run_agent`
+      builds one shared `Arc<TunnelMetrics>` (signature unchanged). Test asserts
+      the counters after a 100 KB round-trip. **M14.1 complete.**
 - **M14.2** `/metrics` endpoint; compose scrape target.
 - **E2E:** metrics endpoint scraped in the testbed; counters increment on
   tunnel activity.

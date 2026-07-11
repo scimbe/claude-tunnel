@@ -8,7 +8,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use quinn::{Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
@@ -17,6 +18,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
 use crate::transport::{dial_quic, register_tunnel};
+use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake};
 use ct_common::RoutingToken;
 
@@ -104,6 +106,7 @@ pub async fn serve_noise_stream<S, R>(
     mut recv: R,
     origin: SocketAddr,
     origin_private: &[u8; 32],
+    metrics: Arc<TunnelMetrics>,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
@@ -113,16 +116,45 @@ where
     let mut buf = vec![0u8; 65535];
     let mut tmp = vec![0u8; 65535];
 
-    // <- handshake message 1, -> handshake message 2
-    let m1 = read_frame(&mut recv).await?;
-    hs.read_message(&m1, &mut tmp)?;
-    let n = hs.write_message(&[], &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    send.flush().await?;
-    let transport = hs.into_transport_mode()?;
+    // <- handshake message 1, -> handshake message 2. Time it and count the
+    // outcome for observability (M14.1b): a completed handshake is an opened
+    // tunnel; a failed one increments the failure counter.
+    let started = Instant::now();
+    let handshake: Result<(), BoxError> = async {
+        let m1 = read_frame(&mut recv).await?;
+        hs.read_message(&m1, &mut tmp)?;
+        let n = hs.write_message(&[], &mut buf)?;
+        send.write_all(&frame(&buf[..n])).await?;
+        send.flush().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = handshake {
+        metrics.tunnels_failed.inc();
+        return Err(e);
+    }
+    let transport = match hs.into_transport_mode() {
+        Ok(t) => {
+            metrics.observe_handshake(started.elapsed());
+            metrics.tunnels_opened.inc();
+            t
+        }
+        Err(e) => {
+            metrics.tunnels_failed.inc();
+            return Err(e.into());
+        }
+    };
 
     // Bridge the Noise session <-> the Origin TCP socket, both ways, streaming.
+    // Meter the Origin socket: bytes read from it flow back to the Client
+    // (bytes_to_client); bytes written to it came from the Client
+    // (bytes_to_origin).
     let tcp = TcpStream::connect(origin).await?;
+    let tcp = Metered::new(
+        tcp,
+        Arc::clone(&metrics.bytes_to_client),
+        Arc::clone(&metrics.bytes_to_origin),
+    );
     let cipher = join(recv, send);
     noise_pump(transport, cipher, tcp).await?;
     Ok(())
@@ -207,13 +239,17 @@ pub async fn serve_direct(
     origin: SocketAddr,
     origin_private: [u8; 32],
     proto: OriginProto,
+    metrics: Arc<TunnelMetrics>,
 ) -> Result<(), BoxError> {
     while let Some(incoming) = listener.accept().await {
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
                 if let Ok((send, recv)) = conn.accept_bi().await {
                     let _ = match proto {
-                        OriginProto::Tcp => serve_noise_stream(send, recv, origin, &origin_private).await,
+                        OriginProto::Tcp => {
+                            serve_noise_stream(send, recv, origin, &origin_private, metrics).await
+                        }
                         OriginProto::Udp => serve_noise_udp(send, recv, origin, &origin_private).await,
                     };
                 }
@@ -237,6 +273,10 @@ pub async fn run_agent(
     let conn = dial_quic(config.edge, edge_cert.clone()).await?;
     register_tunnel(&conn, &token).await?;
 
+    // Shared tunnel metrics for this Agent (M14.1b): handed to every serve task
+    // so the counters aggregate across all tunnels this Agent carries.
+    let metrics = Arc::new(TunnelMetrics::new());
+
     // Optional direct-path listener + advertisement (M11.4b-v): if an advertise
     // IP is configured, run a direct listener, tell the Edge about it (on a
     // separate short-lived connection), and serve direct Client connections.
@@ -250,8 +290,9 @@ pub async fn run_agent(
                     adv.close(0u32.into(), b"advertised");
                 }
                 let (origin, proto) = (config.origin, config.origin_proto);
+                let dmetrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
-                    let _ = serve_direct(listener, origin, origin_private, proto).await;
+                    let _ = serve_direct(listener, origin, origin_private, proto, dmetrics).await;
                 });
             }
         }
@@ -261,9 +302,12 @@ pub async fn run_agent(
     loop {
         let (send, recv) = conn.accept_bi().await?;
         let origin = config.origin;
+        let lmetrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             let _ = match proto {
-                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &origin_private).await,
+                OriginProto::Tcp => {
+                    serve_noise_stream(send, recv, origin, &origin_private, lmetrics).await
+                }
                 OriginProto::Udp => serve_noise_udp(send, recv, origin, &origin_private).await,
             };
         });
@@ -406,9 +450,12 @@ mod tests {
 
         // Agent under test: serve_noise_stream over the relayed cipher stream.
         let origin_priv = origin_kp.private;
+        let metrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
+        let mcheck = std::sync::Arc::clone(&metrics);
         let (a_read, a_write) = tokio::io::split(agent_cipher);
-        let agent =
-            tokio::spawn(async move { serve_noise_stream(a_write, a_read, origin_addr, &origin_priv).await });
+        let agent = tokio::spawn(async move {
+            serve_noise_stream(a_write, a_read, origin_addr, &origin_priv, metrics).await
+        });
 
         // Initiator: handshake, then pump a 100 KB app stream over the session.
         let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
@@ -440,6 +487,13 @@ mod tests {
         pump.await.unwrap().unwrap();
         agent.await.unwrap().unwrap();
         origin.abort();
+
+        // The serve task recorded the handshake and metered both directions.
+        assert_eq!(mcheck.tunnels_opened.get(), 1, "one tunnel opened");
+        assert_eq!(mcheck.tunnels_failed.get(), 0, "no failures");
+        assert_eq!(mcheck.handshakes.get(), 1, "one handshake observed");
+        assert_eq!(mcheck.bytes_to_origin.get(), 100_000, "100 KB forwarded to the origin");
+        assert_eq!(mcheck.bytes_to_client.get(), 100_000, "100 KB echoed back to the client");
     }
 
     #[tokio::test]
@@ -522,8 +576,9 @@ mod tests {
             build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
         let laddr = listener.local_addr().expect("laddr");
         let opriv = origin_kp.private;
+        let dmetrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
         let srv = tokio::spawn(async move {
-            let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp).await;
+            let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp, dmetrics).await;
         });
 
         // Inline Client: connect directly to the listener, handshake, one payload.
