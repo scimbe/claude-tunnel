@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use quinn::Endpoint;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// Errors constructing or driving an Edge endpoint.
@@ -94,9 +96,68 @@ pub async fn accept_and_echo_one(endpoint: &Endpoint) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Build a TCP+TLS listener bound to `addr` (M12.2a) — the Edge's fallback
+/// transport for Clients that can't reach it over UDP/QUIC. Returns the
+/// listener, a TLS acceptor with a fresh self-signed cert, and that cert (which
+/// Clients trust). The tunnel's transport-agnostic byte protocol runs over it.
+pub async fn build_tcp_tls_listener_at(
+    addr: SocketAddr,
+) -> Result<(TcpListener, TlsAcceptor, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = self_signed()?;
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)?;
+    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+    let listener = TcpListener::bind(addr).await?;
+    Ok((listener, acceptor, cert))
+}
+
+/// Connect to a TCP+TLS Edge fallback at `addr`, trusting `edge_cert` (M12.2a).
+pub async fn tcp_tls_connect(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(edge_cert)?;
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(cfg));
+    let tcp = TcpStream::connect(addr).await?;
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?;
+    Ok(connector.connect(server_name, tcp).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn tcp_tls_stream_echoes() {
+        // M12.2a: a Client connects to the Edge's TCP+TLS fallback and a byte
+        // stream round-trips (the transport the tunnel protocol runs over).
+        let (listener, acceptor, cert) =
+            build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into()).await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            tls.write_all(&buf[..n]).await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let mut client = tcp_tls_connect(addr, cert).await.expect("connect");
+        client.write_all(b"tcp-fallback").await.unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"tcp-fallback", "TLS-over-TCP stream round-trips");
+        srv.await.unwrap();
+    }
 
     #[tokio::test]
     async fn server_endpoint_binds_to_ephemeral_port() {
