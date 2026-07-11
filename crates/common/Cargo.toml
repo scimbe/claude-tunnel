@@ -9,6 +9,8 @@ serde = { version = "1", features = ["derive"] }
 ed25519-dalek = "2"
 snow = "0.9"
 sha2 = "0.10"
+tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }

@@ -5,6 +5,9 @@
 //! handshake (P3.2) and QUIC wiring (P3.3) follow.
 
 use crate::OriginIdentity;
+use std::io;
+use std::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The Noise parameter set for Claude Tunnel's mesh handshake (ADR-0013).
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -91,9 +94,141 @@ pub fn take_frame(buf: &[u8]) -> Option<(&[u8], usize)> {
     Some((&buf[2..2 + n], 2 + n))
 }
 
+/// Read exactly one length-prefixed frame (2-byte big-endian length + body) from
+/// an async byte source. Returns an error (typically `UnexpectedEof`) when the
+/// source closes between frames.
+pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 2];
+    recv.read_exact(&mut len).await?;
+    let n = u16::from_be_bytes(len) as usize;
+    let mut body = vec![0u8; n];
+    recv.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+/// Pump a bidirectional plaintext stream over an established Noise transport
+/// session (M9.1). Plaintext read from `plain` is encrypted, framed, and written
+/// to `cipher`; frames read from `cipher` are decrypted and written to `plain`.
+/// Runs until either side closes, propagating the half-close each way.
+///
+/// The two directions run concurrently; the `TransportState` is shared under a
+/// short-held mutex — the send and receive nonces are independent, so
+/// serialising only the (synchronous, fast) crypto step is correct and never
+/// blocks on I/O.
+pub async fn noise_pump<C, P>(
+    transport: snow::TransportState,
+    cipher: C,
+    plain: P,
+) -> io::Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    const CHUNK: usize = 16 * 1024; // well under Noise's 65519-byte plaintext cap
+    let ts = Mutex::new(transport);
+    let (mut c_read, mut c_write) = tokio::io::split(cipher);
+    let (mut p_read, mut p_write) = tokio::io::split(plain);
+
+    let noise_err = |e: snow::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+
+    // plaintext -> encrypt -> ciphertext frames
+    let outbound = async {
+        let mut buf = vec![0u8; CHUNK];
+        let mut ct = vec![0u8; CHUNK + 256];
+        loop {
+            let n = p_read.read(&mut buf).await?;
+            if n == 0 {
+                let _ = c_write.shutdown().await;
+                return Ok::<(), io::Error>(());
+            }
+            let len = ts.lock().unwrap().write_message(&buf[..n], &mut ct).map_err(noise_err)?;
+            c_write.write_all(&frame(&ct[..len])).await?;
+            c_write.flush().await?;
+        }
+    };
+
+    // ciphertext frames -> decrypt -> plaintext
+    let inbound = async {
+        let mut pt = vec![0u8; CHUNK + 256];
+        loop {
+            let fr = match read_frame(&mut c_read).await {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = p_write.shutdown().await;
+                    return Ok::<(), io::Error>(());
+                }
+            };
+            let len = ts.lock().unwrap().read_message(&fr, &mut pt).map_err(noise_err)?;
+            p_write.write_all(&pt[..len]).await?;
+            p_write.flush().await?;
+        }
+    };
+
+    let (o, i) = tokio::join!(outbound, inbound);
+    o?;
+    i?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn noise_pump_streams_bidirectionally() {
+        // Establish two transport states via a real Noise_IK handshake.
+        let origin = generate_static_keypair();
+        let client = generate_static_keypair();
+        let mut ini = client_handshake(&client.private, &origin.public).unwrap();
+        let mut resp = origin_handshake(&origin.private).unwrap();
+        let mut b = [0u8; 1024];
+        let mut s = [0u8; 1024];
+        let n = ini.write_message(&[], &mut b).unwrap();
+        resp.read_message(&b[..n], &mut s).unwrap();
+        let n = resp.write_message(&[], &mut b).unwrap();
+        ini.read_message(&b[..n], &mut s).unwrap();
+        let ini_t = ini.into_transport_mode().unwrap();
+        let resp_t = resp.into_transport_mode().unwrap();
+
+        let (a_cipher, b_cipher) = tokio::io::duplex(64 * 1024);
+        let (a_plain, a_app) = tokio::io::duplex(1024 * 1024);
+        let (b_plain, b_app) = tokio::io::duplex(1024 * 1024);
+
+        // Peer B's app is a plaintext echo — reads all, echoes back, closes.
+        let echo = async move {
+            let (mut r, mut w) = tokio::io::split(b_app);
+            let mut all = Vec::new();
+            r.read_to_end(&mut all).await.unwrap();
+            w.write_all(&all).await.unwrap();
+            w.shutdown().await.unwrap();
+        };
+
+        // 200 KB → many 16 KB Noise frames, both directions.
+        let expected: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let payload = expected.clone();
+        let (mut ar, mut aw) = tokio::io::split(a_app);
+        let writer = async move {
+            aw.write_all(&payload).await.unwrap();
+            aw.shutdown().await.unwrap();
+        };
+        let reader = async move {
+            let mut got = Vec::new();
+            ar.read_to_end(&mut got).await.unwrap();
+            got
+        };
+
+        let (pa, pb, _, _, got) = tokio::join!(
+            noise_pump(ini_t, a_cipher, a_plain),
+            noise_pump(resp_t, b_cipher, b_plain),
+            echo,
+            writer,
+            reader,
+        );
+        pa.unwrap();
+        pb.unwrap();
+        assert_eq!(got.len(), expected.len(), "all 200 KB echoed back");
+        assert_eq!(got, expected, "payload streams both ways through two Noise pumps");
+    }
 
     #[test]
     fn generates_32_byte_keys() {
