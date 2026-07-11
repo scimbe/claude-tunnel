@@ -350,7 +350,13 @@ Minimal technical model; the funded-adversary sybil economics stay an open risk
   double-credit). Unit-tested + a mini-E2E (open → top-up → gated issuance).
 - **M15.4** accounts/payment HTTP endpoints on the control-plane service
   (open account, create+confirm payment, buy token) — wires M15.1–3 to the wire
-  like M13 did for enrollment/registry.
+  like M13 did for enrollment/registry. Decomposed:
+  - **M15.4a** ✅ `billing_router` + `BillingState` (Ledger+PaymentIntake under
+    one lock): `POST /accounts/open`, `POST /payment/intent`,
+    `POST /payment/confirm` (409 already-confirmed), `POST /billing/issue` (402
+    insufficient credit). Oneshot-tested end to end.
+  - **M15.4b** merge `billing_router` into `control_plane_router` + `main` +
+    `ControlPlaneClient` methods, so the flow is reachable on the live service.
 - **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
 
 **Definition of done (full product):** every milestone above green, the whole

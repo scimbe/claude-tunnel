@@ -13,7 +13,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::{AccountId, Ledger, LedgerError};
+use crate::billing::issue_token_for_payment;
 use crate::enrollment::{Enrollment, JoinToken};
+use crate::payment::{PaymentError, PaymentId, PaymentIntake};
 use crate::registry::{TunnelInfo, TunnelRegistry};
 use ct_common::{AgentId, RoutingToken, TenantId};
 
@@ -128,6 +131,131 @@ async fn resolve_tunnel(
     Ok(Json(ResolveResp {
         tenant: info.tenant.0.clone(),
         agent: info.agent.0.clone(),
+    }))
+}
+
+/// Combined billing state: the credit [`Ledger`] and the [`PaymentIntake`] live
+/// behind one lock so a handler that touches both (confirm → credit) is atomic
+/// and there is no lock-ordering to get wrong.
+#[derive(Default)]
+pub struct BillingState {
+    pub ledger: Ledger,
+    pub intake: PaymentIntake,
+}
+
+/// Shared billing state behind the HTTP handlers.
+pub type SharedBilling = Arc<Mutex<BillingState>>;
+
+/// Build the billing router (M15.4): pseudonymous accounts, prepaid top-ups and
+/// credit-gated token issuance.
+///
+/// * `POST /accounts/open` → `{account}` (a fresh pseudonymous account)
+/// * `POST /payment/intent` `{account, credits}` → `{payment}`
+/// * `POST /payment/confirm` `{payment}` → `{balance}` (409 if already confirmed)
+/// * `POST /billing/issue` `{account, price}` → `{token}` (402 if insufficient credit)
+pub fn billing_router(state: SharedBilling) -> Router {
+    Router::new()
+        .route("/accounts/open", post(open_account))
+        .route("/payment/intent", post(create_payment_intent))
+        .route("/payment/confirm", post(confirm_payment))
+        .route("/billing/issue", post(buy_token))
+        .with_state(state)
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountResp {
+    account: String,
+}
+
+async fn open_account(State(state): State<SharedBilling>) -> Json<AccountResp> {
+    let account = state.lock().unwrap().ledger.open_account();
+    Json(AccountResp {
+        account: hex_encode(&account.0),
+    })
+}
+
+#[derive(Deserialize)]
+struct IntentReq {
+    account: String,
+    credits: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct IntentResp {
+    payment: String,
+}
+
+async fn create_payment_intent(
+    State(state): State<SharedBilling>,
+    Json(req): Json<IntentReq>,
+) -> Result<Json<IntentResp>, (StatusCode, String)> {
+    let account = hex_decode_32(&req.account)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
+    let id = state
+        .lock()
+        .unwrap()
+        .intake
+        .create_intent(AccountId(account), req.credits);
+    Ok(Json(IntentResp {
+        payment: hex_encode(&id.0),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ConfirmReq {
+    payment: String,
+}
+#[derive(Serialize, Deserialize)]
+struct BalanceResp {
+    balance: u64,
+}
+
+async fn confirm_payment(
+    State(state): State<SharedBilling>,
+    Json(req): Json<ConfirmReq>,
+) -> Result<Json<BalanceResp>, (StatusCode, String)> {
+    let payment = hex_decode_32(&req.payment)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed payment".to_string()))?;
+    let mut guard = state.lock().unwrap();
+    let BillingState { ledger, intake } = &mut *guard;
+    let balance = intake
+        .confirm_payment(&PaymentId(payment), ledger)
+        .map_err(|e| {
+            let code = match e {
+                PaymentError::UnknownPayment | PaymentError::Ledger(_) => StatusCode::NOT_FOUND,
+                PaymentError::AlreadyConfirmed => StatusCode::CONFLICT,
+            };
+            (code, e.to_string())
+        })?;
+    Ok(Json(BalanceResp { balance }))
+}
+
+#[derive(Deserialize)]
+struct BuyReq {
+    account: String,
+    price: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct TokenResp {
+    token: String,
+}
+
+async fn buy_token(
+    State(state): State<SharedBilling>,
+    Json(req): Json<BuyReq>,
+) -> Result<Json<TokenResp>, (StatusCode, String)> {
+    let account = hex_decode_32(&req.account)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
+    let token = issue_token_for_payment(&mut state.lock().unwrap().ledger, &AccountId(account), req.price)
+        .map_err(|e| {
+            let code = match e {
+                LedgerError::UnknownAccount => StatusCode::NOT_FOUND,
+                // Not enough credit to pay for the token.
+                LedgerError::InsufficientCredit { .. } => StatusCode::PAYMENT_REQUIRED,
+            };
+            (code, e.to_string())
+        })?;
+    Ok(Json(TokenResp {
+        token: hex_encode(&token.0),
     }))
 }
 
@@ -264,5 +392,50 @@ mod tests {
         );
         let (status, _) = post_json(app, "/enroll/redeem", redeem).await;
         assert_eq!(status, StatusCode::CONFLICT, "unknown token rejected");
+    }
+
+    #[tokio::test]
+    async fn billing_open_topup_then_buy_token() {
+        let app = billing_router(Arc::new(Mutex::new(BillingState::default())));
+
+        // Open a fresh pseudonymous account.
+        let (s, body) = post_json(app.clone(), "/accounts/open", "{}".into()).await;
+        assert_eq!(s, StatusCode::OK);
+        let acct: AccountResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(acct.account.len(), 64, "32-byte account id as hex");
+
+        // Broke: buying a token is Payment Required.
+        let buy = format!(r#"{{"account":"{}","price":1}}"#, acct.account);
+        let (s, _) = post_json(app.clone(), "/billing/issue", buy.clone()).await;
+        assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "zero balance is denied a token");
+
+        // Create + confirm a payment top-up of 3 credits.
+        let intent = format!(r#"{{"account":"{}","credits":3}}"#, acct.account);
+        let (s, body) = post_json(app.clone(), "/payment/intent", intent).await;
+        assert_eq!(s, StatusCode::OK);
+        let pay: IntentResp = serde_json::from_slice(&body).unwrap();
+        let confirm = format!(r#"{{"payment":"{}"}}"#, pay.payment);
+        let (s, body) = post_json(app.clone(), "/payment/confirm", confirm.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let bal: BalanceResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(bal.balance, 3, "top-up credited the account");
+
+        // Now issuance succeeds.
+        let (s, body) = post_json(app.clone(), "/billing/issue", buy).await;
+        assert_eq!(s, StatusCode::OK, "funded account gets a token");
+        let tok: TokenResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tok.token.len(), 64, "32-byte routing token as hex");
+
+        // A replayed confirmation is rejected (idempotent).
+        let (s, _) = post_json(app, "/payment/confirm", confirm).await;
+        assert_eq!(s, StatusCode::CONFLICT, "confirmation is single-use");
+    }
+
+    #[tokio::test]
+    async fn confirming_an_unknown_payment_is_not_found() {
+        let app = billing_router(Arc::new(Mutex::new(BillingState::default())));
+        let confirm = format!(r#"{{"payment":"{}"}}"#, "ab".repeat(32));
+        let (s, _) = post_json(app, "/payment/confirm", confirm).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "unknown payment");
     }
 }
