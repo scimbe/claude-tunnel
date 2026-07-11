@@ -257,6 +257,32 @@ pub async fn client_tunnel_direct(
     Ok(response)
 }
 
+/// Try the **direct** P2P path first, else fall back to the **Edge relay**
+/// (M11.4). `direct` is the Agent's advertised `(candidate, cert)`; if it is
+/// `None`, or the direct connect/tunnel fails within `timeout`, the tunnel goes
+/// through the Edge relay on `edge_conn`. Returns `(used_direct, response)`.
+pub async fn client_tunnel_p2p_or_relay(
+    edge_conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    direct: Option<(SocketAddr, CertificateDer<'static>)>,
+    timeout: Duration,
+) -> Result<(bool, Vec<u8>), BoxError> {
+    if let Some((candidate, cert)) = direct {
+        if let Ok(conn) = client_direct_connect(candidate, cert, timeout).await {
+            if let Ok(resp) = client_tunnel_direct(&conn, cap, client_private, payload).await {
+                conn.close(0u32.into(), b"done");
+                return Ok((true, resp));
+            }
+        }
+    }
+    // Fallback: PoW-gated rendezvous + Noise tunnel through the Edge relay.
+    let resp = client_tunnel_noise(edge_conn, token, cap, client_private, payload).await?;
+    Ok((false, resp))
+}
+
 /// Ask the Edge for the Agent's peer candidate for `token` (M11.3a): send a `'P'`
 /// query and parse the length-prefixed UTF-8 address reply (length 0 = none).
 /// Used to attempt a direct P2P path before falling back to the Edge relay.

@@ -508,6 +508,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p2p_falls_back_to_relay_when_direct_fails() {
+        // M11.4: with an unreachable direct candidate, the orchestrator degrades
+        // to the Edge relay and still delivers the payload.
+        use crate::transport::client_tunnel_p2p_or_relay;
+        use ct_agent::serve::serve_noise_stream;
+        use ct_agent::transport::build_direct_listener_at;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let token = RoutingToken([0x7F; 32]);
+        let challenge = Challenge {
+            nonce: [0x11; 16],
+            difficulty: 8,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // Streaming echo Origin.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = l.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        // Edge relay: serve agent (register) then client (rendezvous+relay).
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let ac = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&ac, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            let cc = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&cc, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            cc.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent registers and serves the relayed stream.
+        let aep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let aconn = aep.connect(addr, "localhost").expect("cfg").await.expect("agent conn");
+        let (mut rs, mut rr) = aconn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let opriv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let (s, r) = aconn.accept_bi().await.unwrap();
+            let _ = serve_noise_stream(s, r, origin_addr, &opriv).await;
+            aconn.closed().await;
+        });
+
+        // An unreachable direct candidate (free UDP port, nothing listening) + a
+        // throwaway cert; the direct attempt will time out.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let (_ep, throwaway_cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
+
+        // Orchestrator: direct fails → relay delivers.
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let (used_direct, resp) = client_tunnel_p2p_or_relay(
+            &conn,
+            &token,
+            &cap,
+            &client_kp.private,
+            b"fallback-payload",
+            Some((dead_addr, throwaway_cert)),
+            Duration::from_millis(400),
+        )
+        .await
+        .expect("p2p-or-relay");
+        assert!(!used_direct, "unreachable direct candidate → fell back to relay");
+        assert_eq!(resp, b"fallback-payload", "relay delivered the payload");
+
+        conn.close(0u32.into(), b"done");
+        agent.abort();
+        let _ = edge.await;
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");

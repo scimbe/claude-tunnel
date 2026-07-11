@@ -261,10 +261,17 @@ Mesh Plane promises "any TCP/UDP".
     Agent's candidate; separate from the `'C'` relay flow — non-breaking).
   - **M11.3b** Agent direct-path QUIC listener; advertise its address.
   - **M11.3c** Client attempts a direct QUIC connection to the candidate.
-- **M11.4** Fallback to Edge relay when the direct path fails; NAT-testbed E2E.
-  NOTE: the flat Docker bridge has no NAT → the direct path trivially succeeds
-  there; true simultaneous-open hole-punching needs emulated NAT (M11.4) and may
-  hit testbed limits — will be reported honestly if so.
+- **M11.4** Fallback + integration. **Decomposed**:
+  - **M11.4a** ✅ `client_tunnel_p2p_or_relay` orchestrator (try direct, fall
+    back to relay on timeout/failure); returns `(used_direct, response)`.
+  - **M11.4b** Full-signalling wiring + NAT-testbed E2E: Agent advertises its
+    direct-listener `(addr, cert)` via registration → Edge → `'P'` query returns
+    them → Client uses them. **HONEST GAP**: today the recorded candidate is the
+    Agent's *outbound* Edge-connection address, not its direct-listener address,
+    and the listener cert isn't distributed via `'P'` yet — M11.4b closes this.
+  - NOTE: the flat Docker bridge has no NAT → the direct path trivially succeeds
+    there; true simultaneous-open hole-punching needs emulated NAT and may hit
+    testbed limits — will be reported honestly if so.
 
 ## Milestone 12 — HTTP/2-over-TCP fallback transport (ADR-0004)
 - **M12.1** Agent/Client probe UDP reachability; select TCP transport when blocked.
