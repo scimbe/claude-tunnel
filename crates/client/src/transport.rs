@@ -12,6 +12,7 @@ use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 use std::io;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::io::{join, AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
 
@@ -224,6 +225,36 @@ pub async fn client_tunnel_udp(
         r = from_edge => r?,
     }
     Ok(())
+}
+
+/// Attempt a **direct** QUIC connection to the Agent's advertised candidate
+/// (M11.3c), trusting `agent_cert`, within `timeout`. On success the Client can
+/// tunnel straight to the Agent, bypassing the Edge relay; on timeout/failure the
+/// caller falls back to the relay path (M11.4).
+pub async fn client_direct_connect(
+    candidate: SocketAddr,
+    agent_cert: CertificateDer<'static>,
+    timeout: Duration,
+) -> Result<Connection, BoxError> {
+    match tokio::time::timeout(timeout, dial_edge(candidate, agent_cert)).await {
+        Ok(res) => res,
+        Err(_) => Err("direct connect timed out".into()),
+    }
+}
+
+/// Tunnel `payload` to the Origin over a **direct** connection to the Agent
+/// (M11.3c): no Edge rendezvous or PoW — the Noise handshake authenticates the
+/// path (Client pins the Origin Identity). Returns the decrypted response.
+pub async fn client_tunnel_direct(
+    conn: &Connection,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<Vec<u8>, BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let response = client_noise_exchange(&mut send, &mut recv, client_private, cap, payload).await?;
+    send.finish()?;
+    Ok(response)
 }
 
 /// Ask the Edge for the Agent's peer candidate for `token` (M11.3a): send a `'P'`

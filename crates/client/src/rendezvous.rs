@@ -449,6 +449,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_tunnels_directly_to_agent() {
+        // M11.3c: the Client connects straight to the Agent's direct-path
+        // listener (no Edge, no PoW) and tunnels over Noise to the Origin.
+        use crate::transport::{client_direct_connect, client_tunnel_direct};
+        use ct_agent::serve::serve_noise_stream;
+        use ct_agent::transport::build_direct_listener_at;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        // Streaming TCP echo Origin.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = l.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        // Agent direct listener: accept one direct connection, serve it as the
+        // Noise responder straight to the Origin.
+        let (listener, cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let laddr = listener.local_addr().expect("laddr");
+        let opriv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let conn = listener.accept().await.unwrap().await.unwrap();
+            let (s, r) = conn.accept_bi().await.unwrap();
+            let _ = serve_noise_stream(s, r, origin_addr, &opriv).await;
+            conn.closed().await;
+        });
+
+        // Client: connect directly (bypassing the Edge) and tunnel.
+        let conn = client_direct_connect(laddr, cert, Duration::from_secs(3))
+            .await
+            .expect("direct connect");
+        let resp = client_tunnel_direct(&conn, &cap, &client_kp.private, b"direct-payload")
+            .await
+            .expect("direct tunnel");
+        assert_eq!(resp, b"direct-payload", "direct P2P tunnel bypasses the Edge");
+
+        conn.close(0u32.into(), b"done");
+        agent.abort();
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
