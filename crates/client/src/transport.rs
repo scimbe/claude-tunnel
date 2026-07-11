@@ -10,7 +10,10 @@ use ct_common::pow::{build_request, Challenge};
 use ct_common::{Capability, RoutingToken};
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
+use std::io;
+use std::sync::Mutex;
 use tokio::io::{join, AsyncRead, AsyncWrite};
+use tokio::net::UdpSocket;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -150,5 +153,75 @@ where
     // Bridge the local app stream <-> the Origin over the Noise session.
     let cipher = join(recv, send);
     noise_pump(transport, cipher, app).await?;
+    Ok(())
+}
+
+/// Open a **UDP** tunnel (M10.2): PoW-gated rendezvous + `Noise_IK` initiator
+/// handshake, then bridge the local (connected) UDP socket `local` to the UDP
+/// Origin over the Noise session. One datagram from `local` becomes one Noise
+/// frame and vice versa, preserving datagram boundaries. Runs until the tunnel
+/// stream closes (UDP itself has no EOF).
+pub async fn client_tunnel_udp(
+    conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    local: UdpSocket,
+) -> Result<(), BoxError> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(b"C").await?;
+
+    let mut chal = [0u8; 17];
+    recv.read_exact(&mut chal).await?;
+    let challenge = Challenge {
+        nonce: chal[..16].try_into().unwrap(),
+        difficulty: chal[16],
+    };
+    send.write_all(&build_request(&challenge, token)).await?;
+
+    let mut hs = client_handshake_for(client_private, cap)?;
+    let mut buf = vec![0u8; 65535];
+    let mut tmp = vec![0u8; 65535];
+    let n = hs.write_message(&[], &mut buf)?;
+    send.write_all(&frame(&buf[..n])).await?;
+    let m2 = read_frame(&mut recv).await?;
+    hs.read_message(&m2, &mut tmp)?;
+    let transport = hs.into_transport_mode()?;
+
+    let ts = Mutex::new(transport);
+    // `e` infers to snow::Error (naming it needs snow as a direct dep).
+    let noise_err = |e| io::Error::new(io::ErrorKind::Other, format!("{e}"));
+
+    // Local datagram -> encrypt -> frame to the Edge.
+    let to_edge = async {
+        let mut dg = vec![0u8; 65535];
+        let mut ct = vec![0u8; 65535 + 256];
+        loop {
+            let n = local.recv(&mut dg).await?;
+            let len = ts.lock().unwrap().write_message(&dg[..n], &mut ct).map_err(noise_err)?;
+            send.write_all(&frame(&ct[..len])).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    // Frame from the Edge -> decrypt -> local datagram.
+    let from_edge = async {
+        let mut pt = vec![0u8; 65535];
+        loop {
+            let fr = match read_frame(&mut recv).await {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            let len = ts.lock().unwrap().read_message(&fr, &mut pt).map_err(noise_err)?;
+            local.send(&pt[..len]).await?;
+        }
+        Ok::<(), io::Error>(())
+    };
+
+    tokio::select! {
+        r = to_edge => r?,
+        r = from_edge => r?,
+    }
     Ok(())
 }

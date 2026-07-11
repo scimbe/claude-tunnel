@@ -239,9 +239,11 @@ bidirectional, multi-message Noise stream so arbitrary TCP protocols tunnel.
 
 ## Milestone 10 — UDP origin support
 Mesh Plane promises "any TCP/UDP".
-- **M10.1** Agent bridges a Noise stream to a UDP Origin (datagram framing).
-- **M10.2** Client UDP tunnel mode.
-- **E2E:** a UDP echo Origin round-trips through the tunnel in the testbed.
+- **M10.1** ✅ Agent bridges a Noise stream to a UDP Origin (`serve_noise_udp`).
+- **M10.2** ✅ Client UDP tunnel mode (`client_tunnel_udp`) + UDP E2E through the
+  real Edge (agent `serve_noise_udp`, real UDP echo Origin, boundaries preserved).
+- **M10.3** Live-path wiring: `run_agent` / client `main` select TCP vs UDP by
+  config; docker-compose UDP smoke.
 
 ## Milestone 11 — Direct P2P path + relay fallback (ADR-0015)
 - **M11.1** Edge rendezvous exchanges peer candidates (addr/port) between

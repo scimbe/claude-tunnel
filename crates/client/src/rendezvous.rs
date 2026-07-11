@@ -309,6 +309,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_udp_tunnels_datagrams_through_edge() {
+        // Full UDP path: local UDP app <-> client_tunnel_udp <-> Edge relay <->
+        // agent serve_noise_udp <-> real UDP echo Origin. Datagram boundaries
+        // are preserved (one datagram = one Noise frame).
+        use crate::transport::client_tunnel_udp;
+        use ct_agent::serve::serve_noise_udp;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::net::UdpSocket;
+
+        let token = RoutingToken([0xAB; 32]);
+        let challenge = Challenge {
+            nonce: [0x77; 16],
+            difficulty: 8,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // UDP echo Origin.
+        let origin_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_sock.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let mut b = vec![0u8; 65535];
+            while let Ok((n, peer)) = origin_sock.recv_from(&mut b).await {
+                let _ = origin_sock.send_to(&b[..n], peer).await;
+            }
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        // Edge.
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let ac = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&ac, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            let cc = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&cc, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            cc.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent: register, serve the relayed stream as a UDP bridge.
+        let aep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let aconn = aep.connect(addr, "localhost").expect("cfg").await.expect("agent conn");
+        let (mut rs, mut rr) = aconn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let opriv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let (s, r) = aconn.accept_bi().await.unwrap();
+            let _ = serve_noise_udp(s, r, origin_addr, &opriv).await;
+            aconn.closed().await;
+        });
+
+        // Local UDP "app" <-> client's local UDP socket (mutually connected).
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app.local_addr().unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local.local_addr().unwrap();
+        app.connect(local_addr).await.unwrap();
+        local.connect(app_addr).await.unwrap();
+
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+
+        // Drive discrete datagrams from the app; client tunnel runs concurrently.
+        let driver = async move {
+            let mut buf = vec![0u8; 65535];
+            for msg in [b"udp-one".as_slice(), b"udp-two", b"a-longer-udp-datagram"] {
+                app.send(msg).await.unwrap();
+                let n = app.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], msg, "UDP datagram round-trips with boundary preserved");
+            }
+        };
+
+        tokio::select! {
+            r = client_tunnel_udp(&conn, &token, &cap, &client_kp.private, local) => {
+                panic!("client_tunnel_udp exited early: {r:?}");
+            }
+            _ = driver => {}
+        }
+
+        conn.close(0u32.into(), b"done");
+        agent.abort();
+        let _ = edge.await;
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_exchanges_data_over_stream() {
         let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
         let addr = server.local_addr().expect("addr");
