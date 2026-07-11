@@ -226,13 +226,16 @@ service, agent-side observability, pseudonymous accounts + crypto payment.
 ## Milestone 9 — General streaming data path
 The live Noise path is currently one request/response. Make it a full
 bidirectional, multi-message Noise stream so arbitrary TCP protocols tunnel.
-- **M9.1** Noise transport framing loop: continuous encrypt/decrypt of a
-  bidirectional byte stream (both directions concurrently) over one session.
-- **M9.2** Agent bridge = full-duplex copy between the Noise stream and the
-  Origin TCP socket (replace the one-shot bridge).
-- **M9.3** Client streaming API (send/recv over the live Noise session).
-- **E2E:** multi-message + large (>64 KiB, multi-frame) + interleaved
-  bidirectional payloads round-trip through the real Edge; ciphertext-only tap.
+- **M9.1** ✅ Noise transport framing loop (`noise_pump`): continuous
+  encrypt/decrypt of a bidirectional byte stream over one session.
+- **M9.2** Agent `serve_noise_stream` = handshake + `noise_pump` between the
+  Noise stream and the Origin TCP socket (isolated streaming test; not yet wired).
+- **M9.3** Client streaming API (`client_tunnel_stream`) over the live session.
+- **M9.4** Wire the live path onto streaming (`run_agent`/client `main`) and
+  **migrate the one-shot E2E tests** to streaming semantics (the one-shot
+  `read_to_end` origins deadlock a streaming client — they must half-close
+  correctly). **E2E:** multi-message + >64 KiB + interleaved bidirectional
+  through the real Edge; ciphertext-only tap.
 
 ## Milestone 10 — UDP origin support
 Mesh Plane promises "any TCP/UDP".

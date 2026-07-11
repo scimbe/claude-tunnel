@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 
 use crate::config::AgentConfig;
 use crate::transport::{dial_quic, register_tunnel};
-use ct_common::noise::{frame, origin_handshake};
+use ct_common::noise::{frame, noise_pump, origin_handshake};
 use ct_common::RoutingToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -89,6 +89,40 @@ where
     let n = transport.write_message(&response, &mut buf)?;
     send.write_all(&frame(&buf[..n])).await?;
     send.flush().await?;
+    Ok(())
+}
+
+/// Serve one relayed stream as the Origin's Noise responder with a **full-duplex
+/// streaming** bridge (M9.2): terminate the `Noise_IK` handshake, then
+/// [`noise_pump`] between the decrypted Client stream and the local Origin TCP
+/// socket — arbitrary bidirectional, multi-message traffic, not a single
+/// request/response. Generic over the byte transport (QUIC live, duplex in tests).
+pub async fn serve_noise_stream<S, R>(
+    mut send: S,
+    mut recv: R,
+    origin: SocketAddr,
+    origin_private: &[u8; 32],
+) -> Result<(), BoxError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut hs = origin_handshake(origin_private)?;
+    let mut buf = vec![0u8; 65535];
+    let mut tmp = vec![0u8; 65535];
+
+    // <- handshake message 1, -> handshake message 2
+    let m1 = read_frame(&mut recv).await?;
+    hs.read_message(&m1, &mut tmp)?;
+    let n = hs.write_message(&[], &mut buf)?;
+    send.write_all(&frame(&buf[..n])).await?;
+    send.flush().await?;
+    let transport = hs.into_transport_mode()?;
+
+    // Bridge the Noise session <-> the Origin TCP socket, both ways, streaming.
+    let tcp = TcpStream::connect(origin).await?;
+    let cipher = join(recv, send);
+    noise_pump(transport, cipher, tcp).await?;
     Ok(())
 }
 
@@ -217,6 +251,72 @@ mod tests {
         );
         bridge.await.unwrap().expect("bridge ok");
         let _ = origin.await;
+    }
+
+    #[tokio::test]
+    async fn serve_noise_stream_bridges_streaming_to_origin() {
+        use ct_common::noise::{
+            client_handshake_for, frame, generate_static_keypair, noise_pump, read_frame,
+        };
+        use ct_common::{Capability, OriginIdentity, RoutingToken};
+        use tokio::net::TcpListener;
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        // Streaming TCP echo Origin (echoes bytes as they arrive).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let (ini_cipher, agent_cipher) = tokio::io::duplex(64 * 1024);
+
+        // Agent under test: serve_noise_stream over the relayed cipher stream.
+        let origin_priv = origin_kp.private;
+        let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let agent =
+            tokio::spawn(async move { serve_noise_stream(a_write, a_read, origin_addr, &origin_priv).await });
+
+        // Initiator: handshake, then pump a 100 KB app stream over the session.
+        let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        i_write.write_all(&frame(&buf[..n])).await.unwrap();
+        let m2 = read_frame(&mut i_read).await.unwrap();
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let ini_t = hs.into_transport_mode().unwrap();
+
+        let (app_local, app_remote) = tokio::io::duplex(1024 * 1024);
+        let cipher = tokio::io::join(i_read, i_write);
+        let pump = tokio::spawn(noise_pump(ini_t, cipher, app_local));
+
+        let expected: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let (mut app_r, mut app_w) = tokio::io::split(app_remote);
+        let payload = expected.clone();
+        let writer = tokio::spawn(async move {
+            app_w.write_all(&payload).await.unwrap();
+            app_w.shutdown().await.unwrap();
+        });
+        let mut got = Vec::new();
+        app_r.read_to_end(&mut got).await.unwrap();
+
+        assert_eq!(got, expected, "100 KB streams through serve_noise_stream to the echo Origin");
+        writer.await.unwrap();
+        pump.await.unwrap().unwrap();
+        agent.await.unwrap().unwrap();
+        origin.abort();
     }
 
     #[tokio::test]
