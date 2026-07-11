@@ -192,6 +192,7 @@ dependencies = [
  "ed25519-dalek",
  "quinn",
  "rand 0.8.6",
+ "rcgen",
  "rustls",
  "tokio",
 ]

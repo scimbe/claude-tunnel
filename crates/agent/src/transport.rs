@@ -14,9 +14,37 @@ use std::path::Path;
 use ct_common::credential::SignedCredential;
 use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Generate a self-signed cert/key for the Agent's direct-path listener.
+fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), BoxError> {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let cert = certified.cert.der().clone();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    Ok((cert, key))
+}
+
+/// Build the Agent's direct-path QUIC **server** endpoint bound to `addr`
+/// (M11.3b) — a listener for direct Client connections that bypass the Edge
+/// relay. Returns the endpoint and its self-signed cert (advertised to Clients
+/// so they can trust the direct path).
+pub fn build_direct_listener_at(
+    addr: SocketAddr,
+) -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = self_signed()?;
+    let server_config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key)?;
+    let endpoint = Endpoint::server(server_config, addr)?;
+    Ok((endpoint, cert))
+}
+
+/// Build the direct-path listener on `0.0.0.0:0` (reachable on the container's
+/// bridge IP, ephemeral port).
+pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    build_direct_listener_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+}
 
 /// Transport the Agent uses to reach the Edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +141,38 @@ mod tests {
     #[test]
     fn prefers_quic_when_udp_reachable() {
         assert_eq!(select_transport(true), Transport::Quic);
+    }
+
+    #[tokio::test]
+    async fn direct_listener_accepts_a_connection() {
+        // M11.3b: the Agent's direct-path listener accepts a Client that trusts
+        // its advertised cert and connects directly (bypassing the Edge relay).
+        let (listener, cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("listener");
+        let addr = listener.local_addr().expect("addr");
+
+        let srv = tokio::spawn(async move {
+            let conn = listener.accept().await.unwrap().await.unwrap();
+            let (mut s, mut r) = conn.accept_bi().await.unwrap();
+            let data = r.read_to_end(64).await.unwrap();
+            s.write_all(&data).await.unwrap();
+            s.finish().unwrap();
+            conn.closed().await;
+        });
+
+        let client = ct_edge::transport::build_client_endpoint(cert).expect("client");
+        let conn = client
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("direct conn");
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        s.write_all(b"direct-hello").await.unwrap();
+        s.finish().unwrap();
+        let echoed = r.read_to_end(64).await.unwrap();
+        assert_eq!(echoed, b"direct-hello", "direct listener accepts and echoes");
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
     }
 
     #[test]
