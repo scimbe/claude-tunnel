@@ -313,7 +313,7 @@ mod tests {
         // Full UDP path: local UDP app <-> client_tunnel_udp <-> Edge relay <->
         // agent serve_noise_udp <-> real UDP echo Origin. Datagram boundaries
         // are preserved (one datagram = one Noise frame).
-        use crate::transport::client_tunnel_udp;
+        use crate::transport::udp_selftest;
         use ct_agent::serve::serve_noise_udp;
         use ct_common::noise::generate_static_keypair;
         use ct_common::{Capability, OriginIdentity};
@@ -378,32 +378,13 @@ mod tests {
             aconn.closed().await;
         });
 
-        // Local UDP "app" <-> client's local UDP socket (mutually connected).
-        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let app_addr = app.local_addr().unwrap();
-        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = local.local_addr().unwrap();
-        app.connect(local_addr).await.unwrap();
-        local.connect(app_addr).await.unwrap();
-
         let conn = dial_edge(addr, cert).await.expect("client dial");
 
-        // Drive discrete datagrams from the app; client tunnel runs concurrently.
-        let driver = async move {
-            let mut buf = vec![0u8; 65535];
-            for msg in [b"udp-one".as_slice(), b"udp-two", b"a-longer-udp-datagram"] {
-                app.send(msg).await.unwrap();
-                let n = app.recv(&mut buf).await.unwrap();
-                assert_eq!(&buf[..n], msg, "UDP datagram round-trips with boundary preserved");
-            }
-        };
-
-        tokio::select! {
-            r = client_tunnel_udp(&conn, &token, &cap, &client_kp.private, local) => {
-                panic!("client_tunnel_udp exited early: {r:?}");
-            }
-            _ = driver => {}
-        }
+        // udp_selftest sends one datagram through the tunnel and returns the echo.
+        let echo = udp_selftest(&conn, &token, &cap, &client_kp.private, b"a-udp-datagram")
+            .await
+            .expect("udp selftest");
+        assert_eq!(echo, b"a-udp-datagram", "UDP datagram round-trips with boundary preserved");
 
         conn.close(0u32.into(), b"done");
         agent.abort();

@@ -225,3 +225,38 @@ pub async fn client_tunnel_udp(
     }
     Ok(())
 }
+
+/// UDP self-test (M10.4): bind a local app UDP socket, send `payload` as one
+/// datagram through [`client_tunnel_udp`] to the Origin, and return the echoed
+/// datagram. The tunnel runs concurrently and is torn down once the echo arrives.
+pub async fn udp_selftest(
+    conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<Vec<u8>, BoxError> {
+    // A local "app" socket mutually connected to the tunnel's local socket.
+    let app = UdpSocket::bind("127.0.0.1:0").await?;
+    let app_addr = app.local_addr()?;
+    let local = UdpSocket::bind("127.0.0.1:0").await?;
+    let local_addr = local.local_addr()?;
+    app.connect(local_addr).await?;
+    local.connect(app_addr).await?;
+
+    let mut got = vec![0u8; 65535];
+    tokio::select! {
+        r = client_tunnel_udp(conn, token, cap, client_private, local) => {
+            r?;
+            Err("udp tunnel exited before the echo arrived".into())
+        }
+        res = async {
+            app.send(payload).await?;
+            let n = app.recv(&mut got).await?;
+            Ok::<usize, std::io::Error>(n)
+        } => {
+            let n = res?;
+            Ok(got[..n].to_vec())
+        }
+    }
+}

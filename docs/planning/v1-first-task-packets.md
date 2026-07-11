@@ -245,8 +245,10 @@ Mesh Plane promises "any TCP/UDP".
 - **M10.3** Agent live-path selection: `AgentConfig.origin_proto` (tcp|udp from
   `CT_AGENT_ORIGIN_PROTO`); `run_agent` branches `serve_noise_stream` vs
   `serve_noise_udp`.
-- **M10.4** Client `main` UDP mode (local UDP listener → `client_tunnel_udp`) +
-  docker-compose UDP smoke.
+- **M10.4** Client `main` UDP mode: `CT_CLIENT_MODE=udp` → `udp_selftest`
+  (local UDP socket → `client_tunnel_udp` → verify echo).
+- **M10.5** docker-compose UDP smoke: UDP echo Origin + agent
+  `CT_AGENT_ORIGIN_PROTO=udp` + client `CT_CLIENT_MODE=udp` → round-trip OK.
 
 ## Milestone 11 — Direct P2P path + relay fallback (ADR-0015)
 - **M11.1** Edge rendezvous exchanges peer candidates (addr/port) between

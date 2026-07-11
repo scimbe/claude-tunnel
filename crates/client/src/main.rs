@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ct_client::bench::{csv_row, run_bench, summarize};
 use ct_client::config::ClientConfig;
-use ct_client::transport::{client_tunnel_noise, dial_edge, load_cert};
+use ct_client::transport::{client_tunnel_noise, dial_edge, udp_selftest, load_cert};
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
 
@@ -52,6 +52,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The Client's ephemeral Noise static key (its static key is not pinned by
     // the Origin in Noise_IK, so a fresh one per run is fine).
     let client_kp = generate_static_keypair();
+
+    // UDP mode: send one datagram through the tunnel to a UDP Origin and verify
+    // the echo (the Agent must run with CT_AGENT_ORIGIN_PROTO=udp).
+    if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("udp") {
+        let conn = dial_edge(edge_addr, edge_cert).await?;
+        let echo =
+            udp_selftest(&conn, &cap.token, &cap, &client_kp.private, payload.as_bytes()).await?;
+        println!(
+            "ct-client: udp sent {:?}, received {:?}",
+            payload,
+            String::from_utf8_lossy(&echo)
+        );
+        return if echo == payload.as_bytes() {
+            eprintln!("ct-client: UDP tunnel round-trip OK");
+            Ok(())
+        } else {
+            Err("udp echo mismatch".into())
+        };
+    }
 
     // Bench mode: run N round-trips and emit a labeled CSV row.
     if iterations > 1 {
