@@ -1,0 +1,20 @@
+# UDP overlay for the testbed (M10.5): switches the Origin to a UDP echo and
+# puts the Agent + Client into UDP mode. Compose merges this over the base file:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.udp.yml \
+#       up --build --abort-on-container-exit --exit-code-from client
+#
+# The Agent's serve_noise_udp connects its socket to origin:8080 and only accepts
+# replies from that address, so the Origin must echo *from* port 8080 — a
+# non-forking UDP4-LISTEN does exactly that (a single peer, reply from the bound
+# socket), which is all the single-datagram smoke needs.
+services:
+  origin:
+    command: ["UDP4-LISTEN:8080,reuseaddr", "EXEC:/bin/cat"]
+
+  agent:
+    environment:
+      CT_AGENT_ORIGIN_PROTO: "udp"
+
+  client:
+    environment:
+      CT_CLIENT_MODE: "udp"
