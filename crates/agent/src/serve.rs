@@ -234,8 +234,29 @@ pub async fn run_agent(
     token: RoutingToken,
     origin_private: [u8; 32],
 ) -> Result<(), BoxError> {
-    let conn = dial_quic(config.edge, edge_cert).await?;
+    let conn = dial_quic(config.edge, edge_cert.clone()).await?;
     register_tunnel(&conn, &token).await?;
+
+    // Optional direct-path listener + advertisement (M11.4b-v): if an advertise
+    // IP is configured, run a direct listener, tell the Edge about it (on a
+    // separate short-lived connection), and serve direct Client connections.
+    if let Some(ip) = config.direct_advertise_ip {
+        if let Ok((listener, cert)) = crate::transport::build_direct_listener() {
+            if let Ok(bound) = listener.local_addr() {
+                let advertised = SocketAddr::new(ip, bound.port());
+                if let Ok(adv) = dial_quic(config.edge, edge_cert.clone()).await {
+                    let _ = crate::transport::advertise_direct_listener(&adv, &token, advertised, &cert)
+                        .await;
+                    adv.close(0u32.into(), b"advertised");
+                }
+                let (origin, proto) = (config.origin, config.origin_proto);
+                tokio::spawn(async move {
+                    let _ = serve_direct(listener, origin, origin_private, proto).await;
+                });
+            }
+        }
+    }
+
     let proto = config.origin_proto;
     loop {
         let (send, recv) = conn.accept_bi().await?;
@@ -583,6 +604,7 @@ mod tests {
             edge: edge_addr,
             origin: origin_addr,
             origin_proto: OriginProto::Tcp,
+            direct_advertise_ip: None,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
