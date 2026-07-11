@@ -1,0 +1,18 @@
+# P2P overlay for the testbed (M11.4b-vi): the Agent advertises its direct-path
+# listener at its bridge IP, and the Client uses auto-discovery — the direct path
+# when reachable, else the Edge relay.
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.p2p.yml \
+#       up --build --abort-on-container-exit --exit-code-from client
+#
+# NOTE: the flat Docker bridge has no NAT, so the direct path (Client → Agent
+# 10.5.0.4:<listener>) trivially succeeds; true simultaneous-open hole-punching
+# would require an emulated-NAT topology (documented testbed limitation).
+services:
+  agent:
+    environment:
+      CT_AGENT_DIRECT_ADVERTISE: "10.5.0.4"
+
+  client:
+    environment:
+      CT_CLIENT_MODE: "p2p"

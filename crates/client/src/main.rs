@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ct_client::bench::{csv_row, run_bench, summarize};
 use ct_client::config::ClientConfig;
-use ct_client::transport::{client_tunnel_noise, dial_edge, udp_selftest, load_cert};
+use ct_client::transport::{client_tunnel_auto, client_tunnel_noise, dial_edge, udp_selftest, load_cert};
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
 
@@ -70,6 +70,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             Err("udp echo mismatch".into())
         };
+    }
+
+    // P2P mode: auto-discover the Agent's direct endpoint and use the direct
+    // path, falling back to the Edge relay. Retries briefly to win the startup
+    // race where the Agent hasn't advertised its listener yet.
+    if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("p2p") {
+        let mut result = (false, Vec::new());
+        for attempt in 0..5u32 {
+            let conn = dial_edge(edge_addr, edge_cert.clone()).await?;
+            let (used_direct, resp) = client_tunnel_auto(
+                &conn,
+                &cap.token,
+                &cap,
+                &client_kp.private,
+                payload.as_bytes(),
+                Duration::from_secs(3),
+            )
+            .await?;
+            conn.close(0u32.into(), b"done");
+            if resp != payload.as_bytes() {
+                return Err("p2p echo mismatch".into());
+            }
+            result = (used_direct, resp);
+            if used_direct || attempt == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let (used_direct, resp) = result;
+        println!(
+            "ct-client: p2p sent {:?}, received {:?} (direct={used_direct})",
+            payload,
+            String::from_utf8_lossy(&resp)
+        );
+        eprintln!("ct-client: P2P tunnel round-trip OK (direct={used_direct})");
+        return Ok(());
     }
 
     // Bench mode: run N round-trips and emit a labeled CSV row.
