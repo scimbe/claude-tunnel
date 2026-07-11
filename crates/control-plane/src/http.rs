@@ -71,6 +71,12 @@ async fn redeem(
     Ok(Json(RedeemResp { tenant: tenant.0 }))
 }
 
+/// Build the full control-plane router (M13.3): enrollment + registry/rendezvous
+/// on one app, each with its own shared state.
+pub fn control_plane_router(enrollment: SharedEnrollment, registry: SharedRegistry) -> Router {
+    enrollment_router(enrollment).merge(registry_router(registry))
+}
+
 /// Shared Tunnel Registry behind the HTTP handlers.
 pub type SharedRegistry = Arc<Mutex<TunnelRegistry>>;
 
@@ -231,6 +237,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn merged_router_serves_enrollment_and_registry() {
+        let enr = Arc::new(Mutex::new(Enrollment::new()));
+        let reg = Arc::new(Mutex::new(TunnelRegistry::new()));
+        let app = control_plane_router(enr, reg);
+
+        let (s, _) = post_json(app.clone(), "/enroll/issue", r#"{"tenant":"t"}"#.into()).await;
+        assert_eq!(s, StatusCode::OK, "enrollment route served");
+
+        let body = format!(r#"{{"token":"{}","tenant":"t","agent":"a"}}"#, "66".repeat(32));
+        let (s, _) = post_json(app, "/registry/register", body).await;
+        assert_eq!(s, StatusCode::OK, "registry route served");
     }
 
     #[tokio::test]
