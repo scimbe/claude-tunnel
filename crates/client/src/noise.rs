@@ -161,4 +161,142 @@ mod tests {
         .await;
         assert!(result.is_err(), "mismatched Origin Identity must fail");
     }
+
+    // --- M8.4b: provider-blind assertion --------------------------------------
+    //
+    // The Edge's relay_quic is a pure bidirectional byte copy, so the bytes on
+    // the Client's tunnel stream are byte-for-byte what the Edge relays. These
+    // adapters record exactly those bytes; the test then asserts the plaintext
+    // never appears among them.
+
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    struct RecordingWriter<W> {
+        inner: W,
+        log: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for RecordingWriter<W> {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.inner).poll_write(cx, buf) {
+                Poll::Ready(Ok(n)) => {
+                    this.log.lock().unwrap().extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                }
+                other => other,
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    struct RecordingReader<R> {
+        inner: R,
+        log: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for RecordingReader<R> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let start = buf.filled().len();
+            let this = self.get_mut();
+            match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let fresh = buf.filled()[start..].to_vec();
+                    this.log.lock().unwrap().extend_from_slice(&fresh);
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[tokio::test]
+    async fn tunnel_carries_only_ciphertext_never_the_plaintext() {
+        use ct_common::noise::{origin_handshake, generate_static_keypair};
+        use tokio::net::TcpListener;
+
+        const PLAINTEXT: &[u8] = b"TOP-SECRET-PLAINTEXT-MARKER";
+
+        // Real TCP echo Origin (the only place plaintext legitimately appears).
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = origin_listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.unwrap();
+            sock.write_all(&buf).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (c_read, c_write) = tokio::io::split(client_io);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut rec_write = RecordingWriter { inner: c_write, log: log.clone() };
+        let mut rec_read = RecordingReader { inner: c_read, log: log.clone() };
+
+        // Agent-side responder terminates Noise and bridges plaintext to Origin.
+        let origin_priv = origin_kp.private;
+        let bridge = tokio::spawn(async move {
+            let (mut s_read, mut s_write) = tokio::io::split(server_io);
+            // Inline responder bridge (mirrors ct-agent::serve::serve_noise_bridge).
+            let mut hs = origin_handshake(&origin_priv).unwrap();
+            let mut buf = vec![0u8; 65535];
+            let mut tmp = vec![0u8; 65535];
+            let m1 = read_frame(&mut s_read).await.unwrap();
+            hs.read_message(&m1, &mut tmp).unwrap();
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            s_write.write_all(&frame(&buf[..n])).await.unwrap();
+            let mut transport = hs.into_transport_mode().unwrap();
+            let ct = read_frame(&mut s_read).await.unwrap();
+            let n = transport.read_message(&ct, &mut tmp).unwrap();
+            let request = tmp[..n].to_vec();
+            let mut tcp = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            tcp.write_all(&request).await.unwrap();
+            tcp.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            tcp.read_to_end(&mut response).await.unwrap();
+            let n = transport.write_message(&response, &mut buf).unwrap();
+            s_write.write_all(&frame(&buf[..n])).await.unwrap();
+        });
+
+        let resp = client_noise_exchange(&mut rec_write, &mut rec_read, &client_kp.private, &cap, PLAINTEXT)
+            .await
+            .expect("noise exchange");
+        assert_eq!(resp, PLAINTEXT, "functional: plaintext round-trips E2E");
+
+        let seen = log.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "bytes did cross the tunnel");
+        assert!(
+            !contains(&seen, PLAINTEXT),
+            "provider-blind: the relayed tunnel bytes must never contain the plaintext"
+        );
+
+        bridge.await.unwrap();
+        let _ = origin.await;
+    }
 }
