@@ -2,6 +2,7 @@
 //! enrollment, Tunnel Registry, Rendezvous, billing. Holds no trust material or
 //! payload. See ADR-0005 (enrollment/identity), ADR-0017 (thin control plane).
 
+pub mod accounts;
 pub mod client;
 pub mod credential;
 pub mod enrollment;

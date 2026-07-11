@@ -333,7 +333,10 @@ Turn the in-memory `ct-control-plane` library into a running service.
 ## Milestone 15 — Pseudonymous accounts + crypto payment (ADR-0012, SPEC §9)
 Minimal technical model; the funded-adversary sybil economics stay an open risk
 (`BACKLOG.md`) and are flagged, not hand-waved.
-- **M15.1** Pseudonymous account + prepaid-credit ledger (control plane).
+- **M15.1** ✅ Pseudonymous account + prepaid-credit ledger (control plane) —
+  `ct-control-plane::accounts::Ledger` with opaque random `AccountId`,
+  `open_account`/`balance`/`credit`/`debit`; insufficient debit refused without
+  mutation, saturating top-ups. Unit-tested.
 - **M15.2** Capability/token issuance gated by credit balance.
 - **M15.3** Crypto-payment intake stub (credit top-up).
 - **E2E:** account → top-up → gated token issuance → tunnel; zero-balance denied.
