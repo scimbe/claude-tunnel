@@ -7,14 +7,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::enrollment::{Enrollment, JoinToken};
-use ct_common::{AgentId, TenantId};
+use crate::registry::{TunnelInfo, TunnelRegistry};
+use ct_common::{AgentId, RoutingToken, TenantId};
 
 /// Shared enrollment state behind the HTTP handlers.
 pub type SharedEnrollment = Arc<Mutex<Enrollment>>;
@@ -68,6 +69,60 @@ async fn redeem(
         .redeem(&JoinToken(token), AgentId(req.agent), pubkey)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(RedeemResp { tenant: tenant.0 }))
+}
+
+/// Shared Tunnel Registry behind the HTTP handlers.
+pub type SharedRegistry = Arc<Mutex<TunnelRegistry>>;
+
+/// Build the registry router: `POST /registry/register`,
+/// `GET /registry/resolve/:token` (the Rendezvous lookup).
+pub fn registry_router(state: SharedRegistry) -> Router {
+    Router::new()
+        .route("/registry/register", post(register_tunnel))
+        .route("/registry/resolve/:token", get(resolve_tunnel))
+        .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct RegisterReq {
+    token: String,
+    tenant: String,
+    agent: String,
+}
+
+async fn register_tunnel(
+    State(reg): State<SharedRegistry>,
+    Json(req): Json<RegisterReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = hex_decode_32(&req.token)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed token".to_string()))?;
+    reg.lock().unwrap().register(
+        RoutingToken(token),
+        TunnelInfo {
+            tenant: TenantId(req.tenant),
+            agent: AgentId(req.agent),
+        },
+    );
+    Ok(StatusCode::OK)
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResolveResp {
+    tenant: String,
+    agent: String,
+}
+
+async fn resolve_tunnel(
+    State(reg): State<SharedRegistry>,
+    Path(token_hex): Path<String>,
+) -> Result<Json<ResolveResp>, StatusCode> {
+    let token = hex_decode_32(&token_hex).ok_or(StatusCode::BAD_REQUEST)?;
+    let guard = reg.lock().unwrap();
+    let info = guard.lookup(&RoutingToken(token)).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ResolveResp {
+        tenant: info.tenant.0.clone(),
+        agent: info.agent.0.clone(),
+    }))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -138,6 +193,44 @@ mod tests {
         // A second redemption of the same token is rejected.
         let (status, _) = post_json(app, "/enroll/redeem", redeem).await;
         assert_eq!(status, StatusCode::CONFLICT, "single-use join token");
+    }
+
+    #[tokio::test]
+    async fn register_then_resolve_tunnel() {
+        let reg = Arc::new(Mutex::new(TunnelRegistry::new()));
+        let app = registry_router(reg);
+        let token = "44".repeat(32);
+
+        // Register a tunnel.
+        let body = format!(r#"{{"token":"{token}","tenant":"t","agent":"a"}}"#);
+        let (status, _) = post_json(app.clone(), "/registry/register", body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Resolve it.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/registry/resolve/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let r: ResolveResp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!((r.tenant.as_str(), r.agent.as_str()), ("t", "a"));
+
+        // An unknown token → 404.
+        let resp = app
+            .oneshot(
+                Request::get(format!("/registry/resolve/{}", "55".repeat(32)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
