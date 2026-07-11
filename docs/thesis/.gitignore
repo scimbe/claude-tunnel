@@ -1,0 +1,13 @@
+# LaTeX build artifacts (thesis.pdf is committed as the deliverable)
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.toc
+*.lof
+*.lot
