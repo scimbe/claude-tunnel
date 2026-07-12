@@ -53,6 +53,19 @@ Punkt, an dem Zensur ansetzen kann -- wird \gls{ac:udp} blockiert, ist
 (Abschnitt~\ref{sec:nat} und Kapitel~\ref{ch:architektur}), der denselben Tunnel
 ueber \gls{ac:tls}-ueber-\gls{ac:tcp} traegt.
 
+\paragraph{Handshake und Datenphase.} Der Verbindungsaufbau laeuft in
+\gls{ac:quic} ueber \emph{Initial}- und \emph{Handshake}-Pakete, in die der
+\gls{ac:tls}-1.3-Handshake eingebettet ist; nach einer Rundreise (1-RTT) sind die
+Schluessel etabliert und die Datenphase (\emph{1-RTT}-Pakete) beginnt. Bei einer
+zuvor bekannten Gegenstelle erlaubt die Sitzungswiederaufnahme fruehe Daten
+(0-RTT), die jedoch gegen Wiedereinspielung (Replay) abzusichern sind und daher
+nur fuer idempotente Anfragen taugen. Streams sind entweder bidirektional oder
+unidirektional und werden unabhaengig flusskontrolliert; Verlust auf einem Stream
+blockiert die anderen nicht (kein stream-uebergreifendes Head-of-Line-Blocking).
+Erst dies macht den Rollen-Dispatch (Kapitel~\ref{ch:architektur}) auf einer
+einzigen Verbindung effizient: Registrierung, Relay und Steuerbefehle konkurrieren
+nicht um dieselbe Sequenz.
+
 \section{Ende-zu-Ende-Kryptographie mit Noise}
 \label{sec:noise}
 
@@ -77,6 +90,21 @@ falschem Schluessel scheitert am Pinning. Nach dem Handshake gehen beide Seiten
 in den Transport-Modus ueber und tauschen laengen-praefigierte, verschluesselte
 Frames aus, die der Edge nur noch byteweise weiterreicht.
 
+\paragraph{Ablauf des IK-Handshakes.} Der Handshake besteht aus zwei Nachrichten.
+In der ersten sendet der Initiator seinen ephemeren oeffentlichen Schluessel und
+-- bereits verschluesselt -- seinen statischen Schluessel; die
+Diffie-Hellman-Operationen \texttt{es} (ephemeral--static) und \texttt{ss}
+(static--static) mischen dabei sowohl den ephemeren als auch den vorab bekannten
+Origin-Schluessel in den Sitzungszustand, sodass nur der echte Origin die
+Nachricht entschluesseln kann. In der zweiten Nachricht antwortet der Responder
+mit seinem ephemeren Schluessel und den Operationen \texttt{ee} und \texttt{se};
+damit ist der Sitzungsschluessel beidseitig authentisiert und -- dank der
+ephemeren Anteile -- \emph{vorwaertsgeheim}: die spaetere Kompromittierung eines
+statischen Schluessels legt vergangene Sitzungen nicht offen. Anschliessend leiten
+beide Seiten je Richtung einen symmetrischen Transportschluessel ab. Weil der
+Origin-Schluessel bereits in die erste Nachricht eingeht, ist der Handshake an die
+gepinnte Identitaet gebunden, noch bevor Nutzdaten fliessen.
+
 \section{Proof-of-Work als Missbrauchsschranke}
 \label{sec:pow}
 
@@ -90,6 +118,17 @@ ein einzelner Hash. Dieser asymmetrische Aufwand begrenzt Flut- und
 Rendezvous-Missbrauch, ohne dass der Dienst Identitaeten fuehren oder Inhalte
 sehen muesste. Die Schwierigkeit ist ein Stellparameter, dessen Einfluss die
 Parameterstudie (Kapitel~\ref{ch:evaluation}) untersucht.
+
+\paragraph{Kosten und Asymmetrie.} Modelliert man den Hash als Zufallsorakel, so
+trifft ein einzelner Versuch die geforderten $d$ fuehrenden Nullbits mit
+Wahrscheinlichkeit $2^{-d}$; die erwartete Zahl der Versuche bis zur Loesung ist
+damit $2^{d}$, waehrend die Pruefung genau einen Hash kostet. Der Aufwand des
+Clients waechst also exponentiell in der Schwierigkeit $d$, der des Edge bleibt
+konstant. Genau diese Asymmetrie macht den Nachweis als Schranke brauchbar: Eine
+einzelne Anbahnung bleibt fuer einen ehrlichen Client guenstig, waehrend das
+massenhafte Anbahnen eines Fluters quadratisch bis exponentiell teurer wird. Die
+Wahl von $d$ ist ein Kompromiss zwischen wirksamer Daempfung und der Belastung
+schwacher Clients (Kapitel~\ref{ch:diskussion}).
 
 \section{NAT-Traversal und direkter Pfad}
 \label{sec:nat}
@@ -107,3 +146,21 @@ nutzt; scheitert der direkte Aufbau, faellt der Client transparent auf den Relay
 zurueck. Echtes Hole Punching ueber symmetrisches \gls{ac:nat} bleibt eine
 Grenze des flachen Container-Testbetts und wird in
 Kapitel~\ref{ch:evaluation} eingeordnet.
+
+\subsection{NAT-Typen und ihre Bedeutung fuers Hole Punching}
+\label{sec:nat-typen}
+
+\gls{ac:nat}-Geraete unterscheiden sich darin, wie sie eine einmal geoeffnete
+ausgehende Bindung fuer eingehenden Verkehr wiederverwenden. Bei einem
+\emph{Full-Cone}-\gls{ac:nat} gilt die Bindung fuer beliebige externe Absender;
+bei \emph{Address-Restricted}- bzw.\ \emph{Port-Restricted}-\gls{ac:nat} nur fuer
+zuvor kontaktierte Adressen bzw.\ Adress-Port-Paare. In diesen drei Faellen
+genuegt das gleichzeitige Oeffnen: beide Seiten senden zuerst hinaus und erzeugen
+so die noetige Bindung fuer die Gegenrichtung, woraufhin die vom Vermittler
+beobachtete reflexive Adresse den Peer erreicht. Ein \emph{symmetrisches}
+\gls{ac:nat} dagegen vergibt je Ziel eine \emph{andere} externe Portnummer; die
+beobachtete reflexive Adresse sagt dann nichts ueber den Port voraus, den der
+Peer tatsaechlich sehen wird, und das Hole Punching schlaegt ohne zusaetzliche
+Portvorhersage fehl. Der vorliegende Prototyp setzt auf reflexive Adressen und
+deckt damit die nicht-symmetrischen Faelle ab; symmetrische \gls{ac:nat}s bleiben
+eine bekannte Grenze (Kapitel~\ref{ch:diskussion}).

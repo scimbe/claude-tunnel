@@ -477,7 +477,9 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
 - **M17.10** ✅ Fazit & Ausblick + Reproduzierbarkeits-Anhang. Alle 10 Kapitel
   vorhanden, baut sauber (49 S.). Template-Stubs (first_chapter, example_appendix)
   entfernt.
-- **M17.11+** ⏳ Vertiefungs-Pass: die Kapitel sind strukturell vollstaendig, aber
-  bei 49 S. ~15 unter dem ~64-Seiten-Ziel. Pro Zyklus ein Kapitel vertiefen
-  (Grundlagen, Architektur, Implementierung mit mehr Listings, Evaluation mit
-  mehr Analyse, Related Work) bis ~64 S. erreicht sind.
+- **M17.11+** Vertiefungs-Pass (pro Zyklus ein Kapitel) bis ~64 S.:
+  - **M17.11** ✅ Grundlagen vertieft (QUIC Handshake/0-RTT/Streams, IK-Handshake
+    Nachricht-für-Nachricht + Vorwärtsgeheimnis, PoW-Kostenmodell $2^{-d}/2^{d}$,
+    NAT-Typen-Taxonomie + symmetrisches NAT). 49→51 S.
+  - **M17.12+** ⏳ Architektur, Implementierung (mehr Listings), Evaluation (mehr
+    Analyse), Related Work weiter vertiefen bis ~64 S.
