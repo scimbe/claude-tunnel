@@ -484,5 +484,7 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
   - **M17.12** ✅ Implementierung vertieft (noise_pump-Listing + Framing,
     §Beobachtbarkeit mit /metrics-Listing, §Guthaben-gedeckte Ausgabe mit
     Billing-Listing, Money→Tunnel-E2E-Verweis). 51→52 S.
-  - **M17.13+** ⏳ Architektur, Evaluation (mehr Analyse), Related Work weiter
-    vertiefen bis ~64 S.
+  - **M17.13** ✅ Architektur vertieft (nummerierter 6-Schritt-Tunnelaufbau +
+    Direktpfad-Kurzschluss, Wire-Format-Tabelle des Rollen-Dispatch). 52→53 S.
+  - **M17.14+** ⏳ Evaluation (mehr Analyse), Related Work weiter vertiefen bis
+    ~64 S.

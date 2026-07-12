@@ -77,6 +77,28 @@ verbindet direkt; scheitert das, faellt er auf den Relay zurueck. Ist
 \gls{ac:udp} blockiert, traegt ein \gls{ac:tls}-ueber-\gls{ac:tcp}-Kanal denselben
 Tunnel (F5).
 
+\paragraph{Ablauf eines Tunnelaufbaus.} Der vollstaendige Relay-Pfad laeuft in
+den folgenden Schritten ab:
+\begin{enumerate}
+  \item Der Agent registriert sein Routing-Token beim Edge (\texttt{'A'}); der
+    Edge merkt sich Token, Verbindung und die reflexive Adresse des Agents.
+  \item Der Client oeffnet einen Stream (\texttt{'C'}); der Edge sendet eine
+    \gls{ac:pow}-Challenge (Nonce, Schwierigkeit).
+  \item Der Client loest die Challenge und sendet Loesung und Routing-Token
+    zurueck.
+  \item Der Edge prueft die Loesung (ein Hash) und loest das Token zum
+    registrierten Agent auf; ist das Token unbekannt oder die Loesung ungueltig,
+    bricht er ab.
+  \item Der Edge verbindet den Client-Stream mit einem frischen Stream zum Agent
+    und kopiert ab jetzt nur noch Bytes.
+  \item Ueber diese Bruecke fuehren Client und Origin den Noise-Handshake
+    (Origin-Pinning) und tauschen anschliessend verschluesselte Frames aus; der
+    Edge sieht nur Chiffretext.
+\end{enumerate}
+Der direkte Pfad kuerzt die Schritte~2--5 ab: der Client fragt den direkten
+Endpunkt ab (\texttt{'P'}), verbindet sich unmittelbar zum Agent-Listener und
+fuehrt denselben Noise-Handshake ohne Beteiligung des Edge.
+
 \section{Rollen-Dispatch auf einem Stream}
 \label{sec:arch-dispatch}
 
@@ -92,8 +114,26 @@ wird durch ein fuehrendes Byte auf dem Stream ausgewaehlt:
   \item[\texttt{'P'}] Client fragt den direkten Endpunkt eines Tokens ab.
 \end{description}
 
+Tabelle~\ref{tab:dispatch} fasst das Wire-Format der vier Rollen zusammen.
 Dieser minimale Dispatch haelt den Edge einfach und erweiterbar, ohne ein
 separates Steuerprotokoll auf eigener Verbindung.
+
+\begin{table}[t]
+  \centering
+  \caption{Wire-Format des Rollen-Dispatch (vereinfacht); alle Tokens sind opak,
+  $\|$ bezeichnet Konkatenation.}
+  \label{tab:dispatch}
+  \begin{tabular}{lll}
+    \toprule
+    Byte & Anfrage ($\rightarrow$ Edge) & Antwort (Edge) \\
+    \midrule
+    \texttt{'A'} & Token & \texttt{OK} \\
+    \texttt{'C'} & Loesung $\|$ Token & Route + Byte-Relay \\
+    \texttt{'D'} & Token $\|$ Adresse $\|$ Zertifikat & \texttt{OK} \\
+    \texttt{'P'} & Token & Adresse $\|$ Zertifikat (oder leer) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
 \section{Entwurfsentscheidungen}
 \label{sec:arch-entscheidungen}
