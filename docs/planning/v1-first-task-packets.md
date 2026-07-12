@@ -488,3 +488,67 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
     Direktpfad-Kurzschluss, Wire-Format-Tabelle des Rollen-Dispatch). 52→53 S.
   - **M17.14+** ⏳ Evaluation (mehr Analyse), Related Work weiter vertiefen bis
     ~64 S.
+
+---
+
+# 🚀 Produktivierung (User-Direktive, Zyklus 130) — von Testbett zu produktivem SaaS
+
+**Entscheidungen des Users:** (a) Auslieferung **beides** — gehosteter Portal +
+self-hostbarer Core; (b) **konventionelle Accounts überall** (Keycloak/OIDC-Identität;
+die Pseudonymitäts-Marketingaussage wird bewusst aufgegeben). **Wichtig:** Die
+**E2E-Payload-Verschlüsselung (Noise) bleibt** — Accounts identifizieren den Kunden
+(Identität/Abrechnung), der Betreiber liest die Tunnel-Nutzlast weiterhin nicht.
+Marketing-Claim verschiebt sich von „wir wissen nicht, wer du bist" zu „wir können
+nicht lesen, was du sendest".
+
+**Neue Priorität:** Produktivierung **M18+ vor** Thesis-Vertiefung (M17.14+ pausiert,
+optional). Der Loop nimmt ab jetzt das niedrigste offene M18+-Paket.
+
+**Ehrlicher Ausgangsbefund:** Kernkrypto-Datenpfad + Rendezvous/PoW/Fallbacks/
+Control-Plane laufen (160 Tests, Compose-Smokes). NICHT produktionsreif: alles
+In-Memory (kein Neustart-Überleben), self-signed Certs, keine echte AuthN/AuthZ,
+Deployment nur als Compose-Smoke, Payment nur Stub, kein Rate-Limiting/Quota jenseits
+PoW, P2P-Hole-Punching nur im flachen Bridge-Netz.
+
+## Milestone 18 — Persistenz (Fundament; blockiert alles andere)
+In-Memory-Zustand durch dauerhaften Speicher ersetzen (SQLite self-host / Postgres
+hosted, hinter einem Storage-Trait).
+- **M18.1** Storage-Trait + SQLite-Backend; `Enrollment` persistent (issue/redeem).
+- **M18.2** `TunnelRegistry` persistent (register/resolve).
+- **M18.3** `Ledger` + Accounts persistent (open/credit/debit; Payments idempotent).
+- **E2E:** Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest).
+
+## Milestone 19 — Identität & Auth (Keycloak/OIDC, konventionelle Accounts)
+- **M19.1** Account-Modell an OIDC-Subject gebunden; Datenpfad bleibt E2E-Noise.
+- **M19.2** OIDC-Token-Verifikation (Keycloak-Realm) auf der Control-Plane-API.
+- **M19.3** Agent-/Token-Ausgabe an authentifizierte Accounts gekoppelt (ersetzt das
+  pseudonyme Prepaid-Gating als Standard; Guthaben bleibt als Abrechnungseinheit).
+- **E2E:** nur ein authentifizierter Account kann Agents enrollen / Tokens beziehen.
+
+## Milestone 20 — PKI & TLS
+- Echte Zertifikatsausstellung/-rotation für den Edge (interne CA oder ACME); ersetzt
+  self-signed; Trust-Distribution an Clients.
+
+## Milestone 21 — Deployment (hosted + self-host)
+- Helm-Chart / K8s-Manifeste (hosted) + gehärtetes Compose-Bundle (self-host);
+  Konfiguration, Secrets-Handling, Health/Readiness.
+
+## Milestone 22 — Onboarding-UX (so wenige Schritte wie möglich)
+- Ein-Kommando-Agent-Setup (Install → Auto-Enroll → Tunnel); portalgeführte
+  Tunnel-Einrichtung; Kurzanleitung.
+
+## Milestone 23 — Security-Hardening & Audit
+- Rate-Limits/Quotas je Account, TLS überall, Secrets-Management, Dependency- +
+  Crypto-Usage-Review, Aktualisierung des Bedrohungsmodells für den Produktivbetrieb.
+
+## Milestone 24 — Payment (echt, ersetzt Stub)
+- Zahlungsanbieter-Integration an Accounts + Credit-Ledger gebunden.
+
+## Milestone 25 — Produktdokumentation
+- Positionierung/Marketing (ehrliche Claims), Security-Whitepaper, Betriebs-Runbook,
+  Onboarding-Guide.
+
+**Definition of done (Produkt):** durabler Zustand, echte Identität/Auth, echte PKI,
+reproduzierbares Deployment (hosted + self-host), Ein-Kommando-Onboarding,
+Hardening-Pass bestanden, echtes Payment, Produktdoku — alle mit frozen Tests bzw.
+Deploy-Verifikation.
