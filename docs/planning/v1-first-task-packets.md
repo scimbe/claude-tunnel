@@ -581,8 +581,12 @@ hosted, hinter einem Storage-Trait).
   - **M20.3a** ✅ `build_dual_edge_from_ca(ca, quic_addr, tcp_addr, sans)` —
     CA-issued Dual-Transport-Edge (QUIC + TLS-TCP, ein Leaf), gibt CA-Root zurück.
     Test: CA-Root-Client tunnelt über QUIC.
-  - **M20.3b** ⏳ `run_edge`/config auf CA umstellen; CA-Root nach
-    `CT_EDGE_CERT_OUT` schreiben (statt self-signed Leaf); Compose-Smoke.
+  - **M20.3b** ✅ `run_edge` auf CA umgestellt: erzeugt eine `Ca`, baut den
+    Dual-Edge daraus und schreibt den **CA-Root** nach `CT_EDGE_CERT_OUT` (statt
+    des self-signed Leafs). Agents/Clients bleiben unverändert (trusten den
+    geladenen Cert als Trust-Anchor → jetzt die CA). Compose-Smoke: `tunnel
+    round-trip OK (via=quic)`, `COMPOSE_EXIT=0`. **Milestone 20 (PKI & TLS)
+    komplett.**
 
 ## Milestone 21 — Deployment (hosted + self-host)
 - Helm-Chart / K8s-Manifeste (hosted) + gehärtetes Compose-Bundle (self-host);

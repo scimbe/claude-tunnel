@@ -11,7 +11,8 @@ use std::sync::Arc;
 use crate::config::EdgeConfig;
 use crate::relay::{relay, relay_quic};
 use crate::state::EdgeState;
-use crate::transport::{build_dual_edge, save_cert};
+use crate::pki::{build_dual_edge_from_ca, Ca};
+use crate::transport::save_cert;
 use ct_common::pow::{check_request, Challenge};
 use ct_common::RoutingToken;
 use quinn::{Connection, RecvStream, SendStream};
@@ -186,10 +187,15 @@ where
 /// (shared volume), and serve each incoming connection via [`serve_connection`]
 /// with a fresh per-connection PoW challenge.
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
-    // Listen on both QUIC (primary) and TLS-TCP (fallback) with one shared cert.
-    let (endpoint, tcp_listener, acceptor, cert) =
-        build_dual_edge(config.listen, config.listen).await?;
-    save_cert(cert_out, &cert)?;
+    // Issue the Edge's leaf from an internal CA (M20.3b) and listen on both QUIC
+    // (primary) and TLS-TCP (fallback) with that one shared leaf.
+    let ca = Ca::new("ct-edge-ca")?;
+    let (endpoint, tcp_listener, acceptor, ca_root) =
+        build_dual_edge_from_ca(&ca, config.listen, config.listen, vec!["localhost".to_string()])
+            .await?;
+    // Publish the CA *root* (not the leaf): Agents/Clients trust the CA and
+    // therefore any Edge leaf it signs, so the cert can rotate without redistribution.
+    save_cert(cert_out, &ca_root)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
     let difficulty = config.pow_difficulty;
