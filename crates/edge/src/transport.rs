@@ -17,7 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 /// Errors constructing or driving an Edge endpoint.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     // Idempotent: a second call returns Err, which we ignore.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
