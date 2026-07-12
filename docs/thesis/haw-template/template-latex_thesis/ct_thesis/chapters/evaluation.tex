@@ -6,7 +6,9 @@ Dieses Kapitel beantwortet die Forschungsfragen FF2 (Latenz-Overhead) und FF3
 (Netz- und Betriebsartverhalten) empirisch. Es beschreibt das Testbett und die
 Methodik (Abschnitt~\ref{sec:eval-methodik}), praesentiert die Ergebnisse
 (\ref{sec:eval-ergebnisse}) und ordnet sie samt Limitierungen ein
-(\ref{sec:eval-diskussion}).
+(\ref{sec:eval-diskussion}). Abschnitt~\ref{sec:eval-security} ergaenzt die
+empirische Leistungsbewertung um eine qualitative Sicherheitsbewertung der
+Produktivierung aus Kapitel~\ref{ch:produktivierung}.
 
 \section{Testbett und Methodik}
 \label{sec:eval-methodik}
@@ -88,3 +90,53 @@ aber knapp; die p99-Werte und der Modus-Vergleich unter Verlust sind entsprechen
 vorsichtig zu lesen. Die PoW-Schwierigkeit ist in diesem Lauf fixiert; die
 Sweep-Achse erlaubt eine gezielte Schwierigkeitsstudie. Echtes NAT-Hole-Punching
 bleibt eine Grenze des flachen Container-Testbetts.
+
+\section{Sicherheitsbewertung der Produktivierung}
+\label{sec:eval-security}
+
+Die Leistungsmessung erfasst den Eigenanteil des Tunnels, nicht seine
+Sicherheitseigenschaften. Da ein quantitatives Angriffs-Benchmark den Rahmen
+dieser Arbeit sprengt, werden die in Kapitel~\ref{ch:produktivierung}
+eingefuehrten Kontrollen hier qualitativ gegen ein Angreifermodell bewertet.
+Tabelle~\ref{tab:security-eval} ordnet jeder Angreiferklasse die wirksame
+Kontrolle und das verbleibende Restrisiko zu.
+
+\begin{table}[t]
+  \centering
+  \caption{Angreifer, wirksame Kontrolle und Restrisiko.}
+  \label{tab:security-eval}
+  \begin{tabular}{lll}
+    \toprule
+    Angreifer & Kontrolle & Restrisiko \\
+    \midrule
+    On-Path-Lauscher & Noise-E2E, TLS~1.3 & Nutzlast keins; Metadaten sichtbar \\
+    Rotierter/boeser Edge & interne CA, CA-Root-Trust & keins (Ketten-Validierung) \\
+    Unauth. Zugriff & OIDC-RS256 & an Realm-Schluessel gebunden \\
+    Rendezvous-Flut & PoW + Rate-Limit & begrenzt, nicht ausgeschlossen \\
+    Selbst-Gutschrift & signierter Webhook & keins ohne Provider-Secret \\
+    Finanzierter Sybil & -- & ungeloest \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Die zentrale Invariante ist strukturell und nicht politisch: weil der
+Noise-Handshake (\cite{perrin2018noise}) Client und Origin direkt
+authentifiziert und verschluesselt, sieht der Vermittler nur Chiffrat -- die
+Vertraulichkeit der Nutzlast haengt nicht am Wohlverhalten des Betreibers,
+sondern an der Kryptografie. Ebenso ersetzt die interne CA das Anheften eines
+Blatt-Zertifikats durch Vertrauen in die CA-Wurzel, sodass eine
+Zertifikatsrotation die Kette nicht bricht.
+
+Die Verfuegbarkeitskontrollen sind bewusst nur graduell: das
+Proof-of-Work-Gatter (\cite{back2002hashcash}) verteuert Fluten, und das
+Ratenlimit je Konto verhindert, dass ein einzelnes Konto die Ausgabe
+erschoepft; einen \emph{finanzierten} Angreifer, der echte Kosten traegt,
+schrecken beide nicht ab. Dies ist die ehrlich benannte offene Flanke. Auch die
+Integritaet der Abrechnung ist an ein Geheimnis gebunden: ohne konfiguriertes
+Webhook-Secret wird jede Gutschrift abgelehnt (fail-safe), mit falschem Secret
+schlaegt die HMAC-Verifikation fehl.
+
+Insgesamt sind Vertraulichkeit, Authentifizierung und Abrechnungsintegritaet
+kryptografisch verankert und ohne Zusatzannahmen ueber den Betreiber wirksam,
+waehrend Verfuegbarkeit gegen finanzierte Gegner und der Schutz von Metadaten
+bewusst ausserhalb des Anspruchs liegen (vgl.\ das Bedrohungsmodell).

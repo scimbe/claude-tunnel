@@ -493,7 +493,15 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
     HAW-Stil (ASCII-Umlaute, `\cite` nur auf existierende Bib-Keys perrin2018noise/
     rfc9001/rfc8446/back2002hashcash, interne `\ref`). Texlive-Build im Container:
     **PDF_OK, 0 undefined refs/citations, 0 errors, 53→56 S.**
-  - **M17.15+** ⏳ Evaluation (mehr Analyse), Related Work weiter vertiefen bis ~64 S.
+  - **M17.15** ✅ Evaluation um eine analytische Sicherheitsbewertung ergänzt
+    (`evaluation.tex`, neuer Abschnitt `sec:eval-security`): qualitative Bewertung der
+    Produktivierungs-Kontrollen gegen ein Angreifermodell — Booktabs-Tabelle
+    Angreifer×Kontrolle×Restrisiko + Prosa (strukturelle E2E-Invariante, graduelle
+    Verfügbarkeit, an Secret gebundene Abrechnungsintegrität, ehrliche offene Flanke
+    finanzierter Sybil). Verweist auf `ch:produktivierung`, zitiert perrin2018noise/
+    back2002hashcash. Build: PDF_OK, 0 undefined refs/errors, 56→57 S.
+  - **M17.16+** ⏳ Related Work weiter vertiefen (Oblivious HTTP rfc9458, CONNECT-UDP
+    rfc9298) Richtung ~64 S.
 
 ---
 
