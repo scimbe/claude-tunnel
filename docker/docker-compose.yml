@@ -24,7 +24,7 @@ services:
     command: ["ct-edge"]
     environment:
       CT_EDGE_LISTEN: "0.0.0.0:4433"
-      CT_EDGE_POW_DIFFICULTY: "8"
+      CT_EDGE_POW_DIFFICULTY: "${EDGE_POW_DIFFICULTY:-8}"
       CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
       CT_NETEM_DELAY: "${EDGE_DELAY:-}"
       CT_NETEM_LOSS: "${EDGE_LOSS:-}"

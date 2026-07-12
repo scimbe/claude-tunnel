@@ -400,9 +400,12 @@ Decomposed:
 - **M16.1** ✅ statistically-robust `Summary` — added sample `stddev_ms`,
   `ci95_ms` (95% CI for the mean), and `p99_ms` to `bench::summarize`/`csv_row`
   (appended CSV columns, backward-compatible). Unit-tested.
-- **M16.2** extend `scripts/sweep.sh`: mode matrix (one-shot vs stream vs UDP)
-  and a PoW-difficulty axis; higher iteration count; output to
-  `docs/thesis/data/`.
+- **M16.2** ✅ extend `scripts/sweep.sh`: PoW-difficulty axis (`SWEEP_POWS` →
+  `EDGE_POW_DIFFICULTY`, plumbed through `docker-compose.yml`), the 12-column
+  M16 stats CSV with a prepended `pow` column, higher default n (30). Validated
+  (`bash -n`, `docker compose config`).
+- **M16.2b** mode axis: add stream/UDP bench variants in `bench.rs` + client
+  main, so `SWEEP_MODES` (one-shot/stream/UDP) is measurable.
 - **M16.3** run the matrix under netem → CSV (live compose).
 - **M16.4** extend `plot.py`/`tabulate.py` for the new stats/modes; write the
   analysis under `docs/thesis/data/`.
