@@ -655,7 +655,12 @@ hosted, hinter einem Storage-Trait).
     `AuthedState` bekommt `Arc<Mutex<KeyedRateLimiter<String>>>`; `POST /me/issue` prüft je
     authentifiziertem Subject ein Fixed-Window-Limit (60s) **vor** dem Ledger-Zugriff → 429
     ohne Credit-Verbrauch. 2 Frozen-Tests (keyed limiter/String, HTTP 3.→429). Gate 195 (+2).
-  - **M23.2** ⏳ Dependency-Audit (`cargo audit`/Advisory-Scan im Container) + Pinning-Notiz.
+  - **M23.2** ✅ Dependency-Audit: `scripts/security-audit.sh` (reproduzierbarer
+    `cargo audit` gegen `Cargo.lock` im Hermetic-Container, cargo-audit in
+    persistenten Cache installiert, RustSec-Advisory-DB) + `docs/security/dependency-audit.md`
+    (Ergebnis + Pinning-Policy). Realer Scan: cargo-audit 0.22.2, 1160 Advisories,
+    **206 Deps, 0 Vulnerabilities, 0 Warnings, RC=0**. Verifikation: `sh -n` grün,
+    Skript installiert+ruft cargo-audit, Report=0 Vulns, keine Advisories im Output.
   - **M23.3** ⏳ Secrets-Management-Review + Threat-Model-Update (Doku, produktiv).
   - **M23.4** ⏳ „TLS überall"-Review: Control-Plane-HTTP hinter TLS-Ingress dokumentieren/erzwingen.
 
