@@ -723,7 +723,18 @@ hosted, hinter einem Storage-Trait).
     Secret-Guard) je mit Code-Verweis + „out of scope"-Abschnitt. Drift-Check: zitierte
     Primitive (Noise-Suite/RS256/HMAC-SHA256/CA/429) im Code, 5 verlinkte Docs existieren,
     keine Anonymitäts-Behauptung → WHITEPAPER_DRIFT_OK.
-  - **M25.3** ⏳ Betriebs-Runbook (Deploy, Secret-Rotation, Monitoring, Incident-Response).
+  - **M25.3** ✅ Betriebs-Runbook (`docs/ops/runbook.md`): Deploy (self-host compose /
+    hosted kustomize), Config-Tabelle (Env-Vars je Komponente), Monitoring
+    (`/healthz`/`/readyz`/`/metrics` + Alert-Regeln), Routine (Cert-/Secret-Rotation,
+    Backup, Audit), Incident-Response-Tabelle, „Known limitations". Drift-Check: alle
+    zitierten Env-Vars/Endpoints/Artefakte/Skripte existieren → RUNBOOK_DRIFT_OK.
+
+## Milestone 26 — Wiring-Lücken (bei M25.3-Runbook entdeckt)
+- **M26.1** ⏳ OIDC-Authed-Endpoints in Produktion mounten: `authed_billing_router`
+  (`/me/*`, OIDC-Bearer-Verifikation, M19.3) ist implementiert+getestet, aber **nicht**
+  in `persistent_control_plane_router` gemerged; `CT_OIDC_ISSUER` wird von keinem Binary
+  gelesen. Packet: `OidcVerifier::from_rsa_pem` aus `CT_OIDC_ISSUER`+Realm-Pubkey bauen,
+  `authed_billing_router` in den Unified-Router mergen, E2E-Test durch den Prod-Router.
 
 **Definition of done (Produkt):** durabler Zustand, echte Identität/Auth, echte PKI,
 reproduzierbares Deployment (hosted + self-host), Ein-Kommando-Onboarding,
