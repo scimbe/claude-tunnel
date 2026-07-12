@@ -13,8 +13,11 @@ use rustls::pki_types::CertificateDer;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// CSV header for a sweep result file.
-pub const CSV_HEADER: &str = "delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms";
+/// CSV header for a sweep result file. The M16 statistical columns
+/// (`stddev_ms`, `ci95_ms`, `p99_ms`) are appended after the original M6 columns
+/// so existing readers that index the first nine columns keep working.
+pub const CSV_HEADER: &str =
+    "delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms";
 
 /// Summary statistics over a set of latency samples (milliseconds).
 #[derive(Debug, Clone, PartialEq)]
@@ -25,16 +28,41 @@ pub struct Summary {
     pub max_ms: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
+    /// Sample standard deviation (n−1 denominator); 0 for n < 2.
+    pub stddev_ms: f64,
+    /// Half-width of the 95% confidence interval for the mean
+    /// (1.96·stddev/√n); 0 for n < 2.
+    pub ci95_ms: f64,
+    /// 99th percentile (nearest-rank) — the tail the study reports.
+    pub p99_ms: f64,
 }
 
 /// Summarize latency `samples` (ms). Returns `None` for an empty set. Percentiles
-/// use nearest-rank on the sorted samples.
+/// use nearest-rank on the sorted samples; the spread is reported as the sample
+/// standard deviation and a 95% confidence interval for the mean (M16 — results
+/// must be statistically defensible, not single-point).
 pub fn summarize(samples: &[f64]) -> Option<Summary> {
     if samples.is_empty() {
         return None;
     }
     let n = samples.len();
     let mean_ms = samples.iter().sum::<f64>() / n as f64;
+
+    // Sample variance (n−1); undefined for a single sample → treat spread as 0.
+    let (stddev_ms, ci95_ms) = if n >= 2 {
+        let variance = samples
+            .iter()
+            .map(|x| {
+                let d = x - mean_ms;
+                d * d
+            })
+            .sum::<f64>()
+            / (n as f64 - 1.0);
+        let stddev = variance.sqrt();
+        (stddev, 1.96 * stddev / (n as f64).sqrt())
+    } else {
+        (0.0, 0.0)
+    };
 
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -51,6 +79,9 @@ pub fn summarize(samples: &[f64]) -> Option<Summary> {
         max_ms: sorted[n - 1],
         p50_ms: percentile(50.0),
         p95_ms: percentile(95.0),
+        stddev_ms,
+        ci95_ms,
+        p99_ms: percentile(99.0),
     })
 }
 
@@ -94,11 +125,23 @@ pub async fn run_bench(
     samples
 }
 
-/// Format a CSV row for a netem condition and its latency [`Summary`].
+/// Format a CSV row for a netem condition and its latency [`Summary`]. Column
+/// order matches [`CSV_HEADER`]: the M16 stats are appended after `p95_ms`.
 pub fn csv_row(delay: &str, loss: &str, rate: &str, s: &Summary) -> String {
     format!(
-        "{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
-        delay, loss, rate, s.n, s.mean_ms, s.min_ms, s.max_ms, s.p50_ms, s.p95_ms
+        "{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        delay,
+        loss,
+        rate,
+        s.n,
+        s.mean_ms,
+        s.min_ms,
+        s.max_ms,
+        s.p50_ms,
+        s.p95_ms,
+        s.stddev_ms,
+        s.ci95_ms,
+        s.p99_ms
     )
 }
 
@@ -115,6 +158,20 @@ mod tests {
         assert_eq!(s.max_ms, 50.0);
         assert_eq!(s.p50_ms, 30.0);
         assert_eq!(s.p95_ms, 50.0);
+        assert_eq!(s.p99_ms, 50.0);
+        // Sample stddev = sqrt(1000/4) = sqrt(250) ≈ 15.811; CI95 = 1.96·σ/√5.
+        assert!((s.stddev_ms - 250.0_f64.sqrt()).abs() < 1e-9, "sample stddev");
+        assert!((s.ci95_ms - 1.96 * 250.0_f64.sqrt() / 5.0_f64.sqrt()).abs() < 1e-9, "95% CI");
+    }
+
+    #[test]
+    fn single_sample_has_zero_spread() {
+        let s = summarize(&[42.0]).unwrap();
+        assert_eq!(s.n, 1);
+        assert_eq!(s.mean_ms, 42.0);
+        assert_eq!(s.p99_ms, 42.0);
+        assert_eq!(s.stddev_ms, 0.0, "no spread from one sample");
+        assert_eq!(s.ci95_ms, 0.0, "no CI from one sample");
     }
 
     #[test]
@@ -139,10 +196,13 @@ mod tests {
             max_ms: 50.0,
             p50_ms: 30.0,
             p95_ms: 50.0,
+            stddev_ms: 1.5,
+            ci95_ms: 2.5,
+            p99_ms: 50.0,
         };
         assert_eq!(
             csv_row("30ms", "1%", "10mbit", &s),
-            "30ms,1%,10mbit,5,30.000,10.000,50.000,30.000,50.000"
+            "30ms,1%,10mbit,5,30.000,10.000,50.000,30.000,50.000,1.500,2.500,50.000"
         );
     }
 

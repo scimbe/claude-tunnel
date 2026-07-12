@@ -396,6 +396,17 @@ the product end to end under netem. Then refresh the thesis to match.
 - Reproduzierbar via `scripts/sweep.sh` (erweitert) → CSV + Plots + Tabellen unter
   `docs/thesis/data/`, mit Beschreibung von Aufbau, Störgrößen und Methodik.
 
+Decomposed:
+- **M16.1** ✅ statistically-robust `Summary` — added sample `stddev_ms`,
+  `ci95_ms` (95% CI for the mean), and `p99_ms` to `bench::summarize`/`csv_row`
+  (appended CSV columns, backward-compatible). Unit-tested.
+- **M16.2** extend `scripts/sweep.sh`: mode matrix (one-shot vs stream vs UDP)
+  and a PoW-difficulty axis; higher iteration count; output to
+  `docs/thesis/data/`.
+- **M16.3** run the matrix under netem → CSV (live compose).
+- **M16.4** extend `plot.py`/`tabulate.py` for the new stats/modes; write the
+  analysis under `docs/thesis/data/`.
+
 ## Milestone 17 — Tiefe BA-Thesis (ersetzt M7, HAW-Vorlage, ~64 S.)
 - Aufsetzen auf `docs/thesis/haw-template/` (Coverpage, Konfiguration, Glossar,
   BibLaTeX), texlive-in-Docker-Build.
