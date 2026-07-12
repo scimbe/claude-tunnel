@@ -455,7 +455,9 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
 - **M17.3** ✅ Grundlagen (Providerblindheit/ZK-Prinzip, QUIC+TLS1.3, Noise_IK
   mit Origin-Pinning, PoW/Hashcash, NAT-Traversal/ICE) — 5 zitierte Abschnitte,
   +3 S. `csquotes` für `\enquote` ergänzt. Baut sauber (24 S.).
-- **M17.4** Related Work.
+- **M17.4** ✅ Verwandte Arbeiten (VPN/WireGuard, Tor, Oblivious HTTP, MASQUE,
+  Zensurumgehung [Domain Fronting/Decoy Routing]; Einordnung: die Kombination ist
+  neu). 6 neue Referenzen, +4 S., baut sauber (28 S.).
 - **M17.5** Anforderungen & Bedrohungsmodell.
 - **M17.6** Architektur (aus ADRs).
 - **M17.7** Implementierung (alle Crates, inkl. Streaming/UDP/P2P/Payment).

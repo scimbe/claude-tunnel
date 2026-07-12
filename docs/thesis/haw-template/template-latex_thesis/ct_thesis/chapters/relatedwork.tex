@@ -1,0 +1,91 @@
+% Related Work — claude-tunnel bachelor thesis.
+\chapter{Verwandte Arbeiten}
+\label{ch:relatedwork}
+
+Der Entwurf beruehrt drei Forschungsstraenge: verschluesselte Tunnel und
+Anonymitaetsnetze, providerblinde Vermittlung sowie Zensurumgehung. Dieses
+Kapitel ordnet die vorliegende Arbeit in jeden dieser Straenge ein und arbeitet
+heraus, worin die Kombination neu ist.
+
+\section{Verschluesselte Tunnel und VPNs}
+\label{sec:rw-vpn}
+
+Klassische \gls{ac:vpn}-Loesungen bauen einen verschluesselten Tunnel zwischen
+Client und einem Konzentrator auf. WireGuard~\cite{donenfeld2017wireguard} ist
+hierfuer ein modernes, schlankes Beispiel: es nutzt -- wie die vorliegende
+Arbeit -- Bausteine aus dem Noise-Umfeld (Curve25519, ChaCha20-Poly1305,
+BLAKE2s) und erreicht einen kompakten, gut analysierbaren Handshake. Der
+entscheidende Unterschied liegt im Vertrauensmodell: der VPN-Server ist der
+Endpunkt des Tunnels und sieht damit die Ziele des Clients im Klartext. Die
+Vertraulichkeit gegenueber dem Betreiber ist keine strukturelle Eigenschaft,
+sondern beruht auf dessen Wohlverhalten. Die vorliegende Arbeit uebernimmt die
+kryptographische Substanz, verschiebt den Terminierungspunkt der
+Nutzlast-Verschluesselung aber vom Vermittler zum Origin.
+
+\section{Anonymitaetsnetze}
+\label{sec:rw-tor}
+
+Tor~\cite{dingledine2004tor} entkoppelt Absender und Ziel ueber eine Kette von
+mindestens drei Relays, von denen keines beide Enden zugleich kennt. Das
+Schutzziel ist primaer die \emph{Unverkettbarkeit} von Nutzer und Ziel gegenueber
+einzelnen Relays, erkauft durch mehrere Zwischensprunge und entsprechende
+Latenz. Die vorliegende Arbeit verfolgt ein engeres, aber schaerferes Ziel: die
+strukturelle Blindheit eines \emph{einzelnen} Vermittlers gegenueber
+\emph{Inhalt und Ziel}, ergaenzt um einen direkten Pfad, der diesen Vermittler
+bei Erreichbarkeit ganz umgeht. Anonymitaet im Tor'schen Sinne ist ausdruecklich
+kein Ziel; wohl aber die Nicht-Einsehbarkeit durch den Betreiber.
+
+\section{Providerblinde Vermittlung}
+\label{sec:rw-ohttp}
+
+Am naechsten steht die Arbeit dem Prinzip von Oblivious
+HTTP~\cite{rfc9458}: dort trennt ein Relay das \emph{Wer} vom \emph{Was}, indem
+es Anfragen an ein Gateway weiterreicht, ohne deren Inhalt zu sehen, waehrend das
+Gateway den Absender nicht kennt. Oblivious HTTP ist jedoch auf einzelne,
+kapselbare Anfrage-Antwort-Paare zugeschnitten und setzt ein kooperierendes
+Gateway voraus. Die vorliegende Arbeit uebertraegt den Grundgedanken -- der
+Vermittler sieht nur Chiffretext -- auf einen \emph{allgemeinen, bidirektionalen
+Tunnel} beliebiger \gls{ac:tcp}- und \gls{ac:udp}-Protokolle, mit
+Origin-Pinning statt Gateway und mit einem Proof-of-Work-Rendezvous als
+Missbrauchsschranke.
+
+\section{Proxying ueber HTTP und QUIC}
+\label{sec:rw-masque}
+
+MASQUE (\enquote{Proxying UDP in HTTP})~\cite{rfc9298} tunnelt \gls{ac:udp}
+ueber HTTP/3 und damit ueber \gls{ac:quic}. Technisch aehnelt das dem hier
+genutzten Transport, das Vertrauensmodell unterscheidet sich jedoch erneut: der
+MASQUE-Proxy kennt das Ziel (Adresse und Port), weil er selbst die
+UDP-Assoziation aufbaut. Er ist ein transparenter Weiterleiter, kein blinder
+Relay. Der Fallback der vorliegenden Arbeit (\gls{ac:tls}-ueber-\gls{ac:tcp})
+verfolgt ein verwandtes Ziel wie MASQUE -- Betrieb, wenn \gls{ac:udp} blockiert
+ist --, transportiert dabei aber weiterhin nur den bereits Ende-zu-Ende
+verschluesselten Tunnel.
+
+\section{Zensurumgehung}
+\label{sec:rw-censorship}
+
+Zur Umgehung aktiver Netzsperren existiert ein breites Feld. Domain
+Fronting~\cite{fifield2015domain} verbirgt das wahre Ziel hinter dem Namen eines
+grossen, schwer blockierbaren Dienstes; Decoy Routing bzw.\ Refraction
+Networking~\cite{wustrow2011telex} verlagert die Umlenkung in die
+Netzinfrastruktur selbst. Diese Ansaetze zielen primaer auf die
+\emph{Unauffaelligkeit} des Datenstroms (Verschleierung gegen einen
+beobachtenden Zensor). Die vorliegende Arbeit setzt komplementaer an: nicht
+Verschleierung, sondern strukturelle Blindheit des Vermittlers plus ein
+Transport-Fallback, der die haeufigste grobe Sperre -- das Blockieren von
+\gls{ac:udp} -- ueberbrueckt. Traffic-Analyse-Resistenz gegen einen aktiven
+Beobachter ist kein Ziel und wird in Kapitel~\ref{ch:relatedwork} als offene
+Grenze benannt.
+
+\section{Einordnung}
+\label{sec:rw-einordnung}
+
+Die genannten Systeme decken jeweils einen Teil der Anforderungen ab:
+WireGuard die kryptographische Substanz, Oblivious HTTP die Blindheit, MASQUE den
+QUIC-Transport, Tor die Entkopplung, die Zensurumgehungs-Systeme die
+Sperrresistenz. Der Beitrag der vorliegenden Arbeit ist die \emph{Kombination}
+dieser Eigenschaften in einem einzigen, lauffaehigen System: ein providerblinder,
+allgemein einsetzbarer Tunnel mit Ende-zu-Ende-Pinning, Proof-of-Work-Rendezvous,
+direktem Peer-to-Peer-Pfad und Transport-Fallback -- inklusive empirischer
+Vermessung des dadurch entstehenden Latenz-Overheads.
