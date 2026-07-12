@@ -46,15 +46,25 @@ asymmetrische Proof-of-Work-Aufwand (S4). Nicht adressiert bleiben -- wie im
 Bedrohungsmodell festgelegt -- Traffic-Analyse gegen A2 sowie die Oekonomie des
 finanzierten Sybil-Angreifers (A4).
 
+Ueber das Testbett hinaus erweitert die Produktivierung
+(Kapitel~\ref{ch:produktivierung}) die Schutzziele um Identitaet und
+Abrechnung: eine konventionelle OIDC-Authentifizierung bindet jede Aktion an
+ein verifiziertes Subjekt, die Abrechnungsintegritaet haengt an einer
+signierten Provider-Bestaetigung (der Kontrollknoten kann nicht selbst
+gutschreiben), und ein Ratenlimit je Konto begrenzt die Token-Ausgabe. Die
+strukturelle Blindheit des Betreibers bleibt davon unberuehrt -- die
+zusaetzlichen Kontrollen betreffen Identitaet und Abrechnung, nicht den Zugriff
+auf die Nutzlast.
+
 \section{Offene Risiken und Grenzen}
 \label{sec:disk-risiken}
 
 \begin{description}
-  \item[Finanzierter Sybil-Angriff (A4).] Pseudonyme, prepaid-gedeckte Konten
-    verteuern Missbrauch, loesen die Sybil-Oekonomie aber nicht: wer zahlt, kann
-    beliebig viele Tokens erwerben. Eine Abwehr muesste die Kosten pro
-    schaedlicher Aktion ueber den Token-Preis hinaus anheben oder Reputation
-    einfuehren -- beides im Spannungsfeld zur Pseudonymitaet.
+  \item[Finanzierter Sybil-Angriff (A4).] Die in der Produktivierung
+    eingefuehrten konventionellen Konten verteuern Missbrauch, loesen die
+    Sybil-Oekonomie aber nicht: wer zahlt, kann beliebig viele Tokens erwerben.
+    Eine Abwehr muesste die Kosten pro schaedlicher Aktion ueber den Token-Preis
+    hinaus anheben oder eine kontogebundene Reputation einfuehren.
   \item[Traffic-Analyse.] Groessen- und Timing-Seitenkanaele bleiben fuer einen
     beobachtenden Vermittler oder Netz-Angreifer sichtbar. Verschleierung (etwa
     Padding, konstante Raten) waere eine orthogonale Erweiterung mit eigenem

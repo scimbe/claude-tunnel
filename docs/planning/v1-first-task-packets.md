@@ -514,7 +514,14 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
     obwohl die Produktivierung sie gerade aufgab → auf „konventionelle Konten schrecken
     den finanzierten A4 dennoch nicht ab" umformuliert. `\gls{ac:oidc/pki}` vermieden
     (nicht definiert) → Klartext. Build: PDF_OK, 0 undefined refs/errors, 57 S.
-  - **M17.18+** ⏳ optional weiter Richtung ~64 S.
+  - **M17.18** ✅ Diskussion mit der Produktivierung konsistent gemacht (parallel zu
+    M17.17): (1) neuer Absatz in „Schutzziele" — OIDC-Auth/signaturgesicherte Abrechnung/
+    Per-Konto-Rate-Limit erweitern die Schutzziele, Betreiber-Blindheit bleibt; (2) **gleicher
+    Pseudonymitäts-Widerspruch behoben** im A4-Risiko-Punkt (»pseudonyme Konten … im
+    Spannungsfeld zur Pseudonymität« → »konventionelle Konten«). Build: PDF_OK, 0 undefined
+    refs/errors, 57 S. **Thesis nun durchgängig konsistent mit dem produktivierten System.**
+  - **M17.19+** ⏳ optional (Thesis inhaltlich vollständig & konsistent; weitere Ausbauten
+    nur bei Bedarf).
 
 ---
 
