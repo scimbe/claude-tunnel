@@ -1,0 +1,81 @@
+# Install & use
+
+Easy-going setup. Everything runs in containers, so the only hard requirement is
+**Docker** (plus `git`). No Rust toolchain needs to be installed on the host.
+
+## 1. Get the code
+
+```bash
+git clone https://github.com/scimbe/claude-tunnel.git
+cd claude-tunnel
+```
+
+## 2. Build & test (hermetic — no host toolchain)
+
+```bash
+docker run --rm -v "$PWD":/work -w /work rust:1-slim \
+  sh -c 'cargo build --workspace && cargo test --workspace'
+```
+
+That builds all five crates and runs the full test suite in a throwaway
+container.
+
+## 3. Run it
+
+### Self-host (Docker Compose) — one file, durable state
+
+```bash
+cp docker/deploy/.env.example docker/deploy/.env   # edit ports / OIDC issuer / webhook secret
+docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.env up --build -d
+```
+
+The control plane persists to a named volume and restarts on failure; the edge
+comes up once the control plane is healthy.
+
+### Hosted (Kubernetes)
+
+```bash
+kubectl kustomize docker/deploy/k8s     # review the rendered manifests
+kubectl apply -k docker/deploy/k8s      # namespace ct-system: control plane + edge + TLS ingress
+```
+
+## 4. Onboard an agent (one command)
+
+With a control-plane URL and a single-use join token:
+
+```bash
+CT_AGENT_CP_URL="$CP_URL" \
+CT_AGENT_JOIN_TOKEN="<token>" \
+CT_AGENT_ID="agent-1" \
+CT_AGENT_EDGE="edge.example.com:4433" \
+CT_AGENT_ORIGIN="127.0.0.1:8080" \
+  ct-agent onboard
+```
+
+Full walkthrough: [onboarding quickstart](onboarding/quickstart.md).
+
+## Helper scripts
+
+| Script | What it does |
+|--------|--------------|
+| `scripts/security-audit.sh` | `cargo audit` against the pinned `Cargo.lock` in a container |
+| `scripts/check-no-secrets.sh` | guard that no credential material is committed |
+| `scripts/sweep.sh` | run the latency benchmark matrix (edge netem × modes) |
+| `scripts/plot.sh`, `scripts/tabulate.py` | turn benchmark output into figures / tables |
+| `scripts/thesis-haw-build.sh` | build the thesis PDF in a TeX Live container |
+| `scripts/claude-resume.sh` | development session helper |
+
+## Configuration reference
+
+Environment variables, monitoring endpoints, rotation and incident procedures are
+in the [operations runbook](ops/runbook.md).
+
+## Troubleshooting
+
+- **`/readyz` returns 503** — the control plane can't reach its database; check the
+  data volume mount.
+- **Webhooks return 401** — `CT_PAYMENT_WEBHOOK_SECRET` doesn't match the provider.
+- **`/me/*` returns 404** — OIDC isn't configured; set `CT_OIDC_ISSUER` and
+  `CT_OIDC_PUBKEY_PATH`.
+
+More in the runbook's incident-response table.

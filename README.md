@@ -32,13 +32,30 @@ A Rust Cargo workspace of five crates, each depending only on `ct-common`:
 
 ## Documentation
 
-- [Product positioning](docs/product/positioning.md) — what it is, honest selling points
-- [Security whitepaper](docs/security/whitepaper.md) — the security posture in one page
-- [Onboarding quickstart](docs/onboarding/quickstart.md) — bring an agent online
-- [Payment integration](docs/payment/integration.md) — the signed-webhook flow
-- [Operations runbook](docs/ops/runbook.md) — deploy, monitor, respond
-- [Threat model](docs/security/threat-model.md) · [TLS everywhere](docs/security/tls-everywhere.md) · [Dependency audit](docs/security/dependency-audit.md)
-- `docs/thesis/` — the accompanying bachelor thesis (German, HAW template)
+Four entry points, depending on what you need:
+
+**1. The source base** — how the code is organized
+[**→ Codebase overview**](docs/architecture.md): the five crates, the data path,
+the control path, and where each piece lives.
+
+**2. Using it** — easy install notes and scripts
+[**→ Install & use**](docs/install.md): clone, hermetic build/test, self-host or
+Kubernetes deploy, one-command agent onboarding, and the helper scripts. Plus the
+[onboarding quickstart](docs/onboarding/quickstart.md) and the
+[operations runbook](docs/ops/runbook.md).
+
+**3. Deep detail** — the reasoning and specification
+The 18 [Architecture Decision Records](docs/adr/), the [specification](docs/SPEC.md),
+and the security set: [whitepaper](docs/security/whitepaper.md) ·
+[threat model](docs/security/threat-model.md) ·
+[TLS everywhere](docs/security/tls-everywhere.md) ·
+[dependency audit](docs/security/dependency-audit.md) ·
+[payment integration](docs/payment/integration.md) ·
+[product positioning](docs/product/positioning.md).
+
+**4. The bachelor thesis (draft)** — the academic write-up
+[**→ thesis PDF**](docs/thesis/thesis.pdf) (German, HAW template); LaTeX sources
+under [`docs/thesis/`](docs/thesis/).
 
 ## Build & test
 
