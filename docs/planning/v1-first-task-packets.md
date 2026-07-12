@@ -717,7 +717,12 @@ hosted, hinter einem Storage-Trait).
     Payment) + ehrlicher „What we don't claim"-Abschnitt (keine Anonymität/Metadaten-Blindheit/
     Zensur-Immunität). Drift-Check: 9 Proof-Artefakte + 4 verlinkte Docs existieren, **keine**
     positive Anonymitäts-Behauptung, Disclaimer vorhanden → POSITIONING_DRIFT_OK.
-  - **M25.2** ⏳ Security-Whitepaper (kundenseitig: E2E/PKI/Auth/Rate-Limits/Payment konsolidiert).
+  - **M25.2** ✅ Security-Whitepaper (`docs/security/whitepaper.md`): kundenseitige
+    Konsolidierung — Summary + 7 Abschnitte (E2E-Noise-Suite, TLS-überall, OIDC-RS256-Auth,
+    interne CA, PoW+Rate-Limit, provider-signiertes Payment mit HMAC-SHA256, Dependency-Audit+
+    Secret-Guard) je mit Code-Verweis + „out of scope"-Abschnitt. Drift-Check: zitierte
+    Primitive (Noise-Suite/RS256/HMAC-SHA256/CA/429) im Code, 5 verlinkte Docs existieren,
+    keine Anonymitäts-Behauptung → WHITEPAPER_DRIFT_OK.
   - **M25.3** ⏳ Betriebs-Runbook (Deploy, Secret-Rotation, Monitoring, Incident-Response).
 
 **Definition of done (Produkt):** durabler Zustand, echte Identität/Auth, echte PKI,
