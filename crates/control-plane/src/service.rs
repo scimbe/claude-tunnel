@@ -3,7 +3,8 @@
 //! restart preserves enrollment / registry / billing. This module grows one
 //! router per store; M18.4a wires enrollment.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::header::AUTHORIZATION;
@@ -20,6 +21,7 @@ use crate::registry::TunnelInfo;
 use crate::storage::{
     LedgerOpError, PaymentOpError, RedeemError, SqliteEnrollment, SqliteLedger, SqliteRegistry,
 };
+use ct_common::ratelimit::KeyedRateLimiter;
 use ct_common::{AgentId, RoutingToken, TenantId};
 
 /// Build the persistent enrollment router: `POST /enroll/issue`,
@@ -250,12 +252,18 @@ async fn buy_token(
     }))
 }
 
-/// Shared state for the authenticated billing endpoints: the durable ledger and
-/// the OIDC verifier.
+/// Fixed window (seconds) for the per-subject issuance rate limit (M23.1).
+const ISSUE_WINDOW_SECS: u64 = 60;
+
+/// Shared state for the authenticated billing endpoints: the durable ledger, the
+/// OIDC verifier, and a per-subject issuance rate limiter (M23.1).
 #[derive(Clone)]
 pub struct AuthedState {
     ledger: Arc<SqliteLedger>,
     verifier: Arc<OidcVerifier>,
+    /// Caps `/me/issue` requests per authenticated subject per fixed window, so
+    /// a single account cannot exhaust the control plane with issuance calls.
+    issue_limiter: Arc<Mutex<KeyedRateLimiter<String>>>,
 }
 
 /// Build the **authenticated** billing router (M19.3): the account is derived
@@ -264,12 +272,21 @@ pub struct AuthedState {
 /// on their own account.
 ///
 /// * `GET /me/account` → `{account}` for the authenticated subject
-/// * `POST /me/issue` `{price}` → `{token}` (402 on insufficient credit)
-pub fn authed_billing_router(ledger: Arc<SqliteLedger>, verifier: Arc<OidcVerifier>) -> Router {
+/// * `POST /me/issue` `{price}` → `{token}` (402 on insufficient credit, 429 over
+///   the per-subject rate limit of `max_issues_per_window` per fixed window)
+pub fn authed_billing_router(
+    ledger: Arc<SqliteLedger>,
+    verifier: Arc<OidcVerifier>,
+    max_issues_per_window: u32,
+) -> Router {
     Router::new()
         .route("/me/account", get(me_account))
         .route("/me/issue", post(me_issue))
-        .with_state(AuthedState { ledger, verifier })
+        .with_state(AuthedState {
+            ledger,
+            verifier,
+            issue_limiter: Arc::new(Mutex::new(KeyedRateLimiter::new(max_issues_per_window))),
+        })
 }
 
 /// Extract + verify the bearer token, returning the authenticated subject.
@@ -310,6 +327,18 @@ async fn me_issue(
     Json(req): Json<MeIssueReq>,
 ) -> Result<Json<TokenResp>, (StatusCode, String)> {
     let sub = authed_subject(&state, &headers)?;
+    // Per-subject rate limit (M23.1): reject over-limit callers before touching
+    // the ledger, so a throttled request spends no credit.
+    let window = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / ISSUE_WINDOW_SECS)
+        .unwrap_or(0);
+    if !state.issue_limiter.lock().unwrap().allow(&sub, window) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "issue rate limit exceeded".to_string(),
+        ));
+    }
     let account = state
         .ledger
         .account_for_subject(&sub)
@@ -569,7 +598,7 @@ mod tests {
         let account = ledger.account_for_subject("user-1").unwrap();
         ledger.credit(&account, 5).unwrap();
 
-        let app = authed_billing_router(ledger.clone(), verifier);
+        let app = authed_billing_router(ledger.clone(), verifier, 100);
 
         // No token -> 401.
         let resp = app
@@ -612,6 +641,54 @@ mod tests {
             ledger.balance(&account).unwrap(),
             4,
             "the subject's account was debited"
+        );
+    }
+
+    #[tokio::test]
+    async fn authed_issue_is_rate_limited_per_subject() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+
+        // Cap issuance at 2 per window for each subject.
+        let app = authed_billing_router(ledger, verifier, 2);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({ "sub": "user-1", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        // price 0 so issuance never fails on credit — isolates the rate limit.
+        let issue = || {
+            app.clone().oneshot(
+                Request::post("/me/issue")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"price":0}"#))
+                    .unwrap(),
+            )
+        };
+
+        // All three requests land in the same wall-clock window.
+        assert_eq!(issue().await.unwrap().status(), StatusCode::OK, "1st allowed");
+        assert_eq!(issue().await.unwrap().status(), StatusCode::OK, "2nd allowed");
+        assert_eq!(
+            issue().await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "3rd over the per-subject cap is throttled"
         );
     }
 

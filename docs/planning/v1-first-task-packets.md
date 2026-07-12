@@ -649,6 +649,15 @@ hosted, hinter einem Storage-Trait).
 ## Milestone 23 — Security-Hardening & Audit
 - Rate-Limits/Quotas je Account, TLS überall, Secrets-Management, Dependency- +
   Crypto-Usage-Review, Aktualisierung des Bedrohungsmodells für den Produktivbetrieb.
+  Dekomponiert:
+  - **M23.1** ✅ Per-Subject-Rate-Limit auf Token-Ausgabe: `RateLimiter` zu generischem
+    `KeyedRateLimiter<K>` verallgemeinert (Alias `RateLimiter = KeyedRateLimiter<RoutingToken>`),
+    `AuthedState` bekommt `Arc<Mutex<KeyedRateLimiter<String>>>`; `POST /me/issue` prüft je
+    authentifiziertem Subject ein Fixed-Window-Limit (60s) **vor** dem Ledger-Zugriff → 429
+    ohne Credit-Verbrauch. 2 Frozen-Tests (keyed limiter/String, HTTP 3.→429). Gate 195 (+2).
+  - **M23.2** ⏳ Dependency-Audit (`cargo audit`/Advisory-Scan im Container) + Pinning-Notiz.
+  - **M23.3** ⏳ Secrets-Management-Review + Threat-Model-Update (Doku, produktiv).
+  - **M23.4** ⏳ „TLS überall"-Review: Control-Plane-HTTP hinter TLS-Ingress dokumentieren/erzwingen.
 
 ## Milestone 24 — Payment (echt, ersetzt Stub)
 - Zahlungsanbieter-Integration an Accounts + Credit-Ledger gebunden.

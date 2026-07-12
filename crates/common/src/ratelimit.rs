@@ -6,15 +6,18 @@
 
 use crate::RoutingToken;
 use std::collections::HashMap;
+use std::hash::Hash;
 
-/// Fixed-window per-token rate limiter.
-pub struct RateLimiter {
+/// Fixed-window rate limiter keyed by an arbitrary key `K` (a Routing Token, an
+/// account subject, …). Time is caller-supplied (a window index) so this stays
+/// deterministic and wall-clock-free; the caller buckets wall-clock into windows.
+pub struct KeyedRateLimiter<K> {
     max_per_window: u32,
-    /// token -> (current window, count in that window)
-    counters: HashMap<RoutingToken, (u64, u32)>,
+    /// key -> (current window, count in that window)
+    counters: HashMap<K, (u64, u32)>,
 }
 
-impl RateLimiter {
+impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
     pub fn new(max_per_window: u32) -> Self {
         Self {
             max_per_window,
@@ -22,10 +25,10 @@ impl RateLimiter {
         }
     }
 
-    /// Record an attempt for `token` in `window`; returns whether it is allowed
+    /// Record an attempt for `key` in `window`; returns whether it is allowed
     /// (strictly under the per-window limit). A new window resets the count.
-    pub fn allow(&mut self, token: &RoutingToken, window: u64) -> bool {
-        let entry = self.counters.entry(token.clone()).or_insert((window, 0));
+    pub fn allow(&mut self, key: &K, window: u64) -> bool {
+        let entry = self.counters.entry(key.clone()).or_insert((window, 0));
         if entry.0 != window {
             *entry = (window, 0);
         }
@@ -36,6 +39,10 @@ impl RateLimiter {
         true
     }
 }
+
+/// Per-Routing-Token fixed-window limiter (ADR-0018): rendezvous-attempt cap
+/// layered on the PoW gate.
+pub type RateLimiter = KeyedRateLimiter<RoutingToken>;
 
 #[cfg(test)]
 mod tests {
@@ -70,5 +77,19 @@ mod tests {
         assert!(rl.allow(&token(1), 0));
         assert!(rl.allow(&token(2), 0), "a different token has its own budget");
         assert!(!rl.allow(&token(1), 0));
+    }
+
+    #[test]
+    fn keyed_limiter_works_for_string_subjects() {
+        // The generalized limiter caps per arbitrary key (e.g. an account
+        // subject), independently per key, resetting each window.
+        let mut rl: KeyedRateLimiter<String> = KeyedRateLimiter::new(2);
+        let a = "user-a".to_string();
+        let b = "user-b".to_string();
+        assert!(rl.allow(&a, 0));
+        assert!(rl.allow(&a, 0));
+        assert!(!rl.allow(&a, 0), "user-a is capped at 2 per window");
+        assert!(rl.allow(&b, 0), "user-b has an independent budget");
+        assert!(rl.allow(&a, 1), "a new window resets user-a");
     }
 }
