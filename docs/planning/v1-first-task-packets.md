@@ -694,8 +694,12 @@ hosted, hinter einem Storage-Trait).
     im Body (kein Mapping-Schema nötig). Idempotent: `AlreadyConfirmed`→200 (kein
     Doppel-Credit), Unknown→404. 2 Frozen-Tests (forged→401/kein Credit, valid→200/+7,
     replay→200/kein Doppel-Credit; stale→401). Gate 202 (+2).
-  - **M24.3** ⏳ Produktions-Wiring: Webhook in `persistent_control_plane_router` mounten,
-    Webhook-Secret aus Env, client-`/payment/confirm` aus dem Prod-Router entfernen.
+  - **M24.3** ✅ Produktions-Wiring: `persistent_control_plane_router(db, webhook_secret)`
+    mountet den Webhook-Router und baut die Billing-Fläche **ohne** client-`/payment/confirm`
+    (der M18-Stub ist aus dem Prod-Router raus). `main.rs` liest `CT_PAYMENT_WEBHOOK_SECRET`
+    (unset → zufälliges Secret, Webhook inert statt fälschbar). 1 neuer Test
+    (`/payment/confirm`→404 im Prod-Router) + `unified_control_plane_survives_restart`
+    kreditiert jetzt via signiertem Webhook statt Client-Confirm. Gate 203 (+1).
   - **M24.4** ⏳ Payment-Integrations-Doku (Provider-Config, Webhook-Secret, Test-Ablauf).
 
 ## Milestone 25 — Produktdokumentation

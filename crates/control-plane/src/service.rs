@@ -341,6 +341,9 @@ async fn payment_webhook(
     }
 }
 
+/// Accepted age (seconds, either direction) of a payment webhook timestamp (M24.3).
+const WEBHOOK_TOLERANCE_SECS: u64 = 300;
+
 /// Fixed window (seconds) for the per-subject issuance rate limit (M23.1).
 const ISSUE_WINDOW_SECS: u64 = 60;
 
@@ -471,13 +474,30 @@ async fn readyz(State(ledger): State<Arc<SqliteLedger>>) -> StatusCode {
 /// billing + health, all backed by durable SQLite stores opened on **one**
 /// database file (`db_path`). The three stores share the file via separate
 /// connections; each owns its own tables. This is what a real deployment serves.
-pub fn persistent_control_plane_router(db_path: &str) -> rusqlite::Result<Router> {
+pub fn persistent_control_plane_router(
+    db_path: &str,
+    webhook_secret: &[u8],
+) -> rusqlite::Result<Router> {
     let enrollment = Arc::new(SqliteEnrollment::open(db_path)?);
     let registry = Arc::new(SqliteRegistry::open(db_path)?);
     let ledger = Arc::new(SqliteLedger::open(db_path)?);
+    let verifier = Arc::new(WebhookVerifier::new(
+        webhook_secret.to_vec(),
+        WEBHOOK_TOLERANCE_SECS,
+    ));
+    // Production billing surface: accounts, payment intents and credit-gated
+    // issuance, but **no** client-callable `/payment/confirm` — credits flow only
+    // from a signature-verified provider webhook (M24). That defuses the M18 stub
+    // where any caller could top up an account for free.
+    let billing = Router::new()
+        .route("/accounts/open", post(open_account))
+        .route("/payment/intent", post(create_payment_intent))
+        .route("/billing/issue", post(buy_token))
+        .with_state(ledger.clone());
     Ok(enrollment_router_sqlite(enrollment)
         .merge(registry_router_sqlite(registry))
-        .merge(billing_router_sqlite(ledger.clone()))
+        .merge(billing)
+        .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(health_router(ledger)))
 }
 
@@ -622,12 +642,41 @@ mod tests {
     }
 
     /// Serve the full unified persistent control-plane on an ephemeral port.
+    /// The webhook secret the unified-router tests sign their credit events with.
+    const TEST_WEBHOOK_SECRET: &[u8] = b"whsec_unified_test";
+
     async fn spawn_unified(db_path: &str) -> String {
-        let app = persistent_control_plane_router(db_path).unwrap();
+        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    /// Credit an account by posting a signed "payment succeeded" webhook to a
+    /// live unified router — the production top-up path (there is no client
+    /// `/payment/confirm`). Returns the HTTP status.
+    async fn credit_via_webhook(base: &str, payment: &[u8; 32]) -> reqwest::StatusCode {
+        let verifier = WebhookVerifier::new(TEST_WEBHOOK_SECRET.to_vec(), 300);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = format!(
+            r#"{{"payment":"{}","status":"succeeded"}}"#,
+            hex_encode(payment)
+        );
+        let sig = verifier.sign(now, body.as_bytes());
+        reqwest::Client::new()
+            .post(format!("{base}/payment/webhook"))
+            .header("x-ct-webhook-timestamp", now.to_string())
+            .header("x-ct-webhook-signature", sig)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
     }
 
     /// The milestone E2E: the whole control plane (enrollment + registry +
@@ -641,16 +690,19 @@ mod tests {
         let join;
         let account;
         {
-            let cp = ControlPlaneClient::new(spawn_unified(&db).await);
+            let base = spawn_unified(&db).await;
+            let cp = ControlPlaneClient::new(base.clone());
             // enrollment
             join = cp.issue_join_token(&TenantId("tu".to_string())).await.unwrap();
             cp.redeem(&join, &agent, &[5u8; 32]).await.unwrap();
             // registry
             cp.register(&token, &TenantId("tu".to_string()), &agent).await.unwrap();
-            // billing
+            // billing — credit via the signed provider webhook (production path;
+            // there is no client-callable /payment/confirm on the unified router).
             account = cp.open_account().await.unwrap();
             let p = cp.create_payment_intent(&account, 2).await.unwrap();
-            cp.confirm_payment(&p).await.unwrap();
+            let status = credit_via_webhook(&base, &p).await;
+            assert!(status.is_success(), "signed webhook credits the account");
         }
 
         // Restart on the same database file.
@@ -881,12 +933,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_router_has_no_client_payment_confirm() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // The unified production router must not expose the M18 stub endpoint —
+        // credits come only from the signed webhook (proven crediting-side by
+        // unified_control_plane_survives_restart).
+        let app = persistent_control_plane_router(":memory:", b"whsec_prod").unwrap();
+        let resp = app
+            .oneshot(
+                Request::post("/payment/confirm")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"payment":"00"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "client-callable /payment/confirm is removed from production"
+        );
+    }
+
+    #[tokio::test]
     async fn health_and_readiness_endpoints() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:").unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_health").unwrap();
 
         let health = app
             .clone()
