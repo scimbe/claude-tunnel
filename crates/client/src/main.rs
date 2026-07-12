@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ct_client::bench::{csv_row, run_bench, summarize};
+use ct_client::bench::{csv_row, run_bench, run_bench_stream, summarize};
 use ct_client::config::ClientConfig;
 use ct_client::transport::{
     client_tunnel_auto, client_tunnel_noise, client_tunnel_noise_tcp, dial_edge, tcp_tls_connect,
@@ -111,17 +111,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Bench mode: run N round-trips and emit a labeled CSV row.
+    // Bench mode: run N round-trips and emit a labeled CSV row. CT_BENCH_MODE
+    // selects the measured path — "stream" for the full-duplex streaming path,
+    // otherwise the one-shot path (M16.2b).
     if iterations > 1 {
-        let samples = run_bench(
-            edge_addr,
-            edge_cert,
-            &cap,
-            &client_kp.private,
-            payload.as_bytes(),
-            iterations,
-        )
-        .await;
+        let bench_mode = std::env::var("CT_BENCH_MODE").unwrap_or_default();
+        let samples = if bench_mode == "stream" {
+            run_bench_stream(
+                edge_addr,
+                edge_cert,
+                &cap,
+                &client_kp.private,
+                payload.as_bytes(),
+                iterations,
+            )
+            .await
+        } else {
+            run_bench(
+                edge_addr,
+                edge_cert,
+                &cap,
+                &client_kp.private,
+                payload.as_bytes(),
+                iterations,
+            )
+            .await
+        };
         let summary = summarize(&samples).ok_or("bench produced no samples")?;
         let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();
         let loss = std::env::var("CT_BENCH_LOSS").unwrap_or_default();

@@ -76,6 +76,7 @@ services:
       CT_CLIENT_CAPABILITY: "/shared/capability.bin"
       CT_CLIENT_PAYLOAD: "hello-tunnel"
       CT_CLIENT_ITERATIONS: "${CLIENT_ITERATIONS:-1}"
+      CT_BENCH_MODE: "${BENCH_MODE:-}"
       CT_BENCH_DELAY: "${EDGE_DELAY:-}"
       CT_BENCH_LOSS: "${EDGE_LOSS:-}"
       CT_BENCH_RATE: "${EDGE_RATE:-}"

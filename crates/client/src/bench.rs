@@ -7,7 +7,9 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use crate::transport::{client_tunnel_noise, dial_edge};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::transport::{client_tunnel_noise, client_tunnel_stream, dial_edge};
 use ct_common::Capability;
 use rustls::pki_types::CertificateDer;
 
@@ -119,6 +121,68 @@ pub async fn run_bench(
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         if let Ok(ms) = run_once(edge_addr, edge_cert.clone(), cap, client_private, payload).await {
+            samples.push(ms);
+        }
+    }
+    samples
+}
+
+/// One streaming round-trip (M16.2b): dial → `client_tunnel_stream` bridging a
+/// local duplex to the Origin over the Noise session; write `payload`, signal
+/// EOF, read the echo back. Returns the elapsed time in milliseconds. This
+/// measures the full-duplex streaming path (M9) rather than the one-shot path.
+async fn run_once_stream(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<f64, BoxError> {
+    let start = Instant::now();
+    let conn = dial_edge(edge_addr, edge_cert).await?;
+    let (app_local, app_remote) = tokio::io::duplex(64 * 1024);
+
+    let token = cap.token.clone();
+    let cap_c = cap.clone();
+    let client_private = *client_private;
+    let tunnel =
+        tokio::spawn(
+            async move { client_tunnel_stream(&conn, &token, &cap_c, &client_private, app_local).await },
+        );
+
+    // Drive the local app end: send the payload, half-close so the pump sees
+    // EOF, then read the echoed bytes back.
+    let (mut r, mut w) = tokio::io::split(app_remote);
+    w.write_all(payload).await?;
+    w.shutdown().await?;
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).await?;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let _ = tunnel.await;
+    if got == payload {
+        Ok(elapsed)
+    } else {
+        Err("stream bench response mismatch".into())
+    }
+}
+
+/// Run `iterations` streaming round-trips, returning per-iteration latency in
+/// milliseconds. Failed iterations are skipped. The stream analogue of
+/// [`run_bench`] for the mode comparison (M16.2b).
+pub async fn run_bench_stream(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    iterations: usize,
+) -> Vec<f64> {
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        if let Ok(ms) =
+            run_once_stream(edge_addr, edge_cert.clone(), cap, client_private, payload).await
+        {
             samples.push(ms);
         }
     }
@@ -294,6 +358,103 @@ mod tests {
 
         let samples = run_bench(addr, cert, &cap, &client_kp.private, b"ping", 3).await;
         assert_eq!(samples.len(), 3, "three successful Noise round-trips measured");
+        assert!(summarize(&samples).is_some());
+
+        agent_task.abort();
+        edge.abort();
+        origin.abort();
+    }
+
+    #[tokio::test]
+    async fn run_bench_stream_measures_iterations() {
+        // The streaming-mode bench (M16.2b): agent serves the full-duplex
+        // serve_noise_stream path and run_bench_stream measures round-trips.
+        use ct_agent::serve::serve_noise_stream;
+        use ct_common::metrics::TunnelMetrics;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{OriginIdentity, RoutingToken};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let token = RoutingToken([7u8; 32]);
+        let challenge = Challenge {
+            nonce: [0x33; 16],
+            difficulty: 6,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // Multi-accept streaming echo Origin (one connection per iteration).
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = origin_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            }
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            while let Some(inc) = server.accept().await {
+                let state = state_e.clone();
+                let chal = chal_e.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = inc.await {
+                        let _ = serve_connection(&conn, &state, &chal).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut rs, mut rr) = agent_conn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let metrics = Arc::new(TunnelMetrics::new());
+        let agent_task = tokio::spawn(async move {
+            while let Ok((s, r)) = agent_conn.accept_bi().await {
+                let priv_ = origin_priv;
+                let m = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    let _ = serve_noise_stream(s, r, origin_addr, &priv_, m).await;
+                });
+            }
+        });
+
+        let samples = run_bench_stream(addr, cert, &cap, &client_kp.private, b"ping-stream", 3).await;
+        assert_eq!(samples.len(), 3, "three streaming round-trips measured");
         assert!(summarize(&samples).is_some());
 
         agent_task.abort();

@@ -404,8 +404,11 @@ Decomposed:
   `EDGE_POW_DIFFICULTY`, plumbed through `docker-compose.yml`), the 12-column
   M16 stats CSV with a prepended `pow` column, higher default n (30). Validated
   (`bash -n`, `docker compose config`).
-- **M16.2b** mode axis: add stream/UDP bench variants in `bench.rs` + client
-  main, so `SWEEP_MODES` (one-shot/stream/UDP) is measurable.
+- **M16.2b** ✅ stream mode axis: `bench::run_bench_stream` (full-duplex path
+  via `client_tunnel_stream` + duplex round-trip), client `CT_BENCH_MODE`
+  selector, `SWEEP_MODES` axis + `mode` column in `sweep.sh`, `BENCH_MODE`
+  plumbed through compose. Frozen test measures 3 streaming round-trips.
+- **M16.2c** UDP mode: `run_bench_udp` + `SWEEP_MODES=udp` over the UDP overlay.
 - **M16.3** run the matrix under netem → CSV (live compose).
 - **M16.4** extend `plot.py`/`tabulate.py` for the new stats/modes; write the
   analysis under `docs/thesis/data/`.
