@@ -11,9 +11,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::{AccountId, LedgerError};
 use crate::enrollment::{EnrollError, JoinToken};
+use crate::payment::{PaymentError, PaymentId};
 use crate::registry::TunnelInfo;
-use crate::storage::{RedeemError, SqliteEnrollment, SqliteRegistry};
+use crate::storage::{
+    LedgerOpError, PaymentOpError, RedeemError, SqliteEnrollment, SqliteLedger, SqliteRegistry,
+};
 use ct_common::{AgentId, RoutingToken, TenantId};
 
 /// Build the persistent enrollment router: `POST /enroll/issue`,
@@ -133,6 +137,117 @@ async fn resolve_tunnel(
     }))
 }
 
+/// Build the persistent billing router (accounts / payment / credit-gated
+/// issuance) backed by a durable [`SqliteLedger`].
+pub fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
+    Router::new()
+        .route("/accounts/open", post(open_account))
+        .route("/payment/intent", post(create_payment_intent))
+        .route("/payment/confirm", post(confirm_payment))
+        .route("/billing/issue", post(buy_token))
+        .with_state(store)
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountResp {
+    account: String,
+}
+
+async fn open_account(
+    State(store): State<Arc<SqliteLedger>>,
+) -> Result<Json<AccountResp>, (StatusCode, String)> {
+    let account = store
+        .open_account()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(AccountResp {
+        account: hex_encode(&account.0),
+    }))
+}
+
+#[derive(Deserialize)]
+struct IntentReq {
+    account: String,
+    credits: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct IntentResp {
+    payment: String,
+}
+
+async fn create_payment_intent(
+    State(store): State<Arc<SqliteLedger>>,
+    Json(req): Json<IntentReq>,
+) -> Result<Json<IntentResp>, (StatusCode, String)> {
+    let account = hex_decode_32(&req.account)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
+    let id = store
+        .create_intent(&AccountId(account), req.credits)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(IntentResp {
+        payment: hex_encode(&id.0),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ConfirmReq {
+    payment: String,
+}
+#[derive(Serialize, Deserialize)]
+struct BalanceResp {
+    balance: u64,
+}
+
+async fn confirm_payment(
+    State(store): State<Arc<SqliteLedger>>,
+    Json(req): Json<ConfirmReq>,
+) -> Result<Json<BalanceResp>, (StatusCode, String)> {
+    let payment = hex_decode_32(&req.payment)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed payment".to_string()))?;
+    let balance = store.confirm_payment(&PaymentId(payment)).map_err(|e| {
+        let code = match &e {
+            PaymentOpError::Payment(PaymentError::AlreadyConfirmed) => StatusCode::CONFLICT,
+            PaymentOpError::Payment(_) => StatusCode::NOT_FOUND,
+            PaymentOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (code, e.to_string())
+    })?;
+    Ok(Json(BalanceResp { balance }))
+}
+
+#[derive(Deserialize)]
+struct BuyReq {
+    account: String,
+    price: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct TokenResp {
+    token: String,
+}
+
+async fn buy_token(
+    State(store): State<Arc<SqliteLedger>>,
+    Json(req): Json<BuyReq>,
+) -> Result<Json<TokenResp>, (StatusCode, String)> {
+    let account = hex_decode_32(&req.account)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
+    // Debit first: only mint the token if the account can pay.
+    store.debit(&AccountId(account), req.price).map_err(|e| {
+        let code = match &e {
+            LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => {
+                StatusCode::PAYMENT_REQUIRED
+            }
+            LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+            LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (code, e.to_string())
+    })?;
+    let mut token = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+    Ok(Json(TokenResp {
+        token: hex_encode(&token),
+    }))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -234,6 +349,41 @@ mod tests {
             (t.0.as_str(), a.0.as_str()),
             ("t", "a"),
             "registration survives a service restart"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Serve the persistent billing router (on `db_path`) on an ephemeral port.
+    async fn spawn_billing(db_path: &str) -> String {
+        let store = Arc::new(SqliteLedger::open(db_path).unwrap());
+        let app = billing_router_sqlite(store);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn billing_survives_service_restart() {
+        let db = temp_db_path();
+        let account;
+        let payment;
+        {
+            let cp = ControlPlaneClient::new(spawn_billing(&db).await);
+            account = cp.open_account().await.unwrap();
+            payment = cp.create_payment_intent(&account, 3).await.unwrap();
+            cp.confirm_payment(&payment).await.unwrap(); // balance -> 3
+        }
+        // Fresh instance on the same DB file.
+        let cp2 = ControlPlaneClient::new(spawn_billing(&db).await);
+        // Balance persisted -> buying a token succeeds (debits the credit).
+        let token = cp2.buy_token(&account, 1).await.unwrap();
+        assert_ne!(token.0, [0u8; 32], "a token is minted for the funded account");
+        // Idempotency persisted -> confirming the same payment again is refused.
+        let replay = cp2.confirm_payment(&payment).await;
+        assert!(
+            matches!(replay, Err(crate::client::CpError::Status(_))),
+            "payment stays confirmed across a service restart"
         );
         let _ = std::fs::remove_file(&db);
     }

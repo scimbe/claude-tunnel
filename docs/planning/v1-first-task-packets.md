@@ -534,7 +534,9 @@ hosted, hinter einem Storage-Trait).
     `enrollment_survives_service_restart`: enroll gegen Instanz 1, frische
     Instanz auf **derselben DB-Datei**, konsumiertes Token bleibt konsumiert.
   - **M18.4b** ✅ `registry_router_sqlite(Arc<SqliteRegistry>)` (register/resolve,
-    404 unknown). E2E `registry_survives_service_restart`. · **M18.4c** persistenter Billing-Router
+    404 unknown). E2E `registry_survives_service_restart`. · **M18.4c** ✅ `billing_router_sqlite(Arc<SqliteLedger>)`
+    (open/intent/confirm/issue; 402/409/404). E2E `billing_survives_service_restart`
+    (Balance + Idempotenz überleben Neustart).
   - **M18.4d** unified `persistent_control_plane_router(db_path)` (alle Stores auf
     einer DB) + `main` verdrahten → voller Service-Neustart-E2E.
 - **E2E:** Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest).
