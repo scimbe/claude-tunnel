@@ -1,0 +1,78 @@
+% Diskussion — claude-tunnel bachelor thesis.
+\chapter{Diskussion}
+\label{ch:diskussion}
+
+Dieses Kapitel bewertet das Ergebnis gegen die Forschungsfragen und das
+Bedrohungsmodell (Kapitel~\ref{ch:anforderungen}) und benennt die offenen
+Grenzen.
+
+\section{Beantwortung der Forschungsfragen}
+\label{sec:disk-ff}
+
+\paragraph{FF1 (Realisierbarkeit).} Ein providerblinder Tunnel liess sich
+konstruieren. Der Edge relayt nachweislich nur Chiffretext: der Ende-zu-Ende mit
+Noise verschluesselte Verkehr wird byteweise durchgereicht, ohne dass der
+Vermittler Ziel oder Nutzlast erhaelt. Rendezvous mit Proof-of-Work-Gating,
+direkter Peer-to-Peer-Pfad mit Relay-Rueckfall und der
+\gls{ac:tls}-ueber-\gls{ac:tcp}-Fallback funktionieren im Zusammenspiel; die
+Kette Konto\,$\rightarrow$\,Aufladung\,$\rightarrow$\,guthabengedeckte
+Token-Ausgabe\,$\rightarrow$\,Tunnel ist ebenfalls durchgaengig belegt. FF1 ist
+damit fuer Architektur und Kernmechanismen positiv beantwortet.
+
+\paragraph{FF2 (Latenz-Overhead).} Der Eigenanteil des Tunnels ist gering (rund
+8\,ms Baseline) und der Overhead skaliert vorhersagbar linear mit der
+Netzverzoegerung ($\text{RT} \approx 8{,}8 + 6{,}1 \cdot d$, siehe
+Kapitel~\ref{ch:evaluation}). Der Faktor $\approx 6$ ist die wesentliche Kosten:
+er ruehrt vom mehrfachen Queren der verzoegerten Strecke durch Handshake,
+Rendezvous und Relay-Hin-/Rueckweg und liesse sich durch Verbindungs-Wiederverwendung
+(0-RTT, Keep-Alive) deutlich senken.
+
+\paragraph{FF3 (Netz- und Betriebsartverhalten).} Paketverlust trifft den Tail,
+nicht den Median; die Betriebsart ist bei verlustfreiem Netz nicht
+latenzbestimmend. Ein statistisch belastbarer Modus-Effekt unter Verlust liess
+sich bei $n=20$ nicht nachweisen -- ein Hinweis, dass die Transportwahl fuer die
+reine Latenz zweitrangig ist und primaer nach Semantik (Stream vs.\ Datagramm)
+und Zensurresistenz getroffen werden sollte.
+
+\section{Schutzziele gegen das Bedrohungsmodell}
+\label{sec:disk-schutz}
+
+Gegenueber dem neugierigen Betreiber (A1) werden Vertraulichkeit und
+Ziel-Blindheit (S1, S2) strukturell erreicht: er sieht nur Chiffretext und opake
+Tokens. Gegenueber dem aktiven Angreifer (A2) verhindert das Origin-Pinning die
+Man-in-the-Middle-Uebernahme (S3); ein grober \gls{ac:udp}-Block wird durch den
+\gls{ac:tcp}-Fallback ueberbrueckt. Gegen den Fluter (A3) daempft der
+asymmetrische Proof-of-Work-Aufwand (S4). Nicht adressiert bleiben -- wie im
+Bedrohungsmodell festgelegt -- Traffic-Analyse gegen A2 sowie die Oekonomie des
+finanzierten Sybil-Angreifers (A4).
+
+\section{Offene Risiken und Grenzen}
+\label{sec:disk-risiken}
+
+\begin{description}
+  \item[Finanzierter Sybil-Angriff (A4).] Pseudonyme, prepaid-gedeckte Konten
+    verteuern Missbrauch, loesen die Sybil-Oekonomie aber nicht: wer zahlt, kann
+    beliebig viele Tokens erwerben. Eine Abwehr muesste die Kosten pro
+    schaedlicher Aktion ueber den Token-Preis hinaus anheben oder Reputation
+    einfuehren -- beides im Spannungsfeld zur Pseudonymitaet.
+  \item[Traffic-Analyse.] Groessen- und Timing-Seitenkanaele bleiben fuer einen
+    beobachtenden Vermittler oder Netz-Angreifer sichtbar. Verschleierung (etwa
+    Padding, konstante Raten) waere eine orthogonale Erweiterung mit eigenem
+    Overhead.
+  \item[NAT-Hole-Punching.] Der direkte Pfad gelingt im flachen Container-Testbett
+    trivial; echtes gleichzeitiges Oeffnen ueber symmetrisches \gls{ac:nat} wurde
+    nicht unter realen \gls{ac:nat}-Bedingungen erprobt und bleibt eine
+    Testbett-Grenze.
+  \item[PoW-Parametrisierung.] Die Schwierigkeit ist ein Kompromiss: zu niedrig
+    schwaecht die Schranke, zu hoch benachteiligt schwache Clients. Eine
+    adaptive, lastabhaengige Wahl wurde nicht untersucht.
+\end{description}
+
+\section{Methodische Einordnung}
+\label{sec:disk-methodik}
+
+Die Messung diente der Charakterisierung des Overheads, nicht einem Vergleich
+mit Fremdsystemen. Das einseitige Impairment und der Frisch-Dial je Iteration
+zeichnen ein konservatives Bild; ein groesseres $n$ und eine breitere Matrix
+(inkl.\ Bandbreitenbegrenzung und PoW-Schwierigkeit) wuerden insbesondere die
+Tail-Aussagen und einen etwaigen Modus-Effekt unter Verlust schaerfen.

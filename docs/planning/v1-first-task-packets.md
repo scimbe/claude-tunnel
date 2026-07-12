@@ -471,5 +471,7 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
   eingebettet, FF2/FF3 beantwortet, Limitierungen). M16-Outputs nach
   `ct_thesis/data/` kopiert, graphicspath ergänzt, Platzhalter-Selbstrefs auf
   `ch:evaluation`/`ch:architektur` gefixt. Baut sauber (41 S.).
-- **M17.9** Diskussion & Limitierungen.
+- **M17.9** ✅ Diskussion (FF1–FF3 beantwortet, Schutzziele S1–S4 gegen A1–A4,
+  offene Risiken [Sybil, Traffic-Analyse, Hole-Punching, PoW-Parametrisierung],
+  methodische Einordnung). Baut sauber (44 S.).
 - **M17.10** Fazit & Ausblick + Anhang.
