@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ct_client::bench::{csv_row, run_bench, run_bench_stream, summarize};
+use ct_client::bench::{csv_row, run_bench, run_bench_stream, run_bench_udp, summarize};
 use ct_client::config::ClientConfig;
 use ct_client::transport::{
     client_tunnel_auto, client_tunnel_noise, client_tunnel_noise_tcp, dial_edge, tcp_tls_connect,
@@ -116,26 +116,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // otherwise the one-shot path (M16.2b).
     if iterations > 1 {
         let bench_mode = std::env::var("CT_BENCH_MODE").unwrap_or_default();
-        let samples = if bench_mode == "stream" {
-            run_bench_stream(
-                edge_addr,
-                edge_cert,
-                &cap,
-                &client_kp.private,
-                payload.as_bytes(),
-                iterations,
-            )
-            .await
-        } else {
-            run_bench(
-                edge_addr,
-                edge_cert,
-                &cap,
-                &client_kp.private,
-                payload.as_bytes(),
-                iterations,
-            )
-            .await
+        let samples = match bench_mode.as_str() {
+            "stream" => {
+                run_bench_stream(
+                    edge_addr,
+                    edge_cert,
+                    &cap,
+                    &client_kp.private,
+                    payload.as_bytes(),
+                    iterations,
+                )
+                .await
+            }
+            "udp" => {
+                run_bench_udp(
+                    edge_addr,
+                    edge_cert,
+                    &cap,
+                    &client_kp.private,
+                    payload.as_bytes(),
+                    iterations,
+                )
+                .await
+            }
+            _ => {
+                run_bench(
+                    edge_addr,
+                    edge_cert,
+                    &cap,
+                    &client_kp.private,
+                    payload.as_bytes(),
+                    iterations,
+                )
+                .await
+            }
         };
         let summary = summarize(&samples).ok_or("bench produced no samples")?;
         let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();

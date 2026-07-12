@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::transport::{client_tunnel_noise, client_tunnel_stream, dial_edge};
+use crate::transport::{client_tunnel_noise, client_tunnel_stream, dial_edge, udp_selftest};
 use ct_common::Capability;
 use rustls::pki_types::CertificateDer;
 
@@ -182,6 +182,50 @@ pub async fn run_bench_stream(
     for _ in 0..iterations {
         if let Ok(ms) =
             run_once_stream(edge_addr, edge_cert.clone(), cap, client_private, payload).await
+        {
+            samples.push(ms);
+        }
+    }
+    samples
+}
+
+/// One UDP round-trip (M16.2c): dial → `udp_selftest` sends one datagram through
+/// the tunnel to the UDP Origin and awaits its echo. Returns the elapsed time in
+/// milliseconds. Measures the datagram path (M10).
+async fn run_once_udp(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<f64, BoxError> {
+    let start = Instant::now();
+    let conn = dial_edge(edge_addr, edge_cert).await?;
+    let response = udp_selftest(&conn, &cap.token, cap, client_private, payload).await?;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    conn.close(0u32.into(), b"done");
+    if response == payload {
+        Ok(elapsed)
+    } else {
+        Err("udp bench response mismatch".into())
+    }
+}
+
+/// Run `iterations` UDP round-trips, returning per-iteration latency in
+/// milliseconds. Failed iterations are skipped. The datagram analogue of
+/// [`run_bench`] for the mode comparison (M16.2c).
+pub async fn run_bench_udp(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    iterations: usize,
+) -> Vec<f64> {
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        if let Ok(ms) =
+            run_once_udp(edge_addr, edge_cert.clone(), cap, client_private, payload).await
         {
             samples.push(ms);
         }
@@ -455,6 +499,98 @@ mod tests {
 
         let samples = run_bench_stream(addr, cert, &cap, &client_kp.private, b"ping-stream", 3).await;
         assert_eq!(samples.len(), 3, "three streaming round-trips measured");
+        assert!(summarize(&samples).is_some());
+
+        agent_task.abort();
+        edge.abort();
+        origin.abort();
+    }
+
+    #[tokio::test]
+    async fn run_bench_udp_measures_iterations() {
+        // The UDP-mode bench (M16.2c): agent serves serve_noise_udp and
+        // run_bench_udp measures datagram round-trips through a UDP echo origin.
+        use ct_agent::serve::serve_noise_udp;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{OriginIdentity, RoutingToken};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UdpSocket;
+
+        let token = RoutingToken([8u8; 32]);
+        let challenge = Challenge {
+            nonce: [0x22; 16],
+            difficulty: 6,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // UDP echo Origin: reply each datagram back to its sender from the bound
+        // port (which is what the agent's connected socket expects).
+        let origin_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_sock.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let Ok((n, peer)) = origin_sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let _ = origin_sock.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            while let Some(inc) = server.accept().await {
+                let state = state_e.clone();
+                let chal = chal_e.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = inc.await {
+                        let _ = serve_connection(&conn, &state, &chal).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut rs, mut rr) = agent_conn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let agent_task = tokio::spawn(async move {
+            while let Ok((s, r)) = agent_conn.accept_bi().await {
+                let priv_ = origin_priv;
+                tokio::spawn(async move {
+                    let _ = serve_noise_udp(s, r, origin_addr, &priv_).await;
+                });
+            }
+        });
+
+        let samples = run_bench_udp(addr, cert, &cap, &client_kp.private, b"ping-udp", 3).await;
+        assert_eq!(samples.len(), 3, "three UDP round-trips measured");
         assert!(summarize(&samples).is_some());
 
         agent_task.abort();

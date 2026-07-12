@@ -408,7 +408,12 @@ Decomposed:
   via `client_tunnel_stream` + duplex round-trip), client `CT_BENCH_MODE`
   selector, `SWEEP_MODES` axis + `mode` column in `sweep.sh`, `BENCH_MODE`
   plumbed through compose. Frozen test measures 3 streaming round-trips.
-- **M16.2c** UDP mode: `run_bench_udp` + `SWEEP_MODES=udp` over the UDP overlay.
+- **M16.2c** ✅ UDP mode measurement: `bench::run_bench_udp` (dial → `udp_selftest`
+  datagram round-trip), client `CT_BENCH_MODE=udp` selector. Frozen test measures
+  3 UDP round-trips (agent `serve_noise_udp`, fixed-port UDP echo origin). The
+  live `SWEEP_MODES=udp` compose run needs a **fixed-port** UDP echo origin (the
+  one-shot smoke's forking socat replies from an ephemeral port → rejected by the
+  agent's connected socket) — that overlay folds into **M16.3**.
 - **M16.3** run the matrix under netem → CSV (live compose).
 - **M16.4** extend `plot.py`/`tabulate.py` for the new stats/modes; write the
   analysis under `docs/thesis/data/`.
