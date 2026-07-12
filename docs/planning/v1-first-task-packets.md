@@ -522,7 +522,11 @@ hosted, hinter einem Storage-Trait).
   INSERT OR REPLACE) — durables Äquivalent zu `TunnelRegistry`. Kann dieselbe
   DB-Datei wie `SqliteEnrollment` teilen (eigene Tabellen/Connection je Store).
   Test `registry_state_survives_reopen` belegt Persistenz über Reopen.
-- **M18.3** `Ledger` + Accounts persistent (open/credit/debit; Payments idempotent).
+- **M18.3** ✅ `SqliteLedger` (Schema `accounts`+`payments`): open_account/balance/
+  credit/debit (Ledger-Semantik, InsufficientCredit ohne Mutation) +
+  create_intent/confirm_payment (idempotent, in Transaktion → kein Doppel-Credit
+  bei Crash). `LedgerOpError`/`PaymentOpError`. Test `ledger_state_survives_reopen`
+  belegt Balance + confirmed-Flag über Reopen.
 - **M18.4** persistente Stores in `control_plane_router`/`main` verdrahten
   (In-Memory ersetzen) → Service-Level-E2E.
 - **E2E:** Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest).

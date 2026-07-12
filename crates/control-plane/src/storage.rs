@@ -17,7 +17,9 @@ use std::sync::Mutex;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::accounts::{AccountId, LedgerError};
 use crate::enrollment::{AgentPublicKey, EnrollError, JoinToken};
+use crate::payment::{PaymentError, PaymentId};
 use crate::registry::TunnelInfo;
 use ct_common::{AgentId, RoutingToken, TenantId};
 
@@ -215,6 +217,206 @@ impl SqliteRegistry {
     }
 }
 
+/// Why a persisted ledger operation failed: a ledger rule or the database.
+#[derive(Debug)]
+pub enum LedgerOpError {
+    Ledger(LedgerError),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for LedgerOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LedgerOpError::Ledger(e) => write!(f, "{e}"),
+            LedgerOpError::Db(e) => write!(f, "storage error: {e}"),
+        }
+    }
+}
+impl std::error::Error for LedgerOpError {}
+impl From<rusqlite::Error> for LedgerOpError {
+    fn from(e: rusqlite::Error) -> Self {
+        LedgerOpError::Db(e)
+    }
+}
+
+/// Why a persisted payment confirmation failed: a payment rule or the database.
+#[derive(Debug)]
+pub enum PaymentOpError {
+    Payment(PaymentError),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for PaymentOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaymentOpError::Payment(e) => write!(f, "{e}"),
+            PaymentOpError::Db(e) => write!(f, "storage error: {e}"),
+        }
+    }
+}
+impl std::error::Error for PaymentOpError {}
+impl From<rusqlite::Error> for PaymentOpError {
+    fn from(e: rusqlite::Error) -> Self {
+        PaymentOpError::Db(e)
+    }
+}
+
+/// SQLite-backed prepaid-credit ledger + payment intake (durable equivalent of
+/// [`crate::accounts::Ledger`] and [`crate::payment::PaymentIntake`]).
+///
+/// Balances are stored as SQLite `INTEGER` (i64); credit amounts far below
+/// `i64::MAX` are the realistic case for a prepaid ledger. The confirm path runs
+/// in a transaction so a crash cannot leave a payment confirmed without the
+/// matching credit (or vice versa).
+pub struct SqliteLedger {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteLedger {
+    /// Open (creating if needed) a durable ledger at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory ledger (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS accounts (
+                 account BLOB PRIMARY KEY,
+                 balance INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS payments (
+                 payment   BLOB PRIMARY KEY,
+                 account   BLOB NOT NULL,
+                 credits   INTEGER NOT NULL,
+                 confirmed INTEGER NOT NULL DEFAULT 0
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn balance_of(conn: &Connection, id: &AccountId) -> rusqlite::Result<Option<i64>> {
+        conn.query_row(
+            "SELECT balance FROM accounts WHERE account = ?1",
+            params![&id.0[..]],
+            |r| r.get(0),
+        )
+        .optional()
+    }
+
+    /// Open a fresh account with a zero balance; returns its id.
+    pub fn open_account(&self) -> rusqlite::Result<AccountId> {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO accounts (account, balance) VALUES (?1, 0)",
+            params![&bytes[..]],
+        )?;
+        Ok(AccountId(bytes))
+    }
+
+    /// Current balance, or [`LedgerError::UnknownAccount`].
+    pub fn balance(&self, id: &AccountId) -> Result<u64, LedgerOpError> {
+        let conn = self.conn.lock().unwrap();
+        Self::balance_of(&conn, id)?
+            .map(|b| b as u64)
+            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))
+    }
+
+    /// Add prepaid credit (saturating); returns the new balance.
+    pub fn credit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
+        let conn = self.conn.lock().unwrap();
+        let bal = Self::balance_of(&conn, id)?
+            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let new = bal.saturating_add(amount as i64);
+        conn.execute(
+            "UPDATE accounts SET balance = ?1 WHERE account = ?2",
+            params![new, &id.0[..]],
+        )?;
+        Ok(new as u64)
+    }
+
+    /// Spend credit; fails with [`LedgerError::InsufficientCredit`] and leaves
+    /// the balance unchanged when the account cannot cover `amount`.
+    pub fn debit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
+        let conn = self.conn.lock().unwrap();
+        let bal = Self::balance_of(&conn, id)?
+            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let bal_u = bal as u64;
+        if bal_u < amount {
+            return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
+                balance: bal_u,
+                requested: amount,
+            }));
+        }
+        let new = bal - amount as i64;
+        conn.execute(
+            "UPDATE accounts SET balance = ?1 WHERE account = ?2",
+            params![new, &id.0[..]],
+        )?;
+        Ok(new as u64)
+    }
+
+    /// Register a payment intent (top-up of `credits` against `account`);
+    /// returns an opaque [`PaymentId`]. Unconfirmed until [`Self::confirm_payment`].
+    pub fn create_intent(&self, account: &AccountId, credits: u64) -> rusqlite::Result<PaymentId> {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO payments (payment, account, credits, confirmed) VALUES (?1, ?2, ?3, 0)",
+            params![&bytes[..], &account.0[..], credits as i64],
+        )?;
+        Ok(PaymentId(bytes))
+    }
+
+    /// Confirm a payment and credit the account, atomically. Idempotent: a
+    /// second confirmation returns [`PaymentError::AlreadyConfirmed`] and does
+    /// not credit again. Returns the new balance.
+    pub fn confirm_payment(&self, payment: &PaymentId) -> Result<u64, PaymentOpError> {
+        let mut guard = self.conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        let row: Option<(Vec<u8>, i64, i64)> = tx
+            .query_row(
+                "SELECT account, credits, confirmed FROM payments WHERE payment = ?1",
+                params![&payment.0[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (account, credits, confirmed) =
+            row.ok_or(PaymentOpError::Payment(PaymentError::UnknownPayment))?;
+        if confirmed != 0 {
+            return Err(PaymentOpError::Payment(PaymentError::AlreadyConfirmed));
+        }
+        let bal: i64 = tx
+            .query_row(
+                "SELECT balance FROM accounts WHERE account = ?1",
+                params![&account[..]],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(PaymentOpError::Payment(PaymentError::Ledger(
+                LedgerError::UnknownAccount,
+            )))?;
+        let new_balance = bal.saturating_add(credits);
+        tx.execute(
+            "UPDATE accounts SET balance = ?1 WHERE account = ?2",
+            params![new_balance, &account[..]],
+        )?;
+        tx.execute(
+            "UPDATE payments SET confirmed = 1 WHERE payment = ?1",
+            params![&payment.0[..]],
+        )?;
+        tx.commit()?;
+        Ok(new_balance as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +547,89 @@ mod tests {
             Some(info()),
             "registration persisted across reopen"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ledger_open_credit_debit() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        assert_eq!(ledger.balance(&acct).unwrap(), 0, "new account starts empty");
+        assert_eq!(ledger.credit(&acct, 100).unwrap(), 100);
+        assert_eq!(ledger.credit(&acct, 50).unwrap(), 150, "top-ups accumulate");
+        assert_eq!(ledger.debit(&acct, 30).unwrap(), 120);
+        assert_eq!(ledger.balance(&acct).unwrap(), 120);
+    }
+
+    #[test]
+    fn debit_beyond_balance_is_refused_without_mutation() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 10).unwrap();
+        let refused = ledger.debit(&acct, 25);
+        assert!(matches!(
+            refused,
+            Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: 10, requested: 25 }))
+        ));
+        assert_eq!(ledger.balance(&acct).unwrap(), 10, "balance intact");
+    }
+
+    #[test]
+    fn unknown_account_errors() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let ghost = AccountId([9u8; 32]);
+        assert!(matches!(
+            ledger.balance(&ghost),
+            Err(LedgerOpError::Ledger(LedgerError::UnknownAccount))
+        ));
+        assert!(matches!(
+            ledger.debit(&ghost, 1),
+            Err(LedgerOpError::Ledger(LedgerError::UnknownAccount))
+        ));
+    }
+
+    #[test]
+    fn payment_confirmation_is_idempotent() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        let payment = ledger.create_intent(&acct, 100).unwrap();
+
+        assert_eq!(ledger.confirm_payment(&payment).unwrap(), 100);
+        assert!(
+            matches!(
+                ledger.confirm_payment(&payment),
+                Err(PaymentOpError::Payment(PaymentError::AlreadyConfirmed))
+            ),
+            "second confirmation rejected"
+        );
+        assert_eq!(ledger.balance(&acct).unwrap(), 100, "credited exactly once");
+    }
+
+    /// Production requirement: billing state survives a restart. Open + credit +
+    /// confirm against a file-backed ledger, drop it, reopen, and confirm the
+    /// balance persisted and the payment stays confirmed (no double-credit).
+    #[test]
+    fn ledger_state_survives_reopen() {
+        let path = temp_db_path();
+        let acct;
+        let payment;
+        {
+            let ledger = SqliteLedger::open(&path).unwrap();
+            acct = ledger.open_account().unwrap();
+            ledger.credit(&acct, 5).unwrap();
+            payment = ledger.create_intent(&acct, 3).unwrap();
+            ledger.confirm_payment(&payment).unwrap(); // balance -> 8
+        }
+        let reopened = SqliteLedger::open(&path).unwrap();
+        assert_eq!(reopened.balance(&acct).unwrap(), 8, "balance persisted across reopen");
+        assert!(
+            matches!(
+                reopened.confirm_payment(&payment),
+                Err(PaymentOpError::Payment(PaymentError::AlreadyConfirmed))
+            ),
+            "payment stays confirmed across reopen (no double-credit)"
+        );
+        assert_eq!(reopened.balance(&acct).unwrap(), 8, "no double-credit after reopen");
         let _ = std::fs::remove_file(&path);
     }
 }
