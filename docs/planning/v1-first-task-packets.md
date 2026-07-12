@@ -474,4 +474,10 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
 - **M17.9** ✅ Diskussion (FF1–FF3 beantwortet, Schutzziele S1–S4 gegen A1–A4,
   offene Risiken [Sybil, Traffic-Analyse, Hole-Punching, PoW-Parametrisierung],
   methodische Einordnung). Baut sauber (44 S.).
-- **M17.10** Fazit & Ausblick + Anhang.
+- **M17.10** ✅ Fazit & Ausblick + Reproduzierbarkeits-Anhang. Alle 10 Kapitel
+  vorhanden, baut sauber (49 S.). Template-Stubs (first_chapter, example_appendix)
+  entfernt.
+- **M17.11+** ⏳ Vertiefungs-Pass: die Kapitel sind strukturell vollstaendig, aber
+  bei 49 S. ~15 unter dem ~64-Seiten-Ziel. Pro Zyklus ein Kapitel vertiefen
+  (Grundlagen, Architektur, Implementierung mit mehr Listings, Evaluation mit
+  mehr Analyse, Related Work) bis ~64 S. erreicht sind.

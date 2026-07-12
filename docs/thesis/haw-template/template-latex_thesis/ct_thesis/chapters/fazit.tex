@@ -1,0 +1,62 @@
+% Fazit und Ausblick — claude-tunnel bachelor thesis.
+\chapter{Fazit und Ausblick}
+\label{ch:fazit}
+
+\section{Zusammenfassung}
+\label{sec:fazit-zusammenfassung}
+
+Diese Arbeit hat einen providerblinden, zensurresistenten Netzwerk-Tunnel
+entworfen, als Rust-Prototyp aus fuenf Crates implementiert und in einem rein
+containerbasierten Testbett evaluiert. Der Betreiber der Vermittlungsebene relayt
+ausschliesslich Chiffretext: die Nutzlast ist mit dem Noise-Protokoll ueber
+\gls{ac:quic} Ende-zu-Ende verschluesselt und an die gepinnte Origin-Identitaet
+gebunden, die Adressierung erfolgt ueber opake Tokens statt Hostnamen. Ein
+Proof-of-Work-Rendezvous daempft Missbrauch, ein direkter Peer-to-Peer-Pfad
+umgeht bei Erreichbarkeit den Relay, und ein
+\gls{ac:tls}-ueber-\gls{ac:tcp}-Fallback traegt denselben Tunnel bei blockiertem
+\gls{ac:udp}.
+
+Auf die Forschungsfragen (Kapitel~\ref{ch:einleitung}) antwortet die Arbeit wie
+folgt: Ein solcher Tunnel ist realisierbar (FF1) -- Architektur und
+Kernmechanismen wurden bis hin zum verschluesselten Roundtrip durch echte
+Komponenten belegt, einschliesslich der guthabengedeckten Token-Ausgabe. Der
+Latenz-Overhead ist gering und vorhersagbar (FF2): der Eigenanteil liegt bei rund
+8\,ms, und der Roundtrip skaliert linear mit der Netzverzoegerung
+($\text{RT} \approx 8{,}8 + 6{,}1 \cdot d$). Paketverlust trifft primaer den Tail,
+und die Betriebsart ist bei verlustfreiem Netz nicht latenzbestimmend (FF3).
+
+Der wesentliche Beitrag ist die \emph{Kombination} von struktureller
+Providerblindheit, Ende-zu-Ende-Pinning, Proof-of-Work-Rendezvous, direktem Pfad
+und Transport-Fallback in einem einzigen, lauffaehigen System -- ergaenzt um eine
+reproduzierbare, statistisch charakterisierte Vermessung des dadurch entstehenden
+Overheads.
+
+\section{Ausblick}
+\label{sec:fazit-ausblick}
+
+Aus den in Kapitel~\ref{ch:diskussion} benannten Grenzen ergeben sich mehrere
+Anschlussrichtungen:
+
+\begin{itemize}
+  \item \textbf{Traffic-Analyse-Resistenz.} Padding und Ratenglaettung koennten
+    Groessen- und Timing-Seitenkanaele gegen einen beobachtenden Vermittler
+    verdecken -- als orthogonale Schicht mit eigenem, zu vermessendem Overhead.
+  \item \textbf{Sybil-Oekonomie.} Ueber den reinen Token-Preis hinausgehende
+    Kosten pro schaedlicher Aktion oder pseudonyme Reputation koennten den
+    finanzierten Angreifer (A4) adressieren, ohne die Pseudonymitaet aufzugeben.
+  \item \textbf{NAT-Traversal unter realen Bedingungen.} Ein vollstaendiges
+    \gls{ac:ice}-Verfahren und ein Testbett mit emuliertem symmetrischem
+    \gls{ac:nat} wuerden das Hole-Punching ueber die flache Bridge hinaus
+    belastbar machen.
+  \item \textbf{Overhead-Senkung.} Verbindungs-Wiederverwendung (0-RTT,
+    Keep-Alive) koennte den durch den Frisch-Dial dominierten Handshake-Anteil
+    deutlich reduzieren.
+  \item \textbf{Breitere Parameterstudie.} Groesseres $n$, eine
+    Bandbreiten-Achse und eine ausgefahrene PoW-Schwierigkeitsachse wuerden die
+    Tail-Aussagen und einen etwaigen Modus-Effekt unter Verlust schaerfen.
+\end{itemize}
+
+Insgesamt zeigt die Arbeit, dass providerblinde Vermittlung nicht als
+organisatorisches Versprechen, sondern als strukturelle Eigenschaft eines
+praktisch betreibbaren Tunnels realisierbar ist -- zu einem geringen und
+vorhersagbaren Latenzpreis.

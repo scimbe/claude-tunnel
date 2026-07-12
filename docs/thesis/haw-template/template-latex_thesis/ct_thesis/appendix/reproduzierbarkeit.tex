@@ -1,0 +1,58 @@
+% Anhang: Reproduzierbarkeit — claude-tunnel bachelor thesis.
+\chapter{Reproduzierbarkeit}
+\label{app:repro}
+
+Alle Ergebnisse sind aus dem Repository docker-only reproduzierbar; ein
+Host-seitiges Installieren von Rust, Python oder \TeX{} ist nicht noetig.
+
+\section{Build und Tests}
+\label{app:repro-build}
+
+Der Workspace wird hermetisch in einem Rust-Container gebaut und getestet:
+
+\begin{lstlisting}[caption={Hermetischer Build und Test des Workspace.}]
+docker run --rm -v "$PWD":/work -w /work \
+  -u $(id -u):$(id -g) -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
+  rust:1-slim sh -c 'cargo build --workspace && cargo test --workspace'
+\end{lstlisting}
+
+\section{Testbett-Smokes}
+\label{app:repro-compose}
+
+Die Topologie und ihre Varianten laufen ueber Docker Compose. Der Basispfad und
+die Overlays fuer UDP-Origins, direkten Pfad, TCP-Fallback, Metriken und den
+Control-Plane-Dienst werden jeweils mit \texttt{--abort-on-container-exit}
+gestartet:
+
+\begin{lstlisting}[caption={Basis-Smoke der Topologie.}]
+docker compose -f docker/docker-compose.yml up --build \
+  --abort-on-container-exit --exit-code-from client
+\end{lstlisting}
+
+Die Overlays \texttt{docker-compose.udp.yml}, \texttt{.p2p.yml},
+\texttt{.tcp.yml}, \texttt{.metrics.yml} und \texttt{.controlplane.yml} werden mit
+einem zusaetzlichen \texttt{-f} angehaengt.
+
+\section{Messung und Auswertung}
+\label{app:repro-eval}
+
+Die Parameterstudie (Kapitel~\ref{ch:evaluation}) wird ueber drei Skripte
+reproduziert:
+
+\begin{lstlisting}[caption={Sweep, Abbildungen und Tabellen.}]
+SWEEP_MODES="single stream udp" scripts/sweep.sh   # -> latency.csv
+scripts/plot.sh                                     # -> *.png
+docker run --rm -v "$PWD":/work -w /work python:3-slim \
+  python scripts/tabulate.py                        # -> results-table.{md,tex}
+\end{lstlisting}
+
+Die Achsen der Matrix (\texttt{SWEEP\_MODES}, \texttt{SWEEP\_POWS},
+\texttt{SWEEP\_DELAYS}, \texttt{SWEEP\_LOSSES}, \texttt{SWEEP\_ITERATIONS}) sind
+ueber Umgebungsvariablen konfigurierbar.
+
+\section{Bau dieser Arbeit}
+\label{app:repro-thesis}
+
+Das PDF dieser Arbeit entsteht ueber \texttt{scripts/thesis-haw-build.sh} in
+einem \TeX{}-Live-Container (pdflatex $\rightarrow$ bibtex $\rightarrow$
+makeglossaries $\rightarrow$ pdflatex $\times 2$).
