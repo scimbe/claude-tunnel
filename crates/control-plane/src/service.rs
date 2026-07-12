@@ -5,15 +5,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::enrollment::{EnrollError, JoinToken};
-use crate::storage::{RedeemError, SqliteEnrollment};
-use ct_common::{AgentId, TenantId};
+use crate::registry::TunnelInfo;
+use crate::storage::{RedeemError, SqliteEnrollment, SqliteRegistry};
+use ct_common::{AgentId, RoutingToken, TenantId};
 
 /// Build the persistent enrollment router: `POST /enroll/issue`,
 /// `POST /enroll/redeem`, backed by a durable [`SqliteEnrollment`].
@@ -75,6 +76,61 @@ async fn redeem(
             (code, e.to_string())
         })?;
     Ok(Json(RedeemResp { tenant: tenant.0 }))
+}
+
+/// Build the persistent registry router: `POST /registry/register`,
+/// `GET /registry/resolve/:token`, backed by a durable [`SqliteRegistry`].
+pub fn registry_router_sqlite(store: Arc<SqliteRegistry>) -> Router {
+    Router::new()
+        .route("/registry/register", post(register_tunnel))
+        .route("/registry/resolve/:token", get(resolve_tunnel))
+        .with_state(store)
+}
+
+#[derive(Deserialize)]
+struct RegisterReq {
+    token: String,
+    tenant: String,
+    agent: String,
+}
+
+async fn register_tunnel(
+    State(store): State<Arc<SqliteRegistry>>,
+    Json(req): Json<RegisterReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token =
+        hex_decode_32(&req.token).ok_or((StatusCode::BAD_REQUEST, "malformed token".to_string()))?;
+    store
+        .register(
+            &RoutingToken(token),
+            &TunnelInfo {
+                tenant: TenantId(req.tenant),
+                agent: AgentId(req.agent),
+            },
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResolveResp {
+    tenant: String,
+    agent: String,
+}
+
+async fn resolve_tunnel(
+    State(store): State<Arc<SqliteRegistry>>,
+    Path(token_hex): Path<String>,
+) -> Result<Json<ResolveResp>, StatusCode> {
+    let token = hex_decode_32(&token_hex).ok_or(StatusCode::BAD_REQUEST)?;
+    let info = store
+        .lookup(&RoutingToken(token))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ResolveResp {
+        tenant: info.tenant.0,
+        agent: info.agent.0,
+    }))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -148,6 +204,37 @@ mod tests {
             "the token stays consumed across a service restart"
         );
 
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Serve the persistent registry router (on `db_path`) on an ephemeral port.
+    async fn spawn_registry(db_path: &str) -> String {
+        let store = Arc::new(SqliteRegistry::open(db_path).unwrap());
+        let app = registry_router_sqlite(store);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn registry_survives_service_restart() {
+        let db = temp_db_path();
+        let token = RoutingToken([0x5a; 32]);
+        {
+            let cp = ControlPlaneClient::new(spawn_registry(&db).await);
+            cp.register(&token, &TenantId("t".to_string()), &AgentId("a".to_string()))
+                .await
+                .unwrap();
+        }
+        // Fresh instance on the same DB file.
+        let cp2 = ControlPlaneClient::new(spawn_registry(&db).await);
+        let (t, a) = cp2.resolve(&token).await.unwrap();
+        assert_eq!(
+            (t.0.as_str(), a.0.as_str()),
+            ("t", "a"),
+            "registration survives a service restart"
+        );
         let _ = std::fs::remove_file(&db);
     }
 }
