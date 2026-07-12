@@ -661,7 +661,13 @@ hosted, hinter einem Storage-Trait).
     (Ergebnis + Pinning-Policy). Realer Scan: cargo-audit 0.22.2, 1160 Advisories,
     **206 Deps, 0 Vulnerabilities, 0 Warnings, RC=0**. Verifikation: `sh -n` grün,
     Skript installiert+ruft cargo-audit, Report=0 Vulns, keine Advisories im Output.
-  - **M23.3** ⏳ Secrets-Management-Review + Threat-Model-Update (Doku, produktiv).
+  - **M23.3** ✅ Secrets-Review + Threat-Model: `scripts/check-no-secrets.sh`
+    (Guard — scannt git-getrackte Dateien auf PEM-Private-Keys/Cloud-Access-Keys,
+    verweigert getrackte echte `.env`, prüft `.env` gitignored; exit≠0 CI-tauglich)
+    + `docs/security/threat-model.md` (Produktions-Posture: Trust-Boundaries/„Operator
+    liest Payload nicht", Adversar×Control-Matrix, Secrets-Inventar+Handling, Residual-Risks).
+    Verifikation: `sh -n` grün, Guard clean auf Repo (RC=0), Selbst-Test (Patterns matchen
+    Known-Bad), E2E (gestagete AKIA-Fixture → Guard RC=1).
   - **M23.4** ⏳ „TLS überall"-Review: Control-Plane-HTTP hinter TLS-Ingress dokumentieren/erzwingen.
 
 ## Milestone 24 — Payment (echt, ersetzt Stub)
