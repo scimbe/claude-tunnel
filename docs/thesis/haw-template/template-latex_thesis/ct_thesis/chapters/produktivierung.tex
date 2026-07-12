@@ -1,0 +1,96 @@
+% Produktivierung — claude-tunnel bachelor thesis.
+\chapter{Produktivierung}
+\label{ch:produktivierung}
+
+Der in Kapitel~\ref{ch:implementierung} beschriebene Prototyp weist die
+Machbarkeit des providerblinden Tunnels nach, ist als Testbett aber noch kein
+betreibbarer Dienst: der Zustand liegt ausschliesslich im Speicher, es gibt
+keine konventionelle Nutzeridentitaet, und die Zertifikate sind fest
+verdrahtet. Dieses Kapitel beschreibt die Ueberfuehrung in ein
+produktionsreifes System entlang sechs Bausteinen -- Persistenz
+(Abschnitt~\ref{sec:prod-persistenz}), Identitaet
+(\ref{sec:prod-identitaet}), PKI und Transportsicherheit
+(\ref{sec:prod-pki}), Auslieferung (\ref{sec:prod-deploy}), Haertung
+(\ref{sec:prod-haertung}) und Bezahlung (\ref{sec:prod-payment}). Die
+kryptografische Ende-zu-Ende-Vertraulichkeit der Nutzlast (Noise,
+\cite{perrin2018noise}) bleibt in allen Bausteinen erhalten: die
+Produktivierung fuegt Identitaet und Abrechnung hinzu, ohne dem Betreiber
+Zugriff auf den Klartext zu geben.
+
+\section{Durabler Zustand}
+\label{sec:prod-persistenz}
+
+Enrollment, Tunnel-Registry und Guthaben-Ledger wurden von
+In-Memory-Strukturen auf eine eingebettete SQLite-Datenbank umgestellt. Jeder
+Speicher kapselt seine Tabellen hinter einer synchron gehaltenen Verbindung;
+mehrstufige Operationen wie die Zahlungsbestaetigung laufen in einer
+Transaktion, sodass ein Absturz weder ein Guthaben doppelt gutschreibt noch
+einen Halbzustand hinterlaesst. Die Durabilitaet ist durch Neustart-Tests
+abgesichert: eine zweite Dienstinstanz auf derselben Datei sieht denselben
+Zustand, ein bereits eingeloester Join-Token bleibt verbraucht.
+
+\section{Identitaet und Authentifizierung}
+\label{sec:prod-identitaet}
+
+Statt pseudonymer Konten treten konventionelle Konten ueber einen
+OIDC-Anbieter (Keycloak). Der Kontrollknoten verifiziert Bearer-Token per
+RS256 gegen den oeffentlichen Realm-Schluessel und prueft Aussteller und
+Ablauf; das Konto wird aus dem Token-Subjekt abgeleitet, sodass ein Aufrufer
+stets nur auf sein eigenes Konto wirkt. Bewusst wird damit die frühere
+Pseudonymitaets-Aussage aufgegeben -- der Betreiber kennt die Identitaet zur
+Abrechnung. Die inhaltliche Vertraulichkeit bleibt hingegen bestehen: der
+Datenpfad ist unveraendert Ende-zu-Ende verschluesselt.
+
+\section{PKI und Transportsicherheit}
+\label{sec:prod-pki}
+
+Der Edge betreibt eine interne Zertifizierungsstelle. Clients vertrauen der
+CA-Wurzel statt einem angehefteten Blatt-Zertifikat; dadurch kann der Edge
+sein Zertifikat rotieren, ohne dass ein Client geaendert werden muss. Auf der
+Transportebene gilt \emph{TLS ueberall}: QUIC mit TLS~1.3
+(\cite{rfc9001,rfc8446}) und ein TLS-ueber-TCP-Rueckfallpfad zum Edge, HTTPS
+am Ingress vor dem Kontrollknoten. Der einzige im Klartext sprechende
+Bestandteil -- die HTTP-Schnittstelle des Kontrollknotens -- verlaesst den
+Cluster nie.
+
+\section{Auslieferung}
+\label{sec:prod-deploy}
+
+Der Dienst ist auf zwei Wegen auslieferbar. Fuer den Eigenbetrieb genuegt ein
+gehaertetes Compose-Buendel mit persistentem Datenvolumen, Neustart-Richtlinie
+und einer Bereitschaftspruefung auf \texttt{/readyz}. Fuer den gehosteten
+Betrieb existieren Kubernetes-Manifeste (kustomize) mit einem PVC-gestuetzten
+Kontrollknoten, Liveness-/Readiness-Sonden, gehaerteten Sicherheitskontexten
+und einem TLS-terminierenden Ingress. Beide Wege nutzen dieselben Binaries und
+dasselbe Protokoll.
+
+\section{Haertung}
+\label{sec:prod-haertung}
+
+Neben dem Proof-of-Work-Gatter (\cite{back2002hashcash}) begrenzt ein
+Ratenlimit je Konto die Token-Ausgabe, sodass ein einzelnes Konto den
+Kontrollknoten nicht erschoepfen kann. Die Abhaengigkeiten werden gegen die
+RustSec-Advisory-Datenbank geprueft und ueber eine eingecheckte
+\texttt{Cargo.lock} exakt gepinnt; ein Wächter blockiert versehentlich
+eingecheckte Geheimnisse. Ein aktualisiertes Bedrohungsmodell haelt fest, was
+der Dienst leistet und was nicht -- insbesondere macht er keine
+Anonymitaetsaussage.
+
+\section{Bezahlung}
+\label{sec:prod-payment}
+
+Die Guthaben-Gutschrift wird nur noch durch ein signiertes Ereignis des
+Zahlungsanbieters ausgeloest, nicht durch einen vom Client aufrufbaren
+Endpunkt. Der Kontrollknoten verifiziert die HMAC-SHA256-Signatur des Webhooks
+gegen ein geteiltes Geheimnis und prueft die Frische des Zeitstempels gegen
+Wiedereinspielung; ohne konfiguriertes Geheimnis wird jeder Webhook abgelehnt
+(fail-safe). Die Zustellung ist idempotent, sodass ein wiederholtes Ereignis
+nicht doppelt gutschreibt.
+
+\section{Zusammenfassung}
+\label{sec:prod-fazit}
+
+Mit durablem Zustand, echter Identitaet, rotierbarer PKI, reproduzierbarer
+Auslieferung, Haertung und signaturgesicherter Bezahlung ist aus dem Testbett
+ein betreibbarer Dienst geworden -- ohne die zentrale Eigenschaft aufzugeben,
+dass der Betreiber die Nutzlast nicht lesen kann.

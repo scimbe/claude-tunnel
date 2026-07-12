@@ -486,8 +486,14 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
     Billing-Listing, Money→Tunnel-E2E-Verweis). 51→52 S.
   - **M17.13** ✅ Architektur vertieft (nummerierter 6-Schritt-Tunnelaufbau +
     Direktpfad-Kurzschluss, Wire-Format-Tabelle des Rollen-Dispatch). 52→53 S.
-  - **M17.14+** ⏳ Evaluation (mehr Analyse), Related Work weiter vertiefen bis
-    ~64 S.
+  - **M17.14** ✅ Neues Kapitel „Produktivierung" (`chapters/produktivierung.tex`,
+    zwischen Implementierung und Evaluation eingehängt): dokumentiert die
+    Überführung Testbett→Dienst (M18–M26) in 6+1 Abschnitten (Persistenz,
+    Identität/OIDC, PKI+TLS, Auslieferung, Härtung, Bezahlung, Zusammenfassung),
+    HAW-Stil (ASCII-Umlaute, `\cite` nur auf existierende Bib-Keys perrin2018noise/
+    rfc9001/rfc8446/back2002hashcash, interne `\ref`). Texlive-Build im Container:
+    **PDF_OK, 0 undefined refs/citations, 0 errors, 53→56 S.**
+  - **M17.15+** ⏳ Evaluation (mehr Analyse), Related Work weiter vertiefen bis ~64 S.
 
 ---
 
