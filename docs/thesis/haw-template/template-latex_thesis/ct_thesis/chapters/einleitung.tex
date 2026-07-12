@@ -1,0 +1,101 @@
+% Einleitung — claude-tunnel bachelor thesis.
+\chapter{Einleitung}
+\label{ch:einleitung}
+
+\section{Motivation}
+\label{sec:motivation}
+
+Wer heute einen Netzwerkdienst durch fremde Infrastruktur tunnelt -- sei es
+ein \gls{ac:vpn}-Anbieter, ein Reverse-Proxy oder ein Relay-Netz --, vertraut
+dem Betreiber dieser Infrastruktur weit mehr an, als technisch notwendig waere.
+In den ueblichen Architekturen sieht der Vermittler mindestens die
+Metadaten der Verbindung: welcher Client zu welchem Ziel-Hostnamen spricht, oft
+auch, wie viel und wann. Bei TLS-terminierenden Proxies liegt zeitweise sogar
+der Klartext vor. Dieses Wissen ist ein Angriffspunkt: es kann protokolliert,
+verkauft, unter Zwang herausgegeben oder zur Zensur einzelner Ziele genutzt
+werden. Anonymisierungsnetze wie Tor~\cite{dingledine2004tor} adressieren einen
+Teil des Problems, verlagern das Vertrauen aber auf die Zusammensetzung des
+Relay-Netzes und sind gegen aktive Netzsperren (etwa das Blockieren bekannter
+Einstiegspunkte oder ganzer Transportprotokolle) nur begrenzt robust.
+
+Die Gegenthese dieser Arbeit lautet: Ein Vermittler soll das, was er nicht
+wissen muss, auch strukturell nicht wissen \emph{koennen}. Ein solcher Dienst
+ist \gls{gl:providerblind} -- er relayt ausschliesslich Chiffretext, kennt weder
+Ziel-Hostnamen noch Nutzlast und kann folglich weder das eine noch das andere
+preisgeben. Vertrauen wird so nicht organisatorisch (durch Richtlinien und
+Wohlverhalten des Betreibers) hergestellt, sondern kryptographisch erzwungen.
+
+\section{Problemstellung}
+\label{sec:problem}
+
+Ein providerblinder Tunnel muss mehrere, teils gegenlaeufige Anforderungen
+gleichzeitig erfuellen:
+
+\begin{itemize}
+  \item \textbf{Ende-zu-Ende-Vertraulichkeit gegen den Betreiber.} Die Nutzlast
+    muss zwischen Client und Ziel (\emph{Origin}) verschluesselt sein, sodass die
+    Vermittlungsebene nur opake Frames weiterreicht. Das schliesst eine
+    TLS-Terminierung am Relay aus und verlangt eine eigene
+    \gls{ac:e2e}-Schicht -- hier das Noise-Protokoll~\cite{perrin2018noise} ueber
+    \gls{ac:quic}~\cite{rfc9000,rfc9001}.
+  \item \textbf{Adressierung ohne Hostnamen.} Der Client muss den richtigen
+    Endpunkt erreichen, ohne dem Betreiber einen Hostnamen zu nennen. Das
+    verlangt eine Adressierung ueber opake Tokens und ein \gls{gl:rendezvous},
+    das nicht auf Klarnamen beruht.
+  \item \textbf{Missbrauchsresistenz ohne Identitaeten.} Gerade weil der Dienst
+    blind ist, kann er Missbrauch nicht am Inhalt erkennen. Ein
+    \gls{ac:pow}-Nachweis~\cite{back2002hashcash} verteuert die
+    Verbindungsanbahnung und begrenzt so Flutangriffe, ohne Identitaeten zu
+    fordern.
+  \item \textbf{Zensur- und \gls{ac:nat}-Realitaeten.} Reale Netze blockieren
+    zuweilen \gls{ac:udp} (und damit \gls{ac:quic}) oder liegen hinter
+    \gls{ac:nat}. Der Tunnel braucht daher einen Transport-Fallback und einen
+    direkten Pfad, der den Relay bei Erreichbarkeit umgeht~\cite{ford2005peer}.
+\end{itemize}
+
+Der Kern der Spannung liegt darin, diese Eigenschaften \emph{zusammen} zu
+realisieren: Blindheit erschwert Missbrauchsabwehr, Ende-zu-Ende-Kryptographie
+erschwert Vermittlung, und Zensurresistenz erschwert die Transportwahl.
+
+\section{Zielsetzung und Forschungsfragen}
+\label{sec:ziele}
+
+Ziel der Arbeit ist der Entwurf, die prototypische Implementierung und die
+empirische Evaluation eines providerblinden Tunnels, der die genannten
+Anforderungen in einem lauffaehigen System vereint. Daraus leiten sich drei
+Forschungsfragen ab:
+
+\begin{description}
+  \item[FF1 (Realisierbarkeit).] Laesst sich ein providerblinder Tunnel so
+    konstruieren, dass der Betreiber nachweislich nur Chiffretext sieht, und
+    zugleich Rendezvous, \gls{ac:pow}-Gating, direkter Pfad und
+    Transport-Fallback funktionieren?
+  \item[FF2 (Latenz-Overhead).] Welchen Roundtrip-Overhead verursacht der Tunnel
+    gegenueber der reinen Netzlaufzeit, und wie skaliert er mit Verzoegerung und
+    Paketverlust?
+  \item[FF3 (Netz- und Betriebsartverhalten).] Wie verhalten sich die
+    Betriebsarten One-shot, Streaming und Datagramm unter identischen
+    Netzbedingungen, und welche Rolle spielt die \gls{ac:pow}-Schwierigkeit?
+\end{description}
+
+\section{Beitrag}
+\label{sec:beitrag}
+
+Die Arbeit liefert (i) einen in Rust implementierten Prototyp aus fuenf Crates
+(gemeinsame Wire-Typen, Agent, Edge, Control-Plane, Client), der den vollen
+Pfad Client\,$\rightarrow$\,Edge\,$\rightarrow$\,Agent\,$\rightarrow$\,Origin
+mit \gls{ac:e2e}-Noise, \gls{ac:pow}-Rendezvous, direktem \gls{ac:p2p}-Pfad und
+\gls{ac:tls}-ueber-TCP-Fallback traegt; (ii) ein rein containerbasiertes
+Testbett, das die Topologie samt Stoergroessen (\texttt{tc netem}) emuliert; und
+(iii) eine Parameterstudie am fertigen Produkt, die den Latenz-Overhead ueber
+die drei Betriebsarten statistisch belastbar vermisst.
+
+\section{Aufbau der Arbeit}
+\label{sec:aufbau}
+
+Kapitel~\ref{ch:einleitung} umreisst Motivation und Fragestellung.
+Die weiteren Kapitel behandeln nacheinander die technischen Grundlagen
+(Zero-Knowledge-Prinzip, \gls{ac:quic}, Noise, \gls{ac:pow}, \gls{ac:nat}),
+verwandte Arbeiten, Anforderungen und Bedrohungsmodell, die Architektur, die
+Implementierung, die Evaluation mit der Parameterstudie sowie Diskussion und
+Ausblick.

@@ -69,11 +69,14 @@
 % Chapters
 \cleardoublepage
 \pagenumbering{arabic}
-\input{chapters/first_chapter}
+\input{chapters/einleitung}
 % Add additional chapters here
 
-%\bibliographystyle{plain}
-\bibliographystyle{dinat}
+% dinat.bst (DIN 1505) is not in the container's TeX packages; plainnat is a
+% natbib built-in (natbib is already loaded by the HAW style) and always
+% available. Swap back to dinat if texlive ships it in the build image.
+%\bibliographystyle{dinat}
+\bibliographystyle{plainnat}
 \bibliography{literature}
 
 % Appendix

@@ -447,7 +447,11 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
   Glossar/Akronyme, Stub-Kapitel), `scripts/thesis-haw-build.sh`
   (pdflatex→bibtex→makeglossaries→pdflatex×2), Dockerfile um siunitx/pictures/
   fonts-extra erweitert. Baut sauber → 18-Seiten-PDF (Frontmatter), 0 Fehler.
-- **M17.2** Einleitung (Motivation, Problemstellung, Forschungsfragen, Aufbau).
+- **M17.2** ✅ Einleitung (Motivation, Problemstellung mit 4 Anforderungen,
+  Forschungsfragen FF1–FF3, Beitrag, Aufbau; echte Zitate: QUIC-RFCs, Noise,
+  Hashcash, Tor, NAT-Traversal). `literature.bib` mit realen Referenzen;
+  `dinat.bst` fehlt im Container → auf `plainnat` (natbib-Builtin) umgestellt.
+  Baut sauber → 21 S., 0 undefined citations.
 - **M17.3** Grundlagen (ZK/providerblind, QUIC, Noise, PoW, NAT-Traversal).
 - **M17.4** Related Work.
 - **M17.5** Anforderungen & Bedrohungsmodell.
