@@ -518,7 +518,10 @@ hosted, hinter einem Storage-Trait).
   mit issue/redeem/binding, gleiche Semantik wie in-memory `Enrollment`;
   `RedeemError::{Enroll,Db}`. Test `state_survives_reopen` belegt: Binding
   persistiert + Token bleibt konsumiert über einen Reopen (Neustart-Ersatz).
-- **M18.2** `TunnelRegistry` persistent (register/resolve).
+- **M18.2** ✅ `SqliteRegistry` (Schema `tunnels`; register/lookup/unregister,
+  INSERT OR REPLACE) — durables Äquivalent zu `TunnelRegistry`. Kann dieselbe
+  DB-Datei wie `SqliteEnrollment` teilen (eigene Tabellen/Connection je Store).
+  Test `registry_state_survives_reopen` belegt Persistenz über Reopen.
 - **M18.3** `Ledger` + Accounts persistent (open/credit/debit; Payments idempotent).
 - **M18.4** persistente Stores in `control_plane_router`/`main` verdrahten
   (In-Memory ersetzen) → Service-Level-E2E.

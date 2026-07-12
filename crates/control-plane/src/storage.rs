@@ -18,7 +18,8 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::enrollment::{AgentPublicKey, EnrollError, JoinToken};
-use ct_common::{AgentId, TenantId};
+use crate::registry::TunnelInfo;
+use ct_common::{AgentId, RoutingToken, TenantId};
 
 /// Why a persisted redemption failed: an enrollment rule or the database.
 #[derive(Debug)]
@@ -146,6 +147,74 @@ impl SqliteEnrollment {
     }
 }
 
+/// SQLite-backed tunnel registry (durable equivalent of
+/// [`crate::registry::TunnelRegistry`]). Can share the same database file as
+/// [`SqliteEnrollment`] — each store owns its tables and its own connection.
+pub struct SqliteRegistry {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteRegistry {
+    /// Open (creating if needed) a durable registry at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory registry (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tunnels (
+                 token  BLOB PRIMARY KEY,
+                 tenant TEXT NOT NULL,
+                 agent  TEXT NOT NULL
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Register (or replace) the tunnel served by `token`.
+    pub fn register(&self, token: &RoutingToken, info: &TunnelInfo) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO tunnels (token, tenant, agent) VALUES (?1, ?2, ?3)",
+            params![&token.0[..], info.tenant.0, info.agent.0],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve `token` to its tunnel, if registered (the Rendezvous lookup).
+    pub fn lookup(&self, token: &RoutingToken) -> rusqlite::Result<Option<TunnelInfo>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT tenant, agent FROM tunnels WHERE token = ?1",
+                params![&token.0[..]],
+                |r| {
+                    Ok(TunnelInfo {
+                        tenant: TenantId(r.get(0)?),
+                        agent: AgentId(r.get(1)?),
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Remove the tunnel for `token` (idempotent).
+    pub fn unregister(&self, token: &RoutingToken) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM tunnels WHERE token = ?1",
+            params![&token.0[..]],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +294,57 @@ mod tests {
             "token stays consumed across reopen"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn info() -> TunnelInfo {
+        TunnelInfo {
+            tenant: TenantId("t".into()),
+            agent: AgentId("a".into()),
+        }
+    }
+
+    #[test]
+    fn register_then_lookup() {
+        let reg = SqliteRegistry::open_in_memory().unwrap();
+        let token = RoutingToken([0x5a; 32]);
+        reg.register(&token, &info()).unwrap();
+        assert_eq!(reg.lookup(&token).unwrap(), Some(info()));
+        assert_eq!(reg.lookup(&RoutingToken([0x11; 32])).unwrap(), None, "unknown token");
+    }
+
+    #[test]
+    fn unregister_removes_and_reregister_overwrites() {
+        let reg = SqliteRegistry::open_in_memory().unwrap();
+        let token = RoutingToken([0x5a; 32]);
+        reg.register(&token, &info()).unwrap();
+        reg.unregister(&token).unwrap();
+        assert_eq!(reg.lookup(&token).unwrap(), None);
+        reg.unregister(&token).unwrap(); // idempotent
+
+        reg.register(&token, &info()).unwrap();
+        let other = TunnelInfo {
+            tenant: TenantId("t2".into()),
+            agent: AgentId("a2".into()),
+        };
+        reg.register(&token, &other).unwrap();
+        assert_eq!(reg.lookup(&token).unwrap(), Some(other), "re-register overwrites");
+    }
+
+    #[test]
+    fn registry_state_survives_reopen() {
+        let path = temp_db_path();
+        let token = RoutingToken([0x7c; 32]);
+        {
+            let reg = SqliteRegistry::open(&path).unwrap();
+            reg.register(&token, &info()).unwrap();
+        }
+        let reopened = SqliteRegistry::open(&path).unwrap();
+        assert_eq!(
+            reopened.lookup(&token).unwrap(),
+            Some(info()),
+            "registration persisted across reopen"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
