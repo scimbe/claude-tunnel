@@ -729,7 +729,7 @@ hosted, hinter einem Storage-Trait).
     Backup, Audit), Incident-Response-Tabelle, „Known limitations". Drift-Check: alle
     zitierten Env-Vars/Endpoints/Artefakte/Skripte existieren → RUNBOOK_DRIFT_OK.
 
-## Milestone 26 — Wiring-Lücken (bei M25.3-Runbook entdeckt)
+## Milestone 26 — Wiring-Lücken & Aufräumen
 - **M26.1** ✅ OIDC-Authed-Endpoints in Produktion gemountet: `persistent_control_plane_router`
   nimmt jetzt `oidc: Option<Arc<OidcVerifier>>` und merged `authed_billing_router` (`/me/*`,
   Cap `AUTHED_ISSUES_PER_WINDOW=60`) nur wenn Some. `main.rs` baut den Verifier via
@@ -737,6 +737,12 @@ hosted, hinter einem Storage-Trait).
   beide gesetzt → mounted, sonst None (Endpoints abwesend). 2 Frozen-Tests: mit Some →
   `/me/account` ohne Token 401 / mit gültigem Token 200 durch den Prod-Router; mit None →
   404. Runbook „Known limitation" entfernt, `CT_OIDC_PUBKEY_PATH` dokumentiert. Gate 205 (+2).
+- **M26.2** ✅ Warning-freier Build: 4 Compiler-Warnungen in Testmodulen entfernt
+  (toter `token_e`-Binding in edge/serve.rs; ungenutzte `AsyncReadExt`/`AsyncWriteExt`-Imports
+  in client/bench.rs ×2 + rendezvous.rs — `write_all`/`read_to_end` laufen dort über
+  quinn-Inherent bzw. einen Projekt-Helfer, nicht die Tokio-Traits; nur die tatsächlich
+  ungenutzten Imports entfernt, die Mehrfach-Vorkommen per Token-Seed disambiguiert).
+  Frozen: Gate-Log **0 `warning:`-Zeilen**, 205 Tests grün, 0 Fehler.
 
 **Definition of done (Produkt):** durabler Zustand, echte Identität/Auth, echte PKI,
 reproduzierbares Deployment (hosted + self-host), Ein-Kommando-Onboarding,

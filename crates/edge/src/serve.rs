@@ -375,7 +375,6 @@ mod tests {
 
         // Edge orchestrator: register the Agent, then route the Client's stream.
         let state_e = state.clone();
-        let token_e = token.clone();
         let edge = tokio::spawn(async move {
             let agent_conn = server.accept().await.unwrap().await.unwrap();
             register_agent(&agent_conn, &state_e)

@@ -423,7 +423,7 @@ mod tests {
         use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
         use quinn::Connection;
         use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let token = RoutingToken([7u8; 32]);
@@ -519,7 +519,6 @@ mod tests {
         use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
         use quinn::Connection;
         use std::sync::Arc;
-        use tokio::io::AsyncWriteExt;
         use tokio::net::UdpSocket;
 
         let token = RoutingToken([8u8; 32]);

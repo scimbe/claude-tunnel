@@ -655,7 +655,7 @@ mod tests {
         use std::net::Ipv4Addr;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let token = RoutingToken([0x7F; 32]);
