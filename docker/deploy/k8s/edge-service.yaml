@@ -1,0 +1,28 @@
+# External edge endpoint (M21.2b). Clients dial the edge directly on 4433 for
+# both QUIC (UDP) and the TLS-over-TCP fallback, so it is exposed as a
+# LoadBalancer carrying both protocols on the same port.
+#
+# NOTE: a single Service with mixed protocols on a LoadBalancer requires
+# Kubernetes >= 1.26 (MixedProtocolLBService, GA in 1.26). On older clusters,
+# split this into two Services (one UDP, one TCP).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ct-edge
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: claude-tunnel
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: ct-edge
+  ports:
+    - name: quic
+      port: 4433
+      targetPort: quic
+      protocol: UDP
+    - name: tls-tcp
+      port: 4433
+      targetPort: tls-tcp
+      protocol: TCP

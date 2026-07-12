@@ -4,7 +4,7 @@
 #   kubectl apply -k docker/deploy/k8s         # apply to a cluster
 #
 # Raw kustomize manifests (not Helm) so they render and validate with the
-# kustomize built into kubectl, no extra tooling. M21.2b adds the edge.
+# kustomize built into kubectl, no extra tooling.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ct-system
@@ -14,3 +14,6 @@ resources:
   - control-plane-pvc.yaml
   - control-plane-deployment.yaml
   - control-plane-service.yaml
+  - edge-config.yaml
+  - edge-deployment.yaml
+  - edge-service.yaml

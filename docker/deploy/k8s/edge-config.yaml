@@ -1,0 +1,15 @@
+# Non-secret edge configuration (M21.2b). The PoW difficulty is an operational
+# knob (rendezvous cost); the edge mints its own internal CA at startup and
+# writes the CA root to CT_EDGE_CERT_OUT for out-of-band distribution to clients.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ct-edge-config
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: claude-tunnel
+data:
+  CT_EDGE_LISTEN: "0.0.0.0:4433"
+  CT_EDGE_POW_DIFFICULTY: "16"
+  CT_EDGE_CERT_OUT: "/shared/edge-cert.der"

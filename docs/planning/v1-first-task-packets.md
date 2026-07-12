@@ -612,8 +612,14 @@ hosted, hinter einem Storage-Trait).
     non-root + read-only-rootfs + `drop: ALL`), Service (ClusterIP :8090), gebündelt
     per `kustomization.yaml`. Verifikation: `kubectl kustomize` rendert offline (RC=0,
     5 Objekte) + 11 Asserts grün (Probes, PVC, Mount, Recreate, non-root, envFrom).
-  - **M21.2b** ⏳ Edge-Manifeste: Deployment + Service (UDP+TCP :4433), Cert-Volume,
-    in dieselbe kustomization gehängt.
+  - **M21.2b** ✅ Edge-Manifeste (`docker/deploy/k8s/`): ConfigMap `ct-edge-config`
+    (Listen/PoW/CertOut), Deployment `ct-edge` (QUIC-UDP + TLS-TCP-Fallback beide
+    :4433; `tcpSocket`-Liveness/Readiness auf den TCP-Listener; `emptyDir` `/shared`
+    für CA-Root; non-root/read-only-rootfs/`drop:ALL`; replicas 1 — jeder Edge prägt
+    eigene CA), Service `ct-edge` (LoadBalancer, UDP+TCP :4433; Hinweis: Mixed-Protocol-LB
+    braucht k8s≥1.26). In dieselbe kustomization gehängt. Verifikation: `kubectl kustomize`
+    RC=0, **8 Objekte** (2 ConfigMap/2 Deployment/1 NS/1 PVC/2 Service), 7 Edge-Asserts grün.
+    **🎯 M21.2 komplett → Milestone 21 (Deployment) komplett** (hosted K8s + self-host compose).
 
 ## Milestone 22 — Onboarding-UX (so wenige Schritte wie möglich)
 - Ein-Kommando-Agent-Setup (Install → Auto-Enroll → Tunnel); portalgeführte
