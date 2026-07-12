@@ -1,0 +1,106 @@
+% Anforderungen und Bedrohungsmodell — claude-tunnel bachelor thesis.
+\chapter{Anforderungen und Bedrohungsmodell}
+\label{ch:anforderungen}
+
+Dieses Kapitel praezisiert, was das System leisten soll
+(Abschnitt~\ref{sec:anf-funktional} und~\ref{sec:anf-nichtfunktional}), gegen
+wen es schuetzen soll (Abschnitt~\ref{sec:bedrohung}) und welche Schutzziele
+daraus folgen (Abschnitt~\ref{sec:schutzziele}). Es bildet die Grundlage, an der
+die Architektur (Kapitel~\ref{ch:anforderungen}) und die Evaluation gemessen
+werden.
+
+\section{Funktionale Anforderungen}
+\label{sec:anf-funktional}
+
+\begin{description}
+  \item[F1 Tunnel beliebiger Protokolle.] Das System tunnelt bidirektionale
+    \gls{ac:tcp}-Stroeme sowie \gls{ac:udp}-Datagramme zwischen einem Client und
+    einem Origin. Datagrammgrenzen bleiben erhalten.
+  \item[F2 Enrollment und Identitaet.] Ein Agent registriert sich ueber ein
+    einmaliges Join-Token bei der Steuerebene und bindet dabei einen
+    ed25519-Schluessel; kurzlebige Anmeldedaten dienen als mTLS-aehnlicher
+    Nachweis gegenueber dem Edge.
+  \item[F3 Rendezvous.] Ein Client loest ein opakes Routing-Token beim Edge zum
+    zustaendigen Tunnel auf, ohne einen Hostnamen zu nennen.
+  \item[F4 Missbrauchsschranke.] Die Rendezvous-Anbahnung ist durch einen
+    \gls{ac:pow}-Nachweis verteuert; die Schwierigkeit ist konfigurierbar.
+  \item[F5 Direkter Pfad und Fallbacks.] Bei Erreichbarkeit nutzt der Client
+    einen direkten \gls{ac:p2p}-Pfad zum Agent; andernfalls den Edge-Relay. Ist
+    \gls{ac:udp} blockiert, traegt ein \gls{ac:tls}-ueber-\gls{ac:tcp}-Fallback
+    denselben Tunnel.
+  \item[F6 Steuerebene.] Enrollment, Registry/Rendezvous und Abrechnung sind
+    ueber einen laufenden Dienst erreichbar.
+  \item[F7 Beobachtbarkeit.] Der Agent exponiert Prometheus-Metriken
+    (Tunnelzahl, Bytes, Handshake-Latenz).
+  \item[F8 Konten und Zahlung.] Ein pseudonymes Prepaid-Guthaben gated die
+    Token-Ausgabe; das Guthaben wird ueber einen Krypto-Payment-Stub aufgeladen.
+\end{description}
+
+\section{Nicht-funktionale Anforderungen}
+\label{sec:anf-nichtfunktional}
+
+\begin{description}
+  \item[N1 Providerblindheit.] Der Betreiber der Vermittlungsebene darf Ziel und
+    Nutzlast strukturell nicht einsehen koennen; er relayt nur Chiffretext.
+  \item[N2 Kein Vorhalten von Vertrauensmaterial.] Die Steuerebene haelt weder
+    Origin-Schluessel noch Nutzlast (thin control plane).
+  \item[N3 Beschraenkter Overhead.] Der Latenz-Overhead gegenueber der reinen
+    Netzlaufzeit soll klein und -- ueber Netzbedingungen -- vorhersagbar sein
+    (empirisch belegt in der Evaluation).
+  \item[N4 Reproduzierbarkeit.] Aufbau, Betrieb und Messung erfolgen
+    ausschliesslich containerbasiert und sind aus dem Repository reproduzierbar.
+  \item[N5 Pseudonymitaet.] Konten werden ausschliesslich ueber opake Kennungen
+    gefuehrt; es werden keine personenbezogenen Daten gespeichert.
+\end{description}
+
+\section{Bedrohungsmodell}
+\label{sec:bedrohung}
+
+\subsection{Akteure und Faehigkeiten}
+
+\begin{description}
+  \item[A1 Neugieriger Betreiber (honest-but-curious).] Der Edge/Betreiber
+    fuehrt das Protokoll korrekt aus, versucht aber, aus dem vermittelten
+    Verkehr Ziel oder Inhalt zu lernen. Er sieht Quell-/Zieladressen der
+    QUIC-Pakete, Zeitpunkte und Volumina, jedoch -- so das Ziel -- niemals
+    Klartext oder Ziel-Hostnamen.
+  \item[A2 Aktiver Netz-Angreifer / Zensor.] Kann Pakete beobachten, verwerfen
+    und Protokolle grob blockieren (insbesondere \gls{ac:udp}). Kann versuchen,
+    sich als Origin auszugeben.
+  \item[A3 Boesartiger Client / Fluter.] Versucht, ueber massenhafte
+    Rendezvous-Versuche Ressourcen zu erschoepfen.
+  \item[A4 Finanzierter Sybil-Angreifer.] Kann beliebig viele pseudonyme Konten
+    eroeffnen und bezahlen.
+\end{description}
+
+\subsection{Vertrauensgrenzen und Annahmen}
+
+Der Client vertraut der \emph{Origin-Identitaet}, die er ausserhalb des Bandes
+als Teil einer Capability erhaelt (Pinning, vgl.
+Abschnitt~\ref{sec:noise}). Der Agent ist \emph{Verwalter} des
+Origin-Noise-Schluessels; dieser verlaesst den Agent nie. Die Steuerebene wird
+als verfuegbar, aber nicht als vertraulich angenommen (N2). Die kryptographischen
+Primitiven (X25519, ChaCha20-Poly1305, BLAKE2s, ed25519, SHA-256) gelten als
+sicher.
+
+\section{Schutzziele und Nicht-Ziele}
+\label{sec:schutzziele}
+
+\paragraph{Schutzziele.}
+\textbf{S1 Ende-zu-Ende-Vertraulichkeit und -Integritaet} der Nutzlast gegenueber
+A1 und A2 (durch Noise-Ende-zu-Ende, Abschnitt~\ref{sec:noise}).
+\textbf{S2 Ziel-Blindheit} des Betreibers gegenueber A1 (Adressierung ueber opake
+Tokens, N1). \textbf{S3 Origin-Authentizitaet} gegenueber A2 (Pinning schlaegt
+fehl bei falschem Schluessel). \textbf{S4 Missbrauchsdaempfung} gegenueber A3
+(asymmetrischer \gls{ac:pow}-Aufwand).
+
+\paragraph{Nicht-Ziele.}
+Ausdruecklich \emph{nicht} adressiert werden: \emph{Anonymitaet} im Sinne der
+Unverkettbarkeit von Client und Ziel gegenueber einem globalen Beobachter (das
+ist Tors Ziel, vgl.\ Abschnitt~\ref{sec:rw-tor}); \emph{Traffic-Analyse- und
+Verschleierungs-Resistenz} gegen A2 (Groessen- und Timing-Seitenkanaele bleiben
+sichtbar); \emph{vollstaendiger DoS-Schutz} (\gls{ac:pow} daempft, verhindert
+aber nicht); und die \emph{oekonomische Abwehr von A4}: ein finanzierter
+Sybil-Angreifer kann beliebig viele Konten kaufen. Das prepaid-basierte Gating
+verteuert Missbrauch, loest die Sybil-Oekonomie aber nicht; diese Grenze wird
+offen benannt und im Backlog gefuehrt.
