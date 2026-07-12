@@ -668,7 +668,13 @@ hosted, hinter einem Storage-Trait).
     liest Payload nicht", Adversar×Control-Matrix, Secrets-Inventar+Handling, Residual-Risks).
     Verifikation: `sh -n` grün, Guard clean auf Repo (RC=0), Selbst-Test (Patterns matchen
     Known-Bad), E2E (gestagete AKIA-Fixture → Guard RC=1).
-  - **M23.4** ⏳ „TLS überall"-Review: Control-Plane-HTTP hinter TLS-Ingress dokumentieren/erzwingen.
+  - **M23.4** ✅ „TLS überall": `docker/deploy/k8s/control-plane-ingress.yaml` (TLS-terminierender
+    Ingress vor der Control-Plane — `tls.secretName ct-control-plane-tls`, cert-manager-Annotation,
+    `ssl-redirect`, Backend `ct-control-plane:8090`) in die kustomization gehängt +
+    `docs/security/tls-everywhere.md` (Hop-für-Hop-Tabelle: Payload E2E-Noise, Edge QUIC/TLS,
+    Control-Plane-API HTTPS am Ingress; self-host = TLS-Reverse-Proxy; Pre-Expose-Checkliste).
+    Verifikation: `kubectl kustomize` RC=0, **9 Objekte** (+Ingress), 6 TLS-Asserts grün,
+    Secret-Guard clean. **🎯 Milestone 23 (Security-Hardening & Audit) komplett.**
 
 ## Milestone 24 — Payment (echt, ersetzt Stub)
 - Zahlungsanbieter-Integration an Accounts + Credit-Ledger gebunden.

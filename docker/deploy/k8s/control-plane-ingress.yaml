@@ -1,0 +1,39 @@
+# TLS termination for the control plane (M23.4 — "TLS everywhere").
+#
+# The control plane serves plain HTTP internally; all external access is over
+# HTTPS, terminated here at the ingress. The data path is already encrypted
+# independently (edge QUIC/TLS + end-to-end Noise), so this closes the last
+# plaintext-capable hop: the control-plane HTTP API.
+#
+# - `tls.secretName` holds the server cert/key (issued by cert-manager via the
+#   annotation, or supplied out-of-band). It is a Secret, never committed.
+# - Replace `cp.example.com` and the issuer with your real values before deploy.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ct-control-plane
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-control-plane
+    app.kubernetes.io/part-of: claude-tunnel
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Redirect any plaintext HTTP to HTTPS at the ingress.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - cp.example.com
+      secretName: ct-control-plane-tls
+  rules:
+    - host: cp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ct-control-plane
+                port:
+                  number: 8090
