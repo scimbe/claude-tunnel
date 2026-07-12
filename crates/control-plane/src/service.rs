@@ -248,6 +248,19 @@ async fn buy_token(
     }))
 }
 
+/// Build the full persistent control-plane router: enrollment + registry +
+/// billing, all backed by durable SQLite stores opened on **one** database file
+/// (`db_path`). The three stores share the file via separate connections; each
+/// owns its own tables. This is what a real deployment serves.
+pub fn persistent_control_plane_router(db_path: &str) -> rusqlite::Result<Router> {
+    let enrollment = Arc::new(SqliteEnrollment::open(db_path)?);
+    let registry = Arc::new(SqliteRegistry::open(db_path)?);
+    let ledger = Arc::new(SqliteLedger::open(db_path)?);
+    Ok(enrollment_router_sqlite(enrollment)
+        .merge(registry_router_sqlite(registry))
+        .merge(billing_router_sqlite(ledger)))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -385,6 +398,52 @@ mod tests {
             matches!(replay, Err(crate::client::CpError::Status(_))),
             "payment stays confirmed across a service restart"
         );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Serve the full unified persistent control-plane on an ephemeral port.
+    async fn spawn_unified(db_path: &str) -> String {
+        let app = persistent_control_plane_router(db_path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The milestone E2E: the whole control plane (enrollment + registry +
+    /// billing on one DB) survives a restart. Drive all three against one
+    /// instance, restart on the same file, and confirm every concern persisted.
+    #[tokio::test]
+    async fn unified_control_plane_survives_restart() {
+        let db = temp_db_path();
+        let agent = AgentId("agent-u".to_string());
+        let token = RoutingToken([0x33; 32]);
+        let join;
+        let account;
+        {
+            let cp = ControlPlaneClient::new(spawn_unified(&db).await);
+            // enrollment
+            join = cp.issue_join_token(&TenantId("tu".to_string())).await.unwrap();
+            cp.redeem(&join, &agent, &[5u8; 32]).await.unwrap();
+            // registry
+            cp.register(&token, &TenantId("tu".to_string()), &agent).await.unwrap();
+            // billing
+            account = cp.open_account().await.unwrap();
+            let p = cp.create_payment_intent(&account, 2).await.unwrap();
+            cp.confirm_payment(&p).await.unwrap();
+        }
+
+        // Restart on the same database file.
+        let cp2 = ControlPlaneClient::new(spawn_unified(&db).await);
+        assert!(
+            cp2.redeem(&join, &agent, &[5u8; 32]).await.is_err(),
+            "enrollment persisted (token consumed)"
+        );
+        let (t, a) = cp2.resolve(&token).await.unwrap();
+        assert_eq!((t.0.as_str(), a.0.as_str()), ("tu", "agent-u"), "registry persisted");
+        let bought = cp2.buy_token(&account, 1).await.unwrap();
+        assert_ne!(bought.0, [0u8; 32], "billing persisted (funded account buys a token)");
+
         let _ = std::fs::remove_file(&db);
     }
 }

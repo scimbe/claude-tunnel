@@ -537,9 +537,13 @@ hosted, hinter einem Storage-Trait).
     404 unknown). E2E `registry_survives_service_restart`. · **M18.4c** ✅ `billing_router_sqlite(Arc<SqliteLedger>)`
     (open/intent/confirm/issue; 402/409/404). E2E `billing_survives_service_restart`
     (Balance + Idempotenz überleben Neustart).
-  - **M18.4d** unified `persistent_control_plane_router(db_path)` (alle Stores auf
-    einer DB) + `main` verdrahten → voller Service-Neustart-E2E.
-- **E2E:** Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest).
+  - **M18.4d** ✅ `persistent_control_plane_router(db_path)` (merged alle 3 Stores
+    auf **einer** DB) + `main` serviert es durabel (`CT_CONTROL_PLANE_DB`, Default
+    `control-plane.db`). E2E `unified_control_plane_survives_restart`:
+    enroll+register+topup gegen Instanz-1, frische Instanz auf derselben DB →
+    alle drei Concerns persistiert. **Milestone 18 (Persistenz) komplett.**
+- **E2E:** ✅ Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest,
+  Service-Level, für alle drei Concerns + unified).
 
 ## Milestone 19 — Identität & Auth (Keycloak/OIDC, konventionelle Accounts)
 - **M19.1** Account-Modell an OIDC-Subject gebunden; Datenpfad bleibt E2E-Noise.
