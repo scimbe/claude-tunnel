@@ -11,6 +11,7 @@ pub mod http;
 pub mod issuance;
 pub mod oidc;
 pub mod payment;
+pub mod payment_provider;
 pub mod registry;
 pub mod service;
 pub mod storage;

@@ -677,7 +677,19 @@ hosted, hinter einem Storage-Trait).
     Secret-Guard clean. **🎯 Milestone 23 (Security-Hardening & Audit) komplett.**
 
 ## Milestone 24 — Payment (echt, ersetzt Stub)
-- Zahlungsanbieter-Integration an Accounts + Credit-Ledger gebunden.
+- Zahlungsanbieter-Integration an Accounts + Credit-Ledger gebunden. Kern:
+  Bestätigung muss vom **verifizierten Provider-Webhook** kommen, nicht von einem
+  client-aufrufbaren Endpoint (der M18-Stub). Dekomponiert:
+  - **M24.1** ✅ Webhook-Signatur-Verifier (`crates/control-plane/src/payment_provider.rs`):
+    `WebhookVerifier` (HMAC-SHA256 über `"<timestamp>.<body>"` mit Shared-Secret,
+    Stripe-Stil; `verify` prüft Signatur konstantzeitig via `Mac::verify_slice` +
+    Timestamp-Toleranz gegen Replay; `sign` = Provider-Seite/Tests). Rein & clock-injected
+    (`now` Parameter), wie der OIDC-Verifier. Deps `hmac`+`sha2`. 5 Frozen-Tests: valid,
+    tampered body, wrong secret, stale timestamp, malformed hex. Gate 200 (+5).
+  - **M24.2** ⏳ `/payment/webhook`-Endpoint: verifiziert → mappt Provider-Intent→PaymentId →
+    `confirm_payment` (idempotent, kreditiert); client-`/payment/confirm` entschärfen.
+  - **M24.3** ⏳ Provider-Intent-Ref in `payments`-Schema + `create_intent` speichert sie.
+  - **M24.4** ⏳ Payment-Integrations-Doku (Provider-Config, Webhook-Secret, Test-Ablauf).
 
 ## Milestone 25 — Produktdokumentation
 - Positionierung/Marketing (ehrliche Claims), Security-Whitepaper, Betriebs-Runbook,
