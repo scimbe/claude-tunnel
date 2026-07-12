@@ -294,6 +294,10 @@ impl SqliteLedger {
                  account   BLOB NOT NULL,
                  credits   INTEGER NOT NULL,
                  confirmed INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS account_subjects (
+                 subject TEXT PRIMARY KEY,
+                 account BLOB NOT NULL
              );",
         )?;
         Ok(Self {
@@ -319,6 +323,42 @@ impl SqliteLedger {
             params![&bytes[..]],
         )?;
         Ok(AccountId(bytes))
+    }
+
+    /// Return the account bound to an OIDC `subject` (e.g. a Keycloak `sub`
+    /// claim), creating it with a zero balance on first use (M19.1). Idempotent:
+    /// the same subject always maps to the same account, so conventional
+    /// authenticated users have one stable account. The lookup + creation run in
+    /// a transaction so a subject can never end up with two accounts.
+    pub fn account_for_subject(&self, subject: &str) -> Result<AccountId, LedgerOpError> {
+        let mut guard = self.conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        let existing: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT account FROM account_subjects WHERE subject = ?1",
+                params![subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let account = if let Some(bytes) = existing {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes);
+            AccountId(a)
+        } else {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            tx.execute(
+                "INSERT INTO accounts (account, balance) VALUES (?1, 0)",
+                params![&bytes[..]],
+            )?;
+            tx.execute(
+                "INSERT INTO account_subjects (subject, account) VALUES (?1, ?2)",
+                params![subject, &bytes[..]],
+            )?;
+            AccountId(bytes)
+        };
+        tx.commit()?;
+        Ok(account)
     }
 
     /// Current balance, or [`LedgerError::UnknownAccount`].
@@ -630,6 +670,38 @@ mod tests {
             "payment stays confirmed across reopen (no double-credit)"
         );
         assert_eq!(reopened.balance(&acct).unwrap(), 8, "no double-credit after reopen");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn account_for_subject_is_idempotent() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let a1 = ledger.account_for_subject("keycloak-sub-1").unwrap();
+        let a2 = ledger.account_for_subject("keycloak-sub-1").unwrap();
+        assert_eq!(a1, a2, "same subject maps to the same account");
+        let b = ledger.account_for_subject("keycloak-sub-2").unwrap();
+        assert_ne!(a1, b, "distinct subjects get distinct accounts");
+        // The bound account is a real, usable account.
+        ledger.credit(&a1, 10).unwrap();
+        assert_eq!(ledger.balance(&a1).unwrap(), 10);
+    }
+
+    #[test]
+    fn subject_account_survives_reopen() {
+        let path = temp_db_path();
+        let acct;
+        {
+            let ledger = SqliteLedger::open(&path).unwrap();
+            acct = ledger.account_for_subject("sub-persist").unwrap();
+            ledger.credit(&acct, 7).unwrap();
+        }
+        let reopened = SqliteLedger::open(&path).unwrap();
+        assert_eq!(
+            reopened.account_for_subject("sub-persist").unwrap(),
+            acct,
+            "subject maps to the same account after reopen"
+        );
+        assert_eq!(reopened.balance(&acct).unwrap(), 7);
         let _ = std::fs::remove_file(&path);
     }
 }

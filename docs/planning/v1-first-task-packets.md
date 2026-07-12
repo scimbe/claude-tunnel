@@ -546,7 +546,11 @@ hosted, hinter einem Storage-Trait).
   Service-Level, für alle drei Concerns + unified).
 
 ## Milestone 19 — Identität & Auth (Keycloak/OIDC, konventionelle Accounts)
-- **M19.1** Account-Modell an OIDC-Subject gebunden; Datenpfad bleibt E2E-Noise.
+- **M19.1** ✅ Account-Modell an OIDC-Subject gebunden — `SqliteLedger::account_for_subject(subject)`
+  (Tabelle `account_subjects`): erstellt beim ersten Mal ein Konto, gibt danach
+  idempotent dasselbe zurück; in Transaktion (ein Subject → nie zwei Konten).
+  Datenpfad bleibt E2E-Noise (Accounts = Identität, nicht Payload-Zugriff).
+  Tests: idempotent, distinkte Subjects, überlebt Reopen.
 - **M19.2** OIDC-Token-Verifikation (Keycloak-Realm) auf der Control-Plane-API.
 - **M19.3** Agent-/Token-Ausgabe an authentifizierte Accounts gekoppelt (ersetzt das
   pseudonyme Prepaid-Gating als Standard; Guthaben bleibt als Abrechnungseinheit).
