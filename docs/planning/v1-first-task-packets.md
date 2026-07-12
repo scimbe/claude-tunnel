@@ -427,7 +427,10 @@ Decomposed:
     mode + a new `latency-by-mode.png` (mean vs delay, one series per mode at 0%
     loss). Rendered all three PNGs; the modes overlap at 0% loss (latency is
     delay-dominated, not transport-dominated).
-  - **M16.4c** write the German analysis (`results.md`) from the new data.
+  - **M16.4c** ✅ rewrote `results.md` as the mode-aware M16 analysis (baseline
+    ~8ms all modes, `RT≈8.8+6.1·d`, loss hits the p99 tail not the median [×7.7
+    at 20ms/2%], modes indistinguishable at 0% loss and CI-overlapping under
+    loss, PoW axis available). **Milestone 16 complete.**
 
 ## Milestone 17 — Tiefe BA-Thesis (ersetzt M7, HAW-Vorlage, ~64 S.)
 - Aufsetzen auf `docs/thesis/haw-template/` (Coverpage, Konfiguration, Glossar,
