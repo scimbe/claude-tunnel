@@ -573,8 +573,9 @@ hosted, hinter einem Storage-Trait).
   `build_client_endpoint_trusting_ca` (Client vertraut dem **CA-Root**, nicht dem
   Leaf → Rotation ohne Re-Pinning). Trust-Chain-Tests: Leaf via CA-Root
   akzeptiert (QUIC-Handshake+Echo), Leaf fremder CA abgelehnt.
-- **M20.2** ⏳ Rotation: neuer Leaf unter derselben CA, Client bleibt gültig
-  (frozen Rotationstest).
+- **M20.2** ✅ Rotation: `client_survives_edge_cert_rotation` — ein Client, der
+  den CA-Root einmal vertraut, verbindet sich nach dem Rotieren auf einen
+  frischen Leaf (neuer Cert+Key) unter derselben CA ohne Re-Pinning und tunnelt.
 - **M20.3** ⏳ Edge-Daemon/`run_edge` auf CA umstellen; CA-Root persistieren +
   an Clients verteilen (ersetzt self-signed im Testbett/Compose).
 

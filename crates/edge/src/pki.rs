@@ -145,4 +145,51 @@ mod tests {
         let result = client.connect(addr, "localhost").unwrap().await;
         assert!(result.is_err(), "leaf signed by an untrusted CA is rejected");
     }
+
+    /// Rotation: a client that trusted the CA root once keeps working after the
+    /// Edge rotates to a brand-new leaf (fresh cert + key) under the same CA — no
+    /// client re-pinning required. This is the whole point of CA-based trust.
+    #[tokio::test]
+    async fn client_survives_edge_cert_rotation() {
+        let ca = Ca::new("ct-edge-ca").unwrap();
+
+        // First Edge instance + a client that trusts the CA root (obtained once).
+        let (server1, ca_root) = build_server_endpoint_from_ca(
+            &ca,
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["localhost".into()],
+        )
+        .unwrap();
+        let addr1 = server1.local_addr().unwrap();
+        let srv1 = tokio::spawn(async move { accept_and_echo_one(&server1).await });
+        let client = build_client_endpoint_trusting_ca(ca_root).unwrap();
+        let conn1 = client.connect(addr1, "localhost").unwrap().await.unwrap();
+        conn1.close(0u32.into(), b"done");
+        let _ = srv1.await;
+
+        // Rotate: a brand-new leaf under the same CA on a new endpoint.
+        let (server2, _root2) = build_server_endpoint_from_ca(
+            &ca,
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["localhost".into()],
+        )
+        .unwrap();
+        let addr2 = server2.local_addr().unwrap();
+        let srv2 = tokio::spawn(async move { accept_and_echo_one(&server2).await });
+
+        // The SAME client (same trust config) connects to the rotated cert.
+        let conn2 = client
+            .connect(addr2, "localhost")
+            .unwrap()
+            .await
+            .expect("connect after rotation without re-pinning");
+        let (mut send, mut recv) = conn2.open_bi().await.unwrap();
+        send.write_all(b"after-rotation").await.unwrap();
+        send.finish().unwrap();
+        let echoed = recv.read_to_end(64).await.unwrap();
+        assert_eq!(echoed, b"after-rotation", "works against the rotated cert");
+
+        conn2.close(0u32.into(), b"done");
+        let _ = srv2.await;
+    }
 }
