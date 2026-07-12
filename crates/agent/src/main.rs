@@ -7,13 +7,32 @@ use std::time::Duration;
 
 use ct_agent::capability::mint_capability;
 use ct_agent::config::AgentConfig;
+use ct_agent::onboard::OnboardEnv;
 use ct_agent::origin::OriginKey;
 use ct_agent::serve::run_agent;
 use ct_agent::transport::load_cert;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = AgentConfig::from_env()?;
+    // One-command onboarding: if a join token is present (env or `onboard`
+    // subcommand), auto-enroll against the control plane before serving. This
+    // is the "install -> enroll -> tunnel" single step — the operator supplies
+    // only a control-plane URL and a single-use join token.
+    let onboarding = std::env::args().nth(1).as_deref() == Some("onboard")
+        || std::env::var("CT_AGENT_JOIN_TOKEN").is_ok();
+    let config = if onboarding {
+        let env = OnboardEnv::from_env()?;
+        let edge = env.config.edge;
+        let cp_url = env.cp_url.clone();
+        let onboarded = env.onboard().await?;
+        eprintln!(
+            "ct-agent: onboarded agent={} tenant={} via {} (edge={})",
+            onboarded.agent_id.0, onboarded.tenant.0, cp_url, edge
+        );
+        onboarded.config
+    } else {
+        AgentConfig::from_env()?
+    };
     let cert_path =
         std::env::var("CT_AGENT_EDGE_CERT").unwrap_or_else(|_| "/shared/edge-cert.der".to_string());
     let cap_out = std::env::var("CT_AGENT_CAPABILITY_OUT")

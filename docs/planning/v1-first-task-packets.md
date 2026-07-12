@@ -631,8 +631,12 @@ hosted, hinter einem Storage-Trait).
     von dev-dep zu regulärer dep (azyklisch: hängt nur an ct-common). 2 Frozen-Tests
     gegen In-Process-Enrollment-Router: enrollt+bindet frische Identität; Join-Token
     single-use (zweiter Onboard scheitert). Gate: 190 (+2).
-  - **M22.2** ⏳ `ct-agent` Ein-Kommando-Binary: `onboard`-Subcommand/Env
-    (CP-URL + Join-Token → auto-enroll → serve) statt manueller Mehrschritt-Config.
+  - **M22.2** ✅ `ct-agent` Ein-Kommando-Binary: `OnboardEnv::{parse,from_env,onboard}`
+    (liest `CT_AGENT_CP_URL`/`CT_AGENT_JOIN_TOKEN`-hex/`CT_AGENT_ID` + Edge/Origin-Config,
+    dekodiert Hex-Token → [u8;32], validiert). `main.rs` dispatcht in Onboarding-Modus
+    wenn `onboard`-Subcommand oder `CT_AGENT_JOIN_TOKEN` gesetzt → auto-enroll → serve;
+    sonst Legacy-Pfad. 3 Frozen-Tests (parse ok+Hex-Dekodierung, parse rejects
+    leer/kurz/nicht-hex/leere-ID, `OnboardEnv::onboard` E2E gegen In-Process-CP). Gate 193 (+3).
   - **M22.3** ⏳ Kurzanleitung/Quickstart (Onboarding-Schritte, portalgeführt).
 
 ## Milestone 23 — Security-Hardening & Audit

@@ -17,6 +17,82 @@ use crate::identity::AgentIdentity;
 use ct_common::{AgentId, TenantId};
 use ct_control_plane::client::{ControlPlaneClient, CpError};
 
+/// Decode exactly 64 lowercase/uppercase hex chars into 32 bytes.
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Inputs for one-command onboarding, gathered so the agent can be brought up
+/// with a single command plus a join token. [`OnboardEnv::from_env`] reads them
+/// from the environment; [`OnboardEnv::parse`] builds them from explicit
+/// strings (used by the binary's dispatch and by tests).
+pub struct OnboardEnv {
+    /// Control-plane base URL to enroll against.
+    pub cp_url: String,
+    /// Single-use join token (decoded from hex).
+    pub join_token: [u8; 32],
+    /// Agent id to enroll under.
+    pub agent_id: AgentId,
+    /// Runnable edge/origin config for the serve path.
+    pub config: AgentConfig,
+}
+
+impl OnboardEnv {
+    /// Build onboarding inputs from explicit strings, validating each field:
+    /// a non-empty control-plane URL, a 64-char hex join token, a non-empty
+    /// agent id, and a parseable edge/origin config.
+    pub fn parse(
+        cp_url: &str,
+        join_token_hex: &str,
+        agent_id: &str,
+        config: AgentConfig,
+    ) -> Result<OnboardEnv, String> {
+        let cp_url = cp_url.trim();
+        if cp_url.is_empty() {
+            return Err("CT_AGENT_CP_URL must not be empty".to_string());
+        }
+        let join_token = hex_decode_32(join_token_hex)
+            .ok_or_else(|| "CT_AGENT_JOIN_TOKEN must be 64 hex chars (32 bytes)".to_string())?;
+        let agent_id = agent_id.trim();
+        if agent_id.is_empty() {
+            return Err("CT_AGENT_ID must not be empty".to_string());
+        }
+        Ok(OnboardEnv {
+            cp_url: cp_url.to_string(),
+            join_token,
+            agent_id: AgentId(agent_id.to_string()),
+            config,
+        })
+    }
+
+    /// Read onboarding inputs from the environment:
+    /// `CT_AGENT_CP_URL`, `CT_AGENT_JOIN_TOKEN` (hex), `CT_AGENT_ID`, plus the
+    /// usual edge/origin variables consumed by [`AgentConfig::from_env`].
+    pub fn from_env() -> Result<OnboardEnv, String> {
+        let cp_url = std::env::var("CT_AGENT_CP_URL")
+            .map_err(|_| "CT_AGENT_CP_URL is required for onboarding".to_string())?;
+        let token = std::env::var("CT_AGENT_JOIN_TOKEN")
+            .map_err(|_| "CT_AGENT_JOIN_TOKEN is required for onboarding".to_string())?;
+        let agent_id = std::env::var("CT_AGENT_ID")
+            .map_err(|_| "CT_AGENT_ID is required for onboarding".to_string())?;
+        let config = AgentConfig::from_env()?;
+        Self::parse(&cp_url, &token, &agent_id, config)
+    }
+
+    /// Onboard using these inputs (generate identity, redeem the token, bind).
+    pub async fn onboard(self) -> Result<OnboardedAgent, CpError> {
+        onboard(&self.cp_url, &self.join_token, self.agent_id, self.config).await
+    }
+}
+
 /// A fully onboarded agent: a fresh identity bound to its tenant plus a
 /// ready-to-serve [`AgentConfig`]. The caller hands these to the serve path to
 /// run the tunnel; no further enrollment step is required.
@@ -98,6 +174,51 @@ mod tests {
             store.binding(&agent_id).unwrap(),
             Some((tenant, onboarded.identity.public_key_bytes())),
             "the generated identity is bound to the agent id"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_valid_inputs_and_decodes_the_hex_token() {
+        let token_hex = "aa".repeat(32); // 64 hex chars -> 32 bytes of 0xaa
+        let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
+        let env = OnboardEnv::parse("http://cp:8090/", &token_hex, "agent-1", cfg.clone())
+            .expect("valid onboarding inputs parse");
+        assert_eq!(env.cp_url, "http://cp:8090/");
+        assert_eq!(env.join_token, [0xaa; 32]);
+        assert_eq!(env.agent_id, AgentId("agent-1".into()));
+        assert_eq!(env.config, cfg);
+    }
+
+    #[test]
+    fn parse_rejects_bad_inputs() {
+        let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
+        let good = "aa".repeat(32);
+        // empty control-plane URL
+        assert!(OnboardEnv::parse("", &good, "agent-1", cfg.clone()).is_err());
+        // token too short
+        assert!(OnboardEnv::parse("http://cp", "aabb", "agent-1", cfg.clone()).is_err());
+        // token not hex
+        assert!(OnboardEnv::parse("http://cp", &"zz".repeat(32), "agent-1", cfg.clone()).is_err());
+        // empty agent id
+        assert!(OnboardEnv::parse("http://cp", &good, "  ", cfg).is_err());
+    }
+
+    #[tokio::test]
+    async fn onboard_env_drives_the_full_flow() {
+        let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let tenant = TenantId("tenant-1".into());
+        let token = store.issue_join_token(&tenant).unwrap();
+        let url = serve(store.clone()).await;
+        let token_hex: String = token.0.iter().map(|b| format!("{b:02x}")).collect();
+        let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
+
+        let env = OnboardEnv::parse(&url, &token_hex, "agent-1", cfg).expect("parse");
+        let onboarded = env.onboard().await.expect("onboard from env inputs");
+
+        assert_eq!(onboarded.tenant, tenant);
+        assert_eq!(
+            store.binding(&AgentId("agent-1".into())).unwrap(),
+            Some((tenant, onboarded.identity.public_key_bytes()))
         );
     }
 
