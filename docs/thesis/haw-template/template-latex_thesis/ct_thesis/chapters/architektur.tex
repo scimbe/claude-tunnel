@@ -1,0 +1,115 @@
+% Architektur — claude-tunnel bachelor thesis.
+\chapter{Architektur}
+\label{ch:architektur}
+
+Dieses Kapitel beschreibt die Struktur des Systems: die Komponenten und ihre
+Topologie (Abschnitt~\ref{sec:arch-topologie}), die zentralen Ablaeufe
+(\ref{sec:arch-fluesse}), den Rollen-Dispatch auf einem QUIC-Stream
+(\ref{sec:arch-dispatch}) und die tragenden Entwurfsentscheidungen
+(\ref{sec:arch-entscheidungen}). Es setzt die Anforderungen aus
+Kapitel~\ref{ch:anforderungen} in eine Aufteilung von Verantwortlichkeiten um.
+
+\section{Komponenten und Topologie}
+\label{sec:arch-topologie}
+
+Das System besteht aus vier Rollen auf dem Datenpfad -- Client, Edge, Agent und
+Origin -- sowie einer Steuerebene (Control Plane). Der Client will einen lokalen
+Dienst erreichen; das Origin ist der Zieldienst; der Agent ist kundenseitig und
+haelt den Origin-Schluessel; der Edge ist der providerblinde Vermittler.
+Abbildung~\ref{fig:topologie} zeigt die Topologie.
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      node distance=14mm and 20mm,
+      box/.style={draw, rounded corners, minimum height=9mm, minimum width=18mm,
+                  align=center, font=\small},
+      relay/.style={-{Stealth[]}, thick},
+      e2e/.style={-{Stealth[]}, dashed},
+    ]
+    \node[box] (client) {Client};
+    \node[box, right=of client] (edge) {Edge\\\scriptsize (Relay)};
+    \node[box, right=of edge] (agent) {Agent};
+    \node[box, right=of agent] (origin) {Origin};
+    \node[box, above=of edge] (cp) {Control\\Plane};
+
+    \draw[relay] (client) -- node[above,font=\scriptsize]{QUIC} (edge);
+    \draw[relay] (edge) -- node[above,font=\scriptsize]{QUIC} (agent);
+    \draw[relay] (agent) -- node[above,font=\scriptsize]{TCP/UDP} (origin);
+    \draw[relay, dotted] (agent) -- (cp);
+    \draw[relay, dotted] (client) to[bend left=12] (cp);
+
+    % Provider-blind end-to-end Noise arc: client <-> origin
+    \draw[e2e] (client) to[bend right=28]
+      node[below,font=\scriptsize]{Noise-Ende-zu-Ende (nur Chiffretext am Edge)}
+      (origin);
+  \end{tikzpicture}
+  \caption{Topologie: Der Edge relayt zwischen Client und Agent, sieht aber nur
+  den Ende-zu-Ende mit Noise verschluesselten Verkehr (gestrichelter Bogen). Die
+  Steuerebene koordiniert (gepunktet), traegt aber keine Nutzlast.}
+  \label{fig:topologie}
+\end{figure}
+
+Die Trennung ist bewusst: der Edge kennt nur opake Routing-Tokens und relayt
+Bytes, das Origin terminiert die Noise-Sitzung, und die Steuerebene haelt weder
+Schluessel noch Nutzlast (thin control plane, N2).
+
+\section{Schluesselfluesse}
+\label{sec:arch-fluesse}
+
+\paragraph{Enrollment und Anmeldung.} Der Agent redeemt ein Join-Token bei der
+Steuerebene und bindet seinen ed25519-Schluessel; er erhaelt kurzlebige
+Anmeldedaten, die der Edge zustandslos verifiziert (F2).
+
+\paragraph{Rendezvous mit Proof-of-Work.} Oeffnet ein Client den Tunnel, sendet
+der Edge eine \gls{ac:pow}-Challenge; der Client antwortet mit Loesung und
+Routing-Token. Erst nach gueltiger Loesung loest der Edge das Token zum Agent auf
+(F3, F4).
+
+\paragraph{Relay und Ende-zu-Ende-Handshake.} Der Edge verbindet den Client-Stream
+mit dem registrierten Agent und kopiert fortan nur Bytes. Darueber laeuft der
+Noise-Handshake zwischen Client und Origin; der Client pinnt die
+Origin-Identitaet (S1, S3).
+
+\paragraph{Direkter Pfad und Fallbacks.} Advertisiert der Agent einen direkten
+Listener, entdeckt der Client dessen Adresse und Zertifikat ueber den Edge und
+verbindet direkt; scheitert das, faellt er auf den Relay zurueck. Ist
+\gls{ac:udp} blockiert, traegt ein \gls{ac:tls}-ueber-\gls{ac:tcp}-Kanal denselben
+Tunnel (F5).
+
+\section{Rollen-Dispatch auf einem Stream}
+\label{sec:arch-dispatch}
+
+Client und Agent teilen sich das QUIC-Protokoll zum Edge; die gewuenschte Rolle
+wird durch ein fuehrendes Byte auf dem Stream ausgewaehlt:
+
+\begin{description}
+  \item[\texttt{'A'}] Agent registriert einen Tunnel (Token + reflexive Adresse).
+  \item[\texttt{'C'}] Client fordert Rendezvous an (PoW), wird geroutet und
+    relayt.
+  \item[\texttt{'D'}] Agent advertisiert seinen direkten Listener (Adresse,
+    Zertifikat).
+  \item[\texttt{'P'}] Client fragt den direkten Endpunkt eines Tokens ab.
+\end{description}
+
+Dieser minimale Dispatch haelt den Edge einfach und erweiterbar, ohne ein
+separates Steuerprotokoll auf eigener Verbindung.
+
+\section{Entwurfsentscheidungen}
+\label{sec:arch-entscheidungen}
+
+\begin{description}
+  \item[Thin Control Plane.] Die Steuerebene koordiniert nur (Enrollment,
+    Registry, Abrechnung) und haelt kein Vertrauensmaterial; ein Kompromiss der
+    Steuerebene gefaehrdet damit nicht die Vertraulichkeit der Tunnel.
+  \item[Capability ausserhalb des Bandes.] Die Verbindungserlaubnis (Routing-Token
+    + Origin-Identitaet + Edge-Adresse) wird vom Kunden out-of-band verteilt;
+    Besitz genuegt, um das Origin zu erreichen und zu authentisieren.
+  \item[Noise\_IK mit Origin-Pinning.] Die Wahl des IK-Musters verankert die
+    Origin-Authentizitaet im Client und macht den Edge als Man-in-the-Middle
+    wirkungslos.
+  \item[Transport-agnostischer Datenpfad.] Ein gemeinsamer, bidirektionaler
+    Noise-Streaming-Baustein traegt Streaming, Datagramm, direkten Pfad und
+    TCP-Fallback gleichermassen; die Betriebsarten unterscheiden sich nur an den
+    Raendern.
+\end{description}

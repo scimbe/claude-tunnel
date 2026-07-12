@@ -12,6 +12,8 @@
 ]{scrreprt}
 \usepackage{../style/thesisstyle}
 \usepackage{csquotes}     % \enquote for German typographic quotes (after babel)
+\usepackage{tikz}         % topology diagram (Architektur)
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
 
 \makeglossaries           % create all glossary entries (remember: run makeglossaries manually)
 \loadglsentries{thesisglossaries.tex}  % load acronym, symbol and glossary entries
@@ -74,6 +76,7 @@
 \input{chapters/grundlagen}
 \input{chapters/relatedwork}
 \input{chapters/anforderungen}
+\input{chapters/architektur}
 % Add additional chapters here
 
 % dinat.bst (DIN 1505) is not in the container's TeX packages; plainnat is a

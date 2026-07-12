@@ -461,7 +461,9 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
 - **M17.5** ✅ Anforderungen & Bedrohungsmodell (F1–F8, N1–N5, Akteure A1–A4,
   Vertrauensgrenzen, Schutzziele S1–S4 + explizite Nicht-Ziele inkl.
   finanzierter Sybil). Baut sauber (31 S.).
-- **M17.6** Architektur (aus ADRs).
+- **M17.6** ✅ Architektur (TikZ-Topologie-Diagramm, Schlüsselflüsse, Rollen-
+  Dispatch 'A'/'C'/'D'/'P', Entwurfsentscheidungen aus ADRs). TikZ in Preamble
+  ergänzt; baut sauber (34 S., Abb. 4.1).
 - **M17.7** Implementierung (alle Crates, inkl. Streaming/UDP/P2P/Payment).
 - **M17.8** Evaluation (Parameterstudie M16, Tabellen + Abbildungen).
 - **M17.9** Diskussion & Limitierungen.
