@@ -763,7 +763,12 @@ hosted, hinter einem Storage-Trait).
     Backup, Audit), Incident-Response-Tabelle, „Known limitations". Drift-Check: alle
     zitierten Env-Vars/Endpoints/Artefakte/Skripte existieren → RUNBOOK_DRIFT_OK.
 
-## Milestone 26 — Wiring-Lücken & Aufräumen
+## Milestone 26 — Wiring-Lücken, Aufräumen & Publish
+- **M26.3** ✅ Repo publiziert (github.com/scimbe/claude-tunnel, public, `main`) +
+  MIT-LICENSE-Datei ergänzt (Cargo deklarierte `license = "MIT"`, aber keine
+  LICENSE-Datei → GitHub erkannte keine Lizenz; jetzt „MIT License" erkannt).
+  README + `docs/architecture.md` (Source-Base) + `docs/install.md` (Nutzung/Skripte)
+  als Einstiegspunkte. CI-Workflow temporär untracked (Push ohne `workflow`-Token-Scope).
 - **M26.1** ✅ OIDC-Authed-Endpoints in Produktion gemountet: `persistent_control_plane_router`
   nimmt jetzt `oidc: Option<Arc<OidcVerifier>>` und merged `authed_billing_router` (`/me/*`,
   Cap `AUTHED_ISSUES_PER_WINDOW=60`) nur wenn Some. `main.rs` baut den Verifier via
