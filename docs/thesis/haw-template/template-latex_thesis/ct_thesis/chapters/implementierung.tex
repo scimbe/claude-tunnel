@@ -1,0 +1,94 @@
+% Implementierung — claude-tunnel bachelor thesis.
+\chapter{Implementierung}
+\label{ch:implementierung}
+
+Der Prototyp ist in Rust als Cargo-Workspace aus fuenf Crates umgesetzt. Dieses
+Kapitel beschreibt die Aufteilung (Abschnitt~\ref{sec:impl-workspace}), die
+gemeinsamen Bausteine (\ref{sec:impl-common}), den Rollen-Dispatch am Edge
+(\ref{sec:impl-dispatch}) sowie den Daten- und Steuerpfad
+(\ref{sec:impl-datenpfad}).
+
+\section{Workspace-Struktur}
+\label{sec:impl-workspace}
+
+\begin{table}[t]
+  \centering
+  \caption{Crates des Workspace und ihre Verantwortung.}
+  \label{tab:crates}
+  \begin{tabular}{ll}
+    \toprule
+    Crate & Verantwortung \\
+    \midrule
+    \texttt{ct-common} & Wire-Typen, Noise, PoW, Framing, Metriken \\
+    \texttt{ct-edge} & providerblinder Vermittler (Rollen-Dispatch, Relay) \\
+    \texttt{ct-agent} & kundenseitig, Origin-Schluessel, Serve-Pfad \\
+    \texttt{ct-control-plane} & Enrollment, Registry/Rendezvous, Abrechnung \\
+    \texttt{ct-client} & Tunnel-Aufbau, Betriebsarten, Bench-Harness \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Die Schichtung ist azyklisch: alle Crates haengen nur von \texttt{ct-common} ab,
+nie voneinander (Testabhaengigkeiten ausgenommen). So bleibt der providerblinde
+Edge unabhaengig vom kundenseitigen Agent.
+
+\section{Gemeinsame Bausteine (ct-common)}
+\label{sec:impl-common}
+
+Der Kern liegt in \texttt{ct-common}. Der Proof-of-Work nutzt fuehrende Nullbits
+eines SHA-256-Hashes; die Pruefung ist ein einzelner Hash (Listing~\ref{lst:pow}).
+
+\begin{lstlisting}[caption={Proof-of-Work: Pruefung der Loesung (vereinfacht).},label=lst:pow]
+pub fn verify(challenge: &Challenge, solution: &[u8]) -> bool {
+    let mut h = Sha256::new();
+    h.update(&challenge.nonce);
+    h.update(solution);
+    leading_zero_bits(&h.finalize()) >= challenge.difficulty
+}
+\end{lstlisting}
+
+Der zentrale Datenpfad-Baustein ist \texttt{noise\_pump}: eine
+transport-agnostische, bidirektionale Bruecke, die Klartext und verschluesselte
+Frames in beide Richtungen konkurrent umsetzt. Der \texttt{TransportState} wird
+dabei unter einem kurz gehaltenen Mutex gefuehrt, der nie ueber einen
+\texttt{await}-Punkt gehalten wird. Auf diesem Baustein setzen Streaming,
+Datagramm, direkter Pfad und TCP-Fallback gleichermassen auf.
+
+\section{Rollen-Dispatch am Edge (ct-edge)}
+\label{sec:impl-dispatch}
+
+Der Edge liest je Stream ein fuehrendes Rollen-Byte und verzweigt
+(Listing~\ref{lst:dispatch}). Der \texttt{'C'}-Zweig fuehrt das
+PoW-Rendezvous durch und relayt danach nur noch Bytes.
+
+\begin{lstlisting}[caption={Rollen-Dispatch (vereinfacht).},label=lst:dispatch]
+match role {
+    b'A' => register_agent(conn, &mut recv, state).await?,
+    b'C' => rendezvous_route_relay(conn, state, challenge).await?,
+    b'D' => advertise_direct(&mut recv, state).await?,
+    b'P' => answer_direct_query(&mut recv, &mut send, state).await?,
+    _ => return Err("unknown role".into()),
+}
+\end{lstlisting}
+
+Weil Registrierung, Relay und Direktpfad-Abfrage denselben Stream-Typ nutzen,
+bleibt der Edge ohne separates Steuerprotokoll erweiterbar.
+
+\section{Daten- und Steuerpfad (agent, client, control-plane)}
+\label{sec:impl-datenpfad}
+
+Agentenseitig terminiert \texttt{serve\_noise\_stream} bzw.\
+\texttt{serve\_noise\_udp} die Noise-Sitzung mit dem Origin-Schluessel und
+bridget zur lokalen \gls{ac:tcp}- oder \gls{ac:udp}-Instanz; der Datenpfad ist
+mit Tunnel-Metriken instrumentiert (Tunnelzahl, Bytes je Richtung,
+Handshake-Latenz). Clientseitig waehlt \texttt{client\_tunnel\_auto} den direkten
+Pfad, wenn ein Endpunkt advertisiert ist, und faellt sonst auf den Relay zurueck;
+bei blockiertem \gls{ac:udp} traegt \texttt{client\_tunnel\_noise\_tcp} denselben
+Tunnel ueber \gls{ac:tls}-ueber-\gls{ac:tcp}.
+
+Die Steuerebene stellt Enrollment, Registry/Rendezvous und Abrechnung als
+HTTP-Dienst bereit; ein \texttt{ControlPlaneClient} treibt den vollen Ablauf
+(Konto eroeffnen, aufladen, Token kaufen, aufloesen) gegen den laufenden Dienst.
+Die Korrektheit des Zusammenspiels ist durch eine frozen Testsuite belegt, die
+den Pfad bis hin zum verschluesselten Roundtrip durch echte Komponenten
+ueberprueft.

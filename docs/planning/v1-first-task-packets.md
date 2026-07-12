@@ -464,7 +464,9 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
 - **M17.6** ✅ Architektur (TikZ-Topologie-Diagramm, Schlüsselflüsse, Rollen-
   Dispatch 'A'/'C'/'D'/'P', Entwurfsentscheidungen aus ADRs). TikZ in Preamble
   ergänzt; baut sauber (34 S., Abb. 4.1).
-- **M17.7** Implementierung (alle Crates, inkl. Streaming/UDP/P2P/Payment).
+- **M17.7** ✅ Implementierung (5-Crate-Tabelle, ct-common-Bausteine + PoW-/
+  Dispatch-Listings, Daten-/Steuerpfad). `booktabs`/`listings` in Preamble;
+  baut sauber (37 S.).
 - **M17.8** Evaluation (Parameterstudie M16, Tabellen + Abbildungen).
 - **M17.9** Diskussion & Limitierungen.
 - **M17.10** Fazit & Ausblick + Anhang.
