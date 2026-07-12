@@ -31,6 +31,15 @@ und Transport-Fallback in einem einzigen, lauffaehigen System -- ergaenzt um ein
 reproduzierbare, statistisch charakterisierte Vermessung des dadurch entstehenden
 Overheads.
 
+Ueber den evaluierten Prototyp hinaus wurde das Testbett zu einem betreibbaren
+Dienst weitergefuehrt (Kapitel~\ref{ch:produktivierung}): durabler Zustand,
+konventionelle Identitaet ueber OIDC, eine interne PKI mit
+Wurzel-Vertrauen, reproduzierbare Auslieferung als Self-Host- und
+Kubernetes-Variante, Haertung sowie eine signaturgesicherte Abrechnung. Die
+zentrale Eigenschaft bleibt dabei erhalten -- der Betreiber kann die Nutzlast
+weiterhin nicht lesen; aufgegeben wurde bewusst nur die Pseudonymitaet zugunsten
+konventioneller Konten.
+
 \section{Ausblick}
 \label{sec:fazit-ausblick}
 
@@ -41,9 +50,11 @@ Anschlussrichtungen:
   \item \textbf{Traffic-Analyse-Resistenz.} Padding und Ratenglaettung koennten
     Groessen- und Timing-Seitenkanaele gegen einen beobachtenden Vermittler
     verdecken -- als orthogonale Schicht mit eigenem, zu vermessendem Overhead.
-  \item \textbf{Sybil-Oekonomie.} Ueber den reinen Token-Preis hinausgehende
-    Kosten pro schaedlicher Aktion oder pseudonyme Reputation koennten den
-    finanzierten Angreifer (A4) adressieren, ohne die Pseudonymitaet aufzugeben.
+  \item \textbf{Sybil-Oekonomie.} Der finanzierte Angreifer (A4) bleibt offen:
+    auch die in der Produktivierung eingefuehrten konventionellen Konten
+    schrecken ihn nicht ab, da er reale Kosten traegt. Kosten pro schaedlicher
+    Aktion oder eine kontogebundene Reputation koennten hier ansetzen, wo der
+    reine Token-Preis nicht genuegt.
   \item \textbf{NAT-Traversal unter realen Bedingungen.} Ein vollstaendiges
     \gls{ac:ice}-Verfahren und ein Testbett mit emuliertem symmetrischem
     \gls{ac:nat} wuerden das Hole-Punching ueber die flache Bridge hinaus

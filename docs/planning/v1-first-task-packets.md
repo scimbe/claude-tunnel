@@ -507,7 +507,14 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
     (donenfeld2017wireguard/dingledine2004tor/rfc9458/rfc9298). Build: PDF_OK, 0 undefined
     refs/errors, 57 S. (OHTTP + CONNECT-UDP waren bereits als Prosa vorhanden → Tabelle
     statt Redundanz). (Anm.: OHTTP/MASQUE-Prosa existierte schon; Beitrag ist die Matrix.)
-  - **M17.17+** ⏳ optional weiter Richtung ~64 S. (z.B. Evaluation quantitativer Vergleich).
+  - **M17.17** ✅ Fazit mit der Produktivierung konsistent gemacht: (1) neuer
+    Zusammenfassungs-Absatz (Testbett→betreibbarer Dienst, Verweis `ch:produktivierung`,
+    Kern-Eigenschaft bleibt, nur Pseudonymität bewusst aufgegeben); (2) **Widerspruch
+    behoben** im Ausblick — der Sybil-Punkt sagte „ohne die Pseudonymität aufzugeben",
+    obwohl die Produktivierung sie gerade aufgab → auf „konventionelle Konten schrecken
+    den finanzierten A4 dennoch nicht ab" umformuliert. `\gls{ac:oidc/pki}` vermieden
+    (nicht definiert) → Klartext. Build: PDF_OK, 0 undefined refs/errors, 57 S.
+  - **M17.18+** ⏳ optional weiter Richtung ~64 S.
 
 ---
 
