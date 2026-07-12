@@ -1,0 +1,69 @@
+# Claude Tunnel
+
+A tunnel that exposes a local service (any TCP/UDP) to clients through a thin
+hosted control plane, with the payload **end-to-end encrypted** so the operator
+can route your traffic but never read it.
+
+> Honesty note: this provides payload **confidentiality**, not anonymity.
+> Accounts are conventional (Keycloak/OIDC); the operator sees routing and
+> billing metadata, just not your bytes. See the [threat model](docs/security/threat-model.md).
+
+## Highlights
+
+- **Provider-blind payload** — Noise (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) end-to-end.
+- **One-command onboarding** — `ct-agent onboard`: install → enroll → tunnel.
+- **Deploy your way** — hosted Kubernetes bundle or a self-host Docker Compose file.
+- **Durable & self-healing** — SQLite-backed state, liveness/readiness probes.
+- **Rotating PKI** — internal CA, clients trust the CA root (no re-pinning).
+- **Abuse-resistant** — proof-of-work gate + per-account rate limits.
+- **Trustworthy payment** — credits apply only from a signature-verified provider webhook.
+
+## Architecture
+
+A Rust Cargo workspace of five crates, each depending only on `ct-common`:
+
+| Crate | Responsibility |
+|-------|----------------|
+| `ct-common` | wire types, Noise, PoW, framing, metrics |
+| `ct-edge` | provider-blind relay (role dispatch, QUIC/TLS) |
+| `ct-agent` | customer-run; custodian of the origin key; serve path |
+| `ct-control-plane` | enrollment, tunnel registry/rendezvous, billing |
+| `ct-client` | tunnel setup, operating modes, bench harness |
+
+## Documentation
+
+- [Product positioning](docs/product/positioning.md) — what it is, honest selling points
+- [Security whitepaper](docs/security/whitepaper.md) — the security posture in one page
+- [Onboarding quickstart](docs/onboarding/quickstart.md) — bring an agent online
+- [Payment integration](docs/payment/integration.md) — the signed-webhook flow
+- [Operations runbook](docs/ops/runbook.md) — deploy, monitor, respond
+- [Threat model](docs/security/threat-model.md) · [TLS everywhere](docs/security/tls-everywhere.md) · [Dependency audit](docs/security/dependency-audit.md)
+- `docs/thesis/` — the accompanying bachelor thesis (German, HAW template)
+
+## Build & test
+
+Everything runs in a hermetic container — no host toolchain required:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work rust:1-slim \
+  sh -c 'cargo build --workspace && cargo test --workspace'
+```
+
+## Deploy
+
+```bash
+# Self-host (Docker Compose)
+cp docker/deploy/.env.example docker/deploy/.env   # then edit secrets
+docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.env up --build -d
+
+# Hosted (Kubernetes)
+kubectl apply -k docker/deploy/k8s
+```
+
+See the [runbook](docs/ops/runbook.md) for configuration and operations.
+
+## Status
+
+Research / academic project. The core protocol, productionization (persistence,
+identity, PKI, deployment, onboarding, hardening, payment) and documentation are
+implemented and tested; see [`docs/planning/PROGRESS.md`](docs/planning/PROGRESS.md).
