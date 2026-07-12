@@ -710,7 +710,15 @@ hosted, hinter einem Storage-Trait).
 
 ## Milestone 25 — Produktdokumentation
 - Positionierung/Marketing (ehrliche Claims), Security-Whitepaper, Betriebs-Runbook,
-  Onboarding-Guide.
+  Onboarding-Guide. Dekomponiert (Onboarding-Guide = bereits M22.3):
+  - **M25.1** ✅ Positionierung/Selling-Points (`docs/product/positioning.md`): 7 Selling-Points
+    je mit Code-Beweis (E2E-Noise „we can't read what you send", Ein-Kommando-Onboarding,
+    hosted+self-host, durabel/self-healing, CA-Rotation, Abuse-Resistenz, provider-signiertes
+    Payment) + ehrlicher „What we don't claim"-Abschnitt (keine Anonymität/Metadaten-Blindheit/
+    Zensur-Immunität). Drift-Check: 9 Proof-Artefakte + 4 verlinkte Docs existieren, **keine**
+    positive Anonymitäts-Behauptung, Disclaimer vorhanden → POSITIONING_DRIFT_OK.
+  - **M25.2** ⏳ Security-Whitepaper (kundenseitig: E2E/PKI/Auth/Rate-Limits/Payment konsolidiert).
+  - **M25.3** ⏳ Betriebs-Runbook (Deploy, Secret-Rotation, Monitoring, Incident-Response).
 
 **Definition of done (Produkt):** durabler Zustand, echte Identität/Auth, echte PKI,
 reproduzierbares Deployment (hosted + self-host), Ein-Kommando-Onboarding,
