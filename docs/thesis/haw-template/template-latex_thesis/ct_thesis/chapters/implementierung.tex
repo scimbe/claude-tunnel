@@ -49,10 +49,37 @@ pub fn verify(challenge: &Challenge, solution: &[u8]) -> bool {
 
 Der zentrale Datenpfad-Baustein ist \texttt{noise\_pump}: eine
 transport-agnostische, bidirektionale Bruecke, die Klartext und verschluesselte
-Frames in beide Richtungen konkurrent umsetzt. Der \texttt{TransportState} wird
-dabei unter einem kurz gehaltenen Mutex gefuehrt, der nie ueber einen
-\texttt{await}-Punkt gehalten wird. Auf diesem Baustein setzen Streaming,
-Datagramm, direkter Pfad und TCP-Fallback gleichermassen auf.
+Frames in beide Richtungen konkurrent umsetzt (Listing~\ref{lst:pump}). Die
+beiden Richtungen laufen als nebenlaeufige Zweige eines \texttt{try\_join!}; der
+\texttt{TransportState} wird je Frame unter einem kurz gehaltenen Mutex gefuehrt,
+der \emph{nie} ueber einen \texttt{await}-Punkt gehalten wird -- so bleibt die
+Chiffren-Sequenz konsistent, ohne die Nebenlaeufigkeit zu blockieren.
+
+\begin{lstlisting}[caption={Bidirektionaler Noise-Pump (vereinfacht).},label=lst:pump]
+tokio::try_join!(
+    async { // Klartext -> verschluesseln -> Frame an die Chiffren-Seite
+        while let n = plain.read(&mut buf).await? {
+            if n == 0 { break; }
+            let ct = { ts.lock().write_message(&buf[..n]) };
+            cipher.write_all(&frame(&ct)).await?;
+        }
+        Ok(())
+    },
+    async { // Frame -> entschluesseln -> Klartext an die lokale Seite
+        while let Some(fr) = read_frame(&mut cipher).await? {
+            let pt = { ts.lock().read_message(&fr) };
+            plain.write_all(&pt).await?;
+        }
+        Ok(())
+    },
+)?;
+\end{lstlisting}
+
+Die Frames tragen ein 2-Byte-Big-Endian-Laengenpraefix; dieselbe Rahmung erhaelt
+im \gls{ac:udp}-Fall die Datagrammgrenzen (eine Noise-Frame $=$ ein Datagramm).
+Auf diesem Baustein setzen Streaming, Datagramm, direkter Pfad und TCP-Fallback
+gleichermassen auf -- die Betriebsarten unterscheiden sich nur darin, was an den
+Enden der Bruecke steht.
 
 \section{Rollen-Dispatch am Edge (ct-edge)}
 \label{sec:impl-dispatch}
@@ -91,4 +118,43 @@ HTTP-Dienst bereit; ein \texttt{ControlPlaneClient} treibt den vollen Ablauf
 (Konto eroeffnen, aufladen, Token kaufen, aufloesen) gegen den laufenden Dienst.
 Die Korrektheit des Zusammenspiels ist durch eine frozen Testsuite belegt, die
 den Pfad bis hin zum verschluesselten Roundtrip durch echte Komponenten
-ueberprueft.
+ueberprueft -- einschliesslich eines E2E-Tests, in dem das \emph{ueber den
+bezahlten Flow} ausgegebene Routing-Token einen echten Noise-Tunnel etabliert.
+
+\section{Beobachtbarkeit}
+\label{sec:impl-observability}
+
+Der Datenpfad ist mit einem dependency-freien Metrik-Set instrumentiert:
+atomare Zaehler fuer geoeffnete/fehlgeschlagene Tunnel, Bytes je Richtung sowie
+Handshake-Anzahl und -Latenzsumme. Die Bytes werden ueber einen
+\texttt{Metered}-Adapter gezaehlt, der den Origin-Socket umhuellt und bei jedem
+erfolgreichen \texttt{poll\_read}/\texttt{poll\_write} den jeweiligen Zaehler
+erhoeht, ansonsten aber transparent durchreicht -- so bleibt \texttt{noise\_pump}
+unveraendert. Ein optionaler HTTP-Endpunkt exponiert die Zaehler im
+Prometheus-Textformat (Listing~\ref{lst:metrics}); ein Scraper im Testbett
+belegt, dass sich die Zaehler bei Tunnel-Aktivitaet bewegen.
+
+\begin{lstlisting}[caption={Prometheus-Endpunkt (vereinfacht).},label=lst:metrics]
+async fn render(State(m): State<Arc<TunnelMetrics>>) -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], m.render_prometheus())
+}
+\end{lstlisting}
+
+\section{Guthaben-gedeckte Token-Ausgabe}
+\label{sec:impl-billing}
+
+Die Abrechnung koppelt die Token-Ausgabe an ein pseudonymes Prepaid-Guthaben.
+Entscheidend ist die Reihenfolge (Listing~\ref{lst:billing}): es wird
+\emph{zuerst} abgebucht; schlaegt die Abbuchung fehl (zu wenig Guthaben oder
+unbekanntes Konto), wird kein Token gepraegt und das Guthaben bleibt
+unveraendert. Ein Null-Guthaben-Konto erhaelt somit kein Token und kann keinen
+Tunnel aufbauen. Die Aufladung erfolgt ueber einen idempotenten
+Payment-Intake-Stub, dessen Bestaetigung ein Konto genau einmal gutschreibt.
+
+\begin{lstlisting}[caption={Guthaben-gedeckte Ausgabe (vereinfacht).},label=lst:billing]
+pub fn issue_token_for_payment(ledger, account, price)
+    -> Result<RoutingToken, LedgerError> {
+    ledger.debit(account, price)?;   // erst abbuchen (atomar) ...
+    Ok(RoutingToken(random_32()))    // ... dann praegen
+}
+\end{lstlisting}

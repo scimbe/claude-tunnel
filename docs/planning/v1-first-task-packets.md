@@ -481,5 +481,8 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
   - **M17.11** ✅ Grundlagen vertieft (QUIC Handshake/0-RTT/Streams, IK-Handshake
     Nachricht-für-Nachricht + Vorwärtsgeheimnis, PoW-Kostenmodell $2^{-d}/2^{d}$,
     NAT-Typen-Taxonomie + symmetrisches NAT). 49→51 S.
-  - **M17.12+** ⏳ Architektur, Implementierung (mehr Listings), Evaluation (mehr
-    Analyse), Related Work weiter vertiefen bis ~64 S.
+  - **M17.12** ✅ Implementierung vertieft (noise_pump-Listing + Framing,
+    §Beobachtbarkeit mit /metrics-Listing, §Guthaben-gedeckte Ausgabe mit
+    Billing-Listing, Money→Tunnel-E2E-Verweis). 51→52 S.
+  - **M17.13+** ⏳ Architektur, Evaluation (mehr Analyse), Related Work weiter
+    vertiefen bis ~64 S.
