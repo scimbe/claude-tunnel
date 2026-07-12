@@ -700,7 +700,13 @@ hosted, hinter einem Storage-Trait).
     (unset → zufälliges Secret, Webhook inert statt fälschbar). 1 neuer Test
     (`/payment/confirm`→404 im Prod-Router) + `unified_control_plane_survives_restart`
     kreditiert jetzt via signiertem Webhook statt Client-Confirm. Gate 203 (+1).
-  - **M24.4** ⏳ Payment-Integrations-Doku (Provider-Config, Webhook-Secret, Test-Ablauf).
+  - **M24.4** ✅ Payment-Integrations-Doku (`docs/payment/integration.md`): Flow
+    (open→intent→Kunde zahlt→signierter Webhook→issue), Signatur-Schema (HMAC-SHA256
+    über `"<timestamp>.<raw-body>"`, Header-Tabelle, 401-Regeln, Idempotenz),
+    `CT_PAYMENT_WEBHOOK_SECRET`-Config (fail-safe bei unset), Test-Ablauf. Verifikation:
+    Drift-Check — Env-Var/4 Routes/2 Header/Schema/300s-Toleranz/`succeeded`/Helper
+    existieren im Code, `/payment/confirm` als entfernt dokumentiert → **PAYMENT_DOC_DRIFT_OK**.
+    **🎯 Milestone 24 (echtes Payment) komplett** (Verifier + Webhook-Endpoint + Prod-Wiring + Doku).
 
 ## Milestone 25 — Produktdokumentation
 - Positionierung/Marketing (ehrliche Claims), Security-Whitepaper, Betriebs-Runbook,
