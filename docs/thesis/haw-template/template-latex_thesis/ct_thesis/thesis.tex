@@ -11,6 +11,7 @@
   table
 ]{scrreprt}
 \usepackage{../style/thesisstyle}
+\usepackage{csquotes}     % \enquote for German typographic quotes (after babel)
 
 \makeglossaries           % create all glossary entries (remember: run makeglossaries manually)
 \loadglsentries{thesisglossaries.tex}  % load acronym, symbol and glossary entries
@@ -70,6 +71,7 @@
 \cleardoublepage
 \pagenumbering{arabic}
 \input{chapters/einleitung}
+\input{chapters/grundlagen}
 % Add additional chapters here
 
 % dinat.bst (DIN 1505) is not in the container's TeX packages; plainnat is a

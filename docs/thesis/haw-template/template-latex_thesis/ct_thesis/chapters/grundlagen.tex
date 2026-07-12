@@ -1,0 +1,109 @@
+% Grundlagen — claude-tunnel bachelor thesis.
+\chapter{Grundlagen}
+\label{ch:grundlagen}
+
+Dieses Kapitel fuehrt die Konzepte ein, auf denen der Entwurf aufbaut: das
+Prinzip der Providerblindheit (Abschnitt~\ref{sec:providerblind}), den
+Transport \gls{ac:quic} (\ref{sec:quic}), die Ende-zu-Ende-Kryptographie mit dem
+Noise-Protokoll (\ref{sec:noise}), Proof-of-Work als Missbrauchsschranke
+(\ref{sec:pow}) und die Traversierung von \gls{ac:nat} (\ref{sec:nat}).
+
+\section{Providerblindheit und das Zero-Knowledge-Prinzip}
+\label{sec:providerblind}
+
+Ein Vermittlungsdienst heisst in dieser Arbeit \gls{gl:providerblind}, wenn er
+den vermittelten Verkehr strukturell nicht einsehen kann. Der Begriff
+\emph{Zero-Knowledge} wird hier im woertlichen, systemtechnischen Sinne
+gebraucht -- der Betreiber besitzt \enquote{null Wissen} ueber Ziel und Nutzlast
+-- und nicht im kryptographischen Sinne eines Zero-Knowledge-Beweises. Die
+Blindheit ist eine \emph{strukturelle} Eigenschaft: sie ergibt sich daraus, dass
+die vertraulichen Daten den Vermittler nur als Chiffretext erreichen und die
+Adressierung ueber opake Tokens statt Klarnamen erfolgt. Damit unterscheidet sie
+sich von einer bloss \emph{organisatorischen} Zusicherung (etwa einer
+No-Log-Richtlinie), die auf dem Wohlverhalten des Betreibers beruht.
+
+Das Vertrauensmodell verschiebt sich entsprechend: Der Client muss dem Betreiber
+weder Vertraulichkeit noch Nichtprotokollierung glauben, weil dieser die
+relevanten Informationen gar nicht erst erhaelt. Er muss ihm lediglich
+\emph{Verfuegbarkeit} zutrauen -- ein Relay kann den Dienst verweigern oder
+verzoegern, aber nicht mitlesen. Anonymisierungsnetze wie
+Tor~\cite{dingledine2004tor} verfolgen ein verwandtes Ziel ueber mehrere
+Zwischenstationen; der hier gewaehlte Ansatz konzentriert sich stattdessen auf
+die Blindheit eines einzelnen Vermittlers plus einen direkten Pfad, der diesen
+bei Erreichbarkeit ganz umgeht.
+
+\section{QUIC als Transport}
+\label{sec:quic}
+
+\gls{ac:quic}~\cite{rfc9000} ist ein verbindungsorientiertes Transportprotokoll
+oberhalb von \gls{ac:udp}. Es integriert die Verschluesselung fest in den
+Transport: der Handshake nutzt \gls{ac:tls}~1.3~\cite{rfc8446,rfc9001}, sodass
+bereits die Transportschicht authentisiert und verschluesselt ist. Gegenueber
+\gls{ac:tcp}+TLS bietet \gls{ac:quic} drei fuer diese Arbeit relevante
+Eigenschaften: (i) \emph{gemultiplexte Streams} innerhalb einer Verbindung ohne
+Head-of-Line-Blocking zwischen ihnen, (ii) einen \emph{schnellen
+Verbindungsaufbau} (1-RTT, mit Sitzungswiederaufnahme 0-RTT) und (iii)
+Verbindungs-IDs, die einen Pfadwechsel (Connection Migration) erlauben.
+
+Die Stream-Multiplexierung traegt im Entwurf den Rollen-Dispatch: Client, Agent
+und Steuerbefehle teilen sich eine Verbindung, ohne sich gegenseitig zu
+blockieren. Weil \gls{ac:quic} auf \gls{ac:udp} aufsetzt, ist es zugleich der
+Punkt, an dem Zensur ansetzen kann -- wird \gls{ac:udp} blockiert, ist
+\gls{ac:quic} nicht nutzbar. Der Entwurf braucht daher einen Transport-Fallback
+(Abschnitt~\ref{sec:nat} und Kapitel~\ref{ch:grundlagen}), der denselben Tunnel
+ueber \gls{ac:tls}-ueber-\gls{ac:tcp} traegt.
+
+\section{Ende-zu-Ende-Kryptographie mit Noise}
+\label{sec:noise}
+
+Damit der Vermittler blind bleibt, genuegt die Transportverschluesselung von
+\gls{ac:quic} nicht: sie endet am Edge. Die Nutzlast muss zusaetzlich zwischen
+Client und Origin verschluesselt sein. Dafuer dient das Noise Protocol
+Framework~\cite{perrin2018noise}, ein Baukasten fuer authentisierte
+Schluesselaustausch-Handshakes aus Diffie-Hellman-Operationen, einem
+AEAD-Chiffre und einer Hashfunktion.
+
+Konkret wird das Muster \texttt{Noise\_IK\_25519\_ChaChaPoly\_BLAKE2s}
+eingesetzt: Schluesselaustausch ueber Curve25519 (X25519), Verschluesselung mit
+ChaCha20-Poly1305, Hashing mit BLAKE2s. Im Muster \texttt{IK} uebertraegt der
+\emph{Initiator} (Client) seinen statischen Schluessel waehrend des Handshakes
+(\enquote{I}), waehrend der statische Schluessel des \emph{Responders} (Origin)
+dem Initiator vorab bekannt ist (\enquote{K}). Genau diese Vorabkenntnis ist der
+Hebel fuer die Providerblindheit: der Client \emph{pinnt} die Origin-Identitaet
+(den oeffentlichen Origin-Schluessel), die er ausserhalb des Bandes als Teil
+einer Capability erhaelt. Ein Vermittler, der die Origin-Identitaet nicht kennt,
+kann den Handshake nicht als Man-in-the-Middle unterlaufen; ein Angreifer mit
+falschem Schluessel scheitert am Pinning. Nach dem Handshake gehen beide Seiten
+in den Transport-Modus ueber und tauschen laengen-praefigierte, verschluesselte
+Frames aus, die der Edge nur noch byteweise weiterreicht.
+
+\section{Proof-of-Work als Missbrauchsschranke}
+\label{sec:pow}
+
+Ein blinder Dienst kann Missbrauch nicht am Inhalt erkennen. Um die
+Verbindungsanbahnung dennoch zu verteuern, wird ein Proof-of-Work nach dem
+Hashcash-Prinzip~\cite{back2002hashcash} vorgeschaltet. Der Edge stellt eine
+Challenge aus einem Nonce und einer Schwierigkeit; der Client muss eine Loesung
+finden, deren Hash eine geforderte Anzahl fuehrender Nullbits aufweist. Das
+Finden ist -- exponentiell in der Schwierigkeit -- teuer, die Pruefung dagegen
+ein einzelner Hash. Dieser asymmetrische Aufwand begrenzt Flut- und
+Rendezvous-Missbrauch, ohne dass der Dienst Identitaeten fuehren oder Inhalte
+sehen muesste. Die Schwierigkeit ist ein Stellparameter, dessen Einfluss die
+Parameterstudie (Kapitel~\ref{ch:grundlagen}) untersucht.
+
+\section{NAT-Traversal und direkter Pfad}
+\label{sec:nat}
+
+Reale Endpunkte liegen haeufig hinter \gls{ac:nat}, das ausgehende Verbindungen
+zulaesst, eingehende aber ohne Zustand verwirft. Der Relay-Pfad umgeht dies, weil
+sowohl Client als auch Agent \emph{ausgehend} zum Edge verbinden. Ein
+\emph{direkter} \gls{ac:p2p}-Pfad, der den Edge umgeht, muss dagegen die
+\gls{ac:nat}-Bindung ueberwinden. Das etablierte Verfahren ist das
+gleichzeitige Oeffnen (Hole Punching) auf Basis reflexiver, vom Vermittler
+beobachteter Adressen~\cite{ford2005peer}; standardisiert ist die
+Kandidaten-Aushandlung als \gls{ac:ice}~\cite{rfc8445}. Im Entwurf inseriert der
+Agent einen direkten Listener beim Edge, den der Client entdeckt und bevorzugt
+nutzt; scheitert der direkte Aufbau, faellt der Client transparent auf den Relay
+zurueck. Echtes Hole Punching ueber symmetrisches \gls{ac:nat} bleibt eine
+Grenze des flachen Container-Testbetts und wird in
+Kapitel~\ref{ch:grundlagen} eingeordnet.

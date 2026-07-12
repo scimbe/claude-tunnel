@@ -452,7 +452,9 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
   Hashcash, Tor, NAT-Traversal). `literature.bib` mit realen Referenzen;
   `dinat.bst` fehlt im Container → auf `plainnat` (natbib-Builtin) umgestellt.
   Baut sauber → 21 S., 0 undefined citations.
-- **M17.3** Grundlagen (ZK/providerblind, QUIC, Noise, PoW, NAT-Traversal).
+- **M17.3** ✅ Grundlagen (Providerblindheit/ZK-Prinzip, QUIC+TLS1.3, Noise_IK
+  mit Origin-Pinning, PoW/Hashcash, NAT-Traversal/ICE) — 5 zitierte Abschnitte,
+  +3 S. `csquotes` für `\enquote` ergänzt. Baut sauber (24 S.).
 - **M17.4** Related Work.
 - **M17.5** Anforderungen & Bedrohungsmodell.
 - **M17.6** Architektur (aus ADRs).
