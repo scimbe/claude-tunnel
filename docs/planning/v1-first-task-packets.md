@@ -527,8 +527,15 @@ hosted, hinter einem Storage-Trait).
   create_intent/confirm_payment (idempotent, in Transaktion → kein Doppel-Credit
   bei Crash). `LedgerOpError`/`PaymentOpError`. Test `ledger_state_survives_reopen`
   belegt Balance + confirmed-Flag über Reopen.
-- **M18.4** persistente Stores in `control_plane_router`/`main` verdrahten
-  (In-Memory ersetzen) → Service-Level-E2E.
+- **M18.4** persistente Stores in den Service verdrahten (In-Memory ersetzen).
+  Decomposed:
+  - **M18.4a** ✅ `service.rs`: `enrollment_router_sqlite(Arc<SqliteEnrollment>)`
+    (gleiche JSON-API wie http, aber durabel; Fehler→409/404/500). E2E
+    `enrollment_survives_service_restart`: enroll gegen Instanz 1, frische
+    Instanz auf **derselben DB-Datei**, konsumiertes Token bleibt konsumiert.
+  - **M18.4b** persistenter Registry-Router · **M18.4c** persistenter Billing-Router
+  - **M18.4d** unified `persistent_control_plane_router(db_path)` (alle Stores auf
+    einer DB) + `main` verdrahten → voller Service-Neustart-E2E.
 - **E2E:** Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest).
 
 ## Milestone 19 — Identität & Auth (Keycloak/OIDC, konventionelle Accounts)
