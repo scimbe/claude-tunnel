@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ct-common = { path = "../common" }
+ct-control-plane = { path = "../control-plane" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -16,6 +17,5 @@ axum = "0.7"
 
 [dev-dependencies]
 ct-edge = { path = "../edge" }
-ct-control-plane = { path = "../control-plane" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

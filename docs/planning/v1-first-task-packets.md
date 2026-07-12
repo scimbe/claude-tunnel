@@ -623,7 +623,17 @@ hosted, hinter einem Storage-Trait).
 
 ## Milestone 22 — Onboarding-UX (so wenige Schritte wie möglich)
 - Ein-Kommando-Agent-Setup (Install → Auto-Enroll → Tunnel); portalgeführte
-  Tunnel-Einrichtung; Kurzanleitung.
+  Tunnel-Einrichtung; Kurzanleitung. Dekomponiert:
+  - **M22.1** ✅ Onboarding-Primitive (`crates/agent/src/onboard.rs`): `onboard(cp_url,
+    join_token, agent_id, config) -> OnboardedAgent` fasst Identitäts-Erzeugung +
+    Join-Token-Redeem (bindet frischen Pubkey an Tenant) + Config-Assemblierung in
+    **einen** Aufruf; einziges Geheimnis ist das Single-Use-Join-Token. `ct-control-plane`
+    von dev-dep zu regulärer dep (azyklisch: hängt nur an ct-common). 2 Frozen-Tests
+    gegen In-Process-Enrollment-Router: enrollt+bindet frische Identität; Join-Token
+    single-use (zweiter Onboard scheitert). Gate: 190 (+2).
+  - **M22.2** ⏳ `ct-agent` Ein-Kommando-Binary: `onboard`-Subcommand/Env
+    (CP-URL + Join-Token → auto-enroll → serve) statt manueller Mehrschritt-Config.
+  - **M22.3** ⏳ Kurzanleitung/Quickstart (Onboarding-Schritte, portalgeführt).
 
 ## Milestone 23 — Security-Hardening & Audit
 - Rate-Limits/Quotas je Account, TLS überall, Secrets-Management, Dependency- +
