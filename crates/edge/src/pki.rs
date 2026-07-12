@@ -14,6 +14,8 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 use crate::transport::install_crypto_provider;
 
@@ -75,6 +77,28 @@ pub fn build_server_endpoint_from_ca(
     let server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)?;
     let endpoint = Endpoint::server(server_config, addr)?;
     Ok((endpoint, ca.root_der()))
+}
+
+/// Build both Edge listeners sharing one **CA-issued** leaf (the PKI equivalent
+/// of `build_dual_edge`): a QUIC endpoint on `quic_addr` and a TLS-TCP fallback
+/// on `tcp_addr`. Returns the endpoint, listener, acceptor, and the CA root that
+/// Clients trust for either transport.
+pub async fn build_dual_edge_from_ca(
+    ca: &Ca,
+    quic_addr: SocketAddr,
+    tcp_addr: SocketAddr,
+    sans: Vec<String>,
+) -> Result<(Endpoint, TcpListener, TlsAcceptor, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = ca.issue(sans)?;
+    let quic_cfg = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.clone_key())?;
+    let endpoint = Endpoint::server(quic_cfg, quic_addr)?;
+    let tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+    let listener = TcpListener::bind(tcp_addr).await?;
+    Ok((endpoint, listener, acceptor, ca.root_der()))
 }
 
 /// Build a QUIC client [`Endpoint`] that trusts a **CA root** — and therefore
@@ -191,5 +215,32 @@ mod tests {
 
         conn2.close(0u32.into(), b"done");
         let _ = srv2.await;
+    }
+
+    /// The dual-transport Edge with a CA-issued leaf is trusted over QUIC by a
+    /// client that trusts the CA root.
+    #[tokio::test]
+    async fn dual_edge_from_ca_is_trusted_over_quic() {
+        let ca = Ca::new("ct-edge-ca").unwrap();
+        let (server, _listener, _acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["localhost".into()],
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move { accept_and_echo_one(&server).await });
+
+        let client = build_client_endpoint_trusting_ca(ca_root).unwrap();
+        let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"dual").await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(64).await.unwrap(), b"dual");
+
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
     }
 }

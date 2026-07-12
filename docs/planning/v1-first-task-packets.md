@@ -576,8 +576,13 @@ hosted, hinter einem Storage-Trait).
 - **M20.2** ✅ Rotation: `client_survives_edge_cert_rotation` — ein Client, der
   den CA-Root einmal vertraut, verbindet sich nach dem Rotieren auf einen
   frischen Leaf (neuer Cert+Key) unter derselben CA ohne Re-Pinning und tunnelt.
-- **M20.3** ⏳ Edge-Daemon/`run_edge` auf CA umstellen; CA-Root persistieren +
-  an Clients verteilen (ersetzt self-signed im Testbett/Compose).
+- **M20.3** Edge-Daemon/`run_edge` auf CA umstellen; CA-Root persistieren + an
+  Clients verteilen. Decomposed:
+  - **M20.3a** ✅ `build_dual_edge_from_ca(ca, quic_addr, tcp_addr, sans)` —
+    CA-issued Dual-Transport-Edge (QUIC + TLS-TCP, ein Leaf), gibt CA-Root zurück.
+    Test: CA-Root-Client tunnelt über QUIC.
+  - **M20.3b** ⏳ `run_edge`/config auf CA umstellen; CA-Root nach
+    `CT_EDGE_CERT_OUT` schreiben (statt self-signed Leaf); Compose-Smoke.
 
 ## Milestone 21 — Deployment (hosted + self-host)
 - Helm-Chart / K8s-Manifeste (hosted) + gehärtetes Compose-Bundle (self-host);
