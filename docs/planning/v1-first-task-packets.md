@@ -423,8 +423,10 @@ Decomposed:
   analysis under `docs/thesis/data/`. Decomposed:
   - **M16.4a** ✅ mode-aware `tabulate.py` (Modus column, mean±95%-CI, p50/p95/p99;
     back-compatible with old CSVs) → regenerated `results-table.{md,tex}`.
-  - **M16.4b** mode-aware `plot.py`: latency-vs-delay per mode + a mode-comparison
-    figure.
+  - **M16.4b** ✅ mode-aware `plot.py`: per-loss figures filtered to the reference
+    mode + a new `latency-by-mode.png` (mean vs delay, one series per mode at 0%
+    loss). Rendered all three PNGs; the modes overlap at 0% loss (latency is
+    delay-dominated, not transport-dominated).
   - **M16.4c** write the German analysis (`results.md`) from the new data.
 
 ## Milestone 17 — Tiefe BA-Thesis (ersetzt M7, HAW-Vorlage, ~64 S.)
