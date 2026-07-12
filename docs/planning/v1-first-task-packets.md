@@ -591,6 +591,12 @@ hosted, hinter einem Storage-Trait).
 ## Milestone 21 — Deployment (hosted + self-host)
 - Helm-Chart / K8s-Manifeste (hosted) + gehärtetes Compose-Bundle (self-host);
   Konfiguration, Secrets-Handling, Health/Readiness.
+- **M21.1a** ✅ Health/Readiness-Endpoints: `GET /healthz` (Liveness, immer 200)
+  + `GET /readyz` (Readiness, prüft DB via `SqliteLedger::ping`→200/503), in
+  `persistent_control_plane_router` gemerged. Oneshot-Test.
+- **M21.1b** ⏳ gehärtetes Self-Host-Compose-Bundle (persistentes DB-Volume,
+  `restart: unless-stopped`, Healthcheck auf `/readyz`, `.env`-Secrets).
+- **M21.2** ⏳ K8s-Manifeste / Helm-Chart (hosted) mit Probes + Secrets.
 
 ## Milestone 22 — Onboarding-UX (so wenige Schritte wie möglich)
 - Ein-Kommando-Agent-Setup (Install → Auto-Enroll → Tunnel); portalgeführte

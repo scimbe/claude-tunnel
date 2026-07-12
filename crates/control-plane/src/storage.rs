@@ -361,6 +361,14 @@ impl SqliteLedger {
         Ok(account)
     }
 
+    /// Cheap liveness check that the database is reachable (readiness probe).
+    pub fn ping(&self) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT 1", [], |_| Ok(()))
+    }
+
     /// Current balance, or [`LedgerError::UnknownAccount`].
     pub fn balance(&self, id: &AccountId) -> Result<u64, LedgerOpError> {
         let conn = self.conn.lock().unwrap();

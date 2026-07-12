@@ -332,17 +332,35 @@ async fn me_issue(
     }))
 }
 
+/// Build the health/readiness router (M21.1a): `GET /healthz` (liveness, always
+/// `200`) and `GET /readyz` (readiness — `200` if the database is reachable,
+/// else `503`). Used by orchestrator liveness/readiness probes.
+pub fn health_router(ledger: Arc<SqliteLedger>) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { StatusCode::OK }))
+        .route("/readyz", get(readyz))
+        .with_state(ledger)
+}
+
+async fn readyz(State(ledger): State<Arc<SqliteLedger>>) -> StatusCode {
+    match ledger.ping() {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 /// Build the full persistent control-plane router: enrollment + registry +
-/// billing, all backed by durable SQLite stores opened on **one** database file
-/// (`db_path`). The three stores share the file via separate connections; each
-/// owns its own tables. This is what a real deployment serves.
+/// billing + health, all backed by durable SQLite stores opened on **one**
+/// database file (`db_path`). The three stores share the file via separate
+/// connections; each owns its own tables. This is what a real deployment serves.
 pub fn persistent_control_plane_router(db_path: &str) -> rusqlite::Result<Router> {
     let enrollment = Arc::new(SqliteEnrollment::open(db_path)?);
     let registry = Arc::new(SqliteRegistry::open(db_path)?);
     let ledger = Arc::new(SqliteLedger::open(db_path)?);
     Ok(enrollment_router_sqlite(enrollment)
         .merge(registry_router_sqlite(registry))
-        .merge(billing_router_sqlite(ledger)))
+        .merge(billing_router_sqlite(ledger.clone()))
+        .merge(health_router(ledger)))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -595,5 +613,27 @@ mod tests {
             4,
             "the subject's account was debited"
         );
+    }
+
+    #[tokio::test]
+    async fn health_and_readiness_endpoints() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = persistent_control_plane_router(":memory:").unwrap();
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK, "liveness ok");
+
+        let ready = app
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK, "readiness ok (db reachable)");
     }
 }
