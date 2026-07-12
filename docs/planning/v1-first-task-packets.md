@@ -686,9 +686,16 @@ hosted, hinter einem Storage-Trait).
     Timestamp-Toleranz gegen Replay; `sign` = Provider-Seite/Tests). Rein & clock-injected
     (`now` Parameter), wie der OIDC-Verifier. Deps `hmac`+`sha2`. 5 Frozen-Tests: valid,
     tampered body, wrong secret, stale timestamp, malformed hex. Gate 200 (+5).
-  - **M24.2** ⏳ `/payment/webhook`-Endpoint: verifiziert → mappt Provider-Intent→PaymentId →
-    `confirm_payment` (idempotent, kreditiert); client-`/payment/confirm` entschärfen.
-  - **M24.3** ⏳ Provider-Intent-Ref in `payments`-Schema + `create_intent` speichert sie.
+  - **M24.2** ✅ `/payment/webhook`-Endpoint (`payment_webhook_router(ledger, verifier)`
+    in service.rs): `WebhookState{ledger, verifier}`; Handler extrahiert
+    `X-CT-Webhook-Timestamp`/`-Signature`-Header + rohen Body (`Bytes`), **verifiziert
+    zuerst** die Signatur (401 sonst), parst `{payment, status}`, kreditiert nur bei
+    `status=="succeeded"` via `confirm_payment` — PaymentId reist als Provider-Metadaten
+    im Body (kein Mapping-Schema nötig). Idempotent: `AlreadyConfirmed`→200 (kein
+    Doppel-Credit), Unknown→404. 2 Frozen-Tests (forged→401/kein Credit, valid→200/+7,
+    replay→200/kein Doppel-Credit; stale→401). Gate 202 (+2).
+  - **M24.3** ⏳ Produktions-Wiring: Webhook in `persistent_control_plane_router` mounten,
+    Webhook-Secret aus Env, client-`/payment/confirm` aus dem Prod-Router entfernen.
   - **M24.4** ⏳ Payment-Integrations-Doku (Provider-Config, Webhook-Secret, Test-Ablauf).
 
 ## Milestone 25 — Produktdokumentation

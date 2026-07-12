@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
@@ -17,6 +18,7 @@ use crate::accounts::{AccountId, LedgerError};
 use crate::enrollment::{EnrollError, JoinToken};
 use crate::oidc::OidcVerifier;
 use crate::payment::{PaymentError, PaymentId};
+use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
     LedgerOpError, PaymentOpError, RedeemError, SqliteEnrollment, SqliteLedger, SqliteRegistry,
@@ -250,6 +252,93 @@ async fn buy_token(
     Ok(Json(TokenResp {
         token: hex_encode(&token),
     }))
+}
+
+/// Shared state for the payment webhook: the durable ledger and the provider
+/// webhook signature verifier.
+#[derive(Clone)]
+pub struct WebhookState {
+    ledger: Arc<SqliteLedger>,
+    verifier: Arc<WebhookVerifier>,
+}
+
+/// Build the payment **webhook** router (M24.2): `POST /payment/webhook`.
+///
+/// This is the *real* payment path — a credit is applied only for an event whose
+/// signature verifies against the provider's shared secret, replacing the M18
+/// stub where any caller could confirm a payment. The provider echoes our
+/// `PaymentId` (attached as intent metadata) in the event body, so no separate
+/// intent→payment mapping is needed. Delivery is idempotent (a replayed event
+/// acks `200` without double-crediting).
+///
+/// The provider signs `"<timestamp>.<raw-body>"`; the timestamp and hex
+/// signature arrive in the `X-CT-Webhook-Timestamp` / `X-CT-Webhook-Signature`
+/// headers.
+pub fn payment_webhook_router(
+    ledger: Arc<SqliteLedger>,
+    verifier: Arc<WebhookVerifier>,
+) -> Router {
+    Router::new()
+        .route("/payment/webhook", post(payment_webhook))
+        .with_state(WebhookState { ledger, verifier })
+}
+
+#[derive(Deserialize)]
+struct WebhookEvent {
+    /// Hex-encoded `PaymentId` we attached to the provider intent as metadata.
+    payment: String,
+    /// Provider event status; we credit only on `"succeeded"`.
+    status: String,
+}
+
+async fn payment_webhook(
+    State(state): State<WebhookState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let timestamp = headers
+        .get("x-ct-webhook-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "missing or invalid X-CT-Webhook-Timestamp".to_string(),
+        ))?;
+    let signature = headers
+        .get("x-ct-webhook-signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "missing X-CT-Webhook-Signature".to_string(),
+        ))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Authenticate the event against the provider secret before trusting it.
+    state
+        .verifier
+        .verify(timestamp, &body, signature, now)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+
+    let event: WebhookEvent = serde_json::from_slice(&body)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed event body".to_string()))?;
+    // Acknowledge non-terminal events without crediting.
+    if event.status != "succeeded" {
+        return Ok(StatusCode::OK);
+    }
+    let payment = hex_decode_32(&event.payment)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed payment id".to_string()))?;
+    match state.ledger.confirm_payment(&PaymentId(payment)) {
+        // Fresh confirmation credited the account.
+        Ok(_) => Ok(StatusCode::OK),
+        // Provider retried a delivered event — idempotent, do not double-credit.
+        Err(PaymentOpError::Payment(PaymentError::AlreadyConfirmed)) => Ok(StatusCode::OK),
+        Err(PaymentOpError::Payment(PaymentError::UnknownPayment)) => {
+            Err((StatusCode::NOT_FOUND, "unknown payment".to_string()))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 /// Fixed window (seconds) for the per-subject issuance rate limit (M23.1).
@@ -690,6 +779,105 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "3rd over the per-subject cap is throttled"
         );
+    }
+
+    #[tokio::test]
+    async fn payment_webhook_credits_only_on_a_valid_signature() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"whsec_test";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(WebhookVerifier::new(secret.to_vec(), 300));
+
+        // A pending intent for 7 credits on a fresh account.
+        let account = ledger.open_account().unwrap();
+        let payment = ledger.create_intent(&account, 7).unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 0);
+
+        let app = payment_webhook_router(ledger.clone(), verifier.clone());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = format!(
+            r#"{{"payment":"{}","status":"succeeded"}}"#,
+            hex_encode(&payment.0)
+        );
+
+        let post = |ts: u64, sig: String, body: String| {
+            app.clone().oneshot(
+                Request::post("/payment/webhook")
+                    .header("x-ct-webhook-timestamp", ts.to_string())
+                    .header("x-ct-webhook-signature", sig)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        // Forged signature -> 401, no credit.
+        let resp = post(now, "deadbeef".to_string(), body.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "forged webhook rejected");
+        assert_eq!(ledger.balance(&account).unwrap(), 0, "no credit on a bad signature");
+
+        // Valid signature -> 200, account credited.
+        let sig = verifier.sign(now, body.as_bytes());
+        let resp = post(now, sig.clone(), body.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "signed webhook accepted");
+        assert_eq!(ledger.balance(&account).unwrap(), 7, "credited exactly the intent");
+
+        // Replayed valid event -> 200 (idempotent), still credited once.
+        let resp = post(now, sig, body).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "replay acknowledged");
+        assert_eq!(
+            ledger.balance(&account).unwrap(),
+            7,
+            "idempotent: no double credit"
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_webhook_rejects_a_stale_event() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"whsec_test";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(WebhookVerifier::new(secret.to_vec(), 300));
+        let account = ledger.open_account().unwrap();
+        let payment = ledger.create_intent(&account, 5).unwrap();
+
+        let app = payment_webhook_router(ledger.clone(), verifier.clone());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Timestamp 10 minutes in the past; tolerance is 5 minutes. The signature
+        // is valid for that timestamp, but the event is too old to accept.
+        let stale = now - 600;
+        let body = format!(
+            r#"{{"payment":"{}","status":"succeeded"}}"#,
+            hex_encode(&payment.0)
+        );
+        let sig = verifier.sign(stale, body.as_bytes());
+        let resp = app
+            .oneshot(
+                Request::post("/payment/webhook")
+                    .header("x-ct-webhook-timestamp", stale.to_string())
+                    .header("x-ct-webhook-signature", sig)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "stale event rejected");
+        assert_eq!(ledger.balance(&account).unwrap(), 0, "no credit for a replay");
     }
 
     #[tokio::test]
