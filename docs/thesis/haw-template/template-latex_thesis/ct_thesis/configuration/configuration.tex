@@ -1,0 +1,63 @@
+% !TEX root = ../thesis.tex
+%
+% configurations for the claude-tunnel bachelor thesis
+%
+
+% English Language support (main language stays German)
+\fullenglish{no}
+
+% Supervisors — PLACEHOLDER: replace with the actual examiners.
+\firstSupervisor{Prof. Dr. Vorname Nachname}
+\secondSupervisor{Prof. Dr. Vorname Nachname}
+
+% Thesis title
+\thesisTitle{Providerblinder, zensurresistenter Netzwerk-Tunnel:\\ Entwurf, Implementierung und Parameterstudie}
+\thesisTitleEN{Provider-blind, Censorship-resistant Network Tunnel: Design, Implementation and Parameter Study}
+
+% Keywords
+\keywordsDE{Zero-Knowledge, providerblind, QUIC, Noise, Proof-of-Work, Zensurresistenz, NAT-Traversal}
+\keywordsEN{zero-knowledge, provider-blind, QUIC, Noise, proof-of-work, censorship resistance, NAT traversal}
+
+% Abstract
+\abstractDE{Diese Arbeit entwirft, implementiert und evaluiert einen
+providerblinden, zensurresistenten Netzwerk-Tunnel. Der Betreiber der
+Vermittlungsebene relayt ausschliesslich Chiffretext (Ende-zu-Ende-Verschluesselung
+mit dem Noise-Protokoll ueber QUIC), kennt weder Ziel-Hostnamen noch Nutzlast
+und ist damit strukturell blind gegenueber dem vermittelten Verkehr. Ein
+Proof-of-Work-gestuetztes Rendezvous begrenzt Missbrauch, ein direkter
+Peer-to-Peer-Pfad umgeht bei Erreichbarkeit den Relay, und ein
+TLS-ueber-TCP-Fallback traegt denselben Tunnel, wenn UDP blockiert ist. Eine
+Parameterstudie am fertigen Produkt vermisst die Roundtrip-Latenz unter
+emulierten Netzbedingungen ueber die Betriebsarten One-shot, Streaming und
+Datagramm.}
+\abstractEN{This thesis designs, implements and evaluates a provider-blind,
+censorship-resistant network tunnel. The operator of the mesh plane relays only
+ciphertext (end-to-end encryption with the Noise protocol over QUIC), knows
+neither the destination hostname nor the payload and is thus structurally blind
+to the traffic it forwards. A proof-of-work rendezvous limits abuse, a direct
+peer-to-peer path bypasses the relay when reachable, and a TLS-over-TCP fallback
+carries the same tunnel when UDP is blocked. A parameter study on the finished
+product measures round-trip latency under emulated network conditions across the
+one-shot, streaming and datagram operating modes.}
+
+% Author — PLACEHOLDER: replace with the student's full name.
+\thesisAuthor{Vorname Nachname}
+
+% Submission date — PLACEHOLDER
+\submissionDate{TT. Monat 2026}
+
+% NDA / public
+\NDA{no}
+
+% Cover style
+\Cover{CD2017}
+
+% Lists
+\ListOfFigures{yes}
+\ListOfTables{yes}
+\ListOfAccronyms{yes}
+\ListOfSymbols{no}
+\Glossary{yes}
+
+% Study course
+\studycourse{INF_AI}   % Angewandte Informatik

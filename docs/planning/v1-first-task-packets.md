@@ -441,3 +441,18 @@ Decomposed:
   inkl. Streaming/UDP/P2P), **Evaluation mit der Parameterstudie (M16)**,
   Diskussion/Limitierungen, Fazit & Ausblick, Anhang.
 - **Verification**: kompiliert sauber im texlive-Container; Seitenumfang ~64.
+
+Decomposed (one chapter per cycle; each verified by a clean HAW build):
+- **M17.1** ✅ HAW-Template-Scaffold — Arbeitskopie `…/ct_thesis/` (Metadaten,
+  Glossar/Akronyme, Stub-Kapitel), `scripts/thesis-haw-build.sh`
+  (pdflatex→bibtex→makeglossaries→pdflatex×2), Dockerfile um siunitx/pictures/
+  fonts-extra erweitert. Baut sauber → 18-Seiten-PDF (Frontmatter), 0 Fehler.
+- **M17.2** Einleitung (Motivation, Problemstellung, Forschungsfragen, Aufbau).
+- **M17.3** Grundlagen (ZK/providerblind, QUIC, Noise, PoW, NAT-Traversal).
+- **M17.4** Related Work.
+- **M17.5** Anforderungen & Bedrohungsmodell.
+- **M17.6** Architektur (aus ADRs).
+- **M17.7** Implementierung (alle Crates, inkl. Streaming/UDP/P2P/Payment).
+- **M17.8** Evaluation (Parameterstudie M16, Tabellen + Abbildungen).
+- **M17.9** Diskussion & Limitierungen.
+- **M17.10** Fazit & Ausblick + Anhang.

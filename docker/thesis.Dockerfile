@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         texlive-fonts-recommended \
         texlive-lang-german \
         texlive-bibtex-extra \
+        texlive-science \
+        texlive-pictures \
+        texlive-fonts-extra \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

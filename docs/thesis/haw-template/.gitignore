@@ -17,3 +17,11 @@
 *.acn
 *.acr
 *.alg
+*.glsdefs
+*.synctex.gz
+*.slg
+*.slo
+*.sls
+ct_thesis/thesis.pdf
+**/ct_thesis/thesis.pdf
+.claude-flow/
