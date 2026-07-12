@@ -513,9 +513,15 @@ PoW, P2P-Hole-Punching nur im flachen Bridge-Netz.
 ## Milestone 18 — Persistenz (Fundament; blockiert alles andere)
 In-Memory-Zustand durch dauerhaften Speicher ersetzen (SQLite self-host / Postgres
 hosted, hinter einem Storage-Trait).
-- **M18.1** Storage-Trait + SQLite-Backend; `Enrollment` persistent (issue/redeem).
+- **M18.1** ✅ SQLite-Backend (rusqlite `bundled`, kein System-Dep) für Enrollment:
+  `SqliteEnrollment` [open/open_in_memory, Schema join_tokens+agent_bindings]
+  mit issue/redeem/binding, gleiche Semantik wie in-memory `Enrollment`;
+  `RedeemError::{Enroll,Db}`. Test `state_survives_reopen` belegt: Binding
+  persistiert + Token bleibt konsumiert über einen Reopen (Neustart-Ersatz).
 - **M18.2** `TunnelRegistry` persistent (register/resolve).
 - **M18.3** `Ledger` + Accounts persistent (open/credit/debit; Payments idempotent).
+- **M18.4** persistente Stores in `control_plane_router`/`main` verdrahten
+  (In-Memory ersetzen) → Service-Level-E2E.
 - **E2E:** Zustand überlebt einen Control-Plane-Neustart (frozen Integrationstest).
 
 ## Milestone 19 — Identität & Auth (Keycloak/OIDC, konventionelle Accounts)

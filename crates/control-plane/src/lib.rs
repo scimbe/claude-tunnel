@@ -11,6 +11,7 @@ pub mod http;
 pub mod issuance;
 pub mod payment;
 pub mod registry;
+pub mod storage;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
 pub const CRATE_NAME: &str = "ct-control-plane";
