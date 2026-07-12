@@ -1,0 +1,59 @@
+# Self-host deployment bundle (M21.1b): the operator runs the hosted control
+# plane + one edge as long-running, restart-on-failure services with durable
+# state and health checks. Customers run their own agents (outbound-only) and
+# distribute the CA root (docs/deploy) to their clients.
+#
+#   cp docker/deploy/.env.example docker/deploy/.env   # then edit secrets
+#   docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.env up --build -d
+#
+# The control plane persists to a named volume, so restarts and upgrades keep
+# enrollment, the tunnel registry and the credit ledger intact.
+
+name: ct-selfhost
+
+services:
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    image: ct-testbed
+    command: ["ct-control-plane"]
+    environment:
+      CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
+      CT_CONTROL_PLANE_DB: "/data/control-plane.db"
+      # OIDC / Keycloak (verified for /me/* endpoints); set in .env.
+      CT_OIDC_ISSUER: "${CT_OIDC_ISSUER:-}"
+    env_file:
+      - .env
+    volumes:
+      - cpdata:/data
+    ports:
+      - "${CONTROL_PLANE_PORT:-8090}:8090"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/readyz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  edge:
+    image: ct-testbed
+    command: ["ct-edge"]
+    environment:
+      CT_EDGE_LISTEN: "0.0.0.0:4433"
+      CT_EDGE_POW_DIFFICULTY: "${EDGE_POW_DIFFICULTY:-16}"
+      CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
+    volumes:
+      - shared:/shared
+    ports:
+      - "${EDGE_PORT:-4433}:4433/udp"
+      - "${EDGE_PORT:-4433}:4433/tcp"
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+volumes:
+  cpdata:
+  shared:

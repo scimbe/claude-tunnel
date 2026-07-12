@@ -13,7 +13,7 @@ RUN cargo build --release --workspace --bins
 FROM debian:bookworm-slim AS runtime
 # iproute2 for tc/netem inside the node containers; ca-certificates is harmless.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates \
+    && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ct-edge /usr/local/bin/ct-edge
 COPY --from=builder /build/target/release/ct-agent /usr/local/bin/ct-agent

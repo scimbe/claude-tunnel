@@ -594,8 +594,14 @@ hosted, hinter einem Storage-Trait).
 - **M21.1a** ✅ Health/Readiness-Endpoints: `GET /healthz` (Liveness, immer 200)
   + `GET /readyz` (Readiness, prüft DB via `SqliteLedger::ping`→200/503), in
   `persistent_control_plane_router` gemerged. Oneshot-Test.
-- **M21.1b** ⏳ gehärtetes Self-Host-Compose-Bundle (persistentes DB-Volume,
-  `restart: unless-stopped`, Healthcheck auf `/readyz`, `.env`-Secrets).
+- **M21.1b** ✅ gehärtetes Self-Host-Compose-Bundle (`docker/deploy/compose.selfhost.yml`):
+  control-plane + edge als langlebige Services, persistentes `cpdata`-Volume
+  (`/data/control-plane.db`), `restart: unless-stopped`, Docker-Healthcheck
+  `curl -fsS /readyz` (curl in die Runtime-Image aufgenommen), edge
+  `depends_on: control-plane condition: service_healthy`; Secrets via
+  `.env`/`env_file` (`.env.example` als Vorlage, `.env` gitignored). Live-Smoke:
+  Image neu gebaut, `--wait` bis Healthcheck grün → `WAIT_EXIT=0`,
+  `health=healthy`, sauberer `down -v`.
 - **M21.2** ⏳ K8s-Manifeste / Helm-Chart (hosted) mit Probes + Secrets.
 
 ## Milestone 22 — Onboarding-UX (so wenige Schritte wie möglich)
