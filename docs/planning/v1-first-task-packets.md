@@ -557,9 +557,13 @@ hosted, hinter einem Storage-Trait).
   (HS256) für dev/Tests. 4 Tests: valid→sub, expired/wrong-issuer/bad-sig
   abgelehnt. (HTTP-Middleware, die den Bearer prüft + `account_for_subject`
   mappt, folgt in M19.3.)
-- **M19.3** Agent-/Token-Ausgabe an authentifizierte Accounts gekoppelt (ersetzt das
-  pseudonyme Prepaid-Gating als Standard; Guthaben bleibt als Abrechnungseinheit).
-- **E2E:** nur ein authentifizierter Account kann Agents enrollen / Tokens beziehen.
+- **M19.3** ✅ Token-Ausgabe an authentifizierte Accounts gekoppelt —
+  `authed_billing_router(ledger, verifier)`: `GET /me/account` + `POST /me/issue`
+  {price}; das Konto wird aus dem verifizierten Bearer-`sub` abgeleitet
+  (`account_for_subject`), nicht aus dem Request. Ohne gültiges Token → 401, mit
+  → Debit auf das eigene Konto (402 bei zu wenig Guthaben). Oneshot-E2E.
+  **Milestone 19 (Identität & Auth) komplett.**
+- **E2E:** ✅ nur ein authentifizierter Account kann Tokens beziehen (401 ohne Token).
 
 ## Milestone 20 — PKI & TLS
 - Echte Zertifikatsausstellung/-rotation für den Edge (interne CA oder ACME); ersetzt

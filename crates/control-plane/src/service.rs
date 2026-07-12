@@ -6,13 +6,15 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::accounts::{AccountId, LedgerError};
 use crate::enrollment::{EnrollError, JoinToken};
+use crate::oidc::OidcVerifier;
 use crate::payment::{PaymentError, PaymentId};
 use crate::registry::TunnelInfo;
 use crate::storage::{
@@ -248,6 +250,88 @@ async fn buy_token(
     }))
 }
 
+/// Shared state for the authenticated billing endpoints: the durable ledger and
+/// the OIDC verifier.
+#[derive(Clone)]
+pub struct AuthedState {
+    ledger: Arc<SqliteLedger>,
+    verifier: Arc<OidcVerifier>,
+}
+
+/// Build the **authenticated** billing router (M19.3): the account is derived
+/// from the verified `Authorization: Bearer` token's subject rather than passed
+/// in the request, so only an authenticated (Keycloak) user can act, and always
+/// on their own account.
+///
+/// * `GET /me/account` → `{account}` for the authenticated subject
+/// * `POST /me/issue` `{price}` → `{token}` (402 on insufficient credit)
+pub fn authed_billing_router(ledger: Arc<SqliteLedger>, verifier: Arc<OidcVerifier>) -> Router {
+    Router::new()
+        .route("/me/account", get(me_account))
+        .route("/me/issue", post(me_issue))
+        .with_state(AuthedState { ledger, verifier })
+}
+
+/// Extract + verify the bearer token, returning the authenticated subject.
+fn authed_subject(state: &AuthedState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
+    state
+        .verifier
+        .subject(token)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
+}
+
+async fn me_account(
+    State(state): State<AuthedState>,
+    headers: HeaderMap,
+) -> Result<Json<AccountResp>, (StatusCode, String)> {
+    let sub = authed_subject(&state, &headers)?;
+    let account = state
+        .ledger
+        .account_for_subject(&sub)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(AccountResp {
+        account: hex_encode(&account.0),
+    }))
+}
+
+#[derive(Deserialize)]
+struct MeIssueReq {
+    price: u64,
+}
+
+async fn me_issue(
+    State(state): State<AuthedState>,
+    headers: HeaderMap,
+    Json(req): Json<MeIssueReq>,
+) -> Result<Json<TokenResp>, (StatusCode, String)> {
+    let sub = authed_subject(&state, &headers)?;
+    let account = state
+        .ledger
+        .account_for_subject(&sub)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Debit the authenticated user's own account; mint only if they can pay.
+    state.ledger.debit(&account, req.price).map_err(|e| {
+        let code = match &e {
+            LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => {
+                StatusCode::PAYMENT_REQUIRED
+            }
+            LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+            LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (code, e.to_string())
+    })?;
+    let mut token = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+    Ok(Json(TokenResp {
+        token: hex_encode(&token),
+    }))
+}
+
 /// Build the full persistent control-plane router: enrollment + registry +
 /// billing, all backed by durable SQLite stores opened on **one** database file
 /// (`db_path`). The three stores share the file via separate connections; each
@@ -445,5 +529,71 @@ mod tests {
         assert_ne!(bought.0, [0u8; 32], "billing persisted (funded account buys a token)");
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// M19.3: issuance is tied to the authenticated OIDC subject. Without a valid
+    /// bearer token the request is 401; with one, the debit hits the subject's
+    /// own account (derived from `sub`, not from the request body).
+    #[tokio::test]
+    async fn authed_issue_uses_the_subject_account_and_requires_a_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+
+        // Pre-credit the account bound to the subject so issuance can succeed.
+        let account = ledger.account_for_subject("user-1").unwrap();
+        ledger.credit(&account, 5).unwrap();
+
+        let app = authed_billing_router(ledger.clone(), verifier);
+
+        // No token -> 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/me/issue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"price":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no bearer token");
+
+        // Valid token -> 200 and the subject's own account is debited.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({ "sub": "user-1", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/me/issue")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"price":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "authenticated issue succeeds");
+        assert_eq!(
+            ledger.balance(&account).unwrap(),
+            4,
+            "the subject's account was debited"
+        );
     }
 }
