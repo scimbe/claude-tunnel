@@ -84,7 +84,34 @@ Grenze benannt.
 Die genannten Systeme decken jeweils einen Teil der Anforderungen ab:
 WireGuard die kryptographische Substanz, Oblivious HTTP die Blindheit, MASQUE den
 QUIC-Transport, Tor die Entkopplung, die Zensurumgehungs-Systeme die
-Sperrresistenz. Der Beitrag der vorliegenden Arbeit ist die \emph{Kombination}
+Sperrresistenz. Tabelle~\ref{tab:rw-vergleich} stellt die Systeme entlang der
+zentralen Eigenschaften gegenueber und macht sichtbar, dass keines sie
+vollstaendig vereint.
+
+\begin{table}[t]
+  \centering
+  \caption{Verwandte Systeme entlang der zentralen Eigenschaften.
+  $\bullet$ = erfuellt, $\circ$ = teilweise, -- = nicht erfuellt.}
+  \label{tab:rw-vergleich}
+  \begin{tabular}{lccccc}
+    \toprule
+    System & E2E, Vermittler-blind & Allg.\ TCP/UDP & QUIC & P2P-Pfad & Missbrauchsschranke \\
+    \midrule
+    WireGuard~\cite{donenfeld2017wireguard} & $\circ$ & $\bullet$ & -- & $\bullet$ & -- \\
+    Tor~\cite{dingledine2004tor} & $\circ$ & $\circ$ & -- & -- & -- \\
+    Oblivious HTTP~\cite{rfc9458} & $\bullet$ & -- & -- & -- & -- \\
+    MASQUE~\cite{rfc9298} & -- & $\circ$ & $\bullet$ & -- & -- \\
+    Diese Arbeit & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Die Zeilen bestaetigen die Prosa: WireGuard verschluesselt zwar Ende-zu-Ende,
+doch jeder Peer kennt seinen Gegenpart ($\circ$); Tor entkoppelt zwar Absender
+und Ziel, ist aber auf \gls{ac:tcp} zugeschnitten ($\circ$) und ohne
+Direktpfad; Oblivious HTTP ist blind, aber auf Anfrage-Antwort-Paare begrenzt;
+MASQUE bringt den QUIC-Transport, sein Proxy ist jedoch sehend. Der Beitrag der
+vorliegenden Arbeit ist die \emph{Kombination}
 dieser Eigenschaften in einem einzigen, lauffaehigen System: ein providerblinder,
 allgemein einsetzbarer Tunnel mit Ende-zu-Ende-Pinning, Proof-of-Work-Rendezvous,
 direktem Peer-to-Peer-Pfad und Transport-Fallback -- inklusive empirischer

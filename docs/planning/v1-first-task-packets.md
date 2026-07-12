@@ -500,8 +500,14 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
     Verfügbarkeit, an Secret gebundene Abrechnungsintegrität, ehrliche offene Flanke
     finanzierter Sybil). Verweist auf `ch:produktivierung`, zitiert perrin2018noise/
     back2002hashcash. Build: PDF_OK, 0 undefined refs/errors, 56→57 S.
-  - **M17.16+** ⏳ Related Work weiter vertiefen (Oblivious HTTP rfc9458, CONNECT-UDP
-    rfc9298) Richtung ~64 S.
+  - **M17.16** ✅ Related-Work-Einordnung um eine systematische Vergleichstabelle
+    ergänzt (`relatedwork.tex`, `tab:rw-vergleich`): WireGuard/Tor/Oblivious HTTP/MASQUE/
+    Diese Arbeit × 5 Eigenschaften (E2E-blind, allg. TCP/UDP, QUIC, P2P, Missbrauchsschranke)
+    mit $\bullet$/$\circ$/-- + erläuternde Prosa. Nutzt nur vorhandene Bib-Keys
+    (donenfeld2017wireguard/dingledine2004tor/rfc9458/rfc9298). Build: PDF_OK, 0 undefined
+    refs/errors, 57 S. (OHTTP + CONNECT-UDP waren bereits als Prosa vorhanden → Tabelle
+    statt Redundanz). (Anm.: OHTTP/MASQUE-Prosa existierte schon; Beitrag ist die Matrix.)
+  - **M17.17+** ⏳ optional weiter Richtung ~64 S. (z.B. Evaluation quantitativer Vergleich).
 
 ---
 
