@@ -420,7 +420,12 @@ Decomposed:
   `docs/thesis/data/latency.csv`, 18 rows with the full M16 stats. All modes
   scale ~6.5·delay (handshake RTTs); 2% loss inflates the p99 tail to ~1.3 s.
 - **M16.4** extend `plot.py`/`tabulate.py` for the new stats/modes; write the
-  analysis under `docs/thesis/data/`.
+  analysis under `docs/thesis/data/`. Decomposed:
+  - **M16.4a** ✅ mode-aware `tabulate.py` (Modus column, mean±95%-CI, p50/p95/p99;
+    back-compatible with old CSVs) → regenerated `results-table.{md,tex}`.
+  - **M16.4b** mode-aware `plot.py`: latency-vs-delay per mode + a mode-comparison
+    figure.
+  - **M16.4c** write the German analysis (`results.md`) from the new data.
 
 ## Milestone 17 — Tiefe BA-Thesis (ersetzt M7, HAW-Vorlage, ~64 S.)
 - Aufsetzen auf `docs/thesis/haw-template/` (Coverpage, Konfiguration, Glossar,
