@@ -730,11 +730,13 @@ hosted, hinter einem Storage-Trait).
     zitierten Env-Vars/Endpoints/Artefakte/Skripte existieren → RUNBOOK_DRIFT_OK.
 
 ## Milestone 26 — Wiring-Lücken (bei M25.3-Runbook entdeckt)
-- **M26.1** ⏳ OIDC-Authed-Endpoints in Produktion mounten: `authed_billing_router`
-  (`/me/*`, OIDC-Bearer-Verifikation, M19.3) ist implementiert+getestet, aber **nicht**
-  in `persistent_control_plane_router` gemerged; `CT_OIDC_ISSUER` wird von keinem Binary
-  gelesen. Packet: `OidcVerifier::from_rsa_pem` aus `CT_OIDC_ISSUER`+Realm-Pubkey bauen,
-  `authed_billing_router` in den Unified-Router mergen, E2E-Test durch den Prod-Router.
+- **M26.1** ✅ OIDC-Authed-Endpoints in Produktion gemountet: `persistent_control_plane_router`
+  nimmt jetzt `oidc: Option<Arc<OidcVerifier>>` und merged `authed_billing_router` (`/me/*`,
+  Cap `AUTHED_ISSUES_PER_WINDOW=60`) nur wenn Some. `main.rs` baut den Verifier via
+  `OidcVerifier::from_rsa_pem` aus `CT_OIDC_ISSUER`+`CT_OIDC_PUBKEY_PATH` (PEM-Datei);
+  beide gesetzt → mounted, sonst None (Endpoints abwesend). 2 Frozen-Tests: mit Some →
+  `/me/account` ohne Token 401 / mit gültigem Token 200 durch den Prod-Router; mit None →
+  404. Runbook „Known limitation" entfernt, `CT_OIDC_PUBKEY_PATH` dokumentiert. Gate 205 (+2).
 
 **Definition of done (Produkt):** durabler Zustand, echte Identität/Auth, echte PKI,
 reproduzierbares Deployment (hosted + self-host), Ein-Kommando-Onboarding,

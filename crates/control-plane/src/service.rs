@@ -344,6 +344,9 @@ async fn payment_webhook(
 /// Accepted age (seconds, either direction) of a payment webhook timestamp (M24.3).
 const WEBHOOK_TOLERANCE_SECS: u64 = 300;
 
+/// Per-subject `/me/issue` cap per window on the production authed router (M26.1).
+const AUTHED_ISSUES_PER_WINDOW: u32 = 60;
+
 /// Fixed window (seconds) for the per-subject issuance rate limit (M23.1).
 const ISSUE_WINDOW_SECS: u64 = 60;
 
@@ -477,6 +480,7 @@ async fn readyz(State(ledger): State<Arc<SqliteLedger>>) -> StatusCode {
 pub fn persistent_control_plane_router(
     db_path: &str,
     webhook_secret: &[u8],
+    oidc: Option<Arc<OidcVerifier>>,
 ) -> rusqlite::Result<Router> {
     let enrollment = Arc::new(SqliteEnrollment::open(db_path)?);
     let registry = Arc::new(SqliteRegistry::open(db_path)?);
@@ -494,11 +498,20 @@ pub fn persistent_control_plane_router(
         .route("/payment/intent", post(create_payment_intent))
         .route("/billing/issue", post(buy_token))
         .with_state(ledger.clone());
-    Ok(enrollment_router_sqlite(enrollment)
+    let mut app = enrollment_router_sqlite(enrollment)
         .merge(registry_router_sqlite(registry))
         .merge(billing)
-        .merge(payment_webhook_router(ledger.clone(), verifier))
-        .merge(health_router(ledger)))
+        .merge(payment_webhook_router(ledger.clone(), verifier));
+    // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
+    // verifier is configured (M26.1). Without one they are simply absent (404).
+    if let Some(oidc) = oidc {
+        app = app.merge(authed_billing_router(
+            ledger.clone(),
+            oidc,
+            AUTHED_ISSUES_PER_WINDOW,
+        ));
+    }
+    Ok(app.merge(health_router(ledger)))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -646,7 +659,7 @@ mod tests {
     const TEST_WEBHOOK_SECRET: &[u8] = b"whsec_unified_test";
 
     async fn spawn_unified(db_path: &str) -> String {
-        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET).unwrap();
+        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, None).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -933,6 +946,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_router_mounts_oidc_authed_endpoints_when_configured() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app =
+            persistent_control_plane_router(":memory:", b"whsec", Some(oidc)).unwrap();
+
+        // Without a bearer token the mounted endpoint rejects with 401 (not 404).
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/me/account").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "authed endpoint is gated");
+
+        // A valid token resolves the subject's account through the production router.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({ "sub": "user-1", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        let resp = app
+            .oneshot(
+                Request::get("/me/account")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "authenticated subject gets an account");
+    }
+
+    #[tokio::test]
+    async fn production_router_omits_authed_endpoints_without_oidc() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // With no OIDC verifier configured, /me/* is not mounted at all -> 404.
+        let app = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp = app
+            .oneshot(Request::get("/me/account").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "authed endpoints absent when OIDC is unconfigured"
+        );
+    }
+
+    #[tokio::test]
     async fn production_router_has_no_client_payment_confirm() {
         use axum::body::Body;
         use axum::http::Request;
@@ -941,7 +1019,7 @@ mod tests {
         // The unified production router must not expose the M18 stub endpoint —
         // credits come only from the signed webhook (proven crediting-side by
         // unified_control_plane_survives_restart).
-        let app = persistent_control_plane_router(":memory:", b"whsec_prod").unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_prod", None).unwrap();
         let resp = app
             .oneshot(
                 Request::post("/payment/confirm")
@@ -964,7 +1042,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"whsec_health").unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_health", None).unwrap();
 
         let health = app
             .clone()

@@ -31,7 +31,8 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 |----------|-----------|---------|
 | `CT_CONTROL_PLANE_LISTEN` | control plane | bind address (default `0.0.0.0:8090`) |
 | `CT_CONTROL_PLANE_DB` | control plane | SQLite path (put it on durable storage) |
-| `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL (reserved — see Known limitations) |
+| `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL (with `CT_OIDC_PUBKEY_PATH`, enables `/me/*`) |
+| `CT_OIDC_PUBKEY_PATH` | control plane | PEM file with the realm's RSA public key; set with `CT_OIDC_ISSUER` to mount the authenticated `/me/*` endpoints |
 | `CT_PAYMENT_WEBHOOK_SECRET` | control plane | provider webhook signing secret (unset ⇒ payment disabled) |
 | `CT_EDGE_LISTEN` | edge | bind address (default `0.0.0.0:4433`) |
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
@@ -80,14 +81,13 @@ change; a non-zero exit means a new advisory affects a pinned crate.
 | One account floods issuance | working as designed | per-account rate limit returns `429`; adjust the cap if legitimate |
 | Suspected committed secret | credential in a commit | run `./scripts/check-no-secrets.sh`; rotate the exposed secret |
 
-## Known limitations
+## Enabling authenticated endpoints
 
-- **OIDC authed endpoints not yet mounted.** The `/me/*` billing endpoints and
-  their OIDC bearer verification are implemented and tested
-  (`authed_billing_router`), but are **not** currently mounted in the unified
-  production router, so `CT_OIDC_ISSUER` has no effect yet. Set it, but expect the
-  authenticated endpoints only once M26.1 wires them in. The unauthenticated
-  billing/webhook flow is fully wired.
+The `/me/*` endpoints (OIDC bearer verification, account derived from the token
+subject) are mounted only when **both** `CT_OIDC_ISSUER` and `CT_OIDC_PUBKEY_PATH`
+are set — the latter pointing at a PEM file with the realm's RSA public key. With
+neither set they are absent (any `/me/*` request → `404`); the unauthenticated
+billing/webhook flow works regardless.
 
 ## Escalation & scope
 
