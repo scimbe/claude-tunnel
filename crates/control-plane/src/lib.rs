@@ -9,6 +9,7 @@ pub mod credential;
 pub mod enrollment;
 pub mod http;
 pub mod issuance;
+pub mod oidc;
 pub mod payment;
 pub mod registry;
 pub mod service;

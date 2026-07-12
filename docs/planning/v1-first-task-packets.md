@@ -551,7 +551,12 @@ hosted, hinter einem Storage-Trait).
   idempotent dasselbe zurück; in Transaktion (ein Subject → nie zwei Konten).
   Datenpfad bleibt E2E-Noise (Accounts = Identität, nicht Payload-Zugriff).
   Tests: idempotent, distinkte Subjects, überlebt Reopen.
-- **M19.2** OIDC-Token-Verifikation (Keycloak-Realm) auf der Control-Plane-API.
+- **M19.2** ✅ OIDC-Token-Verifikation (`ct-control-plane::oidc`): `OidcVerifier`
+  (`jsonwebtoken`) prüft Signatur/Expiry/Issuer und liefert `sub`.
+  `from_rsa_pem` (RS256, Keycloak-Realm-Pubkey) für Prod, `from_hs_secret`
+  (HS256) für dev/Tests. 4 Tests: valid→sub, expired/wrong-issuer/bad-sig
+  abgelehnt. (HTTP-Middleware, die den Bearer prüft + `account_for_subject`
+  mappt, folgt in M19.3.)
 - **M19.3** Agent-/Token-Ausgabe an authentifizierte Accounts gekoppelt (ersetzt das
   pseudonyme Prepaid-Gating als Standard; Guthaben bleibt als Abrechnungseinheit).
 - **E2E:** nur ein authentifizierter Account kann Agents enrollen / Tokens beziehen.
