@@ -637,7 +637,14 @@ hosted, hinter einem Storage-Trait).
     wenn `onboard`-Subcommand oder `CT_AGENT_JOIN_TOKEN` gesetzt → auto-enroll → serve;
     sonst Legacy-Pfad. 3 Frozen-Tests (parse ok+Hex-Dekodierung, parse rejects
     leer/kurz/nicht-hex/leere-ID, `OnboardEnv::onboard` E2E gegen In-Process-CP). Gate 193 (+3).
-  - **M22.3** ⏳ Kurzanleitung/Quickstart (Onboarding-Schritte, portalgeführt).
+  - **M22.3** ✅ Quickstart (`docs/onboarding/quickstart.md`): die zwei Schritte
+    (Portal/Operator issued Single-Use-Join-Token via `POST /enroll/issue`; Agent-Host
+    startet `ct-agent onboard` mit `CT_AGENT_CP_URL`/`_JOIN_TOKEN`/`_ID`/`_EDGE`/`_ORIGIN`
+    → auto-enroll → tunnel), optionale Env-Knöpfe, „was gerade passiert ist" (Privatschlüssel
+    bleibt lokal, Payload E2E-verschlüsselt). Verifikation: Drift-Check-Skript — jede zitierte
+    `CT_*`-Var (9) existiert im Code, `/enroll/issue` ist eine Route, `main` dispatcht `onboard`,
+    tenant→token-Felder matchen `IssueReq/Resp`. **DOC_DRIFT_CHECK_OK**.
+    **🎯 Milestone 22 (Onboarding-UX) komplett** (Ein-Aufruf-Primitive + Ein-Kommando-Binary + Quickstart).
 
 ## Milestone 23 — Security-Hardening & Audit
 - Rate-Limits/Quotas je Account, TLS überall, Secrets-Management, Dependency- +
