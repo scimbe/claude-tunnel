@@ -1,0 +1,19 @@
+# Durable state for the control plane (M21.2a). The SQLite DB that holds
+# enrollment, the tunnel registry and the credit ledger must survive pod
+# restarts and rescheduling — the same durability the self-host compose bundle
+# gets from its named volume. ReadWriteOnce because SQLite is a single writer;
+# the Deployment is therefore pinned to replicas: 1 with a Recreate strategy.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ct-control-plane-data
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-control-plane
+    app.kubernetes.io/part-of: claude-tunnel
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

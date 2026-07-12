@@ -1,0 +1,16 @@
+# Hosted deployment (M21.2a): kustomize base for the control plane.
+#
+#   kubectl kustomize docker/deploy/k8s        # render (offline, no cluster)
+#   kubectl apply -k docker/deploy/k8s         # apply to a cluster
+#
+# Raw kustomize manifests (not Helm) so they render and validate with the
+# kustomize built into kubectl, no extra tooling. M21.2b adds the edge.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ct-system
+resources:
+  - namespace.yaml
+  - control-plane-config.yaml
+  - control-plane-pvc.yaml
+  - control-plane-deployment.yaml
+  - control-plane-service.yaml

@@ -602,7 +602,18 @@ hosted, hinter einem Storage-Trait).
   `.env`/`env_file` (`.env.example` als Vorlage, `.env` gitignored). Live-Smoke:
   Image neu gebaut, `--wait` bis Healthcheck grün → `WAIT_EXIT=0`,
   `health=healthy`, sauberer `down -v`.
-- **M21.2** ⏳ K8s-Manifeste / Helm-Chart (hosted) mit Probes + Secrets.
+- **M21.2** K8s-Manifeste (hosted, kustomize-basiert) mit Probes + Secrets.
+  Dekomponiert (Helm-Tooling nicht vorhanden → rohe kustomize-Manifeste, offline
+  via `kubectl kustomize` validierbar; Helm-Verpackung optional später):
+  - **M21.2a** ✅ Control-Plane-Manifeste (`docker/deploy/k8s/`): Namespace `ct-system`,
+    ConfigMap (Listen/DB/Issuer), PVC `ct-control-plane-data` (durable SQLite `/data`,
+    RWO), Deployment (replicas 1 + `Recreate` da SQLite Single-Writer; Liveness
+    `/healthz` + Readiness `/readyz`-Probes; PVC-Mount `/data`; `envFrom` ConfigMap;
+    non-root + read-only-rootfs + `drop: ALL`), Service (ClusterIP :8090), gebündelt
+    per `kustomization.yaml`. Verifikation: `kubectl kustomize` rendert offline (RC=0,
+    5 Objekte) + 11 Asserts grün (Probes, PVC, Mount, Recreate, non-root, envFrom).
+  - **M21.2b** ⏳ Edge-Manifeste: Deployment + Service (UDP+TCP :4433), Cert-Volume,
+    in dieselbe kustomization gehängt.
 
 ## Milestone 22 — Onboarding-UX (so wenige Schritte wie möglich)
 - Ein-Kommando-Agent-Setup (Install → Auto-Enroll → Tunnel); portalgeführte

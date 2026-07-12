@@ -1,0 +1,19 @@
+# Cluster-internal control-plane endpoint (M21.2a). The hosted portal / ingress
+# routes to this ClusterIP; agents and clients reach it through an Ingress or
+# Gateway that terminates TLS in front of the service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ct-control-plane
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-control-plane
+    app.kubernetes.io/part-of: claude-tunnel
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ct-control-plane
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http

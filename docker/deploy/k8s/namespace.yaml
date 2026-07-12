@@ -1,0 +1,8 @@
+# Hosted deployment namespace (M21.2a). All control-plane objects live here so
+# the operator can scope RBAC, quotas and network policies to the tunnel service.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ct-system
+  labels:
+    app.kubernetes.io/part-of: claude-tunnel

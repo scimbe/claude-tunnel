@@ -1,0 +1,18 @@
+# Non-secret control-plane configuration (M21.2a). The OIDC issuer URL is not a
+# secret (it is a public Keycloak realm URL); the realm's signing key is fetched
+# by the verifier. Real per-environment secrets (if any) belong in a Secret that
+# is supplied out-of-band (sealed-secrets / external-secrets), never committed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ct-control-plane-config
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-control-plane
+    app.kubernetes.io/part-of: claude-tunnel
+data:
+  CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
+  # Durable SQLite lives on the PVC mounted at /data.
+  CT_CONTROL_PLANE_DB: "/data/control-plane.db"
+  # Replace with the real Keycloak realm issuer before deploying.
+  CT_OIDC_ISSUER: "https://keycloak.example/realms/claude-tunnel"
