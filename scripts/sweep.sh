@@ -45,13 +45,18 @@ echo "sweep: building testbed image ..."
 run_condition() {
     local mode="$1" pow="$2" delay="$3" loss="$4" rate="$5"
     echo "sweep: mode=$mode pow=$pow delay=${delay:-none} loss=${loss:-none} rate=${rate:-none} (${ITER} iters)"
+    # UDP mode needs the fixed-port echo Origin + agent-in-UDP overlay.
+    local compose=("${COMPOSE[@]}")
+    if [ "$mode" = "udp" ]; then
+        compose+=(-f "$REPO_ROOT/docker/docker-compose.udpbench.yml")
+    fi
     local out row
     out=$(BENCH_MODE="$mode" EDGE_POW_DIFFICULTY="$pow" \
           EDGE_DELAY="$delay" EDGE_LOSS="$loss" EDGE_RATE="$rate" \
           CLIENT_ITERATIONS="$ITER" \
-          "${COMPOSE[@]}" up --no-build --abort-on-container-exit --exit-code-from client 2>&1 || true)
+          "${compose[@]}" up --no-build --abort-on-container-exit --exit-code-from client 2>&1 || true)
     row=$(printf '%s\n' "$out" | grep -m1 'RESULT ' | sed 's/.*RESULT //' | tr -d '\r')
-    "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
+    "${compose[@]}" down -v >/dev/null 2>&1 || true
     if [ -n "$row" ]; then
         echo "$mode,$pow,$row" >> "$OUT"
         echo "  -> $mode,$pow,$row"

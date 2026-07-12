@@ -414,7 +414,11 @@ Decomposed:
   live `SWEEP_MODES=udp` compose run needs a **fixed-port** UDP echo origin (the
   one-shot smoke's forking socat replies from an ephemeral port → rejected by the
   agent's connected socket) — that overlay folds into **M16.3**.
-- **M16.3** run the matrix under netem → CSV (live compose).
+- **M16.3** ✅ run the matrix under netem → CSV. Added `udp_echo` bin (fixed-port
+  UDP echo) + `docker-compose.udpbench.yml` overlay + sweep udp-overlay
+  selection. Live run (3 modes × 3 delays × 2 losses, n=20) →
+  `docs/thesis/data/latency.csv`, 18 rows with the full M16 stats. All modes
+  scale ~6.5·delay (handshake RTTs); 2% loss inflates the p99 tail to ~1.3 s.
 - **M16.4** extend `plot.py`/`tabulate.py` for the new stats/modes; write the
   analysis under `docs/thesis/data/`.
 

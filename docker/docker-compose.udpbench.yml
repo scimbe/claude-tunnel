@@ -1,0 +1,16 @@
+# UDP bench overlay (M16.3): a fixed-port UDP echo Origin + the Agent in UDP
+# mode, while the Client stays in bench mode (BENCH_MODE=udp selects
+# run_bench_udp) rather than the one-shot self-test. Used by sweep.sh for
+# SWEEP_MODES=udp.
+#
+# The origin runs the ct-testbed `udp_echo` binary, which replies from the bound
+# :8080 for every sequential iteration — unlike the forking socat in
+# docker-compose.udp.yml (that smoke does a single datagram only).
+services:
+  origin:
+    image: ct-testbed
+    command: ["udp_echo"]
+
+  agent:
+    environment:
+      CT_AGENT_ORIGIN_PROTO: "udp"
