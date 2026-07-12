@@ -1,0 +1,90 @@
+% Evaluation — claude-tunnel bachelor thesis.
+\chapter{Evaluation}
+\label{ch:evaluation}
+
+Dieses Kapitel beantwortet die Forschungsfragen FF2 (Latenz-Overhead) und FF3
+(Netz- und Betriebsartverhalten) empirisch. Es beschreibt das Testbett und die
+Methodik (Abschnitt~\ref{sec:eval-methodik}), praesentiert die Ergebnisse
+(\ref{sec:eval-ergebnisse}) und ordnet sie samt Limitierungen ein
+(\ref{sec:eval-diskussion}).
+
+\section{Testbett und Methodik}
+\label{sec:eval-methodik}
+
+Gemessen wird in der Docker-Compose-Topologie aus Kapitel~\ref{ch:architektur}
+mit Edge, Agent, Origin und Client auf einem statischen Netz. Link-Stoergroessen
+werden per \texttt{tc netem} auf der Edge-Egress konfiguriert (Verzoegerung,
+Verlust). Der Client vermisst je Bedingung $n=20$ vollstaendige Roundtrips mit
+frisch aufgebauter QUIC-Verbindung; berichtet werden Mittel mit
+95\%-\gls{ac:ci}, Standardabweichung sowie p50/p95/p99. Die Matrix umfasst die
+Betriebsarten One-shot, Streaming und Datagramm $\times$ Verzoegerung
+$\in \{0, 20, 50\}$\,ms $\times$ Verlust $\in \{0, 2\}$\,\%. Aufbau, Messung und
+Auswertung sind ausschliesslich containerbasiert und aus dem Repository
+reproduzierbar (\texttt{scripts/sweep.sh}, \texttt{plot.sh},
+\texttt{tabulate.py}).
+
+\section{Ergebnisse}
+\label{sec:eval-ergebnisse}
+
+Tabelle~\ref{tab:latency} fasst alle Bedingungen zusammen.
+Abbildung~\ref{fig:vs-delay} zeigt die Skalierung mit der Verzoegerung,
+Abbildung~\ref{fig:by-mode} den Vergleich der Betriebsarten und
+Abbildung~\ref{fig:vs-loss} den Einfluss des Verlusts.
+
+\input{data/results-table.tex}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.72\textwidth]{latency-vs-delay.png}
+  \caption{Tunnel-Roundtrip gegen Edge-Verzoegerung (Modus \texttt{single}), je
+  eine Kurve pro Verlust; obere Fehlerbalken bis p95.}
+  \label{fig:vs-delay}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.72\textwidth]{latency-by-mode.png}
+  \caption{Vergleich der Betriebsarten (Verlust 0\,\%): single, stream und udp
+  ueberlagern sich nahezu.}
+  \label{fig:by-mode}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.72\textwidth]{latency-vs-loss.png}
+  \caption{Tunnel-Roundtrip gegen Paketverlust (Modus \texttt{single}), je eine
+  Kurve pro Verzoegerung.}
+  \label{fig:vs-loss}
+\end{figure}
+
+\section{Diskussion und Limitierungen}
+\label{sec:eval-diskussion}
+
+\paragraph{FF2 (Latenz-Overhead).} Die Baseline (0\,ms, 0\,\%) liegt ueber alle
+Betriebsarten bei rund 8\,ms und misst den Eigenanteil des Tunnels
+(QUIC-Handshake, PoW-Rendezvous, Mehrsprung-Relay). Mit der Verzoegerung skaliert
+der Roundtrip linear: fuer \texttt{single} gilt naeherungsweise
+$\text{RT} \approx 8{,}8 + 6{,}1 \cdot d$ (mit $d$ = einseitige Edge-Verzoegerung
+in ms). Der Faktor $\approx 6$ spiegelt wider, dass ein Anwendungs-Roundtrip die
+verzoegerte Strecke mehrfach quert. Bei 0\,\% Verlust sind die
+\gls{ac:ci} eng ($\pm 2$--$5$\,ms), der Zusammenhang also gut aufgeloest.
+
+\paragraph{FF3 (Netz- und Betriebsartverhalten).} Erstens trifft Paketverlust
+fast ausschliesslich den Tail: bei 2\,\% Verlust bleibt der p50 praktisch
+unveraendert, waehrend der p99 explodiert (bei 20\,ms von 150 auf 1154\,ms,
+Faktor $\approx 7{,}7$). Ursache ist der \gls{ac:pto} von QUIC -- ein waehrend
+des Handshakes verlorenes Paket kostet ein RTT-proportionales Timeout. Zweitens
+ist die Betriebsart bei 0\,\% Verlust nicht latenzbestimmend
+(Abbildung~\ref{fig:by-mode}): single, stream und udp ueberlagern sich, die
+Latenz ist verzoegerungsdominiert. Unter Verlust streuen die Punktschaetzer
+zwar, doch die 95\%-\gls{ac:ci} ueberlappen deutlich; ein statistisch
+belastbarer Modus-Effekt laesst sich aus $n=20$ nicht ableiten.
+
+\paragraph{Limitierungen.} Das Impairment wirkt nur auf der Edge-Egress, nicht
+symmetrisch -- die absolute Latenz ist eine untere Schranke. Der Frisch-Dial pro
+Iteration ueberzeichnet den Handshake-Anteil bewusst. $n=20$ loest den
+Mittelwert bei 0\,\% Verlust eng auf, ist fuer den schweren Tail unter Verlust
+aber knapp; die p99-Werte und der Modus-Vergleich unter Verlust sind entsprechend
+vorsichtig zu lesen. Die PoW-Schwierigkeit ist in diesem Lauf fixiert; die
+Sweep-Achse erlaubt eine gezielte Schwierigkeitsstudie. Echtes NAT-Hole-Punching
+bleibt eine Grenze des flachen Container-Testbetts.

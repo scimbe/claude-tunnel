@@ -467,6 +467,9 @@ Decomposed (one chapter per cycle; each verified by a clean HAW build):
 - **M17.7** ✅ Implementierung (5-Crate-Tabelle, ct-common-Bausteine + PoW-/
   Dispatch-Listings, Daten-/Steuerpfad). `booktabs`/`listings` in Preamble;
   baut sauber (37 S.).
-- **M17.8** Evaluation (Parameterstudie M16, Tabellen + Abbildungen).
+- **M17.8** ✅ Evaluation (Testbett/Methodik, M16-Ergebnistabelle + 3 Abbildungen
+  eingebettet, FF2/FF3 beantwortet, Limitierungen). M16-Outputs nach
+  `ct_thesis/data/` kopiert, graphicspath ergänzt, Platzhalter-Selbstrefs auf
+  `ch:evaluation`/`ch:architektur` gefixt. Baut sauber (41 S.).
 - **M17.9** Diskussion & Limitierungen.
 - **M17.10** Fazit & Ausblick + Anhang.

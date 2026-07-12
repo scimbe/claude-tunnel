@@ -50,7 +50,7 @@ und Steuerbefehle teilen sich eine Verbindung, ohne sich gegenseitig zu
 blockieren. Weil \gls{ac:quic} auf \gls{ac:udp} aufsetzt, ist es zugleich der
 Punkt, an dem Zensur ansetzen kann -- wird \gls{ac:udp} blockiert, ist
 \gls{ac:quic} nicht nutzbar. Der Entwurf braucht daher einen Transport-Fallback
-(Abschnitt~\ref{sec:nat} und Kapitel~\ref{ch:grundlagen}), der denselben Tunnel
+(Abschnitt~\ref{sec:nat} und Kapitel~\ref{ch:architektur}), der denselben Tunnel
 ueber \gls{ac:tls}-ueber-\gls{ac:tcp} traegt.
 
 \section{Ende-zu-Ende-Kryptographie mit Noise}
@@ -89,7 +89,7 @@ Finden ist -- exponentiell in der Schwierigkeit -- teuer, die Pruefung dagegen
 ein einzelner Hash. Dieser asymmetrische Aufwand begrenzt Flut- und
 Rendezvous-Missbrauch, ohne dass der Dienst Identitaeten fuehren oder Inhalte
 sehen muesste. Die Schwierigkeit ist ein Stellparameter, dessen Einfluss die
-Parameterstudie (Kapitel~\ref{ch:grundlagen}) untersucht.
+Parameterstudie (Kapitel~\ref{ch:evaluation}) untersucht.
 
 \section{NAT-Traversal und direkter Pfad}
 \label{sec:nat}
@@ -106,4 +106,4 @@ Agent einen direkten Listener beim Edge, den der Client entdeckt und bevorzugt
 nutzt; scheitert der direkte Aufbau, faellt der Client transparent auf den Relay
 zurueck. Echtes Hole Punching ueber symmetrisches \gls{ac:nat} bleibt eine
 Grenze des flachen Container-Testbetts und wird in
-Kapitel~\ref{ch:grundlagen} eingeordnet.
+Kapitel~\ref{ch:evaluation} eingeordnet.
