@@ -36,3 +36,7 @@ agentdb.rvf.lock
 
 # Scratch / analysis temp files
 .tmp_analysis_*.txt
+
+# Temporarily untracked (M-publish): pushing without the `workflow` token scope.
+# Re-add after `gh auth refresh -s workflow`: remove this block and `git add .github/workflows/ci.yml`.
+.github/workflows/ci.yml
