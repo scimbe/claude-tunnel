@@ -844,6 +844,6 @@ Deploy-Verifikation.
   - **F5.1** ✅ Backoff-Primitive `reconnect::Backoff` (exponentiell ab `base`, gedeckelt bei
     `max`, `next_delay()→None` nach `max_attempts`; rein/clock-frei, `reset()` nach Erfolg).
     3 Frozen-Tests (Wachstum+Cap, Aufgabe nach max, reset). Gate 220 (+3).
-  - **F5.2** ⏳ `run_agent` QUIC-Serve in Reconnect-Loop: bei Connection-Drop re-dial+re-register
+  - **F5.2** ✅ `run_agent` in Reconnect-Loop: Einmal-Setup (Metrics/Direct-Listener) vor der Schleife; `serve_quic_connection` serviert bis zum Drop, dann `Backoff` (base 500ms, max 30s, 10 Versuche), re-dial+re-register, klare Log-Zeile je Versuch, Aufgabe mit Fehler nach max. First-Dial-Fail → TCP-Fallback (#3). Frozen-Test `run_agent_reconnects_after_the_edge_connection_drops` (Edge registriert, schließt, Agent re-registriert = 2 Registrierungen). Gate 221 (+1).
     mit `Backoff`, klare Log-Zeile je Versuch, Aufgabe mit Fehler nach max. Test: Edge-Drop → Re-Register.
   - **F5.3** ⏳ TCP-Fallback-Pfad (#3) ebenfalls reconnecten.

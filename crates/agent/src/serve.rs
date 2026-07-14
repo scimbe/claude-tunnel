@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use quinn::{Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
+
+use crate::reconnect::Backoff;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -272,32 +274,15 @@ pub async fn run_agent(
     token: RoutingToken,
     origin_private: [u8; 32],
 ) -> Result<(), BoxError> {
-    // Register over QUIC; if the edge's UDP path is blocked, fall back to the
-    // TLS-TCP transport instead of failing (issue #3 / P1.2c-4b).
-    let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
-        .await
-    {
-        Ok(conn) => conn,
-        Err(_) => return run_agent_tcp_fallback(config, edge_cert, token, origin_private).await,
-    };
-    register_tunnel(&conn, &token).await?;
-
-    // Shared tunnel metrics for this Agent (M14.1b): handed to every serve task
-    // so the counters aggregate across all tunnels this Agent carries.
+    // Shared tunnel metrics for this Agent (M14.1b), plus optional one-time
+    // endpoints — set up once, outside the reconnect loop.
     let metrics = Arc::new(TunnelMetrics::new());
-
-    // Optional Prometheus `/metrics` endpoint (M14.2): expose the shared metrics
-    // when configured. Runs alongside the serve loop.
     if let Some(addr) = config.metrics_listen {
         let mmetrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             let _ = crate::observe::serve_metrics(addr, mmetrics).await;
         });
     }
-
-    // Optional direct-path listener + advertisement (M11.4b-v): if an advertise
-    // IP is configured, run a direct listener, tell the Edge about it (on a
-    // separate short-lived connection), and serve direct Client connections.
     if let Some(ip) = config.direct_advertise_ip {
         if let Ok((listener, cert)) = crate::transport::build_direct_listener() {
             if let Ok(bound) = listener.local_addr() {
@@ -316,17 +301,86 @@ pub async fn run_agent(
         }
     }
 
-    let proto = config.origin_proto;
+    // Reconnect loop (issue #5 / P1.2b): (re)dial + (re)register + serve until the
+    // connection drops, then back off and retry, so a transient edge/network
+    // failure doesn't kill the tunnel. A *first*-dial failure means UDP is blocked
+    // → the TLS-TCP fallback (issue #3).
+    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, RECONNECT_MAX_ATTEMPTS);
+    let mut first = true;
     loop {
-        let (send, recv) = conn.accept_bi().await?;
-        let origin = config.origin;
-        let lmetrics = Arc::clone(&metrics);
+        let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
+            .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                if first {
+                    return run_agent_tcp_fallback(config, edge_cert.clone(), token.clone(), origin_private)
+                        .await;
+                }
+                eprintln!("ct-agent: edge dial failed ({e}); will reconnect");
+                match backoff.next_delay() {
+                    Some(d) => {
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    None => return Err("ct-agent: gave up reconnecting to the edge".into()),
+                }
+            }
+        };
+        first = false;
+        if let Err(e) = register_tunnel(&conn, &token).await {
+            eprintln!("ct-agent: registration failed ({e}); will reconnect");
+            match backoff.next_delay() {
+                Some(d) => {
+                    tokio::time::sleep(d).await;
+                    continue;
+                }
+                None => return Err("ct-agent: gave up re-registering with the edge".into()),
+            }
+        }
+        backoff.reset();
+        eprintln!("ct-agent: registered with edge {} (serving)", config.edge);
+        serve_quic_connection(
+            &conn,
+            config.origin,
+            config.origin_proto,
+            &origin_private,
+            Arc::clone(&metrics),
+        )
+        .await;
+        eprintln!("ct-agent: edge connection dropped; reconnecting");
+        match backoff.next_delay() {
+            Some(d) => tokio::time::sleep(d).await,
+            None => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
+        }
+    }
+}
+
+/// Reconnect backoff parameters (issue #5 / P1.2b).
+const RECONNECT_BASE: Duration = Duration::from_millis(500);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+
+/// Serve Client tunnels over a live QUIC `conn` until it drops, then return so
+/// the caller can reconnect. Each accepted bi-stream is one Client's Noise tunnel.
+async fn serve_quic_connection(
+    conn: &Connection,
+    origin: SocketAddr,
+    proto: OriginProto,
+    origin_private: &[u8; 32],
+    metrics: Arc<TunnelMetrics>,
+) {
+    loop {
+        let (send, recv) = match conn.accept_bi().await {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        let opriv = *origin_private;
+        let m = Arc::clone(&metrics);
         tokio::spawn(async move {
             let _ = match proto {
-                OriginProto::Tcp => {
-                    serve_noise_stream(send, recv, origin, &origin_private, lmetrics).await
-                }
-                OriginProto::Udp => serve_noise_udp(send, recv, origin, &origin_private).await,
+                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &opriv, m).await,
+                OriginProto::Udp => serve_noise_udp(send, recv, origin, &opriv).await,
             };
         });
     }
@@ -748,6 +802,58 @@ mod tests {
         conn.close(0u32.into(), b"done");
         srv.abort();
         let _ = origin.await;
+    }
+
+    #[tokio::test]
+    async fn run_agent_reconnects_after_the_edge_connection_drops() {
+        // issue #5 / P1.2b: when the registered edge connection closes, the agent
+        // re-dials and re-registers instead of dying.
+        use ct_edge::serve::register_agent;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::build_server_endpoint_with_cert;
+        use quinn::Connection;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().unwrap();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let regs = Arc::new(AtomicUsize::new(0));
+
+        let state_e = state.clone();
+        let regs_e = regs.clone();
+        let edge = tokio::spawn(async move {
+            // First registration, then close the connection to force a reconnect.
+            let c1 = server.accept().await.unwrap().await.unwrap();
+            register_agent(&c1, &state_e).await.unwrap();
+            regs_e.fetch_add(1, SeqCst);
+            c1.close(0u32.into(), b"drop");
+            // A second registration proves the agent reconnected + re-registered.
+            let c2 = server.accept().await.unwrap().await.unwrap();
+            register_agent(&c2, &state_e).await.unwrap();
+            regs_e.fetch_add(1, SeqCst);
+            c2.closed().await;
+        });
+
+        let cfg = AgentConfig::parse(&addr.to_string(), "127.0.0.1:9").unwrap();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent(&cfg, cert, RoutingToken([1u8; 32]), [0u8; 32]).await;
+        });
+
+        // Initial registration + one reconnect, within the backoff window.
+        for _ in 0..400 {
+            if regs.load(SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            regs.load(SeqCst),
+            2,
+            "agent re-registered after the edge connection dropped"
+        );
+        agent.abort();
+        edge.abort();
     }
 
     #[tokio::test]
