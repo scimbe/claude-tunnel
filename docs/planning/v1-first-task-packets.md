@@ -840,3 +840,10 @@ Deploy-Verifikation.
   - **F4.3** ✅ Runbook-Monitoring-Abschnitt: `GET /` Dashboard + `GET /status` JSON dokumentiert (Felder, `http://<host>:8090/`, „nur Metadaten/Health, nie Payload"). Drift-Check: Routes + 6 Status-Felder code-backed → MONITORING_DOC_DRIFT_OK. **🎯 #4 komplett (F4.1 JSON + F4.2 HTML + F4.3 Doku).**
 - **#5** Agent Reconnect-on-drop (P1.2b) — offen.
 - **#6** Ein-Kommando-Cross-Host-E2E-Smoke — offen.
+- **#5 Agent Reconnect-on-drop (P1.2b)** (dekomponiert):
+  - **F5.1** ✅ Backoff-Primitive `reconnect::Backoff` (exponentiell ab `base`, gedeckelt bei
+    `max`, `next_delay()→None` nach `max_attempts`; rein/clock-frei, `reset()` nach Erfolg).
+    3 Frozen-Tests (Wachstum+Cap, Aufgabe nach max, reset). Gate 220 (+3).
+  - **F5.2** ⏳ `run_agent` QUIC-Serve in Reconnect-Loop: bei Connection-Drop re-dial+re-register
+    mit `Backoff`, klare Log-Zeile je Versuch, Aufgabe mit Fehler nach max. Test: Edge-Drop → Re-Register.
+  - **F5.3** ⏳ TCP-Fallback-Pfad (#3) ebenfalls reconnecten.
