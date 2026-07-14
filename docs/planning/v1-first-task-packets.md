@@ -808,8 +808,14 @@ Deploy-Verifikation.
     Stream als `Err` zurück wenn kein Agent parkt → Caller fällt auf QUIC-Route durch),
     `has_tcp_agent`; `remove` räumt auf. `BoxedStream = Box<dyn DuplexStream>`
     (AsyncRead+Write+Unpin+Send). tokio-Feature `sync` ergänzt. 3 Frozen-Tests. Gate 212 (+3).
-  - **P1.2c-3b** ⏳ `serve_tcp_connection` verdrahten: `'A'` parkt+relayt, `'C'` liefert an
-    parkenden TCP-Agent (sonst QUIC-Route).
+  - **P1.2c-3b** ✅ `serve_tcp_connection` verdrahtet: neuer `'A'`-Zweig (Token lesen, `OK`
+    acken, `park_tcp_agent`, auf Client warten, `relay`); `'C'`-Zweig liefert nach PoW an
+    einen parkenden TCP-Agent (`deliver_to_tcp_agent`), sonst Fallback auf QUIC-Route.
+    `S`-Bound um `Send + 'static` erweitert (Boxing). Integrations-Frozen-Test
+    `tcp_agent_registers_and_relays_a_delivered_client` (TCP-Register → Park → gelieferter
+    Client → Echo-Round-trip). Gate 213 (+1). **Edge-Seite komplett.**
+  - **P1.2c-4** ⏳ Agent-Seite: `tcp_tls_connect` + `run_agent` wählt QUIC, sonst TCP-Fallback
+    (`register_tunnel_stream` + serve über den Stream) → **Cross-Host-Round-trip** (schließt #3).
   - **P1.2c-4** ⏳ Agent `tcp_tls_connect` + `run_agent` Transport-Wahl (QUIC, sonst
     TCP-Fallback bei blockierter UDP) + Serve über TCP → Cross-Host-Round-trip.
   - _(Reconnect-on-drop P1.2b → eigenes Feature #5.)_

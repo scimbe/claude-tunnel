@@ -146,22 +146,44 @@ pub async fn serve_connection(
     }
 }
 
-/// Serve one Client over the **TCP fallback** (M12.2b): a single TLS-TCP stream
-/// carries the `'C'` rendezvous (challenge → PoW) and is then relayed to the
-/// Agent's QUIC tunnel. The relay is transport-agnostic, so a TCP client bridges
-/// to a QUIC agent. (Agents register over QUIC; this is the Client's UDP-blocked
-/// fallback.)
+/// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
+/// by dispatching on the first byte's role:
+///
+/// * `'A'` — an Agent registers over TCP (UDP/QUIC blocked): read the token, ack
+///   `OK`, park in the rendezvous, and relay this stream to the first Client that
+///   arrives (single-tunnel — a TCP agent has one stream, no QUIC-style muxing).
+/// * `'C'` — a Client runs the `'C'` rendezvous (challenge → PoW) and is delivered
+///   to a parked TCP agent if one exists, else relayed to a QUIC-registered agent.
+///
+/// The relay is transport-agnostic, so any Client (TCP or QUIC) bridges to either
+/// a TCP-registered or a QUIC-registered agent.
 pub async fn serve_tcp_connection<S>(
     mut stream: S,
     state: &EdgeState<Connection>,
     challenge: &Challenge,
 ) -> Result<(), BoxError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut role = [0u8; 1];
     stream.read_exact(&mut role).await?;
     match role[0] {
+        b'A' => {
+            let mut token_buf = [0u8; 32];
+            stream.read_exact(&mut token_buf).await?;
+            let token = RoutingToken(token_buf);
+            stream.write_all(b"OK").await?;
+            stream.flush().await?;
+            // Park and await a Client, then relay this agent stream to it.
+            match state.park_tcp_agent(token).await {
+                Ok(mut client) => {
+                    relay(&mut stream, &mut client).await?;
+                    Ok(())
+                }
+                // Never matched with a Client (edge shutdown / registration replaced).
+                Err(_) => Ok(()),
+            }
+        }
         b'C' => {
             let mut chal = [0u8; 17];
             chal[..16].copy_from_slice(&challenge.nonce);
@@ -173,11 +195,17 @@ where
             stream.read_exact(&mut req).await?;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
-            let agent_conn = state.route(&token).ok_or("no agent tunnel for token")?;
-            let (agent_send, agent_recv) = agent_conn.open_bi().await?;
-            let mut agent = join(agent_recv, agent_send);
-            relay(&mut stream, &mut agent).await?;
-            Ok(())
+            // Prefer a parked TCP-fallback agent; else relay to a QUIC agent.
+            match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
+                Ok(()) => Ok(()),
+                Err(mut stream) => {
+                    let agent_conn = state.route(&token).ok_or("no agent tunnel for token")?;
+                    let (agent_send, agent_recv) = agent_conn.open_bi().await?;
+                    let mut agent = join(agent_recv, agent_send);
+                    relay(&mut stream, &mut agent).await?;
+                    Ok(())
+                }
+            }
         }
         other => Err(format!("unknown TCP role byte: {other}").into()),
     }
@@ -430,5 +458,54 @@ mod tests {
         );
         drop(client_conn);
         edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_agent_registers_and_relays_a_delivered_client() {
+        // issue #3 / P1.2c-3b: an Agent registers over the TCP fallback ('A'),
+        // parks, and the edge relays a delivered Client stream to it end to end.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x55; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // Run the edge 'A' handler on the edge side of the agent duplex.
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(1024);
+        let state_a = state.clone();
+        let chal_a = challenge.clone();
+        let edge = tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_a, &chal_a).await });
+
+        // Agent peer: register 'A' | token, read OK, then echo (origin-relay sim).
+        let mut hdr = vec![b'A'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK", "edge acks the TCP registration");
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 5];
+            agent_peer.read_exact(&mut buf).await.unwrap();
+            agent_peer.write_all(&buf).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        });
+
+        // Once parked, deliver a Client stream (the 'C'/PoW path is tested
+        // separately); the edge relays agent <-> client.
+        while !state.has_tcp_agent(&token) {
+            tokio::task::yield_now().await;
+        }
+        let (mut client_peer, client_edge) = tokio::io::duplex(1024);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        client_peer.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 5];
+        client_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello", "round-trip relayed through the TCP-registered agent");
+
+        echo.await.unwrap();
+        drop(client_peer);
+        let _ = edge.await;
     }
 }
