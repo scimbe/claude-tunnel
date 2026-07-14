@@ -862,3 +862,21 @@ Deploy-Verifikation.
   Deterministischer Frozen-Test `keepalive_holds_the_connection_across_an_idle_gap` (Server mit
   1s-Idle, Client 300ms-Keepalive, 2s Idle-Gap → Round-trip überlebt). **Das war der letzte
   Blocker für echtes cross-host `via=quic`.**
+- **#7 Menschlich-nachvollziehbare Demo (via=quic/tcp, Origin sichtbar, Live-Leistung)** (dekomponiert):
+  Akzeptanz #7: (1) Ein-Kommando-Start mit sichtbarem privatem Origin, (2) sichtbarer Beweis
+  (Origin-Inhalt kommt durch den Tunnel an), (3) Kontrast „ohne Tunnel nicht erreichbar", (4)
+  Leistung sichtbar (N Round-Trips, mean/p95), (5) QUIC + TCP-Fallback umschaltbar, (6) „Demo in
+  2 Minuten"-Doku. Abgrenzung zu #6: #6 ist der Maschinen-Smoke (Exit-Code); #7 *zeigt* es einem
+  Menschen. Voraussetzung für echtes cross-host `via=quic` ist der Keepalive-Fix (#2).
+  - **F7.1** ✅ `scripts/demo.sh`: narriertes Ein-Kommando-Skript, das einen **privaten** Origin
+    (socat-Echo, an 127.0.0.1 gebunden, loggt jede Anfrage) startet, den Kontrast „direkt von
+    außen nicht erreichbar" zeigt, den Agent onboardet (registriert am zentralen Edge), einen
+    `ct-client` mit erkennbarem Payload durch den Tunnel schickt und menschenlesbar meldet:
+    „Client hat \"<secret>\" durch den Tunnel zurückerhalten — via=<quic|tcp>, Round-trip <ms>",
+    plus das Origin-Log als Beweis. `CT_CLIENT_FORCE_TCP=1` schaltet den TCP-Pfad um (Akz. 5).
+    Deckt Akzeptanz 1–3 + 5 (Terminal-Variante). Frozen: `bash -n` grün + Drift-Check (alle
+    CT_AGENT_*/CT_CLIENT_*-Env-Vars + `round-trip OK`/`via=`-Marker code-backed) → DEMO_DRIFT_OK.
+  - **F7.2** ⏳ offen: Live-Leistung sichtbar — `ct-client`-Bench (`CT_CLIENT_ITERATIONS>1`,
+    RESULT-CSV) in die Demo einhängen, mean/p95-Latenz menschenlesbar rendern (Akz. 4).
+  - **F7.3** ⏳ offen: „Demo in 2 Minuten"-Abschnitt (README/runbook) mit Beispiel-Ausgabe (Akz. 6).
+  - (fix-ready erst wenn F7.1–F7.3 alle Akzeptanzkriterien erfüllen.)
