@@ -16,6 +16,7 @@ use ct_common::credential::SignedCredential;
 use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -194,6 +195,31 @@ pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<
     }
 }
 
+/// Register this Agent's tunnel for `token` over a generic byte stream — the
+/// TLS-over-TCP fallback (issue #3 / P1.2c-2): write `role='A' | token(32)` and
+/// await the Edge's `OK`. Unlike the QUIC path (which opens a fresh bi-stream
+/// per client), a TCP agent uses one stream, so the *same* stream then carries
+/// the relayed tunnel — a TCP-fallback agent serves one client at a time.
+pub async fn register_tunnel_stream<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut msg = vec![b'A'];
+    msg.extend_from_slice(&token.0);
+    stream.write_all(&msg).await?;
+    stream.flush().await?;
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+    if &ack == b"OK" {
+        Ok(())
+    } else {
+        Err("edge rejected tunnel registration".into())
+    }
+}
+
 /// Load an Edge certificate (DER) the Edge published to a shared path.
 pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'static>> {
     Ok(CertificateDer::from(std::fs::read(path)?))
@@ -272,6 +298,45 @@ mod tests {
         let reachable = probe_udp_reachable(dead_addr, cert, Duration::from_millis(400)).await;
         assert!(!reachable, "blocked UDP is not reachable");
         assert_eq!(select_transport(reachable), Transport::TcpFallback);
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_sends_role_and_token_and_reads_ok() {
+        // issue #3 / P1.2c-2: the TCP-fallback register primitive writes
+        // 'A' | token(32) and accepts the edge's OK over a generic stream.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x42; 32]);
+
+        // Mock edge: read role+token, verify, ack "OK".
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let mut hdr = [0u8; 33];
+            edge_side.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], b'A', "role byte");
+            assert_eq!(&hdr[1..], &t.0, "token echoed");
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream(&mut agent_side, &token)
+            .await
+            .expect("register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_errors_on_non_ok_ack() {
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x01; 32]);
+        let edge = tokio::spawn(async move {
+            let mut hdr = [0u8; 33];
+            edge_side.read_exact(&mut hdr).await.unwrap();
+            edge_side.write_all(b"NO").await.unwrap(); // rejection
+            edge_side.flush().await.unwrap();
+        });
+        let r = register_tunnel_stream(&mut agent_side, &token).await;
+        assert!(r.is_err(), "a non-OK ack is a rejection");
+        edge.await.unwrap();
     }
 
     #[tokio::test]

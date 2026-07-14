@@ -798,8 +798,13 @@ Deploy-Verifikation.
     `agent/transport.rs`; `run_agent` nutzt es (5s). Frozen-Test
     `dial_quic_or_blocked_error_reports_udp_blocked` (toter UDP-Port → Fehler nennt
     „UDP"+„issue #3", schnell). Gate 207 (+1).
-  - **P1.2c-2** ⏳ Edge akzeptiert Agent-`'A'`-Registrierung über TCP; `EdgeState`
-    abstrahiert über Transport (QUIC- **oder** TCP-Agent), Relay bridged Client→TCP-Agent.
-  - **P1.2c-3** ⏳ Agent registriert+serviert über TLS-TCP; `run_agent` wählt Transport
-    (QUIC, sonst TCP-Fallback bei blockierter UDP).
-  - **P1.2c-4** ⏳ Reconnect-on-drop (P1.2b).
+  - **P1.2c-2** ✅ Agent-seitige Stream-Register-Primitive `register_tunnel_stream(stream, token)`
+    in `agent/transport.rs`: schreibt `'A'|token(32)` über einen generischen
+    `AsyncRead+AsyncWrite`-Stream und liest `OK` (TLS-TCP-Fallback; TCP-Agent bedient
+    einen Client pro Stream — kein QUIC-Multiplexing). 2 Frozen-Tests gegen
+    `tokio::io::duplex`-Mock-Edge (OK-Ack akzeptiert, Nicht-OK → Fehler). Gate 209 (+2).
+  - **P1.2c-3** ⏳ Edge akzeptiert Agent-`'A'` über TCP in `serve_tcp_connection`,
+    speichert den TCP-Agent-Stream, relayt Client→TCP-Agent (single-tunnel).
+  - **P1.2c-4** ⏳ Agent `tcp_tls_connect` + `run_agent` Transport-Wahl (QUIC, sonst
+    TCP-Fallback bei blockierter UDP) + Serve über TCP → Cross-Host-Round-trip.
+  - _(Reconnect-on-drop P1.2b → eigenes Feature #5.)_
