@@ -216,13 +216,29 @@ where
     }
 }
 
+/// Path of the persisted CA signing key: `edge-ca-key.pem` beside the published
+/// root cert (`cert_out`), so both live on the Edge's shared/runtime volume.
+fn ca_key_path_for(cert_out: &str) -> String {
+    let p = std::path::Path::new(cert_out);
+    match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join("edge-ca-key.pem").to_string_lossy().into_owned()
+        }
+        _ => "edge-ca-key.pem".to_string(),
+    }
+}
+
 /// Run the Edge daemon: bind to `config.listen`, write the cert to `cert_out`
 /// (shared volume), and serve each incoming connection via [`serve_connection`]
 /// with a fresh per-connection PoW challenge.
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
     // Issue the Edge's leaf from an internal CA (M20.3b) and listen on both QUIC
-    // (primary) and TLS-TCP (fallback) with that one shared leaf.
-    let ca = Ca::new("ct-edge-ca")?;
+    // (primary) and TLS-TCP (fallback) with that one shared leaf. Persist the CA
+    // signing key beside the published root so a redeploy reloads the SAME CA
+    // and every pinned Agent/Client stays valid — a fresh CA per boot rotated
+    // the root under everyone and broke pins with BadSignature (issue #2).
+    let ca_key_path = ca_key_path_for(cert_out);
+    let ca = Ca::load_or_create(&ca_key_path, "ct-edge-ca")?;
     let (endpoint, tcp_listener, acceptor, ca_root) =
         build_dual_edge_from_ca(&ca, config.listen, config.listen, vec!["localhost".to_string()])
             .await?;

@@ -899,3 +899,15 @@ Deploy-Verifikation.
   Daten **umgebungsbedingt** (Pfad-MTU/PMTUD, symmetrisches NAT, Loss auf dem realen WAN; das
   `ss UNCONN`-Indiz war ein False-Positive — quinn nutzt unverbundene UDP-Sockets) → needs-info,
   gezielter tcpdump/MTU-Capture vom Feld, bevor ein MTU-Clamp codiert wird.
+- **#2 (Blocker) Edge CA persistiert über Neustarts** ✅: `run_edge` rief `Ca::new()` bei jedem
+  Start → **frische CA pro Boot** → jeder Redeploy rotierte den Trust-Root und brach alle
+  gepinnten Agents/Clients mit `BadSignature` (Feld 2× getroffen, blockierte alle Verifikation).
+  Das widersprach dem eigenen PKI-Versprechen („Client traut der CA-Root, Leaf rotiert frei").
+  Fix: `Ca::load_or_create(key_pem_path, cn)` lädt den persistierten CA-Signing-Key (0600, auf
+  dem Edge-Runtime-Volume neben der publizierten Root), sonst generieren+persistieren; `run_edge`
+  nutzt ihn (`ca_key_path_for(cert_out)` → `edge-ca-key.pem`). Gleicher Key ⇒ gleiche Root ⇒
+  Pins bleiben gültig. Frozen-Test `persisted_ca_reload_keeps_pinned_clients_valid` (zwei
+  unabhängige `load_or_create` = Prozess-Neustart; Client mit Pre-Restart-Pin handshaked gegen
+  das Leaf der reloaded CA). Gate 225 (+1), 0 Warnungen. Der CA-Key landet nie im Repo
+  (Runtime-Pfad). Mode (b) bleibt offen (Feld: PMTU/DF ausgeschlossen, Verdacht Edge-Route/Relay-
+  App-Logik) → needs-info, sobald Cert neu publiziert ist, Edge-seitiges Tracing nachziehen.

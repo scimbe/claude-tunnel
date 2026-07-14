@@ -27,10 +27,48 @@ pub struct Ca {
     key: KeyPair,
 }
 
+/// Write `bytes` to `path`, restricting the file to owner read/write (0600) on
+/// Unix so a persisted CA signing key is never world-readable.
+fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 impl Ca {
     /// Generate a fresh CA with the given common name.
     pub fn new(common_name: &str) -> Result<Self, BoxError> {
-        let key = KeyPair::generate()?;
+        Self::from_key(KeyPair::generate()?, common_name)
+    }
+
+    /// Load a CA whose signing key is persisted at `key_pem_path`, or generate a
+    /// fresh one and persist it there. Persisting the CA **key** across restarts
+    /// is what makes the published CA root stable: Agents/Clients trust the CA
+    /// (by its public key + subject), so an Edge redeploy that reloads the same
+    /// key keeps every pinned peer valid. Regenerating the CA on each boot — the
+    /// previous behaviour — rotated the root under everyone and broke all pins
+    /// with `BadSignature` (issue #2). The key file is written owner-only (0600)
+    /// and lives on the Edge's runtime volume, never in the repo.
+    pub fn load_or_create(key_pem_path: &str, common_name: &str) -> Result<Self, BoxError> {
+        match std::fs::read_to_string(key_pem_path) {
+            Ok(pem) => Self::from_key(KeyPair::from_pem(&pem)?, common_name),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key = KeyPair::generate()?;
+                write_owner_only(key_pem_path, key.serialize_pem().as_bytes())?;
+                Self::from_key(key, common_name)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Build the CA certificate deterministically from an existing signing key,
+    /// so a reloaded key yields a root that still validates previously issued
+    /// leaves (trust chains to the CA's public key, unchanged across restarts).
+    fn from_key(key: KeyPair, common_name: &str) -> Result<Self, BoxError> {
         let mut params = CertificateParams::new(Vec::new())?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
@@ -215,6 +253,61 @@ mod tests {
 
         conn2.close(0u32.into(), b"done");
         let _ = srv2.await;
+    }
+
+    /// Issue #2: an Edge **restart** must reload the *same* CA so peers that
+    /// pinned the root before the restart still validate the post-restart leaf.
+    /// Unlike `client_survives_edge_cert_rotation` (one in-memory CA, rotated
+    /// leaf), this simulates a process redeploy: two independent `load_or_create`
+    /// calls against the same persisted key file. Regenerating the CA per boot
+    /// broke this and produced `BadSignature` in the field.
+    #[tokio::test]
+    async fn persisted_ca_reload_keeps_pinned_clients_valid() {
+        let key_path = std::env::temp_dir()
+            .join(format!("ct-edge-ca-{}.pem", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&key_path);
+
+        // First boot: generate + persist the CA; a peer pins this root once.
+        let ca_boot1 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        let pinned_root = ca_boot1.root_der();
+
+        // Redeploy: a brand-new process reloads the CA from the persisted key.
+        let ca_boot2 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        // Same signing key survived the "restart".
+        assert_eq!(
+            ca_boot1.key.public_key_der(),
+            ca_boot2.key.public_key_der(),
+            "reloaded CA keeps the same signing key"
+        );
+
+        // The post-restart Edge serves a leaf from the reloaded CA…
+        let (server, _root2) = build_server_endpoint_from_ca(
+            &ca_boot2,
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["localhost".into()],
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move { accept_and_echo_one(&server).await });
+
+        // …and a client that pinned the pre-restart root still handshakes.
+        let client = build_client_endpoint_trusting_ca(pinned_root).unwrap();
+        let conn = client
+            .connect(addr, "localhost")
+            .unwrap()
+            .await
+            .expect("pre-restart pin trusts the reloaded CA's leaf");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"after-restart").await.unwrap();
+        send.finish().unwrap();
+        let echoed = recv.read_to_end(64).await.unwrap();
+        assert_eq!(echoed, b"after-restart", "round-trip after an edge restart");
+
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
+        let _ = std::fs::remove_file(&key_path);
     }
 
     /// The dual-transport Edge with a CA-issued leaf is trusted over QUIC by a
