@@ -96,6 +96,45 @@ Requires the built binaries (`docker run --rm -v "$PWD":/work -w /work rust:1-sl
 cargo build --workspace`), plus `socat` and `curl`. `EDGE_CERT` is the edge CA
 root (public trust material) copied from the central host.
 
+### Demo in 2 minutes (show a human the tunnel works)
+Where the smoke above prints a machine verdict for operators, `./scripts/demo.sh`
+*shows* a person that real client traffic reaches a **private** origin only through
+the tunnel, and how fast. It starts a private echo origin bound to `127.0.0.1`
+(unreachable from outside), narrates that contrast, onboards the agent, sends a
+recognizable payload through the tunnel, then measures live latency over the same
+path. Same prerequisites as the smoke (built binaries, `socat`, `curl`, the edge
+CA root):
+
+```bash
+BIN=./target/debug CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der ./scripts/demo.sh
+# show the TCP fallback path instead of QUIC:
+CT_CLIENT_FORCE_TCP=1 BIN=./target/debug CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der ./scripts/demo.sh
+# more samples for the latency read:
+CT_CLIENT_ITERATIONS=50 BIN=./target/debug CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der ./scripts/demo.sh
+```
+
+Example output:
+
+```text
+=== claude-tunnel demo: reaching a PRIVATE origin through the tunnel ===
+▶ Starting a PRIVATE origin on 127.0.0.1:8080 (echo; logs each request)
+✓ Origin is up on 127.0.0.1:8080 — bound to loopback, so it is NOT reachable from another host.
+▶ Contrast — is the origin reachable directly from outside loopback?
+✓ Direct connection to the origin from the public side is refused — it is genuinely private.
+▶ Onboarding the agent against the central control plane + edge
+✓ Agent onboarded and registered on the edge (<central-host>:4433).
+▶ A client sends "private-origin-1752570000" through the tunnel (path: QUIC) …
+✓ The client received "private-origin-1752570000" back THROUGH the tunnel — via=quic, round-trip 6 ms.
+   ↳ The PRIVATE origin's own log confirms it was reached only via the tunnel:
+     [origin] served a request at 14:20:03
+▶ Measuring live performance — 20 round-trips through the tunnel (path: QUIC) …
+✓ Live latency over the tunnel — 20/20: mean 1.83ms p95 3.10ms.
+=== DEMO OK — real client traffic reached the private origin over the tunnel (via=quic) ===
+```
+
+Cross-host `via=quic` requires the agent-side keepalive (issue #2, on `main`);
+without it the demo can still run locally/loopback.
+
 ## Incident response
 
 | Symptom | Likely cause | Action |

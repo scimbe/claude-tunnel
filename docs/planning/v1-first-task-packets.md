@@ -881,5 +881,9 @@ Deploy-Verifikation.
     und rendert menschenlesbar „Live latency over the tunnel — N/N: mean X.XXms p95 Y.YYms" aus
     ct-clients Bench-Zeile (Akz. 4). Frozen: `bash -n` grün + Drift-Check (Bench-Marker
     `bench {}/{} iterations, mean … p95 …` + `CT_CLIENT_ITERATIONS` code-backed) → DEMO_BENCH_DRIFT_OK.
-  - **F7.3** ⏳ offen: „Demo in 2 Minuten"-Abschnitt (README/runbook) mit Beispiel-Ausgabe (Akz. 6).
-  - (fix-ready erst wenn F7.1–F7.3 alle Akzeptanzkriterien erfüllen.)
+  - **F7.3** ✅ Runbook-Abschnitt „Demo in 2 minutes (show a human the tunnel works)":
+    `./scripts/demo.sh`-Aufruf (QUIC + `CT_CLIENT_FORCE_TCP` + `CT_CLIENT_ITERATIONS`) mit
+    vollständiger narrierter Beispiel-Ausgabe, abgegrenzt vom Operator-Smoke (#6); Hinweis auf
+    Keepalive (#2) als Voraussetzung für cross-host `via=quic` (Akz. 6). Frozen: Drift-Check
+    (5 Env-Vars + 9 zitierte Output-Marker literal in `demo.sh` vorhanden) → DEMO_DOC_DRIFT_OK.
+  - **🎯 #7 komplett (F7.1 Demo-Skript + F7.2 Live-Latenz + F7.3 Doku) → alle 6 Akzeptanzkriterien erfüllt → fix-ready.**
