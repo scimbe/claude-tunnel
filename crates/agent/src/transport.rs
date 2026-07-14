@@ -114,16 +114,41 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// QUIC keepalive on the Agent's control connection to the Edge (issue #2).
+/// Without it, quinn's idle timeout tears down the registered connection, the
+/// Edge evicts the tunnel, and a Client arriving seconds later gets "no relay".
+/// 5s also keeps the cross-host NAT/UDP mapping warm; the idle timeout sits
+/// comfortably above it.
+const AGENT_KEEPALIVE: Duration = Duration::from_secs(5);
+const AGENT_MAX_IDLE: Duration = Duration::from_secs(30);
+
 fn client_endpoint(edge_cert: CertificateDer<'static>) -> Result<Endpoint, BoxError> {
+    client_endpoint_with(edge_cert, Some(AGENT_KEEPALIVE), AGENT_MAX_IDLE)
+}
+
+/// Build the Agent's QUIC client endpoint trusting `edge_cert`, applying a
+/// `keep_alive_interval` and `max_idle_timeout` so the registered control
+/// connection to the Edge stays alive across idle gaps (issue #2).
+fn client_endpoint_with(
+    edge_cert: CertificateDer<'static>,
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+) -> Result<Endpoint, BoxError> {
     install_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(edge_cert)?;
     let crypto = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let cfg = quinn::ClientConfig::new(Arc::new(
+    let mut cfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(keep_alive);
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(max_idle).map_err(|_| "agent max_idle_timeout out of range")?,
+    ));
+    cfg.transport_config(Arc::new(transport));
     // Bind all interfaces (not loopback) so the Agent can reach a non-local Edge.
     let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
     endpoint.set_default_client_config(cfg);
@@ -415,6 +440,59 @@ mod tests {
         let r = register_tunnel_stream(&mut agent_side, &token).await;
         assert!(r.is_err(), "a non-OK ack is a rejection");
         edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepalive_holds_the_connection_across_an_idle_gap() {
+        // issue #2: a server with a 1s idle timeout evicts an idle peer, but a
+        // client with a 300ms keepalive holds the connection open past 2s of no
+        // application traffic — so the edge retains the tunnel registration
+        // instead of leaving a later client with "no relay".
+        install_crypto_provider();
+        let (cert, key) = self_signed().unwrap();
+        let mut sc = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+        let mut st = quinn::TransportConfig::default();
+        st.max_idle_timeout(Some(quinn::IdleTimeout::try_from(Duration::from_secs(1)).unwrap()));
+        // Deliberately NO keepalive on the server side.
+        sc.transport_config(std::sync::Arc::new(st));
+        let server = Endpoint::server(sc, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            if let Ok((mut s, mut r)) = conn.accept_bi().await {
+                let mut buf = [0u8; 4];
+                if r.read_exact(&mut buf).await.is_ok() {
+                    let _ = s.write_all(&buf).await;
+                    let _ = s.finish();
+                }
+            }
+            conn.closed().await;
+        });
+
+        // Client with a keepalive shorter than the server's idle timeout.
+        let ep =
+            client_endpoint_with(cert, Some(Duration::from_millis(300)), Duration::from_secs(30))
+                .unwrap();
+        let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+
+        // Idle longer than the server's 1s timeout — keepalive must hold it open.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Bounded round-trip: with keepalive it completes fast; without it the
+        // connection is dead and this fails within the timeout (never hangs).
+        let got = tokio::time::timeout(Duration::from_secs(4), async {
+            let (mut s, mut r) = conn.open_bi().await.expect("connection alive after idle gap");
+            s.write_all(b"ping").await.unwrap();
+            s.finish().unwrap();
+            let mut got = [0u8; 4];
+            r.read_exact(&mut got).await.unwrap();
+            got
+        })
+        .await
+        .expect("round-trip within 4s — keepalive should hold the connection open");
+        assert_eq!(&got, b"ping", "keepalive kept the connection past the idle timeout");
+        srv.abort();
     }
 
     #[tokio::test]

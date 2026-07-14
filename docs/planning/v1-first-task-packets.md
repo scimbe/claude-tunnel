@@ -854,3 +854,11 @@ Deploy-Verifikation.
     bzw. `SMOKE FAIL: …` (Exit-Code). Frozen: `bash -n` grün + Drift-Check (11 CT_*-Env-Vars,
     `/enroll/issue`, `onboard`, `round-trip OK`/`via=`-Marker existieren im Code) → E2E_SMOKE_DRIFT_OK.
   - **F6.2** ✅ Runbook-Abschnitt „Verify a deployment end to end (smoke)": `./scripts/e2e-smoke.sh` als Feld-Standard-Check dokumentiert (CENTRAL/EDGE_CERT, TCP-Fallback-Variante, Voraussetzungen). Drift-Check: Skript/Env-Vars/SMOKE-Marker code/skript-backed → SMOKE_DOC_DRIFT_OK. **🎯 #6 komplett → Milestone „Full functional setup" (#4/#5/#6 + #3) fertig.**
+- **#2 QUIC-Keepalive (Feld-diagnostiziert, kritisch)**: ✅ Ohne `keep_alive_interval` baut
+  quinns Idle-Timeout die registrierte Agent→Edge-Kontrollverbindung ab (+ kaltes NAT/UDP-
+  Mapping) → Edge evictet die Registrierung → Client bekommt „no relay" (nur cross-host; loopback
+  0-RTT verdeckt es). Fix in `agent/transport.rs::client_endpoint`: `TransportConfig` mit
+  `keep_alive_interval(5s)` + `max_idle_timeout(30s)` (via testbares `client_endpoint_with`).
+  Deterministischer Frozen-Test `keepalive_holds_the_connection_across_an_idle_gap` (Server mit
+  1s-Idle, Client 300ms-Keepalive, 2s Idle-Gap → Round-trip überlebt). **Das war der letzte
+  Blocker für echtes cross-host `via=quic`.**
