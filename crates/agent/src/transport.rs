@@ -139,6 +139,28 @@ pub async fn dial_quic(
     Ok(conn)
 }
 
+/// Dial the Edge over QUIC within `timeout`, mapping a timeout/failure to a
+/// clear, actionable error instead of quinn's bare `TimedOut` (issue #3 /
+/// P1.2c-1). Agent registration is currently QUIC/UDP-only, so a blocked UDP
+/// path is the common cause; the error names it and points at the TCP-fallback
+/// work still to come, rather than leaving the operator with an opaque timeout.
+pub async fn dial_quic_or_blocked_error(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    timeout: Duration,
+) -> Result<Connection, BoxError> {
+    match tokio::time::timeout(timeout, dial_quic(edge_addr, edge_cert)).await {
+        Ok(Ok(conn)) => Ok(conn),
+        _ => Err(format!(
+            "edge UDP/QUIC unreachable at {edge_addr} — agent registration requires UDP; \
+             TCP-fallback registration is not yet implemented (issue #3 / P1.2c). \
+             Open UDP/{} between hosts, or track the fallback work.",
+            edge_addr.port()
+        )
+        .into()),
+    }
+}
+
 /// Present `signed` to the Edge over a fresh bidirectional stream and await the
 /// Edge's decision. Returns `Ok(())` only if the Edge accepted the credential.
 pub async fn present_credential(
@@ -250,6 +272,30 @@ mod tests {
         let reachable = probe_udp_reachable(dead_addr, cert, Duration::from_millis(400)).await;
         assert!(!reachable, "blocked UDP is not reachable");
         assert_eq!(select_transport(reachable), Transport::TcpFallback);
+    }
+
+    #[tokio::test]
+    async fn dial_quic_or_blocked_error_reports_udp_blocked() {
+        // Nothing listening at this UDP address → the QUIC dial cannot complete;
+        // the agent must surface a clear, actionable error (issue #3 / P1.2c-1)
+        // instead of a bare TimedOut.
+        let (_ep, cert) =
+            build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let start = std::time::Instant::now();
+        let r = dial_quic_or_blocked_error(dead_addr, cert, Duration::from_millis(400)).await;
+        assert!(r.is_err(), "blocked UDP must error, not hang");
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("UDP") && msg.contains("issue #3"),
+            "error must be clear + actionable, got: {msg}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must fail fast, not after a long timeout"
+        );
     }
 
     #[tokio::test]

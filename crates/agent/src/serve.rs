@@ -9,7 +9,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use quinn::{Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
@@ -17,7 +17,7 @@ use tokio::io::{copy_bidirectional, join, AsyncRead, AsyncReadExt, AsyncWrite, A
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
-use crate::transport::{dial_quic, register_tunnel};
+use crate::transport::{dial_quic, dial_quic_or_blocked_error, register_tunnel};
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake};
 use ct_common::RoutingToken;
@@ -270,7 +270,9 @@ pub async fn run_agent(
     token: RoutingToken,
     origin_private: [u8; 32],
 ) -> Result<(), BoxError> {
-    let conn = dial_quic(config.edge, edge_cert.clone()).await?;
+    // Register over QUIC, but fail fast with a clear, actionable error when the
+    // edge's UDP path is blocked instead of a bare `TimedOut` (issue #3 / P1.2c-1).
+    let conn = dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5)).await?;
     register_tunnel(&conn, &token).await?;
 
     // Shared tunnel metrics for this Agent (M14.1b): handed to every serve task

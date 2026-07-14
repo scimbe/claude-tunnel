@@ -787,3 +787,19 @@ hosted, hinter einem Storage-Trait).
 reproduzierbares Deployment (hosted + self-host), Ein-Kommando-Onboarding,
 Hardening-Pass bestanden, echtes Payment, Produktdoku — alle mit frozen Tests bzw.
 Deploy-Verifikation.
+
+## Milestone 27 — Field-gemeldete Lücken (GitHub-Issues, nur scimbe)
+- **P1.2c (Issue #3) — Agent-TCP-Fallback-Registrierung.** Der Agent registriert
+  nur über QUIC; bei blockiertem UDP kann er sich nicht registrieren, daher kein
+  Round-trip (auch nicht mit Client-`CT_CLIENT_FORCE_TCP`). Zu groß für einen
+  Zyklus → dekomponiert:
+  - **P1.2c-1** ✅ Klarer, umsetzbarer Fehler statt bare `TimedOut`, wenn die
+    Edge-UDP blockiert ist: `dial_quic_or_blocked_error(edge, cert, timeout)` in
+    `agent/transport.rs`; `run_agent` nutzt es (5s). Frozen-Test
+    `dial_quic_or_blocked_error_reports_udp_blocked` (toter UDP-Port → Fehler nennt
+    „UDP"+„issue #3", schnell). Gate 207 (+1).
+  - **P1.2c-2** ⏳ Edge akzeptiert Agent-`'A'`-Registrierung über TCP; `EdgeState`
+    abstrahiert über Transport (QUIC- **oder** TCP-Agent), Relay bridged Client→TCP-Agent.
+  - **P1.2c-3** ⏳ Agent registriert+serviert über TLS-TCP; `run_agent` wählt Transport
+    (QUIC, sonst TCP-Fallback bei blockierter UDP).
+  - **P1.2c-4** ⏳ Reconnect-on-drop (P1.2b).
