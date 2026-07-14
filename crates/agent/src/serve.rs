@@ -396,15 +396,45 @@ async fn run_agent_tcp_fallback(
     token: RoutingToken,
     origin_private: [u8; 32],
 ) -> Result<(), BoxError> {
-    let mut stream = tcp_tls_connect(config.edge, edge_cert).await?;
-    register_tunnel_stream(&mut stream, &token).await?;
+    let metrics = Arc::new(TunnelMetrics::new());
+    // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
+    // single tunnel ends or the connection drops, with backoff on failure.
+    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, RECONNECT_MAX_ATTEMPTS);
+    loop {
+        match tcp_connect_register_serve(config, &edge_cert, &token, &origin_private, &metrics).await {
+            // A tunnel completed cleanly — re-register for the next client.
+            Ok(()) => backoff.reset(),
+            Err(e) => {
+                eprintln!("ct-agent: TLS-TCP fallback: {e}; will reconnect");
+                match backoff.next_delay() {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => {
+                        return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into())
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Connect over TLS-TCP, register the tunnel over the stream, and serve one
+/// Client's Noise tunnel over it — the single-shot body of the TCP-fallback
+/// reconnect loop (issue #5 / P1.2b).
+async fn tcp_connect_register_serve(
+    config: &AgentConfig,
+    edge_cert: &CertificateDer<'static>,
+    token: &RoutingToken,
+    origin_private: &[u8; 32],
+    metrics: &Arc<TunnelMetrics>,
+) -> Result<(), BoxError> {
+    let mut stream = tcp_tls_connect(config.edge, edge_cert.clone()).await?;
+    register_tunnel_stream(&mut stream, token).await?;
     eprintln!(
         "ct-agent: registered over the TLS-TCP fallback (UDP blocked), serving one tunnel to {}",
         config.origin
     );
     let (recv, send) = split(stream);
-    let metrics = Arc::new(TunnelMetrics::new());
-    serve_noise_stream(send, recv, config.origin, &origin_private, metrics).await
+    serve_noise_stream(send, recv, config.origin, origin_private, Arc::clone(metrics)).await
 }
 
 #[cfg(test)]
@@ -851,6 +881,62 @@ mod tests {
             regs.load(SeqCst),
             2,
             "agent re-registered after the edge connection dropped"
+        );
+        agent.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_reconnects_after_a_tunnel_drops() {
+        // issue #5 / P1.2b: the TLS-TCP fallback re-registers after each tunnel.
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+
+        let ca = Ca::new("f53-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let regs = Arc::new(AtomicUsize::new(0));
+
+        // Edge: accept two TLS registrations, ack each, then drop the stream.
+        let regs_e = regs.clone();
+        let edge = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let mut hdr = [0u8; 33];
+                tls.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], b'A');
+                tls.write_all(b"OK").await.unwrap();
+                tls.flush().await.unwrap();
+                regs_e.fetch_add(1, SeqCst);
+                // drop `tls` -> the agent's serve sees EOF -> reconnects.
+            }
+        });
+
+        let cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent_tcp_fallback(&cfg, ca_root, RoutingToken([2u8; 32]), [0u8; 32]).await;
+        });
+
+        for _ in 0..400 {
+            if regs.load(SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            regs.load(SeqCst),
+            2,
+            "TLS-TCP fallback re-registered after the tunnel dropped"
         );
         agent.abort();
         edge.abort();

@@ -846,4 +846,4 @@ Deploy-Verifikation.
     3 Frozen-Tests (Wachstum+Cap, Aufgabe nach max, reset). Gate 220 (+3).
   - **F5.2** ✅ `run_agent` in Reconnect-Loop: Einmal-Setup (Metrics/Direct-Listener) vor der Schleife; `serve_quic_connection` serviert bis zum Drop, dann `Backoff` (base 500ms, max 30s, 10 Versuche), re-dial+re-register, klare Log-Zeile je Versuch, Aufgabe mit Fehler nach max. First-Dial-Fail → TCP-Fallback (#3). Frozen-Test `run_agent_reconnects_after_the_edge_connection_drops` (Edge registriert, schließt, Agent re-registriert = 2 Registrierungen). Gate 221 (+1).
     mit `Backoff`, klare Log-Zeile je Versuch, Aufgabe mit Fehler nach max. Test: Edge-Drop → Re-Register.
-  - **F5.3** ⏳ TCP-Fallback-Pfad (#3) ebenfalls reconnecten.
+  - **F5.3** ✅ TCP-Fallback reconnectet: `run_agent_tcp_fallback` in Reconnect-Loop (`tcp_connect_register_serve`-Helfer; nach jedem Tunnel re-register, Backoff bei Fehler, Aufgabe nach max). Frozen-Test `tcp_fallback_reconnects_after_a_tunnel_drops` (Edge akzeptiert 2 TLS-Registrierungen mit Drop dazwischen → Agent re-registriert = 2). Gate 222 (+1). **🎯 #5 komplett (F5.1 Backoff + F5.2 QUIC-Reconnect + F5.3 TCP-Reconnect).**
