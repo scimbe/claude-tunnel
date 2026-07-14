@@ -68,7 +68,7 @@ pub async fn serve_connection(
     conn: &Connection,
     state: &EdgeState<Connection>,
     challenge: &Challenge,
-) -> Result<(), BoxError> {
+) -> Result<Option<RoutingToken>, BoxError> {
     let (mut send, mut recv) = conn.accept_bi().await?;
     let mut role = [0u8; 1];
     recv.read_exact(&mut role).await?;
@@ -77,14 +77,19 @@ pub async fn serve_connection(
         b'A' => {
             let mut token = [0u8; 32];
             recv.read_exact(&mut token).await?;
-            state.register_with_candidate(
-                RoutingToken(token),
-                conn.clone(),
-                conn.remote_address(),
-            );
+            let token = RoutingToken(token);
+            state.register_with_candidate(token.clone(), conn.clone(), conn.remote_address());
             send.write_all(b"OK").await?;
             send.finish()?;
-            Ok(())
+            // Return the registered token so the caller can evict it when the
+            // agent's connection drops — issue #2 (mode a): a dropped agent's
+            // registration was never removed, so a later Client `route()` kept
+            // resolving to a dead `Connection` whose `open_bi()` stalls/errors
+            // instead of failing fast with "no agent tunnel". Eviction lives in
+            // `run_edge`, which owns the connection lifetime; keeping this path
+            // non-blocking preserves the "register then return" contract the
+            // relay harnesses depend on (they serve 'A' then 'C' on one task).
+            Ok(Some(token))
         }
         b'C' => {
             let mut chal = [0u8; 17];
@@ -99,7 +104,7 @@ pub async fn serve_connection(
             let agent_conn = state.route(&token).ok_or("no agent tunnel for token")?;
             let (agent_send, agent_recv) = agent_conn.open_bi().await?;
             relay_quic(send, recv, agent_send, agent_recv).await?;
-            Ok(())
+            Ok(None)
         }
         b'D' => {
             // Agent advertises its direct-path listener (M11.4b-ii):
@@ -118,7 +123,7 @@ pub async fn serve_connection(
             state.advertise_direct(RoutingToken(token), addr, cert);
             send.write_all(b"OK").await?;
             send.finish()?;
-            Ok(())
+            Ok(None)
         }
         b'P' => {
             // Client queries the Agent's advertised direct endpoint (M11.4b-ii):
@@ -140,7 +145,7 @@ pub async fn serve_connection(
                 }
             }
             send.finish()?;
-            Ok(())
+            Ok(None)
         }
         other => Err(format!("unknown role byte: {other}").into()),
     }
@@ -253,8 +258,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let mut nonce = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 let challenge = Challenge { nonce, difficulty };
-                let _ = serve_connection(&conn, &state, &challenge).await;
+                let registered = serve_connection(&conn, &state, &challenge).await;
                 conn.closed().await;
+                // Evict a dropped agent's registration so a later Client
+                // route() fails fast instead of hitting a dead handle (#2).
+                if let Ok(Some(token)) = registered {
+                    state.remove(&token);
+                }
             }
         });
     }
@@ -310,6 +320,65 @@ mod tests {
         );
         conn.close(0u32.into(), b"done");
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn registration_is_evicted_when_the_agent_connection_drops() {
+        // issue #2 (mode a): after an Agent registers over QUIC and its
+        // connection drops, the Edge must evict the registration so a later
+        // Client `route()` returns None (fail fast) rather than resolving to a
+        // dead Connection. Drives the real `serve_connection` 'A' path.
+        let token = RoutingToken([7u8; 32]);
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let state_srv = state.clone();
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge {
+                nonce: [0u8; 16],
+                difficulty: 0,
+            };
+            // Mirror run_edge: serve, then on close evict the returned token.
+            let registered = serve_connection(&conn, &state_srv, &challenge).await;
+            assert!(
+                matches!(&registered, Ok(Some(_))),
+                "'A' registration returns its token for eviction"
+            );
+            conn.closed().await;
+            if let Ok(Some(token)) = registered {
+                state_srv.remove(&token);
+            }
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut msg = vec![b'A'];
+        msg.extend_from_slice(&token.0);
+        send.write_all(&msg).await.unwrap();
+        send.finish().unwrap();
+        let ack = recv.read_to_end(8).await.unwrap();
+        assert_eq!(ack, b"OK");
+        assert!(state.route(&token).is_some(), "routable while the agent is alive");
+
+        // The agent drops — the edge must evict within a bounded window.
+        conn.close(0u32.into(), b"gone");
+        drop(client);
+        let evicted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.route(&token).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(evicted.is_ok(), "dead registration evicted after the connection dropped");
+        assert!(state.candidate(&token).is_none(), "candidate evicted too");
+        edge.abort();
     }
 
     #[tokio::test]

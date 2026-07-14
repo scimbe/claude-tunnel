@@ -887,3 +887,15 @@ Deploy-Verifikation.
     Keepalive (#2) als Voraussetzung für cross-host `via=quic` (Akz. 6). Frozen: Drift-Check
     (5 Env-Vars + 9 zitierte Output-Marker literal in `demo.sh` vorhanden) → DEMO_DOC_DRIFT_OK.
   - **🎯 #7 komplett (F7.1 Demo-Skript + F7.2 Live-Latenz + F7.3 Doku) → alle 6 Akzeptanzkriterien erfüllt → fix-ready.**
+- **#2 (mode a) Edge evicts dropped agent registrations** ✅: der QUIC-Accept-Pfad
+  (`serve_connection` 'A') registrierte die Agent-`Connection`, entfernte sie aber nie beim
+  Verbindungsabbruch → `route(token)` lieferte einen toten Handle, `open_bi()` stockte statt
+  „no agent tunnel". Fix: `serve_connection` gibt den registrierten Token zurück
+  (`Result<Option<RoutingToken>, _>`, non-blocking — die Relay-Harnesses servieren 'A' dann 'C'
+  auf einem Task, dürfen also nicht blockieren); `run_edge` evictet nach `conn.closed()`.
+  Frozen-Test `registration_is_evicted_when_the_agent_connection_drops` (Agent registriert über
+  echtes QUIC, droppt → `route`/`candidate` werden None). Gate 224 (+1), 0 Warnungen.
+  **Mode (b)** (cross-host kein `via=quic` bei frischem Token + lebendem Agent) ist laut Feld-
+  Daten **umgebungsbedingt** (Pfad-MTU/PMTUD, symmetrisches NAT, Loss auf dem realen WAN; das
+  `ss UNCONN`-Indiz war ein False-Positive — quinn nutzt unverbundene UDP-Sockets) → needs-info,
+  gezielter tcpdump/MTU-Capture vom Feld, bevor ein MTU-Clamp codiert wird.
