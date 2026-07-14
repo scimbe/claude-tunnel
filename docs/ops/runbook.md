@@ -79,6 +79,23 @@ enrollment, the tunnel registry, and the credit ledger. Restores are a file copy
 `./scripts/security-audit.sh` — run before each release and on any `Cargo.lock`
 change; a non-zero exit means a new advisory affects a pinned crate.
 
+### Verify a deployment end to end (smoke)
+`./scripts/e2e-smoke.sh` — the standard one-command cross-host check. It mints a
+join token, onboards an agent against the central control plane + edge, runs a
+client through the tunnel to a local echo origin, and prints `SMOKE OK via=<quic|tcp>`
+(exit 0) or `SMOKE FAIL: <reason>` (exit 1). Run it from the agent host after a
+deploy or change:
+
+```bash
+CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der ./scripts/e2e-smoke.sh
+# force the TCP fallback (UDP blocked):
+CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der CT_CLIENT_FORCE_TCP=1 ./scripts/e2e-smoke.sh
+```
+
+Requires the built binaries (`docker run --rm -v "$PWD":/work -w /work rust:1-slim
+cargo build --workspace`), plus `socat` and `curl`. `EDGE_CERT` is the edge CA
+root (public trust material) copied from the central host.
+
 ## Incident response
 
 | Symptom | Likely cause | Action |

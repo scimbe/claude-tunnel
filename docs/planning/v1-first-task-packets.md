@@ -853,4 +853,4 @@ Deploy-Verifikation.
     `ct-agent onboard` (schreibt Capability), fährt `ct-client`, meldet `SMOKE OK via=<quic|tcp>`
     bzw. `SMOKE FAIL: …` (Exit-Code). Frozen: `bash -n` grün + Drift-Check (11 CT_*-Env-Vars,
     `/enroll/issue`, `onboard`, `round-trip OK`/`via=`-Marker existieren im Code) → E2E_SMOKE_DRIFT_OK.
-  - **F6.2** ⏳ Runbook-Doku + Verweis als Feld-Standard-Verifikation.
+  - **F6.2** ✅ Runbook-Abschnitt „Verify a deployment end to end (smoke)": `./scripts/e2e-smoke.sh` als Feld-Standard-Check dokumentiert (CENTRAL/EDGE_CERT, TCP-Fallback-Variante, Voraussetzungen). Drift-Check: Skript/Env-Vars/SMOKE-Marker code/skript-backed → SMOKE_DOC_DRIFT_OK. **🎯 #6 komplett → Milestone „Full functional setup" (#4/#5/#6 + #3) fertig.**
