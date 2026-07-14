@@ -163,6 +163,63 @@ where
     Ok(response)
 }
 
+/// A tunnel-operation timeout error (issue #2): the edge accepted the connection
+/// but never relayed, so the client would otherwise block indefinitely.
+fn tunnel_timeout_error(deadline: Duration) -> BoxError {
+    format!(
+        "tunnel operation timed out after {}s (edge reachable but no relay — is an agent registered for this token?)",
+        deadline.as_secs()
+    )
+    .into()
+}
+
+/// [`client_tunnel_noise`] with an overall `deadline` on the tunnel operation, so
+/// the client never hangs when the edge accepts the QUIC connection but cannot
+/// relay (e.g. no agent is registered for the token). Returns a clear timeout
+/// error instead of blocking. (issue #2)
+pub async fn client_tunnel_noise_timed(
+    conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    deadline: Duration,
+) -> Result<Vec<u8>, BoxError> {
+    match tokio::time::timeout(
+        deadline,
+        client_tunnel_noise(conn, token, cap, client_private, payload),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(tunnel_timeout_error(deadline)),
+    }
+}
+
+/// [`client_tunnel_noise_tcp`] with an overall `deadline` — the TLS-over-TCP
+/// equivalent of [`client_tunnel_noise_timed`]. (issue #2)
+pub async fn client_tunnel_noise_tcp_timed<T>(
+    stream: T,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    deadline: Duration,
+) -> Result<Vec<u8>, BoxError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(
+        deadline,
+        client_tunnel_noise_tcp(stream, token, cap, client_private, payload),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(tunnel_timeout_error(deadline)),
+    }
+}
+
 /// Open a **streaming** Noise tunnel (M9.3): PoW-gated rendezvous for `token`,
 /// then the `Noise_IK` initiator handshake (pinning `cap`'s Origin Identity),
 /// then [`noise_pump`] bridging the local `app` stream to the Origin over the
@@ -413,5 +470,63 @@ pub async fn udp_selftest(
             let n = res?;
             Ok(got[..n].to_vec())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ct_common::noise::generate_static_keypair;
+    use ct_common::OriginIdentity;
+    use ct_edge::transport::build_server_endpoint_with_cert;
+    use std::time::Instant;
+
+    /// issue #2 regression: when the edge accepts the QUIC connection but never
+    /// relays (no agent registered for the token), the tunnel op must return a
+    /// timeout error promptly instead of hanging indefinitely.
+    #[tokio::test]
+    async fn tunnel_noise_timed_errors_when_edge_never_relays() {
+        let token = RoutingToken([7u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // A "silent edge": accept the client's connection, then do nothing (no
+        // rendezvous, no relay) — the client would block reading the challenge.
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let _conn = server.accept().await.unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+
+        let start = Instant::now();
+        let r = client_tunnel_noise_timed(
+            &conn,
+            &token,
+            &cap,
+            &client_kp.private,
+            b"x",
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "must error, not hang, when the edge never relays");
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "error should name the timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return near the deadline, took {elapsed:?}"
+        );
+        edge.abort();
     }
 }

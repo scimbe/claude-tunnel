@@ -10,8 +10,8 @@ use std::time::Duration;
 use ct_client::bench::{csv_row, run_bench, run_bench_stream, run_bench_udp, summarize};
 use ct_client::config::ClientConfig;
 use ct_client::transport::{
-    client_tunnel_auto, client_tunnel_noise, client_tunnel_noise_tcp, dial_edge, tcp_tls_connect,
-    udp_selftest, load_cert,
+    client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed, dial_edge,
+    tcp_tls_connect, udp_selftest, load_cert,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
@@ -176,16 +176,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ => None,
         }
     };
+    // Overall deadline for the tunnel operation once the edge connection is up,
+    // so the client never hangs when the edge accepts the connection but cannot
+    // relay (issue #2 — e.g. no agent registered for the token). Configurable via
+    // CT_CLIENT_TUNNEL_TIMEOUT_SECS (default 10s).
+    let tunnel_timeout = Duration::from_secs(
+        std::env::var("CT_CLIENT_TUNNEL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+    );
     let (response, via) = match quic_conn {
         Some(conn) => {
-            let r = client_tunnel_noise(&conn, &cap.token, &cap, &client_kp.private, payload.as_bytes())
-                .await?;
+            let r = client_tunnel_noise_timed(
+                &conn, &cap.token, &cap, &client_kp.private, payload.as_bytes(), tunnel_timeout,
+            )
+            .await?;
             (r, "quic")
         }
         None => {
             let tls = tcp_tls_connect(edge_addr, edge_cert).await?;
-            let r = client_tunnel_noise_tcp(tls, &cap.token, &cap, &client_kp.private, payload.as_bytes())
-                .await?;
+            let r = client_tunnel_noise_tcp_timed(
+                tls, &cap.token, &cap, &client_kp.private, payload.as_bytes(), tunnel_timeout,
+            )
+            .await?;
             (r, "tcp")
         }
     };
