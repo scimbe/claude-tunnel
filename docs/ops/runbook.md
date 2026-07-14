@@ -43,6 +43,14 @@ never commit them. Verify with `./scripts/check-no-secrets.sh`.
 
 ## Monitor
 
+- **Dashboard**: `GET /` on the control plane — a self-contained operator
+  landing page showing health plus live counts (tunnels, agents, accounts,
+  confirmed payments, uptime), auto-refreshing. Open `http://<host>:8090/`.
+  It shows metadata and health only; the payload is end-to-end encrypted and
+  never visible here.
+- **Status (JSON)**: `GET /status` — the machine-readable data behind the
+  dashboard: `{ready, tunnels, agents, accounts, payments_confirmed, uptime_seconds}`.
+  Scrape or alert on it.
 - **Liveness**: `GET /healthz` on the control plane (always 200 while up).
 - **Readiness**: `GET /readyz` (200 only when the database is reachable; 503
   otherwise — orchestrators route around it).
