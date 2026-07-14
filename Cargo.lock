@@ -283,6 +283,7 @@ name = "ct-agent"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "ct-client",
  "ct-common",
  "ct-control-plane",
  "ct-edge",

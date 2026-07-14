@@ -18,5 +18,6 @@ axum = "0.7"
 
 [dev-dependencies]
 ct-edge = { path = "../edge" }
+ct-client = { path = "../client" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

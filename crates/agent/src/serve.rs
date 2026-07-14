@@ -13,11 +13,13 @@ use std::time::{Duration, Instant};
 
 use quinn::{Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
-use tokio::io::{copy_bidirectional, join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, join, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
-use crate::transport::{dial_quic, dial_quic_or_blocked_error, register_tunnel};
+use crate::transport::{
+    dial_quic, dial_quic_or_blocked_error, register_tunnel, register_tunnel_stream, tcp_tls_connect,
+};
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake};
 use ct_common::RoutingToken;
@@ -270,9 +272,14 @@ pub async fn run_agent(
     token: RoutingToken,
     origin_private: [u8; 32],
 ) -> Result<(), BoxError> {
-    // Register over QUIC, but fail fast with a clear, actionable error when the
-    // edge's UDP path is blocked instead of a bare `TimedOut` (issue #3 / P1.2c-1).
-    let conn = dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5)).await?;
+    // Register over QUIC; if the edge's UDP path is blocked, fall back to the
+    // TLS-TCP transport instead of failing (issue #3 / P1.2c-4b).
+    let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
+        .await
+    {
+        Ok(conn) => conn,
+        Err(_) => return run_agent_tcp_fallback(config, edge_cert, token, origin_private).await,
+    };
     register_tunnel(&conn, &token).await?;
 
     // Shared tunnel metrics for this Agent (M14.1b): handed to every serve task
@@ -325,11 +332,139 @@ pub async fn run_agent(
     }
 }
 
+/// Serve the Agent over the **TLS-TCP fallback** when UDP/QUIC to the Edge is
+/// blocked (issue #3 / P1.2c-4): connect, register over the stream, and serve one
+/// Client's Noise tunnel over it. Single-tunnel — a TCP agent has one stream and
+/// no QUIC-style multiplexing, so it carries one Client at a time.
+async fn run_agent_tcp_fallback(
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    origin_private: [u8; 32],
+) -> Result<(), BoxError> {
+    let mut stream = tcp_tls_connect(config.edge, edge_cert).await?;
+    register_tunnel_stream(&mut stream, &token).await?;
+    eprintln!(
+        "ct-agent: registered over the TLS-TCP fallback (UDP blocked), serving one tunnel to {}",
+        config.origin
+    );
+    let (recv, send) = split(stream);
+    let metrics = Arc::new(TunnelMetrics::new());
+    serve_noise_stream(send, recv, config.origin, &origin_private, metrics).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::dial_quic;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// issue #3 acceptance: with UDP blocked, the agent registers over the TLS-TCP
+    /// fallback and a Client completes a full Noise round-trip through the edge to
+    /// the origin — the cross-host tunnel works without QUIC/UDP.
+    #[tokio::test]
+    async fn tcp_fallback_agent_serves_a_noise_round_trip_end_to_end() {
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+        use std::net::Ipv4Addr;
+
+        // Real dual edge (TCP + QUIC); we exercise only the TCP fallback side.
+        let ca = Ca::new("e2e-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x33; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // Edge: accept each TCP connection and serve it ('A' parks, 'C' delivers).
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let (acc, st, ch) = (acceptor.clone(), state_e.clone(), challenge.clone());
+                tokio::spawn(async move {
+                    if let Ok(tls) = acc.accept(tcp).await {
+                        let _ = serve_tcp_connection(tls, &st, &ch).await;
+                    }
+                });
+            }
+        });
+
+        // Origin: a streaming TCP echo (copy) — echoes bytes as they arrive, so
+        // the round-trip does not depend on a half-close propagating through the
+        // relay chain (matches the known-good TCP-fallback harness).
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = origin_listener.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        // The agent holds the origin private key; the Capability pins its public.
+        let origin_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: tcp_addr.to_string(),
+        };
+
+        // Agent: run the TCP fallback (connect + register + serve one tunnel).
+        let cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        let ca_root_a = ca_root.clone();
+        let a_token = token.clone();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent_tcp_fallback(&cfg, ca_root_a, a_token, origin_kp.private).await;
+        });
+
+        // Wait until the agent has registered (parked) at the edge.
+        for _ in 0..200 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.has_tcp_agent(&token), "agent parked over TLS-TCP");
+
+        // Client: tunnel over TLS-TCP through the edge to the origin, expect echo.
+        let client_kp = generate_static_keypair();
+        let client_stream = ct_client::transport::tcp_tls_connect(tcp_addr, ca_root)
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            ct_client::transport::client_tunnel_noise_tcp(
+                client_stream,
+                &token,
+                &cap,
+                &client_kp.private,
+                b"hello-tcp-fallback",
+            ),
+        )
+        .await
+        .expect("round-trip timed out (relay/serve deadlock)")
+        .unwrap();
+        assert_eq!(
+            resp, b"hello-tcp-fallback",
+            "cross-host TCP-fallback Noise round-trip succeeds"
+        );
+
+        agent.abort();
+        edge.abort();
+    }
     use tokio::net::TcpListener;
 
     async fn echo_origin() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {

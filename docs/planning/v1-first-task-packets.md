@@ -818,9 +818,13 @@ Deploy-Verifikation.
     `tokio-rustls`-Dep ergänzt). Integrations-Frozen-Test `agent_connects_and_registers_over_tls_tcp`:
     Agent dialt den **echten** Edge (`build_dual_edge_from_ca`) über TLS-TCP + `register_tunnel_stream`,
     Edge parkt ihn (`has_tcp_agent`). Gate 214 (+1).
-  - **P1.2c-4b** ⏳ `run_agent`: bei blockierter UDP nach TCP-Fallback verzweigen
-    (`tcp_tls_connect` + `register_tunnel_stream` + `serve_noise_stream` über `split`) +
-    End-to-End-Noise-Round-trip-Test → **schließt #3, `fix-ready`.**
+  - **P1.2c-4b** ✅ `run_agent` verzweigt bei blockierter UDP zu `run_agent_tcp_fallback`
+    (`tcp_tls_connect` + `register_tunnel_stream` + `serve_noise_stream` über `split`,
+    single-tunnel). **End-to-End-Akzeptanztest** `tcp_fallback_agent_serves_a_noise_round_trip_end_to_end`:
+    echter Dual-Edge, Agent registriert über TLS-TCP + serviert, ct-client tunnelt über TLS-TCP
+    → **Noise-Round-trip `hello-tcp-fallback` durch, ohne QUIC/UDP**. `ct-client` als dev-dep
+    (azyklisch). Gate 215 (+1). **🎯 P1.2c komplett → Issue #3 gelöst: Cross-Host-Tunnel bei
+    blockierter UDP funktioniert über den TLS-TCP-Fallback (Client+Agent+Edge).**
   - **P1.2c-4** ⏳ Agent `tcp_tls_connect` + `run_agent` Transport-Wahl (QUIC, sonst
     TCP-Fallback bei blockierter UDP) + Serve über TCP → Cross-Host-Round-trip.
   - _(Reconnect-on-drop P1.2b → eigenes Feature #5.)_
