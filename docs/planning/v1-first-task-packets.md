@@ -876,7 +876,10 @@ Deploy-Verifikation.
     plus das Origin-Log als Beweis. `CT_CLIENT_FORCE_TCP=1` schaltet den TCP-Pfad um (Akz. 5).
     Deckt Akzeptanz 1–3 + 5 (Terminal-Variante). Frozen: `bash -n` grün + Drift-Check (alle
     CT_AGENT_*/CT_CLIENT_*-Env-Vars + `round-trip OK`/`via=`-Marker code-backed) → DEMO_DRIFT_OK.
-  - **F7.2** ⏳ offen: Live-Leistung sichtbar — `ct-client`-Bench (`CT_CLIENT_ITERATIONS>1`,
-    RESULT-CSV) in die Demo einhängen, mean/p95-Latenz menschenlesbar rendern (Akz. 4).
+  - **F7.2** ✅ Live-Leistung sichtbar: nach dem Round-Trip-Beweis fährt `demo.sh` einen
+    Bench-Pass (`CT_CLIENT_ITERATIONS`, Default 20, gleicher Pfad — respektiert `CT_CLIENT_FORCE_TCP`)
+    und rendert menschenlesbar „Live latency over the tunnel — N/N: mean X.XXms p95 Y.YYms" aus
+    ct-clients Bench-Zeile (Akz. 4). Frozen: `bash -n` grün + Drift-Check (Bench-Marker
+    `bench {}/{} iterations, mean … p95 …` + `CT_CLIENT_ITERATIONS` code-backed) → DEMO_BENCH_DRIFT_OK.
   - **F7.3** ⏳ offen: „Demo in 2 Minuten"-Abschnitt (README/runbook) mit Beispiel-Ausgabe (Akz. 6).
   - (fix-ready erst wenn F7.1–F7.3 alle Akzeptanzkriterien erfüllen.)

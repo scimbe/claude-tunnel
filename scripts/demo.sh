@@ -11,6 +11,7 @@
 # already-running control plane + edge:
 #   CENTRAL=<host> EDGE_CERT=/path/to/edge-cert.der ./scripts/demo.sh
 #   ... CT_CLIENT_FORCE_TCP=1 ./scripts/demo.sh    # show the TCP fallback path
+#   ... CT_CLIENT_ITERATIONS=50 ./scripts/demo.sh  # more samples for the latency read
 #
 # Prereqs: built binaries (BIN=./target/debug), socat, curl.
 set -euo pipefail
@@ -90,6 +91,19 @@ if printf '%s' "$OUT" | grep -q "round-trip OK"; then
   ok "The client received \"${SECRET}\" back THROUGH the tunnel — via=${VIA:-?}, round-trip $((END-START)) ms."
   echo "   ↳ The PRIVATE origin's own log confirms it was reached only via the tunnel:"
   sed 's/^/     /' "$ORIGIN_LOG" 2>/dev/null || true
+
+  # 5. Live performance — N timed round-trips through the same path (acceptance #4).
+  ITERS="${CT_CLIENT_ITERATIONS:-20}"
+  step "Measuring live performance — ${ITERS} round-trips through the tunnel (path: ${MODE_NOTE}) …"
+  BENCH="$(CT_CLIENT_CAPABILITY="$CAP" CT_CLIENT_EDGE_CERT="$EDGE_CERT" CT_CLIENT_PAYLOAD="$SECRET" \
+            CT_CLIENT_ITERATIONS="$ITERS" "$BIN/ct-client" 2>&1)" || true
+  STATS="$(printf '%s' "$BENCH" | sed -n 's/.*bench \([0-9]*\/[0-9]*\) iterations, \(mean.*\)/\1: \2/p' | head -1)"
+  if [ -n "$STATS" ]; then
+    ok "Live latency over the tunnel — ${STATS}."
+  else
+    echo "   (bench produced no summary; raw: $(printf '%s' "$BENCH" | tail -1))"
+  fi
+
   bold "=== DEMO OK — real client traffic reached the private origin over the tunnel (via=${VIA:-?}) ==="
 else
   printf '%s\n' "$OUT" >&2
