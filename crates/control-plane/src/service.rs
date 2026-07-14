@@ -473,6 +473,54 @@ async fn readyz(State(ledger): State<Arc<SqliteLedger>>) -> StatusCode {
     }
 }
 
+/// Shared state for the operator status view (F4.1): the three durable stores.
+#[derive(Clone)]
+pub struct StatusState {
+    enrollment: Arc<SqliteEnrollment>,
+    registry: Arc<SqliteRegistry>,
+    ledger: Arc<SqliteLedger>,
+}
+
+/// Aggregated operator status — health plus metadata counts the operator
+/// legitimately sees (never payload; consistent with ADR-0016 / the threat model).
+#[derive(Serialize, Deserialize)]
+pub struct StatusResp {
+    /// Database reachable (same signal as `/readyz`).
+    pub ready: bool,
+    /// Registered tunnels.
+    pub tunnels: i64,
+    /// Enrolled agents (bound public keys).
+    pub agents: i64,
+    /// Open accounts.
+    pub accounts: i64,
+    /// Confirmed payments.
+    pub payments_confirmed: i64,
+}
+
+/// Build the status router (F4.1): `GET /status` returns aggregated counts as
+/// JSON, backing the operator landing page (F4.2).
+pub fn status_router(
+    enrollment: Arc<SqliteEnrollment>,
+    registry: Arc<SqliteRegistry>,
+    ledger: Arc<SqliteLedger>,
+) -> Router {
+    Router::new().route("/status", get(status_handler)).with_state(StatusState {
+        enrollment,
+        registry,
+        ledger,
+    })
+}
+
+async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
+    Json(StatusResp {
+        ready: s.ledger.ping().is_ok(),
+        tunnels: s.registry.tunnel_count().unwrap_or(0),
+        agents: s.enrollment.agent_count().unwrap_or(0),
+        accounts: s.ledger.account_count().unwrap_or(0),
+        payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
+    })
+}
+
 /// Build the full persistent control-plane router: enrollment + registry +
 /// billing + health, all backed by durable SQLite stores opened on **one**
 /// database file (`db_path`). The three stores share the file via separate
@@ -498,10 +546,13 @@ pub fn persistent_control_plane_router(
         .route("/payment/intent", post(create_payment_intent))
         .route("/billing/issue", post(buy_token))
         .with_state(ledger.clone());
+    // Operator status view (F4.1): aggregate counts across the three stores.
+    let status = status_router(enrollment.clone(), registry.clone(), ledger.clone());
     let mut app = enrollment_router_sqlite(enrollment)
         .merge(registry_router_sqlite(registry))
         .merge(billing)
-        .merge(payment_webhook_router(ledger.clone(), verifier));
+        .merge(payment_webhook_router(ledger.clone(), verifier))
+        .merge(status);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
     if let Some(oidc) = oidc {
@@ -1034,6 +1085,50 @@ mod tests {
             StatusCode::NOT_FOUND,
             "client-callable /payment/confirm is removed from production"
         );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_reports_aggregated_counts() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let registry = Arc::new(SqliteRegistry::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+
+        // Seed one of each metadata kind.
+        let tenant = TenantId("t".into());
+        let jt = enrollment.issue_join_token(&tenant).unwrap();
+        enrollment
+            .redeem(&jt, &AgentId("a".into()), [1u8; 32])
+            .unwrap();
+        registry
+            .register(
+                &RoutingToken([2u8; 32]),
+                &TunnelInfo {
+                    tenant: tenant.clone(),
+                    agent: AgentId("a".into()),
+                },
+            )
+            .unwrap();
+        let acct = ledger.open_account().unwrap();
+        let pid = ledger.create_intent(&acct, 5).unwrap();
+        ledger.confirm_payment(&pid).unwrap();
+
+        let app = status_router(enrollment, registry, ledger);
+        let resp = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let s: StatusResp = serde_json::from_slice(&body).unwrap();
+        assert!(s.ready, "db reachable");
+        assert_eq!(s.tunnels, 1);
+        assert_eq!(s.agents, 1);
+        assert_eq!(s.accounts, 1);
+        assert_eq!(s.payments_confirmed, 1);
     }
 
     #[tokio::test]

@@ -147,6 +147,14 @@ impl SqliteEnrollment {
             )
             .optional()
     }
+
+    /// Number of enrolled agents (bound public keys) — for the status view (F4.1).
+    pub fn agent_count(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_bindings", [], |r| r.get(0))
+    }
 }
 
 /// SQLite-backed tunnel registry (durable equivalent of
@@ -214,6 +222,14 @@ impl SqliteRegistry {
             params![&token.0[..]],
         )?;
         Ok(())
+    }
+
+    /// Number of registered tunnels — for the status view (F4.1).
+    pub fn tunnel_count(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tunnels", [], |r| r.get(0))
     }
 }
 
@@ -367,6 +383,24 @@ impl SqliteLedger {
             .lock()
             .unwrap()
             .query_row("SELECT 1", [], |_| Ok(()))
+    }
+
+    /// Number of open accounts — for the status view (F4.1).
+    pub fn account_count(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+    }
+
+    /// Number of confirmed payments — for the status view (F4.1).
+    pub fn confirmed_payment_count(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM payments WHERE confirmed = 1", [], |r| {
+                r.get(0)
+            })
     }
 
     /// Current balance, or [`LedgerError::UnknownAccount`].

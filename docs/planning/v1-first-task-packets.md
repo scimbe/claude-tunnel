@@ -828,3 +828,15 @@ Deploy-Verifikation.
   - **P1.2c-4** ⏳ Agent `tcp_tls_connect` + `run_agent` Transport-Wahl (QUIC, sonst
     TCP-Fallback bei blockierter UDP) + Serve über TCP → Cross-Host-Round-trip.
   - _(Reconnect-on-drop P1.2b → eigenes Feature #5.)_
+
+## Milestone 28 — Feature-Backlog „Full functional setup" (GitHub-Issues #4–#6, nur scimbe)
+- **#4 Operator-Monitoring-Landing-Page** (dekomponiert):
+  - **F4.1** ✅ `GET /status` (JSON): `status_router(enrollment, registry, ledger)` +
+    `StatusResp{ready, tunnels, agents, accounts, payments_confirmed}`; Count-Methoden
+    `agent_count`/`tunnel_count`/`account_count`/`confirmed_payment_count` in storage.rs;
+    in `persistent_control_plane_router` gemerged. Nur Metadaten/Health, nie Payload
+    (ADR-0016). Frozen-Test `status_endpoint_reports_aggregated_counts` (je 1 seed → Counts=1).
+  - **F4.2** ⏳ `GET /` HTML-Landing-Page (self-contained, CSP-safe, rendert `/status`, Auto-Refresh, Uptime).
+  - **F4.3** ⏳ Runbook-Doku + Wire-Notiz.
+- **#5** Agent Reconnect-on-drop (P1.2b) — offen.
+- **#6** Ein-Kommando-Cross-Host-E2E-Smoke — offen.
