@@ -17,6 +17,7 @@ use ct_common::RoutingToken;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -220,6 +221,26 @@ where
     }
 }
 
+/// Connect to the Edge over **TLS-over-TCP** — the UDP-blocked fallback dialer
+/// (issue #3 / P1.2c-4), trusting `edge_cert` (the CA root). Mirrors the Client's
+/// `tcp_tls_connect`; the returned stream is then used with
+/// [`register_tunnel_stream`] to register the Agent when QUIC/UDP is unavailable.
+pub async fn tcp_tls_connect(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(edge_cert)?;
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let tcp = TcpStream::connect(addr).await?;
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?;
+    Ok(connector.connect(server_name, tcp).await?)
+}
+
 /// Load an Edge certificate (DER) the Edge published to a shared path.
 pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'static>> {
     Ok(CertificateDer::from(std::fs::read(path)?))
@@ -298,6 +319,63 @@ mod tests {
         let reachable = probe_udp_reachable(dead_addr, cert, Duration::from_millis(400)).await;
         assert!(!reachable, "blocked UDP is not reachable");
         assert_eq!(select_transport(reachable), Transport::TcpFallback);
+    }
+
+    #[tokio::test]
+    async fn agent_connects_and_registers_over_tls_tcp() {
+        // issue #3 / P1.2c-4: the agent dials the real edge over TLS-TCP and
+        // registers ('A') through the edge's TCP handler, which parks it.
+        use ct_common::pow::Challenge;
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_tcp_connection;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+
+        let ca = Ca::new("test-ca").expect("ca");
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .expect("dual edge");
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x77; 32]);
+        let state = std::sync::Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge {
+            nonce: [0u8; 16],
+            difficulty: 0,
+        };
+
+        // Minimal edge TCP loop: accept one TLS connection, serve it.
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let _ = serve_tcp_connection(tls, &state_e, &challenge).await;
+        });
+
+        // Agent: connect over TLS-TCP (trusting the CA root) and register.
+        let mut stream = tcp_tls_connect(tcp_addr, ca_root)
+            .await
+            .expect("agent TLS-TCP connect");
+        register_tunnel_stream(&mut stream, &token)
+            .await
+            .expect("register over TLS-TCP");
+
+        // The edge's 'A' handler parked this TCP agent.
+        for _ in 0..100 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.has_tcp_agent(&token),
+            "agent registered over TLS-TCP and is parked at the edge"
+        );
+        edge.abort();
     }
 
     #[tokio::test]

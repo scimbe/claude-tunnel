@@ -814,8 +814,13 @@ Deploy-Verifikation.
     `S`-Bound um `Send + 'static` erweitert (Boxing). Integrations-Frozen-Test
     `tcp_agent_registers_and_relays_a_delivered_client` (TCP-Register → Park → gelieferter
     Client → Echo-Round-trip). Gate 213 (+1). **Edge-Seite komplett.**
-  - **P1.2c-4** ⏳ Agent-Seite: `tcp_tls_connect` + `run_agent` wählt QUIC, sonst TCP-Fallback
-    (`register_tunnel_stream` + serve über den Stream) → **Cross-Host-Round-trip** (schließt #3).
+  - **P1.2c-4a** ✅ Agent `tcp_tls_connect(addr, ca_root)` (Spiegel des Client-Dialers,
+    `tokio-rustls`-Dep ergänzt). Integrations-Frozen-Test `agent_connects_and_registers_over_tls_tcp`:
+    Agent dialt den **echten** Edge (`build_dual_edge_from_ca`) über TLS-TCP + `register_tunnel_stream`,
+    Edge parkt ihn (`has_tcp_agent`). Gate 214 (+1).
+  - **P1.2c-4b** ⏳ `run_agent`: bei blockierter UDP nach TCP-Fallback verzweigen
+    (`tcp_tls_connect` + `register_tunnel_stream` + `serve_noise_stream` über `split`) +
+    End-to-End-Noise-Round-trip-Test → **schließt #3, `fix-ready`.**
   - **P1.2c-4** ⏳ Agent `tcp_tls_connect` + `run_agent` Transport-Wahl (QUIC, sonst
     TCP-Fallback bei blockierter UDP) + Serve über TCP → Cross-Host-Round-trip.
   - _(Reconnect-on-drop P1.2b → eigenes Feature #5.)_
