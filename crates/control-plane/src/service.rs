@@ -473,12 +473,14 @@ async fn readyz(State(ledger): State<Arc<SqliteLedger>>) -> StatusCode {
     }
 }
 
-/// Shared state for the operator status view (F4.1): the three durable stores.
+/// Shared state for the operator status view (F4.1): the three durable stores
+/// plus the service start instant for uptime (F4.2).
 #[derive(Clone)]
 pub struct StatusState {
     enrollment: Arc<SqliteEnrollment>,
     registry: Arc<SqliteRegistry>,
     ledger: Arc<SqliteLedger>,
+    started: std::time::Instant,
 }
 
 /// Aggregated operator status — health plus metadata counts the operator
@@ -495,6 +497,8 @@ pub struct StatusResp {
     pub accounts: i64,
     /// Confirmed payments.
     pub payments_confirmed: i64,
+    /// Seconds since the control plane started.
+    pub uptime_seconds: u64,
 }
 
 /// Build the status router (F4.1): `GET /status` returns aggregated counts as
@@ -508,6 +512,7 @@ pub fn status_router(
         enrollment,
         registry,
         ledger,
+        started: std::time::Instant::now(),
     })
 }
 
@@ -518,7 +523,57 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
         agents: s.enrollment.agent_count().unwrap_or(0),
         accounts: s.ledger.account_count().unwrap_or(0),
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
+        uptime_seconds: s.started.elapsed().as_secs(),
     })
+}
+
+/// The operator landing page (F4.2): a single self-contained HTML document (no
+/// external assets, CSP-safe) that fetches `/status` and renders the health and
+/// metadata counts, auto-refreshing. Shows only what the operator legitimately
+/// sees — never payload.
+const LANDING_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-tunnel — operator status</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6edf3}
+ h1{font-size:1.3rem} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:1rem}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem}
+ .n{font-size:2rem;font-weight:700} .l{color:#8b949e;font-size:.85rem}
+ .ok{color:#3fb950} .bad{color:#f85149} .foot{color:#8b949e;font-size:.8rem;margin-top:1.5rem}
+</style></head><body>
+<h1>claude-tunnel — operator status</h1>
+<div id="health" class="l">loading…</div>
+<div class="grid">
+ <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
+ <div class="card"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
+ <div class="card"><div class="n" id="accounts">–</div><div class="l">accounts</div></div>
+ <div class="card"><div class="n" id="payments">–</div><div class="l">confirmed payments</div></div>
+ <div class="card"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
+</div>
+<div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
+<script>
+ async function refresh(){
+  try{
+   const r=await fetch('/status'); const s=await r.json();
+   document.getElementById('health').innerHTML = s.ready ? '<span class="ok">● ready</span>' : '<span class="bad">● not ready</span>';
+   document.getElementById('tunnels').textContent=s.tunnels;
+   document.getElementById('agents').textContent=s.agents;
+   document.getElementById('accounts').textContent=s.accounts;
+   document.getElementById('payments').textContent=s.payments_confirmed;
+   document.getElementById('uptime').textContent=s.uptime_seconds;
+  }catch(e){ document.getElementById('health').innerHTML='<span class="bad">● unreachable</span>'; }
+ }
+ refresh(); setInterval(refresh,5000);
+</script></body></html>"#;
+
+/// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`].
+pub fn landing_router() -> Router {
+    Router::new().route("/", get(landing_handler))
+}
+
+async fn landing_handler() -> axum::response::Html<&'static str> {
+    axum::response::Html(LANDING_HTML)
 }
 
 /// Build the full persistent control-plane router: enrollment + registry +
@@ -546,13 +601,15 @@ pub fn persistent_control_plane_router(
         .route("/payment/intent", post(create_payment_intent))
         .route("/billing/issue", post(buy_token))
         .with_state(ledger.clone());
-    // Operator status view (F4.1): aggregate counts across the three stores.
+    // Operator status view + landing page (F4.1/F4.2): aggregate counts across
+    // the three stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(enrollment.clone(), registry.clone(), ledger.clone());
     let mut app = enrollment_router_sqlite(enrollment)
         .merge(registry_router_sqlite(registry))
         .merge(billing)
         .merge(payment_webhook_router(ledger.clone(), verifier))
-        .merge(status);
+        .merge(status)
+        .merge(landing_router());
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
     if let Some(oidc) = oidc {
@@ -1084,6 +1141,41 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "client-callable /payment/confirm is removed from production"
+        );
+    }
+
+    #[tokio::test]
+    async fn landing_page_serves_self_contained_html() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // The full production router serves the landing page at `/`.
+        let app = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.starts_with("text/html"), "serves HTML, got {ct}");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        // Self-contained (no external asset URLs) and renders the status figures.
+        assert!(html.contains("operator status"), "has a title");
+        assert!(html.contains("fetch('/status')"), "fetches the status endpoint");
+        assert!(
+            html.contains("registered tunnels") && html.contains("uptime"),
+            "renders the key metadata figures"
+        );
+        assert!(
+            !html.contains("http://") && !html.contains("https://") && !html.contains("//cdn"),
+            "no external assets (CSP-safe)"
         );
     }
 

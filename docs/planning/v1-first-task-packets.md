@@ -836,7 +836,7 @@ Deploy-Verifikation.
     `agent_count`/`tunnel_count`/`account_count`/`confirmed_payment_count` in storage.rs;
     in `persistent_control_plane_router` gemerged. Nur Metadaten/Health, nie Payload
     (ADR-0016). Frozen-Test `status_endpoint_reports_aggregated_counts` (je 1 seed → Counts=1).
-  - **F4.2** ⏳ `GET /` HTML-Landing-Page (self-contained, CSP-safe, rendert `/status`, Auto-Refresh, Uptime).
+  - **F4.2** ✅ `GET /` HTML-Landing-Page (`landing_router`, self-contained `LANDING_HTML`, keine externen Assets/CSP-safe, fetcht `/status`, Auto-Refresh 5s, Uptime; `/status` um `uptime_seconds` erweitert). In den Prod-Router gemerged. Frozen-Test `landing_page_serves_self_contained_html` (200 text/html, enthält Titel/fetch/Figures, keine externen URLs).
   - **F4.3** ⏳ Runbook-Doku + Wire-Notiz.
 - **#5** Agent Reconnect-on-drop (P1.2b) — offen.
 - **#6** Ein-Kommando-Cross-Host-E2E-Smoke — offen.
