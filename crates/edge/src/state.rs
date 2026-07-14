@@ -10,6 +10,15 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use ct_common::RoutingToken;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot;
+
+/// A boxed bidirectional byte stream — the concrete handoff type for a
+/// TCP-fallback agent rendezvous (issue #3 / P1.2c-3), where a single stream
+/// cannot be cloned/multiplexed like a QUIC connection.
+pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
+pub type BoxedStream = Box<dyn DuplexStream>;
 
 /// Thread-safe registry of live Agent tunnels keyed by Routing Token, plus each
 /// Agent's Edge-observed peer candidate (its reflexive address) for P2P
@@ -20,6 +29,10 @@ pub struct EdgeState<H> {
     /// Agent-advertised direct-path listener: (address, cert DER) a Client can
     /// connect to directly, bypassing the Edge relay (M11.4b).
     direct: Mutex<HashMap<RoutingToken, (SocketAddr, Vec<u8>)>>,
+    /// Parked TCP-fallback agents (issue #3 / P1.2c-3): a `token` maps to a
+    /// sender the Client handler uses to hand its stream to the waiting agent.
+    /// Unlike QUIC agents these are single-use (one client per registration).
+    tcp_agents: Mutex<HashMap<RoutingToken, oneshot::Sender<BoxedStream>>>,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -28,7 +41,37 @@ impl<H: Clone> EdgeState<H> {
             agents: Mutex::new(HashMap::new()),
             candidates: Mutex::new(HashMap::new()),
             direct: Mutex::new(HashMap::new()),
+            tcp_agents: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Park a TCP-fallback agent for `token`: returns a receiver that resolves to
+    /// a Client's stream once one rendezvouses for this token (single-tunnel).
+    /// The agent then relays its own stream to the received one.
+    pub fn park_tcp_agent(&self, token: RoutingToken) -> oneshot::Receiver<BoxedStream> {
+        let (tx, rx) = oneshot::channel();
+        self.tcp_agents.lock().unwrap().insert(token, tx);
+        rx
+    }
+
+    /// Hand a Client's `stream` to a parked TCP-fallback agent for `token`.
+    /// Returns the stream back as `Err` if no TCP agent is waiting (so the caller
+    /// can fall through to the QUIC route), consuming the registration on success.
+    pub fn deliver_to_tcp_agent(
+        &self,
+        token: &RoutingToken,
+        stream: BoxedStream,
+    ) -> Result<(), BoxedStream> {
+        let tx = self.tcp_agents.lock().unwrap().remove(token);
+        match tx {
+            Some(tx) => tx.send(stream),
+            None => Err(stream),
+        }
+    }
+
+    /// Whether a TCP-fallback agent is currently parked for `token`.
+    pub fn has_tcp_agent(&self, token: &RoutingToken) -> bool {
+        self.tcp_agents.lock().unwrap().contains_key(token)
     }
 
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
@@ -69,6 +112,7 @@ impl<H: Clone> EdgeState<H> {
         self.agents.lock().unwrap().remove(token);
         self.candidates.lock().unwrap().remove(token);
         self.direct.lock().unwrap().remove(token);
+        self.tcp_agents.lock().unwrap().remove(token);
     }
 
     /// Whether `token` currently has a live Agent tunnel.
@@ -156,5 +200,38 @@ mod tests {
         state.register(token(6), 1u32);
         state.remove(&token(6));
         assert_eq!(state.direct_endpoint(&token(6)), None);
+    }
+
+    #[tokio::test]
+    async fn tcp_agent_park_then_deliver_hands_over_the_stream() {
+        // issue #3 / P1.2c-3: a parked TCP agent receives the Client's stream.
+        let state: EdgeState<u32> = EdgeState::new();
+        let rx = state.park_tcp_agent(token(7));
+        assert!(state.has_tcp_agent(&token(7)));
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(
+            state.deliver_to_tcp_agent(&token(7), client).is_ok(),
+            "delivery to a parked agent succeeds"
+        );
+        assert!(rx.await.is_ok(), "the agent receives the client stream");
+        assert!(!state.has_tcp_agent(&token(7)), "registration consumed (single-use)");
+    }
+
+    #[tokio::test]
+    async fn deliver_without_parked_tcp_agent_returns_the_stream() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(
+            state.deliver_to_tcp_agent(&token(8), client).is_err(),
+            "no parked agent → stream handed back so the caller can fall through"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_drops_parked_tcp_agent() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let _rx = state.park_tcp_agent(token(9));
+        state.remove(&token(9));
+        assert!(!state.has_tcp_agent(&token(9)));
     }
 }

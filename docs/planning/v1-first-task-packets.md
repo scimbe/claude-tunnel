@@ -803,8 +803,13 @@ Deploy-Verifikation.
     `AsyncRead+AsyncWrite`-Stream und liest `OK` (TLS-TCP-Fallback; TCP-Agent bedient
     einen Client pro Stream — kein QUIC-Multiplexing). 2 Frozen-Tests gegen
     `tokio::io::duplex`-Mock-Edge (OK-Ack akzeptiert, Nicht-OK → Fehler). Gate 209 (+2).
-  - **P1.2c-3** ⏳ Edge akzeptiert Agent-`'A'` über TCP in `serve_tcp_connection`,
-    speichert den TCP-Agent-Stream, relayt Client→TCP-Agent (single-tunnel).
+  - **P1.2c-3a** ✅ `EdgeState`-Rendezvous-Primitive für TCP-Agents: `park_tcp_agent(token)
+    -> oneshot::Receiver<BoxedStream>`, `deliver_to_tcp_agent(token, stream)` (gibt den
+    Stream als `Err` zurück wenn kein Agent parkt → Caller fällt auf QUIC-Route durch),
+    `has_tcp_agent`; `remove` räumt auf. `BoxedStream = Box<dyn DuplexStream>`
+    (AsyncRead+Write+Unpin+Send). tokio-Feature `sync` ergänzt. 3 Frozen-Tests. Gate 212 (+3).
+  - **P1.2c-3b** ⏳ `serve_tcp_connection` verdrahten: `'A'` parkt+relayt, `'C'` liefert an
+    parkenden TCP-Agent (sonst QUIC-Route).
   - **P1.2c-4** ⏳ Agent `tcp_tls_connect` + `run_agent` Transport-Wahl (QUIC, sonst
     TCP-Fallback bei blockierter UDP) + Serve über TCP → Cross-Host-Round-trip.
   - _(Reconnect-on-drop P1.2b → eigenes Feature #5.)_
