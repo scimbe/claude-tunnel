@@ -12,6 +12,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.13"
 rand = "0.8"
+axum = "0.7"
 
 [dev-dependencies]
 ct-control-plane = { path = "../control-plane" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

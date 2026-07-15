@@ -349,14 +349,17 @@ dependencies = [
 name = "ct-edge"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "ct-common",
  "ct-control-plane",
+ "http-body-util",
  "quinn",
  "rand 0.8.6",
  "rcgen",
  "rustls",
  "tokio",
  "tokio-rustls",
+ "tower",
 ]
 
 [[package]]

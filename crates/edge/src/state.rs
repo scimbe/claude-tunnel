@@ -152,6 +152,18 @@ impl<H: Clone> EdgeState<H> {
         self.agents.lock().unwrap().get(token).map_or(0, Vec::len)
     }
 
+    /// Distinct routing tokens with at least one live Agent — the number of
+    /// tunnels the Edge is currently serving (observability gauge, #10).
+    pub fn active_tunnels(&self) -> usize {
+        self.agents.lock().unwrap().values().filter(|v| !v.is_empty()).count()
+    }
+
+    /// Total live Agent registrations across all tokens — redundant Agents (#8)
+    /// counted separately (observability gauge, #10).
+    pub fn total_registrations(&self) -> usize {
+        self.agents.lock().unwrap().values().map(Vec::len).sum()
+    }
+
     /// Evict exactly the registration `id` for `token` — an Agent whose
     /// connection dropped — leaving any other redundant Agents in place (#8).
     /// The token's candidate/direct entries are cleared only when the **last**

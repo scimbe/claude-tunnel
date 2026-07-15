@@ -988,3 +988,16 @@ Deploy-Verifikation.
   `round-trip OK`/`via=`, `/enroll/issue` code-backed). **🎯 #8 komplett (R1 Registry + R2 Failover +
   R4a Shared-Identity + R4b Doku/Smoke) → alle Akzeptanzkriterien erfüllt → fix-ready. R3 (Round-
   Robin/Last) optional/deferred.**
+
+## Milestone 19 — Edge-Observability (`/metrics` für die Datenebene) — #10
+> Der Edge (Relay) war unbeobachtet; nur Control-Plane-Landing (#4) + Agent-`/metrics` existierten.
+> Prometheus-`/metrics` am Edge, spiegelt das Agent-`observe`-Muster; nur Metadaten (ADR-0016).
+- **O1** ✅ Live-Gauges + `/metrics`-Endpoint: `EdgeState::active_tunnels()` (distinkte Tokens mit ≥1
+  Agent) + `total_registrations()` (alle Live-Registrierungen, redundante Agents #8 mitgezählt).
+  Neues `edge::observe` (axum): `render_edge_metrics<H>` (generisch/testbar) → `ct_edge_active_tunnels`
+  + `ct_edge_active_agents` im Prometheus-Format; `metrics_router`/`serve_metrics`. In `run_edge` per
+  `CT_EDGE_METRICS_LISTEN` opt-in verdrahtet (default aus). Frozen-Tests
+  `gauges_reflect_registered_agents` (2 Agents auf Token A + 1 auf B → tunnels 2, agents 3) +
+  `metrics_endpoint_serves_prometheus` (leerer Edge → 200, `text/plain; version=0.0.4`, gauges 0).
+- **O2** ⏳ Kumulative Counter (registrations, relays, relay-bytes, failovers) in `serve_connection`/Relay.
+- **O3** ⏳ Compose-Scrape-Overlay + Runbook-Abschnitt.

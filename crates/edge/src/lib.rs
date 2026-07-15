@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod observe;
 pub mod pki;
 pub mod relay;
 pub mod rendezvous;

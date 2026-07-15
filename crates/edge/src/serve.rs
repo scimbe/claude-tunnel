@@ -327,6 +327,24 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     let state = Arc::new(EdgeState::<Connection>::new());
     let difficulty = config.pow_difficulty;
 
+    // Optional observability endpoint (#10): serve GET /metrics with the Edge's
+    // live gauges when CT_EDGE_METRICS_LISTEN is set (off by default). Metadata
+    // only — the Edge stays provider-blind.
+    if let Ok(addr) = std::env::var("CT_EDGE_METRICS_LISTEN") {
+        match addr.parse::<SocketAddr>() {
+            Ok(listen) => {
+                let mstate = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::observe::serve_metrics(listen, mstate).await {
+                        eprintln!("ct-edge: metrics endpoint on {listen} exited: {e}");
+                    }
+                });
+                eprintln!("ct-edge: metrics endpoint on {listen} (GET /metrics)");
+            }
+            Err(e) => eprintln!("ct-edge: invalid CT_EDGE_METRICS_LISTEN '{addr}': {e}"),
+        }
+    }
+
     // TCP fallback accept loop (for Clients whose outbound UDP is blocked).
     let state_tcp = state.clone();
     tokio::spawn(async move {
