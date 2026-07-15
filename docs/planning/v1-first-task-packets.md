@@ -1077,7 +1077,11 @@ Zu groß für einen Zyklus → dekomponiert; pro Zyklus genau EIN Sub-Paket mit 
   Frozen-Tests `from_env_defaults_when_all_unset`, `from_env_reads_every_var`,
   `from_env_blank_optionals_are_treated_as_unset`, `from_env_rejects_each_invalid_value`
   (alle Fehler-Branches: edge/origin/proto/direct/metrics). Gate grün.
-- **TC2** ⏳ `onboard.rs::OnboardEnv::from_env()` (L79-88) — gleiche Getter-Naht.
+- **TC2** ✅ `onboard.rs::OnboardEnv::from_env()` (L79-88): gleiche `from_env_with(get)`-Naht;
+  `AgentConfig::from_env_with` auf `pub(crate)` erweitert und via `&get` delegiert. Frozen-Tests
+  `onboard_from_env_reads_required_vars_and_delegates_config` (alle 3 Pflichtvars + Config-Delegation,
+  Proto fließt durch) und `onboard_from_env_requires_each_var` (jede fehlende Pflichtvar → spezifischer
+  Fehler). Gate grün.
 - **TC3** ⏳ `transport.rs` Fehler-/Setup-Branches (build_direct_listener, advertise_direct_listener,
   present_credential, register_tunnel).
 - **TC4** ⏳ `serve.rs` reconnect-/Fehler-Branches (serve_noise_stream/-udp, serve_direct, run_agent,

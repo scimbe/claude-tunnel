@@ -77,13 +77,23 @@ impl OnboardEnv {
     /// `CT_AGENT_CP_URL`, `CT_AGENT_JOIN_TOKEN` (hex), `CT_AGENT_ID`, plus the
     /// usual edge/origin variables consumed by [`AgentConfig::from_env`].
     pub fn from_env() -> Result<OnboardEnv, String> {
-        let cp_url = std::env::var("CT_AGENT_CP_URL")
-            .map_err(|_| "CT_AGENT_CP_URL is required for onboarding".to_string())?;
-        let token = std::env::var("CT_AGENT_JOIN_TOKEN")
-            .map_err(|_| "CT_AGENT_JOIN_TOKEN is required for onboarding".to_string())?;
-        let agent_id = std::env::var("CT_AGENT_ID")
-            .map_err(|_| "CT_AGENT_ID is required for onboarding".to_string())?;
-        let config = AgentConfig::from_env()?;
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Read onboarding inputs from a variable lookup (`from_env` passes
+    /// `std::env::var`). Split out so the required-var branches — and the
+    /// delegated [`AgentConfig::from_env_with`] — are testable without mutating
+    /// the global process environment.
+    pub(crate) fn from_env_with(
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<OnboardEnv, String> {
+        let cp_url = get("CT_AGENT_CP_URL")
+            .ok_or_else(|| "CT_AGENT_CP_URL is required for onboarding".to_string())?;
+        let token = get("CT_AGENT_JOIN_TOKEN")
+            .ok_or_else(|| "CT_AGENT_JOIN_TOKEN is required for onboarding".to_string())?;
+        let agent_id = get("CT_AGENT_ID")
+            .ok_or_else(|| "CT_AGENT_ID is required for onboarding".to_string())?;
+        let config = AgentConfig::from_env_with(&get)?;
         Self::parse(&cp_url, &token, &agent_id, config)
     }
 
@@ -187,6 +197,48 @@ mod tests {
         assert_eq!(env.join_token, [0xaa; 32]);
         assert_eq!(env.agent_id, AgentId("agent-1".into()));
         assert_eq!(env.config, cfg);
+    }
+
+    // #20 TC2: cover OnboardEnv::from_env via the from_env_with getter seam.
+    fn getter<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn onboard_from_env_reads_required_vars_and_delegates_config() {
+        let hex = "aa".repeat(32);
+        let env = OnboardEnv::from_env_with(getter(&[
+            ("CT_AGENT_CP_URL", "http://cp:8090"),
+            ("CT_AGENT_JOIN_TOKEN", hex.as_str()),
+            ("CT_AGENT_ID", "agent-1"),
+            ("CT_AGENT_ORIGIN_PROTO", "udp"),
+        ]))
+        .unwrap();
+        assert_eq!(env.cp_url, "http://cp:8090");
+        assert_eq!(env.join_token, [0xaa; 32]);
+        assert_eq!(env.agent_id, AgentId("agent-1".into()));
+        // The edge/origin config is parsed via the same getter (defaults here),
+        // and CT_AGENT_ORIGIN_PROTO flows through to the delegated config.
+        assert_eq!(env.config.edge, "127.0.0.1:4433".parse().unwrap());
+        assert_eq!(env.config.origin_proto, crate::config::OriginProto::Udp);
+    }
+
+    #[test]
+    fn onboard_from_env_requires_each_var() {
+        let hex = "bb".repeat(32);
+        let full = [
+            ("CT_AGENT_CP_URL", "http://cp:8090"),
+            ("CT_AGENT_JOIN_TOKEN", hex.as_str()),
+            ("CT_AGENT_ID", "a"),
+        ];
+        for missing in ["CT_AGENT_CP_URL", "CT_AGENT_JOIN_TOKEN", "CT_AGENT_ID"] {
+            let subset: Vec<(&str, &str)> =
+                full.iter().copied().filter(|(k, _)| *k != missing).collect();
+            let err = OnboardEnv::from_env_with(getter(&subset))
+                .err()
+                .expect("a missing required var must error");
+            assert!(err.contains(missing), "missing {missing}: {err}");
+        }
     }
 
     #[test]

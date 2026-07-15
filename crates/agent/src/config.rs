@@ -72,7 +72,9 @@ impl AgentConfig {
     /// `std::env::var`; splitting the parsing out behind a getter lets every
     /// branch (defaults, blank optionals, invalid values) be unit-tested without
     /// mutating the global process environment (which races across tests).
-    fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<AgentConfig, String> {
+    pub(crate) fn from_env_with(
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<AgentConfig, String> {
         let edge = get("CT_AGENT_EDGE").unwrap_or_else(|| "127.0.0.1:4433".to_string());
         let origin = get("CT_AGENT_ORIGIN").unwrap_or_else(|| "127.0.0.1:8080".to_string());
         let proto = get("CT_AGENT_ORIGIN_PROTO").unwrap_or_else(|| "tcp".to_string());
