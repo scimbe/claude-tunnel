@@ -138,6 +138,15 @@ impl<H: Clone> EdgeState<H> {
             .and_then(|v| v.last().map(|(_, h)| h.clone()))
     }
 
+    /// All live Agent handles for `token`, **most-recently-registered first** —
+    /// the failover order for the relay: try the newest, fall back to older ones
+    /// if its `open_bi()` fails (#8 R2, covers the dead-but-not-yet-evicted race).
+    pub fn routes(&self, token: &RoutingToken) -> Vec<H> {
+        self.agents.lock().unwrap().get(token).map_or_else(Vec::new, |v| {
+            v.iter().rev().map(|(_, h)| h.clone()).collect()
+        })
+    }
+
     /// Number of redundant Agent registrations currently serving `token` (#8).
     pub fn registration_count(&self, token: &RoutingToken) -> usize {
         self.agents.lock().unwrap().get(token).map_or(0, Vec::len)

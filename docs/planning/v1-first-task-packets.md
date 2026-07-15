@@ -967,7 +967,10 @@ Deploy-Verifikation.
   Frozen-Test `redundant_agents_fail_over_on_registration_drop` (2 Agents, route bevorzugt neuesten,
   Evict → Failover auf Überlebenden, idempotent, letzter weg → Tunnel weg). Alle Edge-/e2e-Relay-Tests
   grün durch die geänderte Registry. **fix-ready erst wenn R1–R4 alle Akzeptanzkriterien erfüllen.**
-- **R2** ⏳ Edge-Relay-Failover-Retry: schlägt `open_bi()` zum gewählten Agent fehl, den nächsten
-  Live-Agent probieren (deckt das Dead-but-not-yet-evicted-Rennen ab).
+- **R2** ✅ Edge-Relay-Failover-Retry: `EdgeState::routes(token)` liefert alle Live-Agents (neuester
+  zuerst); `open_agent_stream` probiert sie der Reihe nach durch, bis ein `open_bi()` gelingt — deckt
+  redundante Agents UND das Dead-but-not-yet-evicted-Rennen ab (Client bekommt Failover statt „no
+  relay"). Frozen-Test `relay_fails_over_from_a_dead_agent_to_a_live_one` (2 echte QUIC-Agents, der
+  neueste mit 0 bidi-Credit = tot → Failover auf den überlebenden). Gate grün.
 - **R3** ⏳ Round-Robin/Lastverteilung über redundante Agents (optional).
 - **R4** ⏳ Runbook + Smoke/Demo für redundante Agents (einen mitten im Tunnel killen → Tunnel überlebt).

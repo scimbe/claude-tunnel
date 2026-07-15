@@ -78,25 +78,41 @@ async fn open_agent_stream_with(
     timeout: Duration,
 ) -> Result<(SendStream, RecvStream), BoxError> {
     let th = token_hex(token);
-    let Some(agent_conn) = state.route(token) else {
+    let agents = state.routes(token);
+    if agents.is_empty() {
         edge_trace(format_args!("route token={th} -> MISS (no registration)"));
         return Err("no agent tunnel for token".into());
-    };
-    edge_trace(format_args!("route token={th} -> hit; opening relay stream"));
-    match tokio::time::timeout(timeout, agent_conn.open_bi()).await {
-        Ok(Ok(streams)) => {
-            edge_trace(format_args!("open_bi token={th} -> ok"));
-            Ok(streams)
-        }
-        Ok(Err(e)) => {
-            edge_trace(format_args!("open_bi token={th} -> err: {e}"));
-            Err(e.into())
-        }
-        Err(_) => {
-            edge_trace(format_args!("open_bi token={th} -> TIMED OUT after {timeout:?}"));
-            Err(format!("agent tunnel unresponsive: open_bi to {th} timed out").into())
+    }
+    // Failover (#8 R2): try each live agent, newest first, until one opens a relay
+    // stream. This covers redundant agents AND the race where the chosen agent's
+    // connection is dead but not yet evicted — the next agent takes over instead
+    // of the client seeing an opaque "no relay".
+    let total = agents.len();
+    let mut last_err = String::new();
+    for (i, agent_conn) in agents.into_iter().enumerate() {
+        edge_trace(format_args!(
+            "route token={th} -> hit (agent {}/{total}); opening relay stream",
+            i + 1
+        ));
+        match tokio::time::timeout(timeout, agent_conn.open_bi()).await {
+            Ok(Ok(streams)) => {
+                edge_trace(format_args!("open_bi token={th} agent {}/{total} -> ok", i + 1));
+                return Ok(streams);
+            }
+            Ok(Err(e)) => {
+                edge_trace(format_args!("open_bi token={th} agent {}/{total} -> err: {e}", i + 1));
+                last_err = e.to_string();
+            }
+            Err(_) => {
+                edge_trace(format_args!(
+                    "open_bi token={th} agent {}/{total} -> TIMED OUT after {timeout:?}",
+                    i + 1
+                ));
+                last_err = format!("open_bi to {th} timed out");
+            }
         }
     }
+    Err(format!("agent tunnel unresponsive: all {total} agent(s) failed ({last_err})").into())
 }
 
 /// [`open_agent_stream_with`] using the default [`RELAY_OPEN_BI_TIMEOUT`].
@@ -529,6 +545,56 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         edge.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_fails_over_from_a_dead_agent_to_a_live_one() {
+        // #8 R2: two agents serve one token; the most-recent one can't open a
+        // relay stream (0 bidi-stream credit = effectively dead), so
+        // open_agent_stream must fail over to the surviving agent instead of
+        // returning "no relay".
+        use quinn::{Endpoint, TransportConfig};
+        use std::net::Ipv4Addr;
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().unwrap();
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        let token = RoutingToken([5u8; 32]);
+
+        // Healthy agent (default bidi credit) connects first → registered older.
+        let healthy_ep = build_client_endpoint(cert.clone()).unwrap();
+        let h_task =
+            tokio::spawn(async move { healthy_ep.connect(addr, "localhost").unwrap().await.unwrap() });
+        let srv_healthy = server.accept().await.unwrap().await.unwrap();
+        let _h_client = h_task.await.unwrap();
+        state.register(token.clone(), srv_healthy);
+
+        // Starved agent (0 bidi credit) connects second → registered most-recent.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        ));
+        let mut tc = TransportConfig::default();
+        tc.max_concurrent_bidi_streams(0u32.into());
+        cfg.transport_config(Arc::new(tc));
+        let mut starved_ep = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        starved_ep.set_default_client_config(cfg);
+        let s_task =
+            tokio::spawn(async move { starved_ep.connect(addr, "localhost").unwrap().await.unwrap() });
+        let srv_starved = server.accept().await.unwrap().await.unwrap();
+        let _s_client = s_task.await.unwrap();
+        state.register(token.clone(), srv_starved);
+
+        assert_eq!(state.registration_count(&token), 2, "two redundant agents");
+
+        // Tries the starved (most-recent) agent first → times out → fails over to
+        // the healthy one and returns a stream.
+        let r = open_agent_stream_with(&state, &token, Duration::from_millis(300)).await;
+        assert!(r.is_ok(), "failed over to the surviving agent: {:?}", r.err());
     }
 
     #[tokio::test]
