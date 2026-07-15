@@ -102,4 +102,41 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.0 200") || resp.starts_with("HTTP/1.1 200"), "200 OK: {resp:.40}");
         assert!(resp.contains("ct_tunnels_opened_total 3"), "scraped counter value");
     }
+
+    #[tokio::test]
+    async fn serve_metrics_binds_its_own_listener_and_serves() {
+        // Exercises serve_metrics() itself (the bind + serve wrapper), not just
+        // metrics_router: reserve an ephemeral port, hand it to serve_metrics,
+        // scrape once, then stop the (otherwise endless) server.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let metrics = Arc::new(TunnelMetrics::new());
+        metrics.tunnels_opened.add(5);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe); // free the port for serve_metrics to bind
+
+        let m = Arc::clone(&metrics);
+        let server = tokio::spawn(async move { serve_metrics(addr, m).await });
+
+        // serve_metrics binds asynchronously; retry briefly until it answers.
+        let mut resp = String::new();
+        for _ in 0..50 {
+            if let Ok(mut sock) = tokio::net::TcpStream::connect(addr).await {
+                sock.write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = sock.read_to_string(&mut resp).await;
+                if !resp.is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert!(
+            resp.contains("ct_tunnels_opened_total 5"),
+            "serve_metrics served the scrape: {resp:.60}"
+        );
+    }
 }

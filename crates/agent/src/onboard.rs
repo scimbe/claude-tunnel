@@ -242,6 +242,16 @@ mod tests {
     }
 
     #[test]
+    fn from_env_wrapper_surfaces_a_missing_required_var() {
+        // Exercise the thin from_env() wrapper against the real environment; no
+        // test sets CT_AGENT_CP_URL, so it must surface the required-var error.
+        let err = OnboardEnv::from_env()
+            .err()
+            .expect("missing CT_AGENT_CP_URL must error");
+        assert!(err.contains("CT_AGENT_CP_URL"), "{err}");
+    }
+
+    #[test]
     fn parse_rejects_bad_inputs() {
         let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
         let good = "aa".repeat(32);

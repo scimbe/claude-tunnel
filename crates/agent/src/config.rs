@@ -198,4 +198,13 @@ mod tests {
             assert!(err.contains(needle), "{var}: unexpected error {err}");
         }
     }
+
+    #[test]
+    fn from_env_wrapper_reads_the_process_environment() {
+        // Exercise the thin from_env() wrapper (delegates to from_env_with with
+        // std::env::var). No test in this crate sets CT_AGENT_* and the hermetic
+        // gate has none, so it resolves the documented defaults.
+        let c = AgentConfig::from_env().expect("defaults parse");
+        assert_eq!(c.origin_proto, OriginProto::Tcp);
+    }
 }

@@ -1088,11 +1088,15 @@ Zu groß für einen Zyklus → dekomponiert; pro Zyklus genau EIN Sub-Paket mit 
   Reject-Zweige, die der echte Edge nie nimmt. Frozen-Tests `register_tunnel_surfaces_an_edge_rejection`
   (non-OK → "rejected tunnel registration") und `advertise_direct_listener_roundtrips_and_surfaces_rejection`
   (OK-Happy-Path + non-OK → "advertisement rejected"; deckt auch `build_direct_listener`). Gate grün.
-- **TC4** ⏳ `serve.rs` reconnect-/Fehler-Branches (serve_noise_stream/-udp, serve_direct, run_agent,
-  serve_quic_connection, run_agent_tcp_fallback).
-- **TC5** ⏳ `observe.rs::serve_metrics()` — bind + ein Scrape über echten Socket.
-- **TC6** ⏳ `capability.rs` Fehler-Branches (resolve_primary_identity, load_extra_origin_keys,
-  rotate_origin_key).
-- **TC7** ⏳ Entrypoints (main.rs, bin/*) aus dem Coverage-Nenner nehmen
-  (`--ignore-filename-regex '(bin/|main\.rs)'`) ODER Prozess-Smokes. Erst wenn lib-only ≥95%
-  gemessen → #20 **fix-ready**.
+- **Wrapper** ✅ `config.rs::from_env()` + `onboard.rs::OnboardEnv::from_env()` dünne Real-Env-Wrapper
+  (`from_env_wrapper_*`-Tests; kein Test setzt CT_AGENT_*, also race-frei). config.rs + onboard.rs → 100%.
+- **TC5** ✅ `observe.rs::serve_metrics()`: `serve_metrics_binds_its_own_listener_and_serves` (ephemeren
+  Port reservieren → an serve_metrics geben → einmal per Raw-HTTP scrapen → Server abbrechen). 100% Funktionen.
+- **TC6** ✅ `capability.rs` Fehler-Branches: `resolve_tolerates_a_missing_rotation_dir` (read_dir Err → leer)
+  und `rotate_rejects_a_non_32_byte_current_key` ("not 32 bytes"). capability.rs 99.1% Zeilen / 100% Funktionen.
+- **TC4** ⏭️ `serve.rs` tiefe reconnect-/Fehler-Branches (Netzwerk-Fehlerpfade) BEWUSST zurückgestellt:
+  das Aggregat-Ziel (lib-only ≥95%) ist ohne sie erreicht; serve.rs bleibt die einzige Datei <95%
+  (89.8% Zeilen / 89.6% Regions). Optionaler Stretch, falls per-file/Region-95% gewünscht wird.
+- **TC7** ✅ Gemessen (`cargo llvm-cov -p ct-agent --ignore-filename-regex '(bin/|main\.rs)'`):
+  **lib-only 95.41% Zeilen / 96.56% Funktionen** (Baseline 91.1%), ct-agent 52 → 65 Tests. Ziel erreicht
+  → **#20 fix-ready** (Regions 94.05%, serve.rs die einzige Restlücke — transparent kommuniziert).

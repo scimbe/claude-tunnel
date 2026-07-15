@@ -293,6 +293,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tolerates_a_missing_rotation_dir() {
+        // #12 K3 error branch: a nonexistent rotation dir yields no extra keys
+        // (load_extra_origin_keys read_dir Err -> empty), just the primary.
+        let key = tmp("md-origin.key");
+        let cap = tmp("md-cap.bin");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let missing = tmp("does-not-exist-dir");
+        let _ = std::fs::remove_dir_all(&missing);
+        let id = resolve_serving_identity(Some(&key), &cap, "edge:443", Some(&missing)).unwrap();
+        assert_eq!(id.origin_keys.len(), 1, "missing dir -> only the primary key");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+    }
+
+    #[test]
+    fn rotate_rejects_a_non_32_byte_current_key() {
+        // #12 K4 guard: rotation refuses a corrupt/short current origin key.
+        let key = tmp("bk-origin.key");
+        let cap = tmp("bk-cap.bin");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        resolve_serving_identity(Some(&key), &cap, "edge:443", None).unwrap();
+        std::fs::write(&key, b"short").unwrap(); // not 32 bytes
+        let dir = tmp("bk-dir");
+        let err = rotate_origin_key(&key, &cap, &dir)
+            .err()
+            .expect("a non-32-byte current key must be rejected");
+        assert!(err.to_string().contains("not 32 bytes"), "{err}");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+    }
+
+    #[test]
     fn mints_distinct_tokens() {
         let a = mint_capability(OriginIdentity([1u8; 32]), "edge:443".into());
         let b = mint_capability(OriginIdentity([1u8; 32]), "edge:443".into());
