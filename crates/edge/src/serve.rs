@@ -522,6 +522,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_is_evicted_when_a_killed_agent_goes_idle() {
+        // issue #8 (failover regression): the test above covers a *graceful*
+        // drop (`conn.close` sends a QUIC CLOSE frame → `conn.closed()` fires at
+        // once). A *killed* agent sends NO close frame, so eviction can only fire
+        // on the Edge server's idle timeout. Without an Edge-side
+        // `max_idle_timeout` the dead registration lingers (~30s peer-negotiated),
+        // clients keep routing to the corpse, and redundancy failover never
+        // engages — which is exactly what `redundancy-smoke.sh` caught. This pins
+        // the mechanism the production fix adds (`edge_server_transport`): build a
+        // server with a short idle timeout, register an agent, then let its
+        // connection go SILENT (no keepalive, no close — the kill analogue) and
+        // assert the idle timeout tears it down so `run_edge`'s eviction runs.
+        use quinn::{Endpoint, IdleTimeout, TransportConfig};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use std::net::Ipv4Addr;
+
+        let token = RoutingToken([11u8; 32]);
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+
+        // Edge server with a 1s idle timeout (fast analogue of the production
+        // ~10s) and NO keepalive — so a silent peer idles out within the test
+        // window instead of being kept warm.
+        crate::transport::install_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified.key_pair.serialize_der(),
+        ));
+        let mut server_config =
+            quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+        let mut t = TransportConfig::default();
+        t.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(1)).unwrap()));
+        server_config.transport_config(Arc::new(t));
+        let server =
+            Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into()).expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let state_srv = state.clone();
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            // Mirror run_edge exactly: serve, await close, evict on drop.
+            let registered = serve_connection(&conn, &state_srv, &challenge).await;
+            conn.closed().await;
+            if let Ok(Some((token, reg))) = registered {
+                state_srv.remove_registration(&token, reg);
+            }
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut msg = vec![b'A'];
+        msg.extend_from_slice(&token.0);
+        send.write_all(&msg).await.unwrap();
+        send.finish().unwrap();
+        let ack = recv.read_to_end(8).await.unwrap();
+        assert_eq!(ack, b"OK");
+        assert!(state.route(&token).is_some(), "routable while the agent is alive");
+
+        // The agent goes SILENT — no close frame, no keepalive (the kill case).
+        // The Edge's idle timeout must tear the connection down so eviction runs
+        // well before the old ~30s peer-negotiated timeout. Hold `conn`/`client`
+        // (do NOT drop them, which would send a close) so only the idle path can
+        // trigger eviction.
+        let evicted = tokio::time::timeout(Duration::from_secs(5), async {
+            while state.route(&token).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            evicted.is_ok(),
+            "a killed (silent) agent is evicted via the edge idle timeout"
+        );
+        drop(conn);
+        drop(client);
+        edge.abort();
+    }
+
+    #[tokio::test]
     async fn open_agent_stream_distinguishes_missing_from_unresponsive() {
         // issue #2 (mode b): the Client can't tell "no registration" from "live
         // agent that never yields a relay stream" — both look like "no relay".

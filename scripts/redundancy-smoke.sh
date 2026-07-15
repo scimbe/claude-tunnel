@@ -76,14 +76,25 @@ ok "Baseline round-trip OK (via=${VIA:-?})."
 
 step "Killing the most-recently-registered agent (agent 2, the one now serving)"
 kill "$A2" 2>/dev/null || true
-# Give the edge time to notice the drop and evict that registration.
-sleep 6
-ok "Agent 2 killed; edge should have evicted its registration."
+# A KILLED agent sends no QUIC CLOSE frame, so the edge can only notice it via
+# its idle timeout (EDGE_MAX_IDLE ≈ 10s in edge/pki.rs). Until then the dead
+# registration lingers and the edge may still route to it. So don't assert on a
+# single fixed wait: poll the failover client until the edge has evicted agent 2
+# and routes to the survivor, with a budget comfortably past the idle window.
+sleep 12
+ok "Agent 2 killed; waiting out the edge's dead-connection detection window."
 
 step "Client round-trip after the serving agent died — must fail over to agent 1"
-OUT2="$(run_client)" || true
-if printf '%s' "$OUT2" | grep -q "round-trip OK"; then
-  VIA2="$(printf '%s' "$OUT2" | sed -n 's/.*via=\([a-z]*\).*/\1/p' | head -1)"
+OUT2=""; VIA2=""
+for _ in $(seq 1 12); do
+  OUT2="$(run_client)" || true
+  if printf '%s' "$OUT2" | grep -q "round-trip OK"; then
+    VIA2="$(printf '%s' "$OUT2" | sed -n 's/.*via=\([a-z]*\).*/\1/p' | head -1)"
+    break
+  fi
+  sleep 2
+done
+if [ -n "$VIA2" ]; then
   ok "Failover round-trip OK (via=${VIA2:-?}) — the tunnel survived losing an agent."
   printf '\033[1;32mREDUNDANCY OK — tunnel served by the surviving agent (via=%s)\033[0m\n' "${VIA2:-?}"
 else

@@ -21,6 +21,35 @@ use crate::transport::install_crypto_provider;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// How often the Edge pings each peer connection (Agents and Clients), and how
+/// long it tolerates silence before declaring one dead.
+///
+/// #8 failover hinges on this: a **killed** Agent sends no QUIC CLOSE frame, so
+/// the Edge can only notice it via the idle timeout. Without an Edge-side
+/// `max_idle_timeout` the connection lingers at the peer-negotiated timeout
+/// (~30s), the dead registration is never evicted (`conn.closed()` never fires),
+/// and clients keep routing to the corpse instead of failing over to a surviving
+/// Agent. With these set, the Edge actively pings and tears a dead connection
+/// down within ~`EDGE_MAX_IDLE`, firing `conn.closed()` so `run_edge` evicts.
+///
+/// `EDGE_MAX_IDLE` is kept comfortably above the Agent's 5s keepalive so a
+/// *live* Agent — which both keepalives and ACKs the Edge's pings, generating
+/// traffic every ~`EDGE_KEEP_ALIVE` — is never falsely disconnected.
+const EDGE_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(3);
+const EDGE_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Transport config for the Edge's QUIC **server** side: keepalive + idle
+/// timeout so dead Agent connections are detected and evicted (#8). Shared by
+/// both production server builders below.
+fn edge_server_transport() -> Result<Arc<quinn::TransportConfig>, BoxError> {
+    let mut t = quinn::TransportConfig::default();
+    t.keep_alive_interval(Some(EDGE_KEEP_ALIVE));
+    t.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(EDGE_MAX_IDLE).map_err(|_| "edge max_idle out of range")?,
+    ));
+    Ok(Arc::new(t))
+}
+
 /// An in-memory Certificate Authority that issues leaf certificates.
 pub struct Ca {
     cert: rcgen::Certificate,
@@ -112,7 +141,8 @@ pub fn build_server_endpoint_from_ca(
 ) -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
     install_crypto_provider();
     let (cert, key) = ca.issue(sans)?;
-    let server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)?;
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)?;
+    server_config.transport_config(edge_server_transport()?);
     let endpoint = Endpoint::server(server_config, addr)?;
     Ok((endpoint, ca.root_der()))
 }
@@ -129,7 +159,8 @@ pub async fn build_dual_edge_from_ca(
 ) -> Result<(Endpoint, TcpListener, TlsAcceptor, CertificateDer<'static>), BoxError> {
     install_crypto_provider();
     let (cert, key) = ca.issue(sans)?;
-    let quic_cfg = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.clone_key())?;
+    let mut quic_cfg = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.clone_key())?;
+    quic_cfg.transport_config(edge_server_transport()?);
     let endpoint = Endpoint::server(quic_cfg, quic_addr)?;
     let tls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
