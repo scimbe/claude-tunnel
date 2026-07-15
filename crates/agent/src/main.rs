@@ -37,13 +37,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cap_out = std::env::var("CT_AGENT_CAPABILITY_OUT")
         .unwrap_or_else(|_| "/shared/capability.bin".to_string());
 
-    // Wait for the Edge to publish its certificate.
-    let edge_cert = loop {
-        match load_cert(&cert_path) {
-            Ok(cert) => break cert,
-            Err(_) => {
-                eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    // Obtain the Edge CA root. With CT_AGENT_EDGE_CERT_URL set, fetch it from the
+    // control plane's published /pki/ca (#11 C2) — self-serve cross-host, no
+    // out-of-band copy. Otherwise wait for it on the shared-volume path.
+    let edge_cert = if let Ok(url) = std::env::var("CT_AGENT_EDGE_CERT_URL") {
+        let der = ct_control_plane::client::ControlPlaneClient::new(url.clone())
+            .fetch_edge_cert()
+            .await
+            .map_err(|e| format!("ct-agent: fetch edge cert from {url}: {e:?}"))?;
+        eprintln!("ct-agent: fetched edge cert from {url} ({} bytes)", der.len());
+        rustls::pki_types::CertificateDer::from(der)
+    } else {
+        loop {
+            match load_cert(&cert_path) {
+                Ok(cert) => break cert,
+                Err(_) => {
+                    eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         }
     };

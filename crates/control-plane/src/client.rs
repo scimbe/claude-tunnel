@@ -93,6 +93,15 @@ impl ControlPlaneClient {
         Ok(TenantId(body.tenant))
     }
 
+    /// `GET /pki/ca` — fetch the edge CA root DER the control plane publishes
+    /// (#11), so a cross-host Agent/Client can obtain the trust root over HTTP
+    /// instead of copying it out of band. Public key material only.
+    pub async fn fetch_edge_cert(&self) -> CpResult<Vec<u8>> {
+        let resp = self.http.get(format!("{}/pki/ca", self.base)).send().await?;
+        let resp = ok(resp)?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     /// `POST /registry/register` — register a tunnel's routing token.
     pub async fn register(
         &self,
@@ -317,6 +326,24 @@ mod tests {
         // Single-use: the second redemption is rejected (409) as a Status error.
         let second = cp.redeem(&join, &agent, &[1u8; 32]).await;
         assert!(matches!(second, Err(CpError::Status(_))), "join token is single-use");
+    }
+
+    #[tokio::test]
+    async fn fetch_edge_cert_downloads_the_published_root() {
+        // #11 C2: the client fetches the edge CA root the CP publishes at /pki/ca.
+        let der: &[u8] = b"\x30\x82\x01\x0a-fetched-ca-root";
+        let path = std::env::temp_dir().join(format!("ct-cpc-ca-{}.der", std::process::id()));
+        std::fs::write(&path, der).unwrap();
+        let app = crate::service::pki_router(path.to_string_lossy().into_owned());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cp = ControlPlaneClient::new(format!("http://{addr}"));
+        let got = cp.fetch_edge_cert().await.unwrap();
+        assert_eq!(got, der, "fetches the exact published CA root DER");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The full M15 billing flow over a real socket: open account → a broke

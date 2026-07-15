@@ -1019,5 +1019,9 @@ Deploy-Verifikation.
   `persistent_control_plane_router` gemerged. Stabil über Edge-Redeploys dank persistenter CA (#2).
   Frozen-Test `pki_endpoint_publishes_the_edge_ca_root` (DER geschrieben → 200 + exakte Bytes +
   Content-Type; fehlend → 503). Gate grün.
-- **C2** ⏳ Agent/Client holen die Cert von der CP (`CT_AGENT_EDGE_CERT_URL`) statt lokaler Datei.
+- **C2** ✅ `ControlPlaneClient::fetch_edge_cert()` (GET /pki/ca via reqwest) + Agent-Verdrahtung:
+  ist `CT_AGENT_EDGE_CERT_URL` gesetzt, holt der Agent die Edge-CA-Root von der CP (self-serve
+  cross-host, kein Out-of-Band-Kopieren) statt vom Shared-Volume-Pfad. Frozen-Test
+  `fetch_edge_cert_downloads_the_published_root` (pki_router live gebunden → Client holt exakte
+  Bytes). Gate grün. (Client-Seite `CT_CLIENT_EDGE_CERT_URL` als kleiner Folgeschritt in C3.)
 - **C3** ⏳ Runbook + Onboarding-Doku.
