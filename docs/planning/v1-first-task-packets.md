@@ -972,5 +972,13 @@ Deploy-Verifikation.
   redundante Agents UND das Dead-but-not-yet-evicted-Rennen ab (Client bekommt Failover statt „no
   relay"). Frozen-Test `relay_fails_over_from_a_dead_agent_to_a_live_one` (2 echte QUIC-Agents, der
   neueste mit 0 bidi-Credit = tot → Failover auf den überlebenden). Gate grün.
+- **R4a** ✅ Shared-Identity-Support (Voraussetzung für deploybare Redundanz): zwei unabhängig
+  gestartete Agents minteten bisher je eigenen Origin-Key + Zufalls-Token → nie redundant.
+  `resolve_serving_identity(key_path, cap_path, edge)`: mit `CT_AGENT_ORIGIN_KEY` persistiert der
+  erste Agent Origin-Key (0600) + Capability und spätere Agents **laden** sie → gleicher Token →
+  mehrere Agents bedienen einen Tunnel; ohne die Env frische Einzel-Identität (Default). `main.rs`
+  verdrahtet. Frozen-Test `shared_identity_lets_multiple_agents_serve_one_token` (geteilte Dateien →
+  gleicher Token/Key/Identity; Default → eindeutig). Gate grün. (Ersten Agent zuerst starten, damit
+  die geteilten Dateien existieren.)
 - **R3** ⏳ Round-Robin/Lastverteilung über redundante Agents (optional).
 - **R4** ⏳ Runbook + Smoke/Demo für redundante Agents (einen mitten im Tunnel killen → Tunnel überlebt).

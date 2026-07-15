@@ -5,10 +5,9 @@
 
 use std::time::Duration;
 
-use ct_agent::capability::mint_capability;
+use ct_agent::capability::resolve_serving_identity;
 use ct_agent::config::AgentConfig;
 use ct_agent::onboard::OnboardEnv;
-use ct_agent::origin::OriginKey;
 use ct_agent::serve::run_agent;
 use ct_agent::transport::load_cert;
 
@@ -49,17 +48,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Mint a Capability carrying the real Origin Identity (M8.1). The Agent is
+    // Resolve the serving identity (Capability + Origin static key). The Agent is
     // custodian of the Origin static Noise keypair; only its public half travels
     // in the Capability. The private half stays here to terminate the E2E
-    // handshake (M8.3).
-    let origin_key = OriginKey::generate();
-    let cap = mint_capability(origin_key.origin_identity(), config.edge.to_string());
-    std::fs::write(&cap_out, cap.encode())?;
+    // handshake (M8.3). With CT_AGENT_ORIGIN_KEY set, the key + capability are
+    // persisted/shared so multiple agents can serve one tunnel (redundancy, #8).
+    let origin_key_path = std::env::var("CT_AGENT_ORIGIN_KEY").ok();
+    let identity = resolve_serving_identity(origin_key_path.as_deref(), &cap_out, &config.edge.to_string())?;
     eprintln!(
-        "ct-agent: edge={} origin={} capability -> {}",
-        config.edge, config.origin, cap_out
+        "ct-agent: edge={} origin={} capability -> {}{}",
+        config.edge,
+        config.origin,
+        cap_out,
+        match &origin_key_path {
+            Some(p) => format!(" (shared identity, origin key {p})"),
+            None => String::new(),
+        }
     );
 
-    run_agent(&config, edge_cert, cap.token, origin_key.private_bytes()).await
+    run_agent(&config, edge_cert, identity.cap.token, identity.origin_private).await
 }
