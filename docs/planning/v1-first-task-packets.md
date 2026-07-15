@@ -1024,4 +1024,9 @@ Deploy-Verifikation.
   cross-host, kein Out-of-Band-Kopieren) statt vom Shared-Volume-Pfad. Frozen-Test
   `fetch_edge_cert_downloads_the_published_root` (pki_router live gebunden → Client holt exakte
   Bytes). Gate grün. (Client-Seite `CT_CLIENT_EDGE_CERT_URL` als kleiner Folgeschritt in C3.)
-- **C3** ⏳ Runbook + Onboarding-Doku.
+- **C3** ✅ Runbook: Config-Tabelle um `CT_EDGE_METRICS_LISTEN`/`CT_CP_EDGE_CERT_PATH`/
+  `CT_AGENT_EDGE_CERT_URL` erweitert + Abschnitt „Distribute the edge CA root cross-host" (Agent
+  Auto-Fetch via `CT_AGENT_EDGE_CERT_URL`; der schlanke Client bleibt HTTP-Client-frei und holt die
+  Root per einmaligem `curl /pki/ca -o edge-cert.der` → `CT_CLIENT_EDGE_CERT`). Kein ct-control-plane
+  (rusqlite/axum) ins Client-Binary ziehen. **🎯 #11 komplett (C1 CP-Endpoint + C2 Agent-Fetch +
+  C3 Client-curl/Doku) → fix-ready.**

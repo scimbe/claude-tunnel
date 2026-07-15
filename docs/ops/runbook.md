@@ -37,9 +37,27 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_EDGE_LISTEN` | edge | bind address (default `0.0.0.0:4433`) |
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
 | `CT_EDGE_CERT_OUT` | edge | path the edge writes its CA root to |
+| `CT_EDGE_METRICS_LISTEN` | edge | bind address for `GET /metrics` (unset ⇒ off, issue #10) |
+| `CT_CP_EDGE_CERT_PATH` | control plane | path it reads the edge CA root from to publish at `/pki/ca` (default `/shared/edge-cert.der`, issue #11) |
+| `CT_AGENT_EDGE_CERT_URL` | agent | fetch the edge CA root from this control-plane URL instead of a local file (issue #11) |
 
 Secrets come from `.env` (self-host, gitignored) or Kubernetes Secrets (hosted) —
 never commit them. Verify with `./scripts/check-no-secrets.sh`.
+
+### Distribute the edge CA root cross-host (issue #11)
+On a single host the edge CA root reaches agents/clients via the shared Docker
+volume. **Cross-host**, publish it over HTTP: the control plane serves the current
+root at `GET /pki/ca` (public key material only — the CA signing key never leaves
+the edge; the root is stable across edge redeploys thanks to the persisted CA).
+A remote agent/client then fetches it self-serve instead of an out-of-band copy:
+
+```bash
+# agent — fetches the root automatically, no local file needed:
+CT_AGENT_EDGE_CERT_URL=http://<central-host>:8090 ct-agent onboard
+# client (kept HTTP-client-free) — fetch once with curl, then point it at the file:
+curl -s http://<central-host>:8090/pki/ca -o edge-cert.der
+CT_CLIENT_EDGE_CERT=edge-cert.der ct-client
+```
 
 ## Monitor
 

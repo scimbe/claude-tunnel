@@ -25,7 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    // Wait for the Edge cert.
+    // Wait for the Edge cert. Cross-host, fetch the published root once with
+    // `curl http://<cp>:8090/pki/ca -o edge-cert.der` (#11) and point
+    // CT_CLIENT_EDGE_CERT at it; the lean client stays HTTP-client-free.
     let edge_cert = loop {
         match load_cert(&config.edge_cert_file) {
             Ok(cert) => break cert,
