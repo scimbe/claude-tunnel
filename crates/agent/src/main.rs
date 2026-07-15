@@ -13,6 +13,27 @@ use ct_agent::transport::load_cert;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // `rotate` subcommand (#12 K4): rotate the origin key while KEEPING the
+    // routing token, then exit. Re-mints the capability (same token, new origin),
+    // retires the old key into CT_AGENT_ORIGIN_KEY_DIR, and promotes the new key.
+    // Restart the agent (with that dir set) to serve both identities.
+    if std::env::args().nth(1).as_deref() == Some("rotate") {
+        let key_path = std::env::var("CT_AGENT_ORIGIN_KEY")
+            .map_err(|_| "rotate requires CT_AGENT_ORIGIN_KEY (the primary key path)")?;
+        let cap_out = std::env::var("CT_AGENT_CAPABILITY_OUT")
+            .unwrap_or_else(|_| "/shared/capability.bin".to_string());
+        let dir = std::env::var("CT_AGENT_ORIGIN_KEY_DIR")
+            .map_err(|_| "rotate requires CT_AGENT_ORIGIN_KEY_DIR (the retired-key dir)")?;
+        let new_cap = ct_agent::capability::rotate_origin_key(&key_path, &cap_out, &dir)?;
+        eprintln!(
+            "ct-agent: rotated origin key — new capability at {cap_out} (same token, new origin); \
+             old key retired to {dir}. Restart the agent to serve both, then distribute the new \
+             capability and remove the retired key once the window closes."
+        );
+        let _ = new_cap;
+        return Ok(());
+    }
+
     // One-command onboarding: if a join token is present (env or `onboard`
     // subcommand), auto-enroll against the control plane before serving. This
     // is the "install -> enroll -> tunnel" single step — the operator supplies

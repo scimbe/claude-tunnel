@@ -84,6 +84,29 @@ sustained `429`s on `/me/issue` (a client hitting the rate limit), and webhook
 Restart the edge. It mints a fresh CA leaf under its internal CA on startup;
 clients trust the CA root, so no client change is needed.
 
+### Rotate the origin key (zero-downtime, issue #12)
+Rotate the origin's static Noise key **without breaking clients that still hold
+the old capability**. The routing token is preserved, so old clients keep
+rendezvousing; only the origin identity changes, and the agent serves both the
+old and new identity during the window.
+
+```bash
+# 1. Rotate: re-mint the capability (SAME token, new origin) and retire the old key.
+CT_AGENT_ORIGIN_KEY=/shared/origin.key CT_AGENT_CAPABILITY_OUT=/shared/capability.bin \
+  CT_AGENT_ORIGIN_KEY_DIR=/shared/retired ct-agent rotate
+# 2. Restart the agent WITH the retired-key dir so it serves both identities:
+CT_AGENT_ORIGIN_KEY=/shared/origin.key CT_AGENT_ORIGIN_KEY_DIR=/shared/retired \
+  CT_AGENT_CAPABILITY_OUT=/shared/capability.bin … ct-agent onboard
+# 3. Distribute the new /shared/capability.bin to clients (same token, new origin).
+# 4. Close the window: once clients are on the new capability, delete the retired
+#    key and restart the agent so only the new identity is served.
+rm /shared/retired/retired-*.key
+```
+
+During steps 2–3 an old capability (old origin, same token) and the new
+capability (new origin, same token) both complete the tunnel. Verify with
+`./scripts/rotation-smoke.sh`. Keep the retired key files owner-only.
+
 ### Rotate the payment webhook secret
 Update it in the provider dashboard and in `CT_PAYMENT_WEBHOOK_SECRET`, then
 restart the control plane. Expect brief webhook `401`s until both sides match;

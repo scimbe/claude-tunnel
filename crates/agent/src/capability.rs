@@ -16,8 +16,19 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub fn mint_capability(origin: OriginIdentity, edge_addr: String) -> Capability {
     let mut token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut token);
+    mint_capability_with_token(RoutingToken(token), origin, edge_addr)
+}
+
+/// Mint a Capability with an **explicit** Routing Token — used by key rotation
+/// (#12 K4) to re-mint with the *same* token while changing the Origin Identity,
+/// so clients holding the old capability keep rendezvousing during the window.
+pub fn mint_capability_with_token(
+    token: RoutingToken,
+    origin: OriginIdentity,
+    edge_addr: String,
+) -> Capability {
     Capability {
-        token: RoutingToken(token),
+        token,
         origin,
         edge_addr,
     }
@@ -115,6 +126,49 @@ fn load_extra_origin_keys(dir: &str) -> Result<Vec<[u8; 32]>, BoxError> {
     Ok(keys)
 }
 
+/// Rotate the Agent's Origin key while **keeping the Routing Token** (#12 K4).
+/// Origin-key rotation only helps clients holding the old capability if they can
+/// still rendezvous, so the token stays the same and only the Origin Identity
+/// changes: generate a fresh Origin key, re-mint the capability with the same
+/// token + the new identity, persist the new key as the primary (`key_path`) and
+/// the new capability (`cap_path`), and move the previous key into
+/// `extra_keys_dir` so the Agent keeps serving the old identity during the window
+/// (remove it after the window to finish the rotation). Returns the new
+/// capability. Restart the Agent (with `CT_AGENT_ORIGIN_KEY_DIR` set) to serve
+/// both identities.
+pub fn rotate_origin_key(
+    key_path: &str,
+    cap_path: &str,
+    extra_keys_dir: &str,
+) -> Result<Capability, BoxError> {
+    let old_cap = Capability::decode(&std::fs::read(cap_path)?)?;
+    let old_key = std::fs::read(key_path)?;
+    if old_key.len() != 32 {
+        return Err(format!("current origin key at {key_path} is not 32 bytes").into());
+    }
+    let new_key = OriginKey::generate();
+    let new_cap = mint_capability_with_token(
+        old_cap.token.clone(),
+        new_key.origin_identity(),
+        old_cap.edge_addr.clone(),
+    );
+    // Retire the previous key into the rotation directory (still served until
+    // removed); name it by the old Origin Identity so repeated rotations don't
+    // collide.
+    std::fs::create_dir_all(extra_keys_dir)?;
+    let retired = std::path::Path::new(extra_keys_dir)
+        .join(format!("retired-{}.key", hex8(&old_cap.origin.0)));
+    write_owner_only(&retired.to_string_lossy(), &old_key)?;
+    // Promote the new key + capability.
+    write_owner_only(key_path, &new_key.private_bytes())?;
+    std::fs::write(cap_path, new_cap.encode())?;
+    Ok(new_cap)
+}
+
+fn hex8(bytes: &[u8]) -> String {
+    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Write `bytes` to `path`, restricting to owner read/write (0600) on Unix — a
 /// persisted Origin private key must never be world-readable.
 fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
@@ -197,6 +251,41 @@ mod tests {
         let bare = resolve_serving_identity(Some(&key), &cap, "edge:443", None).unwrap();
         assert_eq!(bare.origin_keys.len(), 1);
         assert_eq!(id.origin_keys[0], bare.origin_keys[0], "primary is first");
+
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_keeps_the_token_and_retires_the_old_key() {
+        // #12 K4: rotation preserves the routing token (so old clients still
+        // rendezvous) while changing the origin identity, and the old key is
+        // retired into the dir so the agent serves BOTH during the window.
+        let key = tmp("rk-origin.key");
+        let cap = tmp("rk-cap.bin");
+        let dir = std::env::temp_dir().join(format!("ct-rk-dir-{}", std::process::id()));
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&cap);
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_s = dir.to_string_lossy().into_owned();
+
+        // Establish the initial identity (token T0, origin O0).
+        let id0 = resolve_serving_identity(Some(&key), &cap, "edge:443", None).unwrap();
+        let token0 = id0.cap.token.clone();
+        let origin0 = id0.cap.origin.clone();
+
+        // Rotate: same token, new origin; old key retired into the dir.
+        let new_cap = rotate_origin_key(&key, &cap, &dir_s).unwrap();
+        assert_eq!(new_cap.token, token0, "routing token preserved across rotation");
+        assert_ne!(new_cap.origin, origin0, "origin identity rotated");
+
+        // The agent now serves the new primary + the retired old identity, still
+        // publishing the same token.
+        let id1 = resolve_serving_identity(Some(&key), &cap, "edge:443", Some(&dir_s)).unwrap();
+        assert_eq!(id1.cap.token, token0, "same token still published");
+        assert_eq!(id1.cap.origin, new_cap.origin, "primary is the new origin");
+        assert_eq!(id1.origin_keys.len(), 2, "serves new primary + retired old key");
 
         let _ = std::fs::remove_file(&key);
         let _ = std::fs::remove_file(&cap);

@@ -1056,6 +1056,11 @@ Deploy-Verifikation.
   (2 alte Keys im Dir → 3 Keys, Primary zuerst, Nicht-Key ignoriert). Gate grün.
 - **K4** ⏳ **Token-erhaltender Rotate**: Damit alte Clients während des Fensters weiter *routen*,
   muss der Routing-Token GLEICH bleiben und nur die Origin-Identität (Key) rotieren. Braucht ein
-  `rotate`-Kommando (neue Cap = gleicher Token + neuer Origin-Pubkey, alten Key in den Dir) —
-  `mint_capability` erzeugt aktuell einen Zufalls-Token, daher separates Re-Mint nötig. Plus
-  Runbook-Prozedur + Smoke (alt+neu-Capability round-trippen mit gleichem Token, ein Key gekillt).
+  `rotate`-Kommando ✅: `mint_capability_with_token` (expliziter Token) + `rotate_origin_key`
+  (liest alte Cap → gleicher Token; neuer Origin-Key; neue Cap = Token + neuer Pubkey; alten Key als
+  `retired-<hex>.key` in `CT_AGENT_ORIGIN_KEY_DIR`; neuen Key als Primary). `ct-agent rotate`-Subcommand.
+  Frozen-Test `rotate_keeps_the_token_and_retires_the_old_key` (Token erhalten, Origin geändert, nach
+  Rotate serviert Agent 2 Identitäten mit gleichem Token). Runbook „Rotate the origin key" +
+  `scripts/rotation-smoke.sh` (alt+neu-Cap round-trippen, `bash -n`+Drift grün). Gate grün.
+  **🎯 #12 komplett (K1 Primitive + K2 Serve-Set + K3 Key-Set-Loading + K4 Token-erhaltender Rotate)
+  → alle Akzeptanzkriterien → fix-ready.**
