@@ -185,6 +185,26 @@ pub async fn serve_connection(
             recv.read_exact(&mut req).await?;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
+            // A QUIC client must also reach a TCP-fallback agent (#13): the TCP
+            // path prefers a parked TCP agent, and the QUIC path must mirror it or
+            // a QUIC-client → TCP-agent tunnel is invisible and dies with
+            // `early eof`. If one is parked, hand off the joined client stream
+            // (cross-transport QUIC↔TCP relay); otherwise keep the QUIC→QUIC
+            // relay_quic path unchanged.
+            if state.has_tcp_agent(&token) {
+                match state.deliver_to_tcp_agent(&token, Box::new(join(recv, send))) {
+                    Ok(()) => return Ok(None),
+                    // Raced (the parked agent was consumed between check and
+                    // deliver) → relay this client to a QUIC agent instead.
+                    Err(mut client) => {
+                        let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
+                        let mut agent = join(agent_recv, agent_send);
+                        let (a, b) = relay(&mut client, &mut agent).await?;
+                        state.note_relay(a + b);
+                        return Ok(None);
+                    }
+                }
+            }
             let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
             let (a, b) = relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
             state.note_relay(a + b); // #10 O2
@@ -767,6 +787,91 @@ mod tests {
         );
         drop(client_conn);
         edge.abort();
+    }
+
+    #[tokio::test]
+    async fn quic_client_reaches_a_tcp_fallback_agent() {
+        // #13: the mirror of edge_relays_tcp_fallback_client_to_quic_agent — a
+        // QUIC client must reach a parked TCP-fallback agent. Before the fix,
+        // serve_connection's 'C' arm ignored deliver_to_tcp_agent and the tunnel
+        // died with `early eof`.
+        use crate::transport::{
+            build_client_endpoint, build_server_endpoint_with_cert, build_tcp_tls_listener_at,
+            tcp_tls_connect,
+        };
+        use ct_common::pow::build_request;
+        use std::net::Ipv4Addr;
+
+        let token = RoutingToken([0x77; 32]);
+        let challenge = Challenge {
+            nonce: [0x55; 16],
+            difficulty: 8,
+        };
+        let state = Arc::new(EdgeState::<Connection>::new());
+
+        // QUIC edge (for the client) + TLS-TCP listener (for the fallback agent).
+        let (server, qcert) = build_server_endpoint_with_cert().expect("quic edge");
+        let qaddr = server.local_addr().unwrap();
+        let (tcp_listener, acceptor, tcert) =
+            build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into()).await.expect("tcp edge");
+        let taddr = tcp_listener.local_addr().unwrap();
+
+        // TLS-TCP edge: serve the fallback AGENT ('A' → park → relay).
+        let state_t = state.clone();
+        let chal_t = challenge.clone();
+        let tcp_edge = tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t).await;
+        });
+
+        // Agent over TLS-TCP: register 'A', then echo the relayed client bytes.
+        let agent = tokio::spawn(async move {
+            let mut a = tcp_tls_connect(taddr, tcert).await.expect("agent tcp connect");
+            a.write_all(b"A").await.unwrap();
+            a.write_all(&token.0).await.unwrap();
+            a.flush().await.unwrap();
+            let mut ok = [0u8; 2];
+            a.read_exact(&mut ok).await.unwrap();
+            assert_eq!(&ok, b"OK");
+            let mut buf = [0u8; 15];
+            a.read_exact(&mut buf).await.unwrap();
+            a.write_all(&buf).await.unwrap();
+            a.flush().await.unwrap();
+        });
+
+        // Let the agent register + park before the client rendezvouses.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // QUIC edge: serve one client connection.
+        let state_q = state.clone();
+        let chal_q = challenge.clone();
+        let quic_edge = tokio::spawn(async move {
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            let _ = serve_connection(&client_conn, &state_q, &chal_q).await;
+            client_conn.closed().await;
+        });
+
+        // QUIC client: 'C' rendezvous + 15 bytes, read the 15-byte echo.
+        let client_ep = build_client_endpoint(qcert).expect("client ep");
+        let cconn = client_ep.connect(qaddr, "localhost").unwrap().await.unwrap();
+        let (mut cs, mut cr) = cconn.open_bi().await.unwrap();
+        cs.write_all(b"C").await.unwrap();
+        let mut chal = [0u8; 17];
+        cr.read_exact(&mut chal).await.unwrap();
+        let ch = Challenge {
+            nonce: chal[..16].try_into().unwrap(),
+            difficulty: chal[16],
+        };
+        cs.write_all(&build_request(&ch, &token)).await.unwrap();
+        cs.write_all(b"quic-to-tcp-agt").await.unwrap();
+        let mut got = [0u8; 15];
+        cr.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"quic-to-tcp-agt", "QUIC client relayed to the TCP-fallback agent");
+
+        agent.await.unwrap();
+        quic_edge.abort();
+        tcp_edge.abort();
     }
 
     #[tokio::test]
