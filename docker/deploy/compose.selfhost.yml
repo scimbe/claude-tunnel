@@ -21,12 +21,18 @@ services:
     environment:
       CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
       CT_CONTROL_PLANE_DB: "/data/control-plane.db"
+      # Where the control plane reads the edge CA root to publish at /pki/ca
+      # (#11). The edge writes it into the shared volume (CT_EDGE_CERT_OUT below);
+      # the control plane mounts that volume read-only and serves the DER. Without
+      # the mount, /shared/edge-cert.der is absent and /pki/ca returns 503 (#16).
+      CT_CP_EDGE_CERT_PATH: "/shared/edge-cert.der"
       # OIDC / Keycloak (verified for /me/* endpoints); set in .env.
       CT_OIDC_ISSUER: "${CT_OIDC_ISSUER:-}"
     env_file:
       - .env
     volumes:
       - cpdata:/data
+      - shared:/shared:ro
     ports:
       - "${CONTROL_PLANE_PORT:-8090}:8090"
     restart: unless-stopped
