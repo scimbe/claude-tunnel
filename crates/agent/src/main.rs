@@ -77,5 +77,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     );
 
-    run_agent(&config, edge_cert, identity.cap.token, identity.origin_private).await
+    run_agent(
+        &config,
+        edge_cert,
+        identity.cap.token,
+        std::sync::Arc::new(vec![identity.origin_private]),
+    )
+    .await
 }

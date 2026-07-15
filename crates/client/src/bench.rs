@@ -492,7 +492,7 @@ mod tests {
                 let priv_ = origin_priv;
                 let m = Arc::clone(&metrics);
                 tokio::spawn(async move {
-                    let _ = serve_noise_stream(s, r, origin_addr, &priv_, m).await;
+                    let _ = serve_noise_stream(s, r, origin_addr, &[priv_], m).await;
                 });
             }
         });
@@ -583,7 +583,7 @@ mod tests {
             while let Ok((s, r)) = agent_conn.accept_bi().await {
                 let priv_ = origin_priv;
                 tokio::spawn(async move {
-                    let _ = serve_noise_udp(s, r, origin_addr, &priv_).await;
+                    let _ = serve_noise_udp(s, r, origin_addr, &[priv_]).await;
                 });
             }
         });

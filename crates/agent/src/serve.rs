@@ -23,7 +23,7 @@ use crate::transport::{
     dial_quic, dial_quic_or_blocked_error, register_tunnel, register_tunnel_stream, tcp_tls_connect,
 };
 use ct_common::metrics::{Metered, TunnelMetrics};
-use ct_common::noise::{frame, noise_pump, origin_handshake};
+use ct_common::noise::{frame, noise_pump, origin_handshake, origin_handshake_any};
 use ct_common::RoutingToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -109,31 +109,43 @@ pub async fn serve_noise_stream<S, R>(
     mut send: S,
     mut recv: R,
     origin: SocketAddr,
-    origin_private: &[u8; 32],
+    origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let mut hs = origin_handshake(origin_private)?;
     let mut buf = vec![0u8; 65535];
-    let mut tmp = vec![0u8; 65535];
 
     // <- handshake message 1, -> handshake message 2. Time it and count the
-    // outcome for observability (M14.1b): a completed handshake is an opened
-    // tunnel; a failed one increments the failure counter.
+    // outcome for observability (M14.1b). During a key rotation (#12) the Agent
+    // may hold several Origin keys; `origin_handshake_any` selects whichever one
+    // the Client pinned. A completed handshake is an opened tunnel; a failed one
+    // increments the failure counter.
     let started = Instant::now();
-    let handshake: Result<(), BoxError> = async {
-        let m1 = read_frame(&mut recv).await?;
-        hs.read_message(&m1, &mut tmp)?;
+    let m1 = match read_frame(&mut recv).await {
+        Ok(m) => m,
+        Err(e) => {
+            metrics.tunnels_failed.inc();
+            return Err(e);
+        }
+    };
+    let mut hs = match origin_handshake_any(origin_keys, &m1) {
+        Some(hs) => hs,
+        None => {
+            metrics.tunnels_failed.inc();
+            return Err("no origin identity matched the client handshake".into());
+        }
+    };
+    let write_msg2 = async {
         let n = hs.write_message(&[], &mut buf)?;
         send.write_all(&frame(&buf[..n])).await?;
         send.flush().await?;
-        Ok(())
+        Ok::<(), BoxError>(())
     }
     .await;
-    if let Err(e) = handshake {
+    if let Err(e) = write_msg2 {
         metrics.tunnels_failed.inc();
         return Err(e);
     }
@@ -173,17 +185,16 @@ pub async fn serve_noise_udp<S, R>(
     mut send: S,
     mut recv: R,
     origin: SocketAddr,
-    origin_private: &[u8; 32],
+    origin_keys: &[[u8; 32]],
 ) -> Result<(), BoxError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let mut hs = origin_handshake(origin_private)?;
     let mut hbuf = vec![0u8; 65535];
-    let mut htmp = vec![0u8; 65535];
     let m1 = read_frame(&mut recv).await?;
-    hs.read_message(&m1, &mut htmp)?;
+    let mut hs = origin_handshake_any(origin_keys, &m1)
+        .ok_or("no origin identity matched the client handshake")?;
     let n = hs.write_message(&[], &mut hbuf)?;
     send.write_all(&frame(&hbuf[..n])).await?;
     send.flush().await?;
@@ -241,20 +252,21 @@ where
 pub async fn serve_direct(
     listener: Endpoint,
     origin: SocketAddr,
-    origin_private: [u8; 32],
+    origin_keys: Arc<Vec<[u8; 32]>>,
     proto: OriginProto,
     metrics: Arc<TunnelMetrics>,
 ) -> Result<(), BoxError> {
     while let Some(incoming) = listener.accept().await {
         let metrics = Arc::clone(&metrics);
+        let keys = Arc::clone(&origin_keys);
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
                 if let Ok((send, recv)) = conn.accept_bi().await {
                     let _ = match proto {
                         OriginProto::Tcp => {
-                            serve_noise_stream(send, recv, origin, &origin_private, metrics).await
+                            serve_noise_stream(send, recv, origin, &keys, metrics).await
                         }
-                        OriginProto::Udp => serve_noise_udp(send, recv, origin, &origin_private).await,
+                        OriginProto::Udp => serve_noise_udp(send, recv, origin, &keys).await,
                     };
                 }
                 conn.closed().await;
@@ -272,7 +284,7 @@ pub async fn run_agent(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
-    origin_private: [u8; 32],
+    origin_keys: Arc<Vec<[u8; 32]>>,
 ) -> Result<(), BoxError> {
     // Shared tunnel metrics for this Agent (M14.1b), plus optional one-time
     // endpoints — set up once, outside the reconnect loop.
@@ -294,8 +306,9 @@ pub async fn run_agent(
                 }
                 let (origin, proto) = (config.origin, config.origin_proto);
                 let dmetrics = Arc::clone(&metrics);
+                let dkeys = Arc::clone(&origin_keys);
                 tokio::spawn(async move {
-                    let _ = serve_direct(listener, origin, origin_private, proto, dmetrics).await;
+                    let _ = serve_direct(listener, origin, dkeys, proto, dmetrics).await;
                 });
             }
         }
@@ -314,8 +327,13 @@ pub async fn run_agent(
             Ok(conn) => conn,
             Err(e) => {
                 if first {
-                    return run_agent_tcp_fallback(config, edge_cert.clone(), token.clone(), origin_private)
-                        .await;
+                    return run_agent_tcp_fallback(
+                        config,
+                        edge_cert.clone(),
+                        token.clone(),
+                        Arc::clone(&origin_keys),
+                    )
+                    .await;
                 }
                 eprintln!("ct-agent: edge dial failed ({e}); will reconnect");
                 match backoff.next_delay() {
@@ -344,7 +362,7 @@ pub async fn run_agent(
             &conn,
             config.origin,
             config.origin_proto,
-            &origin_private,
+            &origin_keys,
             Arc::clone(&metrics),
         )
         .await;
@@ -367,7 +385,7 @@ async fn serve_quic_connection(
     conn: &Connection,
     origin: SocketAddr,
     proto: OriginProto,
-    origin_private: &[u8; 32],
+    origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
 ) {
     loop {
@@ -375,12 +393,12 @@ async fn serve_quic_connection(
             Ok(x) => x,
             Err(_) => return,
         };
-        let opriv = *origin_private;
+        let keys = origin_keys.to_vec();
         let m = Arc::clone(&metrics);
         tokio::spawn(async move {
             let _ = match proto {
-                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &opriv, m).await,
-                OriginProto::Udp => serve_noise_udp(send, recv, origin, &opriv).await,
+                OriginProto::Tcp => serve_noise_stream(send, recv, origin, &keys, m).await,
+                OriginProto::Udp => serve_noise_udp(send, recv, origin, &keys).await,
             };
         });
     }
@@ -394,14 +412,14 @@ async fn run_agent_tcp_fallback(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
-    origin_private: [u8; 32],
+    origin_keys: Arc<Vec<[u8; 32]>>,
 ) -> Result<(), BoxError> {
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
     // single tunnel ends or the connection drops, with backoff on failure.
     let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, RECONNECT_MAX_ATTEMPTS);
     loop {
-        match tcp_connect_register_serve(config, &edge_cert, &token, &origin_private, &metrics).await {
+        match tcp_connect_register_serve(config, &edge_cert, &token, &origin_keys, &metrics).await {
             // A tunnel completed cleanly — re-register for the next client.
             Ok(()) => backoff.reset(),
             Err(e) => {
@@ -424,7 +442,7 @@ async fn tcp_connect_register_serve(
     config: &AgentConfig,
     edge_cert: &CertificateDer<'static>,
     token: &RoutingToken,
-    origin_private: &[u8; 32],
+    origin_keys: &[[u8; 32]],
     metrics: &Arc<TunnelMetrics>,
 ) -> Result<(), BoxError> {
     let mut stream = tcp_tls_connect(config.edge, edge_cert.clone()).await?;
@@ -434,7 +452,7 @@ async fn tcp_connect_register_serve(
         config.origin
     );
     let (recv, send) = split(stream);
-    serve_noise_stream(send, recv, config.origin, origin_private, Arc::clone(metrics)).await
+    serve_noise_stream(send, recv, config.origin, origin_keys, Arc::clone(metrics)).await
 }
 
 #[cfg(test)]
@@ -511,7 +529,7 @@ mod tests {
         let ca_root_a = ca_root.clone();
         let a_token = token.clone();
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root_a, a_token, origin_kp.private).await;
+            let _ = run_agent_tcp_fallback(&cfg, ca_root_a, a_token, std::sync::Arc::new(vec![origin_kp.private])).await;
         });
 
         // Wait until the agent has registered (parked) at the edge.
@@ -684,7 +702,7 @@ mod tests {
         let mcheck = std::sync::Arc::clone(&metrics);
         let (a_read, a_write) = tokio::io::split(agent_cipher);
         let agent = tokio::spawn(async move {
-            serve_noise_stream(a_write, a_read, origin_addr, &origin_priv, metrics).await
+            serve_noise_stream(a_write, a_read, origin_addr, &[origin_priv], metrics).await
         });
 
         // Initiator: handshake, then pump a 100 KB app stream over the session.
@@ -727,6 +745,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_noise_stream_selects_the_pinned_key_from_a_rotation_set() {
+        // #12 K2: an agent serving a SET of origin keys (a rotation window)
+        // terminates the handshake for the identity the client pinned, even when
+        // it isn't the first key in the set.
+        use ct_common::noise::{
+            client_handshake_for, frame, generate_static_keypair, noise_pump, read_frame,
+        };
+        use ct_common::{Capability, OriginIdentity, RoutingToken};
+        use tokio::net::TcpListener;
+
+        let old_kp = generate_static_keypair();
+        let new_kp = generate_static_keypair(); // the client pins THIS one
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0u8; 32]),
+            origin: OriginIdentity(new_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let (ini_cipher, agent_cipher) = tokio::io::duplex(64 * 1024);
+        // Rotation window: old key first, the pinned new key second.
+        let key_set = vec![old_kp.private, new_kp.private];
+        let metrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
+        let mcheck = std::sync::Arc::clone(&metrics);
+        let (a_read, a_write) = tokio::io::split(agent_cipher);
+        let agent = tokio::spawn(async move {
+            serve_noise_stream(a_write, a_read, origin_addr, &key_set, metrics).await
+        });
+
+        let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
+        let mut hs = client_handshake_for(&client_kp.private, &cap).unwrap();
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        i_write.write_all(&frame(&buf[..n])).await.unwrap();
+        let m2 = read_frame(&mut i_read).await.unwrap();
+        hs.read_message(&m2, &mut tmp).unwrap();
+        let ini_t = hs.into_transport_mode().unwrap();
+
+        let (app_local, app_remote) = tokio::io::duplex(1024 * 1024);
+        let cipher = tokio::io::join(i_read, i_write);
+        let pump = tokio::spawn(noise_pump(ini_t, cipher, app_local));
+        let (mut app_r, mut app_w) = tokio::io::split(app_remote);
+        let writer = tokio::spawn(async move {
+            app_w.write_all(b"hello-rotation").await.unwrap();
+            app_w.shutdown().await.unwrap();
+        });
+        let mut got = Vec::new();
+        app_r.read_to_end(&mut got).await.unwrap();
+
+        assert_eq!(got, b"hello-rotation", "round-trip via the pinned (non-first) key");
+        writer.await.unwrap();
+        pump.await.unwrap().unwrap();
+        agent.await.unwrap().unwrap();
+        origin.abort();
+        assert_eq!(mcheck.tunnels_opened.get(), 1, "agent selected the pinned key and served");
+    }
+
+    #[tokio::test]
     async fn serve_noise_udp_bridges_datagrams_to_origin() {
         use ct_common::noise::{client_handshake_for, frame, generate_static_keypair, read_frame};
         use ct_common::{Capability, OriginIdentity, RoutingToken};
@@ -755,7 +841,7 @@ mod tests {
         let origin_priv = origin_kp.private;
         let (a_read, a_write) = tokio::io::split(agent_cipher);
         let agent =
-            tokio::spawn(async move { serve_noise_udp(a_write, a_read, origin_addr, &origin_priv).await });
+            tokio::spawn(async move { serve_noise_udp(a_write, a_read, origin_addr, &[origin_priv]).await });
 
         // Initiator: handshake, then send discrete datagrams and read echoes.
         let (mut i_read, mut i_write) = tokio::io::split(ini_cipher);
@@ -808,7 +894,7 @@ mod tests {
         let opriv = origin_kp.private;
         let dmetrics = std::sync::Arc::new(ct_common::metrics::TunnelMetrics::new());
         let srv = tokio::spawn(async move {
-            let _ = serve_direct(listener, origin_addr, opriv, OriginProto::Tcp, dmetrics).await;
+            let _ = serve_direct(listener, origin_addr, std::sync::Arc::new(vec![opriv]), OriginProto::Tcp, dmetrics).await;
         });
 
         // Inline Client: connect directly to the listener, handshake, one payload.
@@ -867,7 +953,7 @@ mod tests {
 
         let cfg = AgentConfig::parse(&addr.to_string(), "127.0.0.1:9").unwrap();
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&cfg, cert, RoutingToken([1u8; 32]), [0u8; 32]).await;
+            let _ = run_agent(&cfg, cert, RoutingToken([1u8; 32]), std::sync::Arc::new(vec![[0u8; 32]])).await;
         });
 
         // Initial registration + one reconnect, within the backoff window.
@@ -924,7 +1010,7 @@ mod tests {
 
         let cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
         let agent = tokio::spawn(async move {
-            let _ = run_agent_tcp_fallback(&cfg, ca_root, RoutingToken([2u8; 32]), [0u8; 32]).await;
+            let _ = run_agent_tcp_fallback(&cfg, ca_root, RoutingToken([2u8; 32]), std::sync::Arc::new(vec![[0u8; 32]])).await;
         });
 
         for _ in 0..400 {
@@ -1003,7 +1089,7 @@ mod tests {
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&config, cert, token_a, origin_priv).await;
+            let _ = run_agent(&config, cert, token_a, std::sync::Arc::new(vec![origin_priv])).await;
         });
 
         let echoed = edge.await.unwrap().unwrap();

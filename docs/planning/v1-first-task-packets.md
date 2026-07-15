@@ -1041,6 +1041,12 @@ Deploy-Verifikation.
   passenden Handshake-State zurück, sonst None. Basis für ein Agent, der mehrere Origin-Identitäten
   gleichzeitig terminiert. Frozen-Test `origin_handshake_any_selects_the_pinned_identity` (Client
   pinnt A; Kandidaten {B,A} → matcht A und schließt den Handshake ab; {B,client} → None). Gate grün.
-- **K2** ⏳ Agent lädt ein Key-SET und bedient alle Identitäten im Fenster (serve_noise_stream nutzt origin_handshake_any).
+- **K2** ✅ Agent bedient ein Origin-Key-SET: origin-Key-Typ durch die ganze Serve-Kette von
+  `[u8;32]` → `Arc<Vec<[u8;32]>>` / `&[[u8;32]]` (run_agent, run_agent_tcp_fallback, serve_direct,
+  serve_quic_connection, tcp_connect_register_serve) + `serve_noise_stream`/`serve_noise_udp` nutzen
+  `origin_handshake_any`. `main` übergibt `[identity.origin_private]` (Verhalten unverändert; K3 lädt
+  mehrere). Alle Client-/Agent-Test-Call-Sites auf 1-Element-Sets angepasst. Frozen-Test
+  `serve_noise_stream_selects_the_pinned_key_from_a_rotation_set` (Set [old,new], Client pinnt new →
+  Round-trip über den nicht-ersten Key). Gate grün.
 - **K3** ⏳ Rotations-Kommando / Capability-Re-Mint-Flow.
 - **K4** ⏳ Runbook-Rotationsprozedur + Smoke (alt+neu-Capability beide Round-Trip).
