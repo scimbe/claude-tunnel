@@ -576,6 +576,36 @@ async fn landing_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(LANDING_HTML)
 }
 
+/// Build the CA-publish router (#11 C1): `GET /pki/ca` serves the edge CA root
+/// DER read from `cert_path` — the same file the edge writes (`CT_EDGE_CERT_OUT`),
+/// co-located with the control plane on the central host. This is **public key
+/// material** (the trust root, never the signing key), so publishing it over HTTP
+/// lets remote agents/clients fetch the root instead of copying it out of band.
+/// Returns 503 until the edge has written its cert. The root is stable across
+/// edge redeploys now that the CA persists (#2 `f9e64e9`).
+pub fn pki_router(cert_path: String) -> Router {
+    Router::new()
+        .route("/pki/ca", get(ca_handler))
+        .with_state(Arc::new(cert_path))
+}
+
+async fn ca_handler(State(path): State<Arc<String>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match std::fs::read(path.as_str()) {
+        Ok(der) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/x-x509-ca-cert")],
+            der,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "edge CA root not published yet",
+        )
+            .into_response(),
+    }
+}
+
 /// Build the full persistent control-plane router: enrollment + registry +
 /// billing + health, all backed by durable SQLite stores opened on **one**
 /// database file (`db_path`). The three stores share the file via separate
@@ -604,12 +634,19 @@ pub fn persistent_control_plane_router(
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
     // the three stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(enrollment.clone(), registry.clone(), ledger.clone());
+    // Publish the edge CA root (#11): read from the path the edge writes it to,
+    // co-located on the central host (CT_CP_EDGE_CERT_PATH, default matches the
+    // edge's CT_EDGE_CERT_OUT).
+    let pki = pki_router(
+        std::env::var("CT_CP_EDGE_CERT_PATH").unwrap_or_else(|_| "/shared/edge-cert.der".to_string()),
+    );
     let mut app = enrollment_router_sqlite(enrollment)
         .merge(registry_router_sqlite(registry))
         .merge(billing)
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
-        .merge(landing_router());
+        .merge(landing_router())
+        .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
     if let Some(oidc) = oidc {
@@ -1177,6 +1214,42 @@ mod tests {
             !html.contains("http://") && !html.contains("https://") && !html.contains("//cdn"),
             "no external assets (CSP-safe)"
         );
+    }
+
+    #[tokio::test]
+    async fn pki_endpoint_publishes_the_edge_ca_root() {
+        // #11 C1: GET /pki/ca serves the edge CA root DER read from the shared
+        // path, and 503s until it exists.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let der: &[u8] = b"\x30\x82\x01\x0a-fake-ca-root-der";
+        let path = std::env::temp_dir().join(format!("ct-cp-ca-{}.der", std::process::id()));
+        std::fs::write(&path, der).unwrap();
+
+        let app = pki_router(path.to_string_lossy().into_owned());
+        let resp = app
+            .oneshot(Request::get("/pki/ca").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-x509-ca-cert"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], der, "serves the exact CA root DER");
+
+        // Missing file (edge hasn't published yet) → 503.
+        let app2 = pki_router("/nonexistent/ct-edge-ca.der".to_string());
+        let resp2 = app2
+            .oneshot(Request::get("/pki/ca").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

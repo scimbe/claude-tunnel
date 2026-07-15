@@ -1008,3 +1008,16 @@ Deploy-Verifikation.
   `:9101`) + Runbook-Abschnitt „Edge data-plane metrics" (alle 6 Serien-Tabelle, Scrape-Beispiel,
   Provider-blind/Metadaten-only). Drift-Check: alle Metriknamen + `CT_EDGE_METRICS_LISTEN` code-backed.
   **🎯 #10 komplett (O1 Gauges + O2 Counter + O3 Compose/Doku) → fix-ready.**
+
+## Milestone 20 — Edge-CA-Root über Control-Plane publizieren (self-serve cross-host Cert-Distribution) — #11
+> #9 zeigte: kein cross-host Distributionskanal für die Edge-CA-Root (nur Shared-Volume). Da CP+Edge
+> auf dem zentralen Host co-lokiert sind, liest die CP die vom Edge geschriebene Cert-Datei und
+> publiziert sie über HTTP. Nur öffentliches Schlüsselmaterial (Trust-Root, nie der Signing-Key).
+- **C1** ✅ CP-Endpoint `GET /pki/ca`: `pki_router(cert_path)` liest die Edge-CA-Root-DER vom Pfad
+  (`CT_CP_EDGE_CERT_PATH`, default `/shared/edge-cert.der` = Edge-`CT_EDGE_CERT_OUT`), liefert sie mit
+  `application/x-x509-ca-cert` (200), sonst 503 (Edge hat noch nicht publiziert). In
+  `persistent_control_plane_router` gemerged. Stabil über Edge-Redeploys dank persistenter CA (#2).
+  Frozen-Test `pki_endpoint_publishes_the_edge_ca_root` (DER geschrieben → 200 + exakte Bytes +
+  Content-Type; fehlend → 503). Gate grün.
+- **C2** ⏳ Agent/Client holen die Cert von der CP (`CT_AGENT_EDGE_CERT_URL`) statt lokaler Datei.
+- **C3** ⏳ Runbook + Onboarding-Doku.
