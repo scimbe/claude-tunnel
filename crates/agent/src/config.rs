@@ -65,22 +65,29 @@ impl AgentConfig {
     /// (`tcp` | `udp`, default `tcp`) and `CT_AGENT_DIRECT_ADVERTISE` (an IP the
     /// Agent advertises for its direct-path listener; unset = P2P disabled).
     pub fn from_env() -> Result<AgentConfig, String> {
-        let edge = std::env::var("CT_AGENT_EDGE").unwrap_or_else(|_| "127.0.0.1:4433".to_string());
-        let origin =
-            std::env::var("CT_AGENT_ORIGIN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-        let proto = std::env::var("CT_AGENT_ORIGIN_PROTO").unwrap_or_else(|_| "tcp".to_string());
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Parse the config from a variable lookup. `from_env` passes
+    /// `std::env::var`; splitting the parsing out behind a getter lets every
+    /// branch (defaults, blank optionals, invalid values) be unit-tested without
+    /// mutating the global process environment (which races across tests).
+    fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<AgentConfig, String> {
+        let edge = get("CT_AGENT_EDGE").unwrap_or_else(|| "127.0.0.1:4433".to_string());
+        let origin = get("CT_AGENT_ORIGIN").unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        let proto = get("CT_AGENT_ORIGIN_PROTO").unwrap_or_else(|| "tcp".to_string());
         let mut cfg = Self::parse(&edge, &origin)?;
         cfg.origin_proto = OriginProto::parse(&proto)?;
-        cfg.direct_advertise_ip = match std::env::var("CT_AGENT_DIRECT_ADVERTISE") {
-            Ok(s) if !s.trim().is_empty() => Some(
+        cfg.direct_advertise_ip = match get("CT_AGENT_DIRECT_ADVERTISE") {
+            Some(s) if !s.trim().is_empty() => Some(
                 s.trim()
                     .parse::<IpAddr>()
                     .map_err(|e| format!("invalid CT_AGENT_DIRECT_ADVERTISE '{s}': {e}"))?,
             ),
             _ => None,
         };
-        cfg.metrics_listen = match std::env::var("CT_AGENT_METRICS_LISTEN") {
-            Ok(s) if !s.trim().is_empty() => Some(
+        cfg.metrics_listen = match get("CT_AGENT_METRICS_LISTEN") {
+            Some(s) if !s.trim().is_empty() => Some(
                 s.trim()
                     .parse::<SocketAddr>()
                     .map_err(|e| format!("invalid CT_AGENT_METRICS_LISTEN '{s}': {e}"))?,
@@ -129,5 +136,64 @@ mod tests {
     #[test]
     fn rejects_bad_origin() {
         assert!(AgentConfig::parse("10.0.0.2:4433", "nope").is_err());
+    }
+
+    // #20 TC1: cover config.rs::from_env via the from_env_with getter seam
+    // (deterministic, no global-env mutation).
+    fn get_from<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn from_env_defaults_when_all_unset() {
+        let c = AgentConfig::from_env_with(|_| None).unwrap();
+        assert_eq!(c.edge, "127.0.0.1:4433".parse().unwrap());
+        assert_eq!(c.origin, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(c.origin_proto, OriginProto::Tcp);
+        assert_eq!(c.direct_advertise_ip, None);
+        assert_eq!(c.metrics_listen, None);
+    }
+
+    #[test]
+    fn from_env_reads_every_var() {
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_EDGE", "10.0.0.2:4433"),
+            ("CT_AGENT_ORIGIN", "127.0.0.1:9000"),
+            ("CT_AGENT_ORIGIN_PROTO", "udp"),
+            ("CT_AGENT_DIRECT_ADVERTISE", "10.5.0.4"),
+            ("CT_AGENT_METRICS_LISTEN", "0.0.0.0:9101"),
+        ]))
+        .unwrap();
+        assert_eq!(c.edge, "10.0.0.2:4433".parse().unwrap());
+        assert_eq!(c.origin, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(c.origin_proto, OriginProto::Udp);
+        assert_eq!(c.direct_advertise_ip, Some("10.5.0.4".parse().unwrap()));
+        assert_eq!(c.metrics_listen, Some("0.0.0.0:9101".parse().unwrap()));
+    }
+
+    #[test]
+    fn from_env_blank_optionals_are_treated_as_unset() {
+        let c = AgentConfig::from_env_with(get_from(&[
+            ("CT_AGENT_DIRECT_ADVERTISE", "   "),
+            ("CT_AGENT_METRICS_LISTEN", ""),
+        ]))
+        .unwrap();
+        assert_eq!(c.direct_advertise_ip, None);
+        assert_eq!(c.metrics_listen, None);
+    }
+
+    #[test]
+    fn from_env_rejects_each_invalid_value() {
+        for (var, needle) in [
+            ("CT_AGENT_EDGE", "CT_AGENT_EDGE"),
+            ("CT_AGENT_ORIGIN", "CT_AGENT_ORIGIN"),
+            ("CT_AGENT_ORIGIN_PROTO", "CT_AGENT_ORIGIN_PROTO"),
+            ("CT_AGENT_DIRECT_ADVERTISE", "CT_AGENT_DIRECT_ADVERTISE"),
+            ("CT_AGENT_METRICS_LISTEN", "CT_AGENT_METRICS_LISTEN"),
+        ] {
+            let err = AgentConfig::from_env_with(get_from(&[(var, "nope")]))
+                .unwrap_err();
+            assert!(err.contains(needle), "{var}: unexpected error {err}");
+        }
     }
 }

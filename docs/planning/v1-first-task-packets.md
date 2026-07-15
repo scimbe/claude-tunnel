@@ -1064,3 +1064,27 @@ Deploy-Verifikation.
   `scripts/rotation-smoke.sh` (alt+neu-Cap round-trippen, `bash -n`+Drift grün). Gate grün.
   **🎯 #12 komplett (K1 Primitive + K2 Serve-Set + K3 Key-Set-Loading + K4 Token-erhaltender Rotate)
   → alle Akzeptanzkriterien → fix-ready.**
+
+## #20 — ct-agent Test-Coverage → 95% (lib-only)
+
+Baseline (gemessen, `cargo llvm-cov -p ct-agent`): Crate **84.9%** / lib-only **91.1%**.
+Ziel: **lib-only ≥95%** (bin/*, main.rs sind dünne Entrypoints → aus dem Nenner, TC7).
+Zu groß für einen Zyklus → dekomponiert; pro Zyklus genau EIN Sub-Paket mit Frozen-Test.
+
+- **TC1** ✅ `config.rs::from_env()` (größte Lib-Lücke, 64.9% → ~100%): testbare Naht
+  `from_env_with(get: impl Fn(&str)->Option<String>)` extrahiert, `from_env` delegiert an
+  `std::env::var`. Deckt alle Zweige OHNE globale-Env-Mutation (kein Test-Race, kein `unsafe set_var`).
+  Frozen-Tests `from_env_defaults_when_all_unset`, `from_env_reads_every_var`,
+  `from_env_blank_optionals_are_treated_as_unset`, `from_env_rejects_each_invalid_value`
+  (alle Fehler-Branches: edge/origin/proto/direct/metrics). Gate grün.
+- **TC2** ⏳ `onboard.rs::OnboardEnv::from_env()` (L79-88) — gleiche Getter-Naht.
+- **TC3** ⏳ `transport.rs` Fehler-/Setup-Branches (build_direct_listener, advertise_direct_listener,
+  present_credential, register_tunnel).
+- **TC4** ⏳ `serve.rs` reconnect-/Fehler-Branches (serve_noise_stream/-udp, serve_direct, run_agent,
+  serve_quic_connection, run_agent_tcp_fallback).
+- **TC5** ⏳ `observe.rs::serve_metrics()` — bind + ein Scrape über echten Socket.
+- **TC6** ⏳ `capability.rs` Fehler-Branches (resolve_primary_identity, load_extra_origin_keys,
+  rotate_origin_key).
+- **TC7** ⏳ Entrypoints (main.rs, bin/*) aus dem Coverage-Nenner nehmen
+  (`--ignore-filename-regex '(bin/|main\.rs)'`) ODER Prozess-Smokes. Erst wenn lib-only ≥95%
+  gemessen → #20 **fix-ready**.
