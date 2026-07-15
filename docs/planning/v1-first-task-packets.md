@@ -1100,3 +1100,22 @@ Zu groß für einen Zyklus → dekomponiert; pro Zyklus genau EIN Sub-Paket mit 
 - **TC7** ✅ Gemessen (`cargo llvm-cov -p ct-agent --ignore-filename-regex '(bin/|main\.rs)'`):
   **lib-only 95.41% Zeilen / 96.56% Funktionen** (Baseline 91.1%), ct-agent 52 → 65 Tests. Ziel erreicht
   → **#20 fix-ready** (Regions 94.05%, serve.rs die einzige Restlücke — transparent kommuniziert).
+
+## #21 — Workspace-Coverage → 95% (lib-only)
+
+Baseline (Report): Workspace 90.84% Zeilen / 89.75% Funktionen. #20 hat davon schon
+`agent/config.rs` (66%→100%) und `agent/observe.rs` (87%→97%) erledigt. Scope-Entscheidung:
+**lib-only** (dünne main.rs/bin/*-Entrypoints raus, via Shell-Smokes gedeckt), wie bei #20.
+Zu groß für einen Zyklus → dekomponiert.
+
+- **WC1** ✅ `scripts/coverage.sh` — hermetische Coverage-Messung (rust:1-slim, persistenter
+  CARGO_HOME, cargo-llvm-cov) mit `--fail-under-lines`-Gate (Default 95) und Knöpfen
+  `COVERAGE_MIN` / `COVERAGE_SCOPE` (lib|all) / `COVERAGE_PKG`. Muster wie `scripts/security-audit.sh`.
+  Verifiziert: `sh -n` grün + hermetischer Lauf `COVERAGE_PKG=ct-agent` → 95.41% Zeilen, Exit 0
+  (Gate greift). Kein Rust geändert → Cargo-Gate trivial grün.
+- **WC2** ⏳ `edge/src/config.rs` (72.22%, schlechteste testbare Datei) — Env-Parsing-Naht wie beim Agent.
+- **WC3** ⏳ `control-plane/src/oidc.rs` (88.89%) — sicherheitsrelevante OIDC-Verifikations-Branches.
+- **WC4** ⏳ `client/src/transport.rs` (83.01%) — Fehler-/Setup-Branches.
+- **WC5** ⏳ `edge/src/serve.rs` (85.08%, 97 Zeilen) + `agent/src/serve.rs` (89.80%, 82 Zeilen) —
+  Kern-Relay-Pfad, größte absolute Lücke (vermutlich mehrere Pakete).
+- **WC6** ⏳ Re-Messung mit `scripts/coverage.sh` (Workspace, lib-only); wenn ≥95% → **#21 fix-ready**.
