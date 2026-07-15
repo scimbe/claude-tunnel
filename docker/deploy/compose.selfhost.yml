@@ -54,15 +54,18 @@ services:
       CT_EDGE_LISTEN: "0.0.0.0:4433"
       CT_EDGE_POW_DIFFICULTY: "${EDGE_POW_DIFFICULTY:-16}"
       CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
-      # Expose live gauges on the internal network so the control plane can
-      # report the real tunnel count at /status (#17). Not published to the host
-      # here — that is the operator-facing concern tracked separately (#19).
+      # Expose live gauges (ct_edge_active_tunnels/-agents + relay counters, #10).
+      # The control plane scrapes this internally for /status (#17); it is also
+      # published to the host below so operators can scrape it directly (#19).
       CT_EDGE_METRICS_LISTEN: "0.0.0.0:9600"
     volumes:
       - shared:/shared
     ports:
       - "${EDGE_PORT:-4433}:4433/udp"
       - "${EDGE_PORT:-4433}:4433/tcp"
+      # Operator-facing metrics scrape endpoint (#19). Override the host port with
+      # EDGE_METRICS_PORT in .env; defaults to 9600.
+      - "${EDGE_METRICS_PORT:-9600}:9600"
     restart: unless-stopped
     depends_on:
       control-plane:
