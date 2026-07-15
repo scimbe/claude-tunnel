@@ -911,3 +911,18 @@ Deploy-Verifikation.
   das Leaf der reloaded CA). Gate 225 (+1), 0 Warnungen. Der CA-Key landet nie im Repo
   (Runtime-Pfad). Mode (b) bleibt offen (Feld: PMTU/DF ausgeschlossen, Verdacht Edge-Route/Relay-
   App-Logik) → needs-info, sobald Cert neu publiziert ist, Edge-seitiges Tracing nachziehen.
+- **#2 (mode b) Edge-seitige Relay-Diagnose** ✅ (Diagnose, kein Fix): mode (b) — frischer Token +
+  lebender Agent, aber Client-`'C'` wird nie relayed — reproduziert das Feld auf sauberem Pfad
+  (1 Hop, MTU 1500, 0% Loss; PMTU/DF ausgeschlossen). In der Single-Host-Gate nicht reproduzierbar
+  (alle e2e-Tests loopback). Statt zu raten diagnostiziert jetzt der Edge selbst: `open_agent_stream`
+  routet + öffnet den Relay-Stream mit Timeout (`RELAY_OPEN_BI_TIMEOUT` 5s < Client-8s) und liefert
+  **unterscheidbare Verdikte**: `no agent tunnel` (route-miss) vs `agent tunnel unresponsive:
+  open_bi … timed out` (registriert+lebend, aber Edge kann keinen Stream öffnen — z.B. kein
+  bidi-Stream-Credit / kaputter Rückweg). `CT_EDGE_TRACE=1` loggt jeden Entscheidungspunkt
+  (route hit/miss, open_bi ok/err/timeout) mit Token-Hex-Präfix für den Lockstep-Capture. Alle drei
+  Relay-Call-Sites (QUIC 'C', `route_and_relay`, TCP→QUIC) nutzen den Helper. Frozen-Test
+  `open_agent_stream_distinguishes_missing_from_unresponsive` (hungernder Agent = 0 bidi-Credit,
+  registriert+lebend → Edge-Timeout mit `unresponsive`; unbekannter Token → `no agent tunnel`) —
+  reproduziert die mode-b-Form (registriert+lebend, doch nicht öffenbar) erstmals in der Gate.
+  Gate 226 (+1), 0 Warnungen. needs-info bleibt: Operator deployt mit `CT_EDGE_TRACE=1`, Feld fährt
+  den timestamped Lauf → Edge-Log grep auf Token lokalisiert route-miss vs unresponsive.

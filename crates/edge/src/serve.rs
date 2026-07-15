@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::EdgeConfig;
 use crate::relay::{relay, relay_quic};
@@ -45,6 +46,67 @@ pub async fn register_agent(
     Ok(token)
 }
 
+/// How long the Edge waits for `open_bi()` to the Agent to yield a stream before
+/// declaring the tunnel unresponsive. Kept under the Client's own tunnel timeout
+/// (8 s) so the Edge fails first with a precise reason instead of the Client
+/// giving up with an opaque "no relay" (issue #2, mode b).
+const RELAY_OPEN_BI_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First 8 hex chars of a token, for correlating an Edge trace line with a
+/// field-supplied token during cross-host diagnosis.
+fn token_hex(token: &RoutingToken) -> String {
+    token.0.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Emit an Edge-side diagnostic line when `CT_EDGE_TRACE` is set. Off by default
+/// (no overhead / noise in production); enabled for a lockstep cross-host capture.
+fn edge_trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("CT_EDGE_TRACE").is_some() {
+        eprintln!("[edge-trace] {args}");
+    }
+}
+
+/// Resolve `token` to its registered Agent connection and open a relay stream to
+/// it, bounded by `timeout`. Distinguishes the two cross-host failure modes the
+/// Client can't tell apart: **no registration** (`route` miss) vs a **live but
+/// unresponsive** Agent whose `open_bi()` never yields a stream (e.g. it granted
+/// no bidi-stream credit, or the return path is broken). Traces each decision
+/// point under `CT_EDGE_TRACE` (issue #2, mode b).
+async fn open_agent_stream_with(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+    timeout: Duration,
+) -> Result<(SendStream, RecvStream), BoxError> {
+    let th = token_hex(token);
+    let Some(agent_conn) = state.route(token) else {
+        edge_trace(format_args!("route token={th} -> MISS (no registration)"));
+        return Err("no agent tunnel for token".into());
+    };
+    edge_trace(format_args!("route token={th} -> hit; opening relay stream"));
+    match tokio::time::timeout(timeout, agent_conn.open_bi()).await {
+        Ok(Ok(streams)) => {
+            edge_trace(format_args!("open_bi token={th} -> ok"));
+            Ok(streams)
+        }
+        Ok(Err(e)) => {
+            edge_trace(format_args!("open_bi token={th} -> err: {e}"));
+            Err(e.into())
+        }
+        Err(_) => {
+            edge_trace(format_args!("open_bi token={th} -> TIMED OUT after {timeout:?}"));
+            Err(format!("agent tunnel unresponsive: open_bi to {th} timed out").into())
+        }
+    }
+}
+
+/// [`open_agent_stream_with`] using the default [`RELAY_OPEN_BI_TIMEOUT`].
+async fn open_agent_stream(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+) -> Result<(SendStream, RecvStream), BoxError> {
+    open_agent_stream_with(state, token, RELAY_OPEN_BI_TIMEOUT).await
+}
+
 /// Route a resolved Client stream to the Agent tunnel serving `token` and relay
 /// bytes between them. Opens a fresh stream on the Agent's registered connection
 /// and pipes the two together (provider-blind).
@@ -54,8 +116,7 @@ pub async fn route_and_relay(
     client_send: SendStream,
     client_recv: RecvStream,
 ) -> Result<(), BoxError> {
-    let agent_conn = state.route(token).ok_or("no agent tunnel for token")?;
-    let (agent_send, agent_recv) = agent_conn.open_bi().await?;
+    let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
     relay_quic(client_send, client_recv, agent_send, agent_recv).await?;
     Ok(())
 }
@@ -101,8 +162,7 @@ pub async fn serve_connection(
             recv.read_exact(&mut req).await?;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
-            let agent_conn = state.route(&token).ok_or("no agent tunnel for token")?;
-            let (agent_send, agent_recv) = agent_conn.open_bi().await?;
+            let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
             relay_quic(send, recv, agent_send, agent_recv).await?;
             Ok(None)
         }
@@ -204,8 +264,7 @@ where
             match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
                 Err(mut stream) => {
-                    let agent_conn = state.route(&token).ok_or("no agent tunnel for token")?;
-                    let (agent_send, agent_recv) = agent_conn.open_bi().await?;
+                    let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
                     let mut agent = join(agent_recv, agent_send);
                     relay(&mut stream, &mut agent).await?;
                     Ok(())
@@ -394,6 +453,76 @@ mod tests {
         .await;
         assert!(evicted.is_ok(), "dead registration evicted after the connection dropped");
         assert!(state.candidate(&token).is_none(), "candidate evicted too");
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn open_agent_stream_distinguishes_missing_from_unresponsive() {
+        // issue #2 (mode b): the Client can't tell "no registration" from "live
+        // agent that never yields a relay stream" — both look like "no relay".
+        // The Edge must: (1) return the missing-registration error for an unknown
+        // token, and (2) time out with a distinct "unresponsive" verdict when a
+        // registered, still-connected agent grants no bidi-stream credit (so the
+        // Edge's open_bi() never completes) — instead of hanging until the Client
+        // gives up.
+        use quinn::{Endpoint, TransportConfig};
+        use std::net::Ipv4Addr;
+
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+
+        // (1) Unknown token → immediate missing-registration error.
+        let miss = open_agent_stream_with(&state, &RoutingToken([9u8; 32]), Duration::from_millis(300))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(miss.contains("no agent tunnel"), "unknown token: {miss}");
+
+        // (2) A live agent that grants the Edge zero bidi streams.
+        let token = RoutingToken([8u8; 32]);
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().unwrap();
+        let state_srv = state.clone();
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            let _ = serve_connection(&conn, &state_srv, &challenge).await;
+        });
+
+        // Starved client: allows the peer (edge) to open 0 bidi streams toward it.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        ));
+        let mut tc = TransportConfig::default();
+        tc.max_concurrent_bidi_streams(0u32.into());
+        cfg.transport_config(Arc::new(tc));
+        let mut client = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        client.set_default_client_config(cfg);
+
+        let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
+        // Registration is a client-initiated stream, so it succeeds despite the 0
+        // peer-bidi limit; the agent then stays connected.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut msg = vec![b'A'];
+        msg.extend_from_slice(&token.0);
+        send.write_all(&msg).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(8).await.unwrap(), b"OK");
+        assert!(state.route(&token).is_some(), "registered and live");
+
+        // The Edge tries to open a relay stream: it can't (0 credit) and must time
+        // out with the distinct unresponsive verdict, not hang.
+        let err = open_agent_stream_with(&state, &token, Duration::from_millis(300))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unresponsive"), "live-but-starved agent: {err}");
+
+        conn.close(0u32.into(), b"done");
         edge.abort();
     }
 
