@@ -61,6 +61,29 @@ pub fn origin_handshake(origin_private: &[u8; 32]) -> Result<snow::HandshakeStat
         .build_responder()
 }
 
+/// Try each candidate Origin private key as the responder against the Client's
+/// handshake message 1, returning the handshake state (with `msg1` already read)
+/// for whichever key **authenticates** it. In Noise_IK the initiator encrypts to
+/// the responder's static key, so only the matching private key decrypts `msg1`;
+/// a wrong key fails the AEAD tag. This lets one Agent terminate handshakes for
+/// **multiple Origin identities at once** — the basis for zero-downtime key
+/// rotation (#12): during the window the Agent holds both the old and new keys.
+/// Returns `None` if no candidate matches.
+pub fn origin_handshake_any(
+    candidates: &[[u8; 32]],
+    msg1: &[u8],
+) -> Option<snow::HandshakeState> {
+    let mut scratch = [0u8; 1024];
+    for key in candidates {
+        if let Ok(mut hs) = origin_handshake(key) {
+            if hs.read_message(msg1, &mut scratch).is_ok() {
+                return Some(hs);
+            }
+        }
+    }
+    None
+}
+
 /// Build a Client (initiator) handshake that pins the Origin Identity carried
 /// by `cap` (P3.4). The Client imports a Capability out of band, then uses its
 /// Origin Identity as the handshake's pinned remote static key.
@@ -173,6 +196,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_handshake_any_selects_the_pinned_identity() {
+        // #12 K1: a client pins origin A; an agent holding {B, A} (a rotation
+        // window) must terminate the handshake with A, and reject a candidate set
+        // that lacks the pinned identity.
+        let a = generate_static_keypair();
+        let b = generate_static_keypair();
+        let client = generate_static_keypair();
+
+        let mut ini = client_handshake(&client.private, &a.public).unwrap();
+        let mut buf = [0u8; 1024];
+        let n = ini.write_message(&[], &mut buf).unwrap();
+        let msg1 = buf[..n].to_vec();
+
+        // Candidate set contains A (in second position) → matches, and the
+        // returned responder state completes the handshake with the client.
+        let mut resp = origin_handshake_any(&[b.private, a.private], &msg1)
+            .expect("matches the pinned origin key among candidates");
+        let mut out = [0u8; 1024];
+        let m = resp.write_message(&[], &mut out).unwrap();
+        ini.read_message(&out[..m], &mut buf).unwrap();
+        assert!(
+            resp.into_transport_mode().is_ok() && ini.into_transport_mode().is_ok(),
+            "handshake completes on the selected identity"
+        );
+
+        // No candidate is the pinned identity → None.
+        assert!(
+            origin_handshake_any(&[b.private, client.private], &msg1).is_none(),
+            "rejects when the pinned origin key is absent"
+        );
+    }
 
     #[tokio::test]
     async fn noise_pump_streams_bidirectionally() {

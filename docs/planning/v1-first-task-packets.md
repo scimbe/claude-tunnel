@@ -1030,3 +1030,17 @@ Deploy-Verifikation.
   Root per einmaligem `curl /pki/ca -o edge-cert.der` → `CT_CLIENT_EDGE_CERT`). Kein ct-control-plane
   (rusqlite/axum) ins Client-Binary ziehen. **🎯 #11 komplett (C1 CP-Endpoint + C2 Agent-Fetch +
   C3 Client-curl/Doku) → fix-ready.**
+
+## Milestone 21 — Key-Rotation (Origin/Capability rotieren ohne Client-Bruch) — #12
+> Origin-Key kompromittiert/fällig → rotieren, ohne Clients mit alter Capability zu brechen. Im
+> Rotationsfenster bedient der Agent BEIDE Identitäten (Noise-Responder probiert mehrere Keys),
+> danach wird der alte Key retired. Deferred-Backlog (ADR-0013/0014).
+- **K1** ✅ Multi-Key-Origin-Handshake-Primitive `noise::origin_handshake_any(candidates, msg1)`:
+  probiert jeden Kandidaten-Origin-Private-Key als Responder gegen Client-msg1; in Noise_IK
+  entschlüsselt nur der passende Private-Key msg1 (falscher Key → AEAD-Tag-Fehler) → gibt den
+  passenden Handshake-State zurück, sonst None. Basis für ein Agent, der mehrere Origin-Identitäten
+  gleichzeitig terminiert. Frozen-Test `origin_handshake_any_selects_the_pinned_identity` (Client
+  pinnt A; Kandidaten {B,A} → matcht A und schließt den Handshake ab; {B,client} → None). Gate grün.
+- **K2** ⏳ Agent lädt ein Key-SET und bedient alle Identitäten im Fenster (serve_noise_stream nutzt origin_handshake_any).
+- **K3** ⏳ Rotations-Kommando / Capability-Re-Mint-Flow.
+- **K4** ⏳ Runbook-Rotationsprozedur + Smoke (alt+neu-Capability beide Round-Trip).
