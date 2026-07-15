@@ -926,3 +926,17 @@ Deploy-Verifikation.
   reproduziert die mode-b-Form (registriert+lebend, doch nicht öffenbar) erstmals in der Gate.
   Gate 226 (+1), 0 Warnungen. needs-info bleibt: Operator deployt mit `CT_EDGE_TRACE=1`, Feld fährt
   den timestamped Lauf → Edge-Log grep auf Token lokalisiert route-miss vs unresponsive.
+- **#2 (mode b) Edge-Relay Rückrichtung: expliziter Pump + per-Richtung-Trace** (Diagnose + plausibler Fix):
+  Feld hat mit Agent-Trace bewiesen: Vorwärts-Leg (client→agent) voll ok — `accept_bi` liefert den
+  Stream, Client-msg1 (96B) kommt an, Agent schreibt msg2 (48B) zurück + flush + noise_pump. Client
+  bekommt msg2 nie → Verlust auf **Rückrichtung (agent→edge→client)**. `relay_quic` nutzte
+  `copy_bidirectional` (opak, keine Per-Richtung-Sicht). Ersetzt durch expliziten Zwei-Richtungs-Pump
+  (`relay_pair`/`pump_dir`): jede Richtung unabhängig, **flush pro Chunk** (kleine Antwort wird sofort
+  auf die Leitung geschoben statt hinter der leerlaufenden Vorwärtsrichtung zu hängen), Per-Richtung-
+  Byte-Zähler + `CT_EDGE_TRACE` First-Byte-Log, mit Token-Label. Frozen-Test
+  `relay_delivers_the_reply_while_the_request_side_stays_open` (Client sendet msg1 und lässt offen,
+  Agent antwortet msg2 → muss beim Client ankommen; fwd=rev=4B) — genau das mode-b-Muster. Alle e2e-
+  Relay-Tests (client→edge→agent, bidirektional, noise-to-origin) grün durch den neuen Relay. Gate 227
+  (+1), 0 Warnungen. **Kein bestätigter Fix** (cross-host nicht in der Gate verifizierbar): Feld deployt
+  Edge auf diesen Rev + `CT_EDGE_TRACE=1`, re-fire → Trace zeigt fwd/rev-Bytes. rev>0 & Client bekommt
+  msg2 = gefixt; rev=0 = agent→edge-Stream-Richtung (nächster Schritt). needs-info bis Feld bestätigt.

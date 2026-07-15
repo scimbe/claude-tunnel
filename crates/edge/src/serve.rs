@@ -117,7 +117,7 @@ pub async fn route_and_relay(
     client_recv: RecvStream,
 ) -> Result<(), BoxError> {
     let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
-    relay_quic(client_send, client_recv, agent_send, agent_recv).await?;
+    relay_quic(client_send, client_recv, agent_send, agent_recv, &token_hex(token)).await?;
     Ok(())
 }
 
@@ -163,7 +163,7 @@ pub async fn serve_connection(
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
             let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-            relay_quic(send, recv, agent_send, agent_recv).await?;
+            relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
             Ok(None)
         }
         b'D' => {

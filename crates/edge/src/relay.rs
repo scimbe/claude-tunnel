@@ -6,7 +6,16 @@
 //! wires it onto paired QUIC streams (Client stream ↔ Agent tunnel).
 
 use quinn::{RecvStream, SendStream};
-use tokio::io::{copy_bidirectional, join, AsyncRead, AsyncWrite};
+use tokio::io::{
+    copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+};
+
+/// Emit an Edge relay diagnostic when `CT_EDGE_TRACE` is set (issue #2, mode b).
+fn relay_trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("CT_EDGE_TRACE").is_some() {
+        eprintln!("[edge-trace] {args}");
+    }
+}
 
 /// Relay bytes both directions between `a` and `b` until both sides close.
 /// Returns `(bytes a→b, bytes b→a)`. The bytes are never inspected.
@@ -18,17 +27,70 @@ where
     copy_bidirectional(a, b).await
 }
 
-/// Relay between a Client's QUIC stream and an Agent's QUIC tunnel stream. Each
-/// `(recv, send)` pair is joined into one duplex, then relayed via [`relay`].
+/// Pump one direction: read from `r`, write+**flush** each chunk to `w`, until
+/// `r` reaches EOF, then shut `w` down. Flushing per chunk means a small reply
+/// (e.g. a Noise handshake response) is pushed to the wire immediately instead
+/// of waiting for more source data — and the per-direction byte count + trace
+/// make a stalled direction visible in real time (issue #2, mode b: the agent's
+/// reply reached the edge but never made it back to the client).
+async fn pump_dir<R, W>(mut r: R, mut w: W, dir: &str, label: &str) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 16 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            let _ = w.shutdown().await;
+            break;
+        }
+        if total == 0 {
+            relay_trace(format_args!("relay {label} {dir}: first {n} bytes"));
+        }
+        total += n as u64;
+        w.write_all(&buf[..n]).await?;
+        w.flush().await?;
+    }
+    relay_trace(format_args!("relay {label} {dir}: {total} bytes total then EOF"));
+    Ok(total)
+}
+
+/// Relay both directions between an `a` side (`a_recv`/`a_send`) and a `b` side,
+/// pumping each direction independently so the reverse direction is never
+/// starved by the forward one. Returns `(bytes a→b, bytes b→a)`.
+async fn relay_pair<AR, AW, BR, BW>(
+    a_recv: AR,
+    a_send: AW,
+    b_recv: BR,
+    b_send: BW,
+    label: &str,
+) -> std::io::Result<(u64, u64)>
+where
+    AR: AsyncRead + Unpin,
+    AW: AsyncWrite + Unpin,
+    BR: AsyncRead + Unpin,
+    BW: AsyncWrite + Unpin,
+{
+    let fwd = pump_dir(a_recv, b_send, "a->b", label);
+    let rev = pump_dir(b_recv, a_send, "b->a", label);
+    tokio::try_join!(fwd, rev)
+}
+
+/// Relay between a Client's QUIC stream and an Agent's QUIC tunnel stream,
+/// pumping `client→agent` and `agent→client` independently (each flushed per
+/// chunk) so the agent's reply can't be stranded behind an idle forward
+/// direction. `label` (a token hex) tags the per-direction trace.
 pub async fn relay_quic(
     client_send: SendStream,
     client_recv: RecvStream,
     agent_send: SendStream,
     agent_recv: RecvStream,
+    label: &str,
 ) -> std::io::Result<(u64, u64)> {
-    let mut client = join(client_recv, client_send);
-    let mut agent = join(agent_recv, agent_send);
-    relay(&mut client, &mut agent).await
+    // a = client, b = agent: a→b is client→agent, b→a is agent→client.
+    relay_pair(client_recv, client_send, agent_recv, agent_send, label).await
 }
 
 #[cfg(test)]
@@ -64,6 +126,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_delivers_the_reply_while_the_request_side_stays_open() {
+        // issue #2 (mode b): the forward leg (client→agent) works and the agent
+        // writes its reply, but the reply must reach the client even though the
+        // client hasn't closed its send (a Noise handshake: send msg1, keep the
+        // stream open, await msg2). The reverse direction must not be starved by
+        // the idle forward direction. Drives the generic relay_pair core.
+        use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, edge_client) = duplex(1024);
+        let (edge_agent, mut agent) = duplex(1024);
+        let (ec_r, ec_w) = split(edge_client);
+        let (ea_r, ea_w) = split(edge_agent);
+
+        let relay_task =
+            tokio::spawn(async move { relay_pair(ec_r, ec_w, ea_r, ea_w, "test").await });
+
+        // Client sends msg1 and keeps its stream OPEN (no shutdown).
+        client.write_all(b"msg1").await.unwrap();
+        let mut got = [0u8; 4];
+        agent.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"msg1", "forward leg delivers the request");
+
+        // Agent replies while the forward (request) direction is still open.
+        agent.write_all(b"msg2").await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"msg2", "reply relayed back with the request side still open");
+
+        // Close both ends so the relay finishes and reports byte counts.
+        client.shutdown().await.unwrap();
+        agent.shutdown().await.unwrap();
+        let (fwd, rev) = relay_task.await.unwrap().unwrap();
+        assert_eq!((fwd, rev), (4, 4), "one message each direction");
+    }
+
+    #[tokio::test]
     async fn edge_relays_client_bytes_to_agent_over_quic() {
         use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
 
@@ -80,7 +178,7 @@ mod tests {
             let (agent_send, agent_recv) = agent_conn.open_bi().await.unwrap();
             let client_conn = server.accept().await.unwrap().await.unwrap();
             let (client_send, client_recv) = client_conn.accept_bi().await.unwrap();
-            let _ = relay_quic(client_send, client_recv, agent_send, agent_recv).await;
+            let _ = relay_quic(client_send, client_recv, agent_send, agent_recv, "test").await;
         });
 
         // Agent connects first, then reads the relayed stream to end.
