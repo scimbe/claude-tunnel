@@ -47,10 +47,22 @@ command -v curl >/dev/null || fail "curl is required"
 
 bold "=== claude-tunnel demo: reaching a PRIVATE origin through the tunnel ==="
 
-# 1. A private origin, bound to loopback, that logs every request it serves.
+# 1. A private origin, bound to loopback, that echoes and logs every request.
+# The per-request marker is written to the LOG FILE by a tiny handler, then the
+# handler execs `cat` to echo — the marker never touches stdout, which is the
+# tunnel data path. (Logging inline in `socat SYSTEM:"…"` corrupted the echoed
+# payload: socat wires the child's stdout AND stderr to the data channel, and the
+# nested shell quoting leaked `[origin]` into the stream → `tunnel response
+# mismatch`, #7 re-test. A handler script sidesteps both traps.)
 step "Starting a PRIVATE origin on 127.0.0.1:${ORIGIN_PORT} (echo; logs each request)"
-socat "TCP-LISTEN:${ORIGIN_PORT},reuseaddr,fork,bind=127.0.0.1" \
-      SYSTEM:"printf '[origin] served a request at %s\n' \"\$(date +%T)\" >>'$ORIGIN_LOG'; cat" \
+ORIGIN_HANDLER="$WORK/origin-handler.sh"
+cat > "$ORIGIN_HANDLER" <<HANDLER
+#!/bin/sh
+printf '[origin] served a request through the tunnel\n' >> "$ORIGIN_LOG"
+exec cat
+HANDLER
+chmod +x "$ORIGIN_HANDLER"
+socat "TCP-LISTEN:${ORIGIN_PORT},reuseaddr,fork,bind=127.0.0.1" EXEC:"$ORIGIN_HANDLER" \
       >/dev/null 2>&1 &
 ORIGIN_PID=$!
 sleep 1
