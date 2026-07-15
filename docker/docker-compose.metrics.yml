@@ -9,6 +9,12 @@
 # (`ct-client && metrics_probe`), so its exit code is the probe's verdict and
 # the client's own exit doesn't abort the run before the scrape happens.
 services:
+  edge:
+    # Edge data-plane observability (#10): scrape ct_edge_active_tunnels /
+    # ct_edge_active_agents / ct_edge_*_total at http://<edge>:9101/metrics.
+    environment:
+      CT_EDGE_METRICS_LISTEN: "0.0.0.0:9101"
+
   agent:
     environment:
       CT_AGENT_METRICS_LISTEN: "0.0.0.0:9100"

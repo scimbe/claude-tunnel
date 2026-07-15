@@ -1004,4 +1004,7 @@ Deploy-Verifikation.
   QUIC-'C'/`route_and_relay`/TCP-Pfad), `failovers_total` (`open_agent_stream` bei Erfolg auf
   Nicht-Primär-Agent, #8). `/metrics` rendert alle vier als Prometheus-Counter. Frozen-Test
   `cumulative_counters_render_after_activity`. Gate grün.
-- **O3** ⏳ Compose-Scrape-Overlay + Runbook-Abschnitt.
+- **O3** ✅ `docker/docker-compose.metrics.yml` um den Edge erweitert (`CT_EDGE_METRICS_LISTEN`
+  `:9101`) + Runbook-Abschnitt „Edge data-plane metrics" (alle 6 Serien-Tabelle, Scrape-Beispiel,
+  Provider-blind/Metadaten-only). Drift-Check: alle Metriknamen + `CT_EDGE_METRICS_LISTEN` code-backed.
+  **🎯 #10 komplett (O1 Gauges + O2 Counter + O3 Compose/Doku) → fix-ready.**

@@ -165,6 +165,31 @@ the serving agent, and confirms the client still gets `via=quic` off the survivo
 failover line. Keep the shared `origin.key` owner-only — it's the origin's static
 Noise secret.
 
+### Edge data-plane metrics (issue #10)
+The edge exposes Prometheus metrics for the relay itself (complementing the
+control-plane landing page and the agent `/metrics`). Enable with
+`CT_EDGE_METRICS_LISTEN` (off by default) and scrape `GET /metrics`:
+
+```bash
+CT_EDGE_METRICS_LISTEN=0.0.0.0:9101 ct-edge   # or set it in the edge container env
+curl -s http://<edge-host>:9101/metrics
+```
+
+Exposed series (metadata only — the edge stays provider-blind):
+
+| metric | type | meaning |
+|--------|------|---------|
+| `ct_edge_active_tunnels` | gauge | distinct routing tokens with ≥1 live agent |
+| `ct_edge_active_agents` | gauge | live agent registrations (redundant agents #8 counted) |
+| `ct_edge_registrations_total` | counter | agent registrations accepted since start |
+| `ct_edge_relays_total` | counter | client relays served |
+| `ct_edge_relay_bytes_total` | counter | bytes relayed (both directions) |
+| `ct_edge_failovers_total` | counter | relays that failed over to a non-primary agent (#8) |
+
+The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
+(edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
+`ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
+
 ## Incident response
 
 | Symptom | Likely cause | Action |
