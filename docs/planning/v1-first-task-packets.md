@@ -940,3 +940,14 @@ Deploy-Verifikation.
   (+1), 0 Warnungen. **Kein bestätigter Fix** (cross-host nicht in der Gate verifizierbar): Feld deployt
   Edge auf diesen Rev + `CT_EDGE_TRACE=1`, re-fire → Trace zeigt fwd/rev-Bytes. rev>0 & Client bekommt
   msg2 = gefixt; rev=0 = agent→edge-Stream-Richtung (nächster Schritt). needs-info bis Feld bestätigt.
+- **#2 AUFGELÖST — kein Defekt (Test-Harness-Origin ohne Echo).** Feld-Client-Trace zeigte: msg2
+  wurde sauber empfangen, Handshake beidseitig fertig; der Client blockierte danach auf der
+  **verschlüsselten Antwort auf sein Payload** — weil das Origin `python3 -m http.server` war, das den
+  `hello-tunnel`-Payload **nicht zurückschickt**. Mit Echo-Origin cross-host: `ct-client: tunnel
+  round-trip OK (via=quic)`, exit 0, ~2s. Also weder Relay noch msg2 noch Stream-State noch Wire —
+  ein nicht-antwortendes Origin. Konsistent mit dem Code (Agent bridged den Noise-Tunnel zum
+  Origin-Socket; antwortet das Origin nicht, hat der Client-Read nichts). Die auf dem Weg gelandeten
+  Fixes bleiben eigenständig korrekt: QUIC-Keepalive (`aa42363`→ wait, keepalive war früher),
+  Edge-Eviction (`aa42363`), persistente CA (`f9e64e9`), Relay-Diagnose (`c75fd9e`),
+  Per-Richtung-Relay-Pump (`f35f72e`). #2 geschlossen als „not a defect". Sanktionierter
+  `SMOKE OK via=quic` via `scripts/e2e-smoke.sh` (socat-Echo-Origin) als formale Bestätigung offen.
