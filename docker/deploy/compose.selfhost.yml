@@ -26,6 +26,10 @@ services:
       # the control plane mounts that volume read-only and serves the DER. Without
       # the mount, /shared/edge-cert.der is absent and /pki/ca returns 503 (#16).
       CT_CP_EDGE_CERT_PATH: "/shared/edge-cert.der"
+      # Live tunnel count for /status & the operator page (#17): the live
+      # registry is the edge's, so scrape its /metrics (ct_edge_active_tunnels)
+      # over the internal network. Falls back to the CP registry if unreachable.
+      CT_CP_EDGE_METRICS_URL: "http://edge:9600/metrics"
       # OIDC / Keycloak (verified for /me/* endpoints); set in .env.
       CT_OIDC_ISSUER: "${CT_OIDC_ISSUER:-}"
     env_file:
@@ -50,6 +54,10 @@ services:
       CT_EDGE_LISTEN: "0.0.0.0:4433"
       CT_EDGE_POW_DIFFICULTY: "${EDGE_POW_DIFFICULTY:-16}"
       CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
+      # Expose live gauges on the internal network so the control plane can
+      # report the real tunnel count at /status (#17). Not published to the host
+      # here — that is the operator-facing concern tracked separately (#19).
+      CT_EDGE_METRICS_LISTEN: "0.0.0.0:9600"
     volumes:
       - shared:/shared
     ports:

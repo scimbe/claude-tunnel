@@ -481,6 +481,13 @@ pub struct StatusState {
     registry: Arc<SqliteRegistry>,
     ledger: Arc<SqliteLedger>,
     started: std::time::Instant,
+    /// When set, `/status.tunnels` reports the edge's live registration count
+    /// scraped from this URL (the edge's `/metrics` `ct_edge_active_tunnels`
+    /// gauge, #10) instead of the CP rendezvous registry — which the live
+    /// onboard/serve path never writes, so it read 0 even with active tunnels
+    /// (#17). Falls back to the registry count if the scrape fails or is unset.
+    edge_metrics_url: Option<String>,
+    http: reqwest::Client,
 }
 
 /// Aggregated operator status — health plus metadata counts the operator
@@ -507,24 +514,67 @@ pub fn status_router(
     enrollment: Arc<SqliteEnrollment>,
     registry: Arc<SqliteRegistry>,
     ledger: Arc<SqliteLedger>,
+    edge_metrics_url: Option<String>,
 ) -> Router {
     Router::new().route("/status", get(status_handler)).with_state(StatusState {
         enrollment,
         registry,
         ledger,
         started: std::time::Instant::now(),
+        edge_metrics_url,
+        http: reqwest::Client::new(),
     })
 }
 
 async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
     Json(StatusResp {
         ready: s.ledger.ping().is_ok(),
-        tunnels: s.registry.tunnel_count().unwrap_or(0),
+        tunnels: live_tunnel_count(&s).await,
         agents: s.enrollment.agent_count().unwrap_or(0),
         accounts: s.ledger.account_count().unwrap_or(0),
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
         uptime_seconds: s.started.elapsed().as_secs(),
     })
+}
+
+/// Resolve the operator "registered tunnels" count. The live tunnel registry
+/// lives in the **edge** (`EdgeState`, evicted on drop, #8), exposed as the
+/// `ct_edge_active_tunnels` gauge on the edge `/metrics` (#10). When an edge
+/// metrics URL is configured, report that live count; otherwise (or if the
+/// scrape fails) fall back to the CP rendezvous registry. The CP registry is not
+/// written by the onboard/serve path, so without this `/status.tunnels` read 0
+/// even with active tunnels (#17).
+async fn live_tunnel_count(s: &StatusState) -> i64 {
+    if let Some(url) = &s.edge_metrics_url {
+        if let Ok(resp) = s
+            .http
+            .get(url.as_str())
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(body) = resp.text().await {
+                if let Some(n) = parse_metric(&body, "ct_edge_active_tunnels") {
+                    return n;
+                }
+            }
+        }
+    }
+    s.registry.tunnel_count().unwrap_or(0)
+}
+
+/// Parse a Prometheus gauge value by metric name from a metrics exposition body:
+/// the first `<name> <value>` sample line, ignoring `# HELP`/`# TYPE` comments.
+fn parse_metric(body: &str, name: &str) -> Option<i64> {
+    body.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| {
+            let mut it = l.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some(k), Some(v)) if k == name => v.parse::<f64>().ok().map(|f| f as i64),
+                _ => None,
+            }
+        })
 }
 
 /// The operator landing page (F4.2): a single self-contained HTML document (no
@@ -633,7 +683,14 @@ pub fn persistent_control_plane_router(
         .with_state(ledger.clone());
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
     // the three stores, plus a self-contained HTML dashboard at `/`.
-    let status = status_router(enrollment.clone(), registry.clone(), ledger.clone());
+    let status = status_router(
+        enrollment.clone(),
+        registry.clone(),
+        ledger.clone(),
+        std::env::var("CT_CP_EDGE_METRICS_URL")
+            .ok()
+            .filter(|u| !u.is_empty()),
+    );
     // Publish the edge CA root (#11): read from the path the edge writes it to,
     // co-located on the central host (CT_CP_EDGE_CERT_PATH, default matches the
     // edge's CT_EDGE_CERT_OUT).
@@ -1281,7 +1338,7 @@ mod tests {
         let pid = ledger.create_intent(&acct, 5).unwrap();
         ledger.confirm_payment(&pid).unwrap();
 
-        let app = status_router(enrollment, registry, ledger);
+        let app = status_router(enrollment, registry, ledger, None);
         let resp = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
             .await
@@ -1290,10 +1347,66 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let s: StatusResp = serde_json::from_slice(&body).unwrap();
         assert!(s.ready, "db reachable");
-        assert_eq!(s.tunnels, 1);
+        assert_eq!(s.tunnels, 1, "no edge url -> falls back to the CP registry count");
         assert_eq!(s.agents, 1);
         assert_eq!(s.accounts, 1);
         assert_eq!(s.payments_confirmed, 1);
+    }
+
+    #[test]
+    fn parse_metric_reads_the_named_gauge() {
+        let body = "# HELP ct_edge_active_tunnels x\n\
+                    # TYPE ct_edge_active_tunnels gauge\n\
+                    ct_edge_active_tunnels 4\n\
+                    ct_edge_active_agents 9\n";
+        assert_eq!(parse_metric(body, "ct_edge_active_tunnels"), Some(4));
+        assert_eq!(parse_metric(body, "ct_edge_active_agents"), Some(9));
+        assert_eq!(parse_metric(body, "nonexistent"), None);
+    }
+
+    #[tokio::test]
+    async fn status_reports_live_edge_tunnels_when_configured() {
+        // #17: the live tunnel registry lives in the edge, not the CP rendezvous
+        // registry (which the onboard/serve path never writes). With an edge
+        // metrics URL configured, /status.tunnels must report the edge's live
+        // ct_edge_active_tunnels gauge — even when the CP registry is EMPTY.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Mock edge /metrics reporting 3 live tunnels (7 redundant agents).
+        let metrics = "# HELP ct_edge_active_tunnels x\n\
+                       # TYPE ct_edge_active_tunnels gauge\n\
+                       ct_edge_active_tunnels 3\n\
+                       # TYPE ct_edge_active_agents gauge\n\
+                       ct_edge_active_agents 7\n";
+        let edge = Router::new().route("/metrics", get(move || async move { metrics }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, edge).await.unwrap() });
+
+        // CP stores with an EMPTY registry (0 rendezvous entries).
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let registry = Arc::new(SqliteRegistry::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+
+        let app = status_router(
+            enrollment,
+            registry,
+            ledger,
+            Some(format!("http://{addr}/metrics")),
+        );
+        let resp = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let s: StatusResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            s.tunnels, 3,
+            "reports the live edge tunnel count, not the empty CP registry"
+        );
     }
 
     #[tokio::test]
