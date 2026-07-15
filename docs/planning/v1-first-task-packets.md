@@ -1113,7 +1113,10 @@ Zu groß für einen Zyklus → dekomponiert.
   `COVERAGE_MIN` / `COVERAGE_SCOPE` (lib|all) / `COVERAGE_PKG`. Muster wie `scripts/security-audit.sh`.
   Verifiziert: `sh -n` grün + hermetischer Lauf `COVERAGE_PKG=ct-agent` → 95.41% Zeilen, Exit 0
   (Gate greift). Kein Rust geändert → Cargo-Gate trivial grün.
-- **WC2** ⏳ `edge/src/config.rs` (72.22%, schlechteste testbare Datei) — Env-Parsing-Naht wie beim Agent.
+- **WC2** ✅ `edge/src/config.rs` (72.22% → 97.06% Zeilen): `from_env_with(get)`-Naht wie beim Agent (TC1).
+  Frozen-Tests `from_env_defaults_when_unset`, `from_env_reads_both_vars`,
+  `from_env_rejects_each_invalid_value` (listen + difficulty), `from_env_wrapper_reads_the_process_environment`.
+  Gate grün.
 - **WC3** ⏳ `control-plane/src/oidc.rs` (88.89%) — sicherheitsrelevante OIDC-Verifikations-Branches.
 - **WC4** ⏳ `client/src/transport.rs` (83.01%) — Fehler-/Setup-Branches.
 - **WC5** ⏳ `edge/src/serve.rs` (85.08%, 97 Zeilen) + `agent/src/serve.rs` (89.80%, 82 Zeilen) —

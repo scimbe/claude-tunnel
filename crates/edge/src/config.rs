@@ -32,8 +32,15 @@ impl EdgeConfig {
     /// Read from `CT_EDGE_LISTEN` (default `0.0.0.0:4433`) and
     /// `CT_EDGE_POW_DIFFICULTY` (default `16`).
     pub fn from_env() -> Result<EdgeConfig, String> {
-        let listen = std::env::var("CT_EDGE_LISTEN").unwrap_or_else(|_| "0.0.0.0:4433".to_string());
-        let difficulty = std::env::var("CT_EDGE_POW_DIFFICULTY").unwrap_or_else(|_| "16".to_string());
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (`from_env` passes `std::env::var`). Split out
+    /// so the defaults and error branches are testable without mutating the
+    /// global process environment (which races across parallel tests).
+    fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<EdgeConfig, String> {
+        let listen = get("CT_EDGE_LISTEN").unwrap_or_else(|| "0.0.0.0:4433".to_string());
+        let difficulty = get("CT_EDGE_POW_DIFFICULTY").unwrap_or_else(|| "16".to_string());
         Self::parse(&listen, &difficulty)
     }
 }
@@ -57,5 +64,46 @@ mod tests {
     #[test]
     fn rejects_bad_difficulty() {
         assert!(EdgeConfig::parse("127.0.0.1:4433", "300").is_err());
+    }
+
+    // #21 WC2: cover from_env via the from_env_with getter seam (no global-env
+    // mutation) — edge/config.rs was the worst testable file at 72%.
+    fn get_from<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn from_env_defaults_when_unset() {
+        let c = EdgeConfig::from_env_with(|_| None).unwrap();
+        assert_eq!(c.listen, "0.0.0.0:4433".parse().unwrap());
+        assert_eq!(c.pow_difficulty, 16);
+    }
+
+    #[test]
+    fn from_env_reads_both_vars() {
+        let c = EdgeConfig::from_env_with(get_from(&[
+            ("CT_EDGE_LISTEN", "127.0.0.1:5000"),
+            ("CT_EDGE_POW_DIFFICULTY", "20"),
+        ]))
+        .unwrap();
+        assert_eq!(c.listen, "127.0.0.1:5000".parse().unwrap());
+        assert_eq!(c.pow_difficulty, 20);
+    }
+
+    #[test]
+    fn from_env_rejects_each_invalid_value() {
+        let bad_listen = EdgeConfig::from_env_with(get_from(&[("CT_EDGE_LISTEN", "nope")]))
+            .unwrap_err();
+        assert!(bad_listen.contains("CT_EDGE_LISTEN"), "{bad_listen}");
+        let bad_diff =
+            EdgeConfig::from_env_with(get_from(&[("CT_EDGE_POW_DIFFICULTY", "300")])).unwrap_err();
+        assert!(bad_diff.contains("CT_EDGE_POW_DIFFICULTY"), "{bad_diff}");
+    }
+
+    #[test]
+    fn from_env_wrapper_reads_the_process_environment() {
+        // Thin wrapper over std::env::var; no test sets CT_EDGE_* and the gate
+        // container has none, so it resolves the documented defaults.
+        assert!(EdgeConfig::from_env().is_ok());
     }
 }
