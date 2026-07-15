@@ -529,4 +529,50 @@ mod tests {
         );
         edge.abort();
     }
+
+    // #21 WC4: cover client_tunnel_noise_tcp_timed (the TLS-over-TCP timed
+    // variant, issue #2) over an in-memory duplex — both the deadline arm and
+    // the surfaced-inner-error arm, without needing a real edge.
+    #[tokio::test]
+    async fn tcp_timed_surfaces_timeout_and_inner_error() {
+        let token = RoutingToken([8u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "127.0.0.1:4433".into(),
+        };
+
+        // (a) Idle peer: the inner op blocks -> the deadline (Err) arm fires.
+        let (client_side, peer) = tokio::io::duplex(4096);
+        let start = Instant::now();
+        let r = client_tunnel_noise_tcp_timed(
+            client_side,
+            &token,
+            &cap,
+            &client_kp.private,
+            b"hi",
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(r.is_err(), "idle peer -> error, not a hang");
+        assert!(start.elapsed() < Duration::from_secs(2), "returned near the deadline");
+        drop(peer);
+
+        // (b) Closed peer: the inner op hits EOF and errors before the deadline,
+        // so the Ok(inner) arm surfaces that error.
+        let (client_side2, peer2) = tokio::io::duplex(4096);
+        drop(peer2);
+        let r2 = client_tunnel_noise_tcp_timed(
+            client_side2,
+            &token,
+            &cap,
+            &client_kp.private,
+            b"hi",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(r2.is_err(), "closed peer -> inner error surfaced");
+    }
 }

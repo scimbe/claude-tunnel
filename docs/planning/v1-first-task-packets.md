@@ -1122,7 +1122,12 @@ Zu groß für einen Zyklus → dekomponiert.
   Display. Frozen-Tests `from_rsa_pem_builds_a_verifier_from_a_public_key` (eingebetteter RSA-PUBLIC-Key
   — vom Secret-Guard erlaubt, nur PRIVATE-Keys werden geflaggt), `from_rsa_pem_rejects_malformed_pem`,
   `oidc_error_displays_a_reason`. Gate grün.
-- **WC4** ⏳ `client/src/transport.rs` (83.01%) — Fehler-/Setup-Branches.
+- **WC4** ✅ `client/src/transport.rs` (90.72% Zeilen): `client_tunnel_noise_tcp_timed` (der TLS-über-TCP
+  Timed-Wrapper, #2) war komplett ungetestet. Frozen-Test `tcp_timed_surfaces_timeout_and_inner_error`
+  deckt beide Zweige über einen In-Memory-`tokio::io::duplex` (idle Peer → Deadline-Arm; geschlossener
+  Peer → innerer Fehler wird durchgereicht) — ohne echten Edge. Gate grün.
+  (Restliche Lücken: UDP-Data-Loop-Branches + timed-QUIC-Success-Arm — Harness-lastig, in WC5 mit dem
+  Kern-Relay-Pfad.)
 - **WC5** ⏳ `edge/src/serve.rs` (85.08%, 97 Zeilen) + `agent/src/serve.rs` (89.80%, 82 Zeilen) —
   Kern-Relay-Pfad, größte absolute Lücke (vermutlich mehrere Pakete).
 - **WC6** ⏳ Re-Messung mit `scripts/coverage.sh` (Workspace, lib-only); wenn ≥95% → **#21 fix-ready**.
