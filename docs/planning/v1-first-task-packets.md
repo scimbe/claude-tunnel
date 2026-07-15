@@ -1117,7 +1117,11 @@ Zu groß für einen Zyklus → dekomponiert.
   Frozen-Tests `from_env_defaults_when_unset`, `from_env_reads_both_vars`,
   `from_env_rejects_each_invalid_value` (listen + difficulty), `from_env_wrapper_reads_the_process_environment`.
   Gate grün.
-- **WC3** ⏳ `control-plane/src/oidc.rs` (88.89%) — sicherheitsrelevante OIDC-Verifikations-Branches.
+- **WC3** ✅ `control-plane/src/oidc.rs` (88.89%): der RS256/Keycloak-Produktions-Konstruktor
+  `from_rsa_pem` (bisher ungetestet; HS256-Tests decken die geteilte subject()-Logik) + `OidcError`
+  Display. Frozen-Tests `from_rsa_pem_builds_a_verifier_from_a_public_key` (eingebetteter RSA-PUBLIC-Key
+  — vom Secret-Guard erlaubt, nur PRIVATE-Keys werden geflaggt), `from_rsa_pem_rejects_malformed_pem`,
+  `oidc_error_displays_a_reason`. Gate grün.
 - **WC4** ⏳ `client/src/transport.rs` (83.01%) — Fehler-/Setup-Branches.
 - **WC5** ⏳ `edge/src/serve.rs` (85.08%, 97 Zeilen) + `agent/src/serve.rs` (89.80%, 82 Zeilen) —
   Kern-Relay-Pfad, größte absolute Lücke (vermutlich mehrere Pakete).
