@@ -29,9 +29,25 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>) -> String {
          ct_edge_active_tunnels {tunnels}\n\
          # HELP ct_edge_active_agents Total live agent registrations (redundant agents counted).\n\
          # TYPE ct_edge_active_agents gauge\n\
-         ct_edge_active_agents {agents}\n",
+         ct_edge_active_agents {agents}\n\
+         # HELP ct_edge_registrations_total Agent registrations accepted since start.\n\
+         # TYPE ct_edge_registrations_total counter\n\
+         ct_edge_registrations_total {registrations}\n\
+         # HELP ct_edge_relays_total Client relays served since start.\n\
+         # TYPE ct_edge_relays_total counter\n\
+         ct_edge_relays_total {relays}\n\
+         # HELP ct_edge_relay_bytes_total Bytes relayed (both directions) since start.\n\
+         # TYPE ct_edge_relay_bytes_total counter\n\
+         ct_edge_relay_bytes_total {relay_bytes}\n\
+         # HELP ct_edge_failovers_total Relays that failed over to a non-primary agent.\n\
+         # TYPE ct_edge_failovers_total counter\n\
+         ct_edge_failovers_total {failovers}\n",
         tunnels = state.active_tunnels(),
         agents = state.total_registrations(),
+        registrations = state.registrations_total(),
+        relays = state.relays_total(),
+        relay_bytes = state.relay_bytes_total(),
+        failovers = state.failovers_total(),
     )
 }
 
@@ -81,6 +97,22 @@ mod tests {
         let body = render_edge_metrics(&state);
         assert!(body.contains("ct_edge_active_tunnels 2"), "{body}");
         assert!(body.contains("ct_edge_active_agents 3"), "{body}");
+    }
+
+    #[test]
+    fn cumulative_counters_render_after_activity() {
+        // #10 O2: registrations count every registration; relays/bytes/failovers
+        // reflect data-plane activity.
+        let state: EdgeState<u32> = EdgeState::new();
+        state.register(token(1), 10);
+        state.register(token(1), 11); // redundant → 2 registrations
+        state.note_relay(150);
+        state.note_failover();
+        let body = render_edge_metrics(&state);
+        assert!(body.contains("ct_edge_registrations_total 2"), "{body}");
+        assert!(body.contains("ct_edge_relays_total 1"), "{body}");
+        assert!(body.contains("ct_edge_relay_bytes_total 150"), "{body}");
+        assert!(body.contains("ct_edge_failovers_total 1"), "{body}");
     }
 
     #[tokio::test]

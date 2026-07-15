@@ -97,6 +97,9 @@ async fn open_agent_stream_with(
         match tokio::time::timeout(timeout, agent_conn.open_bi()).await {
             Ok(Ok(streams)) => {
                 edge_trace(format_args!("open_bi token={th} agent {}/{total} -> ok", i + 1));
+                if i > 0 {
+                    state.note_failover(); // served by a non-primary agent (#10 O2)
+                }
                 return Ok(streams);
             }
             Ok(Err(e)) => {
@@ -133,7 +136,8 @@ pub async fn route_and_relay(
     client_recv: RecvStream,
 ) -> Result<(), BoxError> {
     let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
-    relay_quic(client_send, client_recv, agent_send, agent_recv, &token_hex(token)).await?;
+    let (a, b) = relay_quic(client_send, client_recv, agent_send, agent_recv, &token_hex(token)).await?;
+    state.note_relay(a + b); // #10 O2
     Ok(())
 }
 
@@ -182,7 +186,8 @@ pub async fn serve_connection(
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
             let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-            relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
+            let (a, b) = relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
+            state.note_relay(a + b); // #10 O2
             Ok(None)
         }
         b'D' => {
@@ -285,7 +290,8 @@ where
                 Err(mut stream) => {
                     let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
                     let mut agent = join(agent_recv, agent_send);
-                    relay(&mut stream, &mut agent).await?;
+                    let (a, b) = relay(&mut stream, &mut agent).await?;
+                    state.note_relay(a + b); // #10 O2
                     Ok(())
                 }
             }

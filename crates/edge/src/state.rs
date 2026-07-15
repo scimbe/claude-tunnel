@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use ct_common::metrics::Counter;
 use ct_common::RoutingToken;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
@@ -39,6 +40,11 @@ pub struct EdgeState<H> {
     /// sender the Client handler uses to hand its stream to the waiting agent.
     /// Unlike QUIC agents these are single-use (one client per registration).
     tcp_agents: Mutex<HashMap<RoutingToken, oneshot::Sender<BoxedStream>>>,
+    /// Cumulative data-plane counters for observability (#10 O2).
+    registrations: Counter,
+    relays: Counter,
+    relay_bytes: Counter,
+    failovers: Counter,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -49,7 +55,34 @@ impl<H: Clone> EdgeState<H> {
             candidates: Mutex::new(HashMap::new()),
             direct: Mutex::new(HashMap::new()),
             tcp_agents: Mutex::new(HashMap::new()),
+            registrations: Counter::default(),
+            relays: Counter::default(),
+            relay_bytes: Counter::default(),
+            failovers: Counter::default(),
         }
+    }
+
+    /// Note a completed relay of `bytes` total bytes (both directions), and a
+    /// failover to a non-primary agent, for observability (#10 O2).
+    pub fn note_relay(&self, bytes: u64) {
+        self.relays.inc();
+        self.relay_bytes.add(bytes);
+    }
+    pub fn note_failover(&self) {
+        self.failovers.inc();
+    }
+    /// Cumulative counter snapshots for the metrics endpoint (#10 O2).
+    pub fn registrations_total(&self) -> u64 {
+        self.registrations.get()
+    }
+    pub fn relays_total(&self) -> u64 {
+        self.relays.get()
+    }
+    pub fn relay_bytes_total(&self) -> u64 {
+        self.relay_bytes.get()
+    }
+    pub fn failovers_total(&self) -> u64 {
+        self.failovers.get()
     }
 
     /// Park a TCP-fallback agent for `token`: returns a receiver that resolves to
@@ -105,6 +138,7 @@ impl<H: Clone> EdgeState<H> {
             .entry(token)
             .or_default()
             .push((id, handle));
+        self.registrations.inc();
         id
     }
 

@@ -999,5 +999,9 @@ Deploy-Verifikation.
   `CT_EDGE_METRICS_LISTEN` opt-in verdrahtet (default aus). Frozen-Tests
   `gauges_reflect_registered_agents` (2 Agents auf Token A + 1 auf B → tunnels 2, agents 3) +
   `metrics_endpoint_serves_prometheus` (leerer Edge → 200, `text/plain; version=0.0.4`, gauges 0).
-- **O2** ⏳ Kumulative Counter (registrations, relays, relay-bytes, failovers) in `serve_connection`/Relay.
+- **O2** ✅ Kumulative Counter in `EdgeState` (ct-common `Counter`): `registrations_total` (jede
+  Registrierung), `relays_total`/`relay_bytes_total` (nach jedem Relay via `note_relay(a+b)` in
+  QUIC-'C'/`route_and_relay`/TCP-Pfad), `failovers_total` (`open_agent_stream` bei Erfolg auf
+  Nicht-Primär-Agent, #8). `/metrics` rendert alle vier als Prometheus-Counter. Frozen-Test
+  `cumulative_counters_render_after_activity`. Gate grün.
 - **O3** ⏳ Compose-Scrape-Overlay + Runbook-Abschnitt.
