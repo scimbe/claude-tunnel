@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ct_common::RoutingToken;
@@ -24,7 +25,12 @@ pub type BoxedStream = Box<dyn DuplexStream>;
 /// Agent's Edge-observed peer candidate (its reflexive address) for P2P
 /// rendezvous (M11.1).
 pub struct EdgeState<H> {
-    agents: Mutex<HashMap<RoutingToken, H>>,
+    /// Live Agent tunnels per token. **Multiple** Agents may register the same
+    /// token for redundancy/failover (#8); each is tagged with a monotonic
+    /// registration id so exactly one can be evicted when its connection drops.
+    agents: Mutex<HashMap<RoutingToken, Vec<(u64, H)>>>,
+    /// Source of monotonic registration ids.
+    next_reg: AtomicU64,
     candidates: Mutex<HashMap<RoutingToken, SocketAddr>>,
     /// Agent-advertised direct-path listener: (address, cert DER) a Client can
     /// connect to directly, bypassing the Edge relay (M11.4b).
@@ -39,6 +45,7 @@ impl<H: Clone> EdgeState<H> {
     pub fn new() -> Self {
         Self {
             agents: Mutex::new(HashMap::new()),
+            next_reg: AtomicU64::new(1),
             candidates: Mutex::new(HashMap::new()),
             direct: Mutex::new(HashMap::new()),
             tcp_agents: Mutex::new(HashMap::new()),
@@ -85,16 +92,33 @@ impl<H: Clone> EdgeState<H> {
         self.direct.lock().unwrap().get(token).cloned()
     }
 
-    /// Register (or replace) the Agent tunnel serving `token`.
-    pub fn register(&self, token: RoutingToken, handle: H) {
-        self.agents.lock().unwrap().insert(token, handle);
+    /// Register an Agent tunnel serving `token`, returning a **registration id**.
+    /// Multiple Agents may register the same token for redundancy/failover (#8);
+    /// the id lets exactly this registration be evicted (via
+    /// [`remove_registration`](Self::remove_registration)) when its connection
+    /// drops, without disturbing the other Agents serving the token.
+    pub fn register(&self, token: RoutingToken, handle: H) -> u64 {
+        let id = self.next_reg.fetch_add(1, Ordering::Relaxed);
+        self.agents
+            .lock()
+            .unwrap()
+            .entry(token)
+            .or_default()
+            .push((id, handle));
+        id
     }
 
     /// Register the Agent tunnel and record its Edge-observed peer candidate —
-    /// the reflexive address a Client will hole-punch toward (M11.1).
-    pub fn register_with_candidate(&self, token: RoutingToken, handle: H, candidate: SocketAddr) {
+    /// the reflexive address a Client will hole-punch toward (M11.1). Returns the
+    /// registration id (see [`register`](Self::register)).
+    pub fn register_with_candidate(
+        &self,
+        token: RoutingToken,
+        handle: H,
+        candidate: SocketAddr,
+    ) -> u64 {
         self.candidates.lock().unwrap().insert(token.clone(), candidate);
-        self.register(token, handle);
+        self.register(token, handle)
     }
 
     /// The Agent's Edge-observed peer candidate for `token`, if recorded.
@@ -102,12 +126,42 @@ impl<H: Clone> EdgeState<H> {
         self.candidates.lock().unwrap().get(token).copied()
     }
 
-    /// Route `token` to its Agent tunnel handle, if registered.
+    /// Route `token` to a live Agent tunnel handle, if any. Returns the **most
+    /// recently registered** Agent, so a reconnecting Agent is preferred over its
+    /// own dying registration and, with redundant Agents (#8), the newest serves
+    /// (the next takes over on its drop).
     pub fn route(&self, token: &RoutingToken) -> Option<H> {
-        self.agents.lock().unwrap().get(token).cloned()
+        self.agents
+            .lock()
+            .unwrap()
+            .get(token)
+            .and_then(|v| v.last().map(|(_, h)| h.clone()))
     }
 
-    /// Remove the Agent tunnel (and its candidate + direct endpoint) for `token`.
+    /// Number of redundant Agent registrations currently serving `token` (#8).
+    pub fn registration_count(&self, token: &RoutingToken) -> usize {
+        self.agents.lock().unwrap().get(token).map_or(0, Vec::len)
+    }
+
+    /// Evict exactly the registration `id` for `token` — an Agent whose
+    /// connection dropped — leaving any other redundant Agents in place (#8).
+    /// The token's candidate/direct entries are cleared only when the **last**
+    /// Agent for the token is gone.
+    pub fn remove_registration(&self, token: &RoutingToken, id: u64) {
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(v) = agents.get_mut(token) {
+            v.retain(|(rid, _)| *rid != id);
+            if v.is_empty() {
+                agents.remove(token);
+                drop(agents);
+                self.candidates.lock().unwrap().remove(token);
+                self.direct.lock().unwrap().remove(token);
+            }
+        }
+    }
+
+    /// Remove **all** Agent tunnels (and candidate + direct + tcp) for `token` —
+    /// a full teardown, regardless of how many redundant Agents serve it.
     pub fn remove(&self, token: &RoutingToken) {
         self.agents.lock().unwrap().remove(token);
         self.candidates.lock().unwrap().remove(token);
@@ -115,9 +169,13 @@ impl<H: Clone> EdgeState<H> {
         self.tcp_agents.lock().unwrap().remove(token);
     }
 
-    /// Whether `token` currently has a live Agent tunnel.
+    /// Whether `token` currently has at least one live Agent tunnel.
     pub fn is_known(&self, token: &RoutingToken) -> bool {
-        self.agents.lock().unwrap().contains_key(token)
+        self.agents
+            .lock()
+            .unwrap()
+            .get(token)
+            .is_some_and(|v| !v.is_empty())
     }
 }
 
@@ -148,6 +206,35 @@ mod tests {
         let state: EdgeState<u32> = EdgeState::new();
         assert_eq!(state.route(&token(9)), None);
         assert!(!state.is_known(&token(9)));
+    }
+
+    #[test]
+    fn redundant_agents_fail_over_on_registration_drop() {
+        // #8 R1: two Agents register the same token; routing prefers the most
+        // recent, and evicting one registration fails over to the other without
+        // disturbing it — the whole point of Agent redundancy.
+        let state: EdgeState<u32> = EdgeState::new();
+        let t = token(1);
+        let a = state.register(t.clone(), 10); // Agent A
+        let b = state.register(t.clone(), 20); // Agent B (more recent)
+        assert_eq!(state.registration_count(&t), 2, "both agents registered");
+        assert_eq!(state.route(&t), Some(20), "most-recent agent serves");
+
+        // Agent B's connection drops → evict just B → fail over to A.
+        state.remove_registration(&t, b);
+        assert_eq!(state.route(&t), Some(10), "failover to the surviving agent");
+        assert_eq!(state.registration_count(&t), 1);
+        assert!(state.is_known(&t), "tunnel still up on one agent");
+
+        // Evicting an already-gone id is a no-op (idempotent).
+        state.remove_registration(&t, b);
+        assert_eq!(state.route(&t), Some(10));
+
+        // Last agent drops → tunnel is gone and its metadata is cleaned up.
+        state.remove_registration(&t, a);
+        assert_eq!(state.route(&t), None, "no agents left");
+        assert!(!state.is_known(&t));
+        assert_eq!(state.registration_count(&t), 0);
     }
 
     #[test]

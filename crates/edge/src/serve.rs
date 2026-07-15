@@ -129,7 +129,7 @@ pub async fn serve_connection(
     conn: &Connection,
     state: &EdgeState<Connection>,
     challenge: &Challenge,
-) -> Result<Option<RoutingToken>, BoxError> {
+) -> Result<Option<(RoutingToken, u64)>, BoxError> {
     let (mut send, mut recv) = conn.accept_bi().await?;
     let mut role = [0u8; 1];
     recv.read_exact(&mut role).await?;
@@ -139,18 +139,21 @@ pub async fn serve_connection(
             let mut token = [0u8; 32];
             recv.read_exact(&mut token).await?;
             let token = RoutingToken(token);
-            state.register_with_candidate(token.clone(), conn.clone(), conn.remote_address());
+            let reg = state.register_with_candidate(token.clone(), conn.clone(), conn.remote_address());
             send.write_all(b"OK").await?;
             send.finish()?;
-            // Return the registered token so the caller can evict it when the
-            // agent's connection drops — issue #2 (mode a): a dropped agent's
-            // registration was never removed, so a later Client `route()` kept
-            // resolving to a dead `Connection` whose `open_bi()` stalls/errors
-            // instead of failing fast with "no agent tunnel". Eviction lives in
-            // `run_edge`, which owns the connection lifetime; keeping this path
-            // non-blocking preserves the "register then return" contract the
-            // relay harnesses depend on (they serve 'A' then 'C' on one task).
-            Ok(Some(token))
+            // Return the (token, registration id) so the caller can evict exactly
+            // THIS agent when its connection drops — issue #2 (mode a): a dropped
+            // agent's registration was never removed, so a later Client `route()`
+            // kept resolving to a dead `Connection` whose `open_bi()` stalls.
+            // The registration id (not just the token) is what makes eviction
+            // precise now that multiple agents may register one token for
+            // redundancy (#8): dropping one must not disturb the others.
+            // Eviction lives in `run_edge`, which owns the connection lifetime;
+            // keeping this path non-blocking preserves the "register then return"
+            // contract the relay harnesses depend on (they serve 'A' then 'C' on
+            // one task).
+            Ok(Some((token, reg)))
         }
         b'C' => {
             let mut chal = [0u8; 17];
@@ -335,10 +338,12 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let challenge = Challenge { nonce, difficulty };
                 let registered = serve_connection(&conn, &state, &challenge).await;
                 conn.closed().await;
-                // Evict a dropped agent's registration so a later Client
-                // route() fails fast instead of hitting a dead handle (#2).
-                if let Ok(Some(token)) = registered {
-                    state.remove(&token);
+                // Evict exactly this dropped agent's registration so a later
+                // Client route() fails fast instead of hitting a dead handle (#2)
+                // — and, with redundant agents (#8), so the OTHER agents serving
+                // the same token keep the tunnel up.
+                if let Ok(Some((token, reg))) = registered {
+                    state.remove_registration(&token, reg);
                 }
             }
         });
@@ -415,15 +420,15 @@ mod tests {
                 nonce: [0u8; 16],
                 difficulty: 0,
             };
-            // Mirror run_edge: serve, then on close evict the returned token.
+            // Mirror run_edge: serve, then on close evict the returned registration.
             let registered = serve_connection(&conn, &state_srv, &challenge).await;
             assert!(
                 matches!(&registered, Ok(Some(_))),
-                "'A' registration returns its token for eviction"
+                "'A' registration returns its (token, id) for eviction"
             );
             conn.closed().await;
-            if let Ok(Some(token)) = registered {
-                state_srv.remove(&token);
+            if let Ok(Some((token, reg))) = registered {
+                state_srv.remove_registration(&token, reg);
             }
         });
 

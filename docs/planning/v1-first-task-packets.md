@@ -951,3 +951,23 @@ Deploy-Verifikation.
   Edge-Eviction (`aa42363`), persistente CA (`f9e64e9`), Relay-Diagnose (`c75fd9e`),
   Per-Richtung-Relay-Pump (`f35f72e`). #2 geschlossen als „not a defect". Sanktionierter
   `SMOKE OK via=quic` via `scripts/e2e-smoke.sh` (socat-Echo-Origin) als formale Bestätigung offen.
+
+## Milestone 18 — Agent-Redundanz (mehrere Agents pro Tunnel, Failover) — #8
+> Produktions-HA auf der Origin-Seite: mehrere Agents dürfen denselben Routing-Token
+> registrieren; der Edge failovert auf einen überlebenden Agent, wenn einer wegbricht.
+> Komplement zu Reconnect (#5) und zur Eviction (`aa42363`).
+- **R1** ✅ EdgeState-Multi-Agent-Primitive: `agents` von `HashMap<Token, H>` → `HashMap<Token,
+  Vec<(u64, H)>>` (monotone Registrierungs-Id via `AtomicU64`). `register`/`register_with_candidate`
+  geben die Reg-Id zurück; `route` liefert den **zuletzt** registrierten Agent (reconnectender Agent
+  wird der eigenen sterbenden Registrierung vorgezogen; bei Redundanz bedient der neueste, der nächste
+  übernimmt beim Drop); `remove_registration(token, id)` evictet **genau einen** Agent (Kandidat/Direct
+  erst beim letzten bereinigt); `remove(token)` bleibt Full-Teardown; `registration_count` neu.
+  `serve_connection` gibt jetzt `(RoutingToken, u64)` zurück, `run_edge` evictet via
+  `remove_registration` — ein wegbrechender Agent stört die anderen für denselben Token nicht mehr.
+  Frozen-Test `redundant_agents_fail_over_on_registration_drop` (2 Agents, route bevorzugt neuesten,
+  Evict → Failover auf Überlebenden, idempotent, letzter weg → Tunnel weg). Alle Edge-/e2e-Relay-Tests
+  grün durch die geänderte Registry. **fix-ready erst wenn R1–R4 alle Akzeptanzkriterien erfüllen.**
+- **R2** ⏳ Edge-Relay-Failover-Retry: schlägt `open_bi()` zum gewählten Agent fehl, den nächsten
+  Live-Agent probieren (deckt das Dead-but-not-yet-evicted-Rennen ab).
+- **R3** ⏳ Round-Robin/Lastverteilung über redundante Agents (optional).
+- **R4** ⏳ Runbook + Smoke/Demo für redundante Agents (einen mitten im Tunnel killen → Tunnel überlebt).
