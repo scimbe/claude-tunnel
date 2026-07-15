@@ -650,4 +650,59 @@ mod tests {
         assert_eq!(loaded, cert, "agent loads the edge cert from the shared file");
         let _ = std::fs::remove_file(&path);
     }
+
+    // #20 TC3: a mock edge that reads one bi-stream request and replies with a
+    // fixed ack — lets us drive the reject branches the real edge never takes.
+    async fn mock_edge_replying(
+        ack: &'static [u8],
+    ) -> (SocketAddr, CertificateDer<'static>, tokio::task::JoinHandle<()>) {
+        let (server, cert) = ct_edge::transport::build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let h = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let _ = recv.read_to_end(8192).await.unwrap();
+            send.write_all(ack).await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+        (addr, cert, h)
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_surfaces_an_edge_rejection() {
+        let (addr, cert, edge) = mock_edge_replying(b"NO").await;
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        let err = register_tunnel(&conn, &RoutingToken([3u8; 32]))
+            .await
+            .err()
+            .expect("non-OK ack must error")
+            .to_string();
+        assert!(err.contains("rejected tunnel registration"), "{err}");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn advertise_direct_listener_roundtrips_and_surfaces_rejection() {
+        let (_ep, dcert) = build_direct_listener().expect("direct listener");
+        let dummy: SocketAddr = "10.5.0.4:40001".parse().unwrap();
+        let token = RoutingToken([4u8; 32]);
+
+        for (ack, expect_ok) in [(&b"OK"[..], true), (&b"NO"[..], false)] {
+            let (addr, cert, edge) = mock_edge_replying(ack).await;
+            let conn = dial_quic(addr, cert).await.expect("dial");
+            let res = advertise_direct_listener(&conn, &token, dummy, &dcert).await;
+            assert_eq!(res.is_ok(), expect_ok, "ack={ack:?}");
+            if !expect_ok {
+                assert!(res
+                    .err()
+                    .expect("rejected")
+                    .to_string()
+                    .contains("advertisement rejected"));
+            }
+            conn.close(0u32.into(), b"done");
+            let _ = edge.await;
+        }
+    }
 }

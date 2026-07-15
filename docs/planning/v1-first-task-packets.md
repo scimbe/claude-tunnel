@@ -1082,8 +1082,12 @@ Zu groß für einen Zyklus → dekomponiert; pro Zyklus genau EIN Sub-Paket mit 
   `onboard_from_env_reads_required_vars_and_delegates_config` (alle 3 Pflichtvars + Config-Delegation,
   Proto fließt durch) und `onboard_from_env_requires_each_var` (jede fehlende Pflichtvar → spezifischer
   Fehler). Gate grün.
-- **TC3** ⏳ `transport.rs` Fehler-/Setup-Branches (build_direct_listener, advertise_direct_listener,
-  present_credential, register_tunnel).
+- **TC3** ✅ `transport.rs` Fehler-Branches: `present_credential` war bereits gedeckt
+  (`agent_authenticates…` + `edge_rejects_expired_credential`). Neu ein Mock-Edge-Helper
+  `mock_edge_replying(ack)` (liest einen Bi-Stream, antwortet mit fixem Ack) → deckt die
+  Reject-Zweige, die der echte Edge nie nimmt. Frozen-Tests `register_tunnel_surfaces_an_edge_rejection`
+  (non-OK → "rejected tunnel registration") und `advertise_direct_listener_roundtrips_and_surfaces_rejection`
+  (OK-Happy-Path + non-OK → "advertisement rejected"; deckt auch `build_direct_listener`). Gate grün.
 - **TC4** ⏳ `serve.rs` reconnect-/Fehler-Branches (serve_noise_stream/-udp, serve_direct, run_agent,
   serve_quic_connection, run_agent_tcp_fallback).
 - **TC5** ⏳ `observe.rs::serve_metrics()` — bind + ein Scrape über echten Socket.
