@@ -981,4 +981,10 @@ Deploy-Verifikation.
   gleicher Token/Key/Identity; Default → eindeutig). Gate grün. (Ersten Agent zuerst starten, damit
   die geteilten Dateien existieren.)
 - **R3** ⏳ Round-Robin/Lastverteilung über redundante Agents (optional).
-- **R4** ⏳ Runbook + Smoke/Demo für redundante Agents (einen mitten im Tunnel killen → Tunnel überlebt).
+- **R4b** ✅ Runbook-Abschnitt „Run redundant agents (HA origin)" + `scripts/redundancy-smoke.sh`:
+  ein Echo-Origin, zwei Agents mit geteilter Identität (`CT_AGENT_ORIGIN_KEY`), Client-Round-Trip,
+  dann den bedienenden Agent killen → Client bekommt weiter `via=quic` vom Überlebenden
+  (`REDUNDANCY OK`). Frozen: `bash -n` grün + Drift-Check (alle CT_*-Env-Vars, `CT_AGENT_ORIGIN_KEY`,
+  `round-trip OK`/`via=`, `/enroll/issue` code-backed). **🎯 #8 komplett (R1 Registry + R2 Failover +
+  R4a Shared-Identity + R4b Doku/Smoke) → alle Akzeptanzkriterien erfüllt → fix-ready. R3 (Round-
+  Robin/Last) optional/deferred.**

@@ -135,6 +135,36 @@ Example output:
 Cross-host `via=quic` requires the agent-side keepalive (issue #2, on `main`);
 without it the demo can still run locally/loopback.
 
+### Run redundant agents (HA origin, issue #8)
+Run **two or more agents for one tunnel** so it survives an agent (or host) dying.
+Redundant agents must share **one identity** (same routing token + origin key), so
+point them at the same `CT_AGENT_ORIGIN_KEY` + `CT_AGENT_CAPABILITY_OUT` paths on a
+shared volume. The **first** agent generates and persists the identity; later
+agents load it. Start the primary first so the shared files exist:
+
+```bash
+# agent 1 (primary — creates the shared identity):
+CT_AGENT_JOIN_TOKEN=<tok> CT_AGENT_ORIGIN_KEY=/shared/origin.key \
+  CT_AGENT_CAPABILITY_OUT=/shared/capability.bin CT_AGENT_ORIGIN=127.0.0.1:8081 ct-agent onboard
+# agent 2+ (redundant — load the same identity, same origin):
+CT_AGENT_JOIN_TOKEN=<tok2> CT_AGENT_ORIGIN_KEY=/shared/origin.key \
+  CT_AGENT_CAPABILITY_OUT=/shared/capability.bin CT_AGENT_ORIGIN=127.0.0.1:8081 ct-agent onboard
+```
+
+The edge tracks every agent registered for the token and **routes to the most
+recent**, failing over to a survivor when one drops — evicting only the dropped
+agent's registration, never the others. Verify it end to end with:
+
+```bash
+CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der ./scripts/redundancy-smoke.sh
+```
+
+which brings up two agents on one origin, establishes a client round-trip, kills
+the serving agent, and confirms the client still gets `via=quic` off the survivor
+(`REDUNDANCY OK`). With `CT_EDGE_TRACE=1` on the edge you'll see the `agent 2/2`
+failover line. Keep the shared `origin.key` owner-only — it's the origin's static
+Noise secret.
+
 ## Incident response
 
 | Symptom | Likely cause | Action |
