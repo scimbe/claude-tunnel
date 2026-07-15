@@ -1048,5 +1048,14 @@ Deploy-Verifikation.
   mehrere). Alle Client-/Agent-Test-Call-Sites auf 1-Element-Sets angepasst. Frozen-Test
   `serve_noise_stream_selects_the_pinned_key_from_a_rotation_set` (Set [old,new], Client pinnt new →
   Round-trip über den nicht-ersten Key). Gate grün.
-- **K3** ⏳ Rotations-Kommando / Capability-Re-Mint-Flow.
-- **K4** ⏳ Runbook-Rotationsprozedur + Smoke (alt+neu-Capability beide Round-Trip).
+- **K3** ✅ Agent lädt ein Key-SET: `ServingIdentity.origin_private` → `origin_keys: Vec<[u8;32]>`
+  (Primary zuerst); `resolve_serving_identity(..., extra_keys_dir)` hängt zusätzliche 32-Byte-Key-
+  Dateien aus `CT_AGENT_ORIGIN_KEY_DIR` an (sortiert, Nicht-32-Byte ignoriert, fehlendes Dir → leer).
+  `main` liest die Env und übergibt das Set an `run_agent`. K3 ist NUR der Lade-Mechanismus
+  (mehrere Origin-Keys halten). Frozen-Test `rotation_dir_adds_old_keys_alongside_the_primary`
+  (2 alte Keys im Dir → 3 Keys, Primary zuerst, Nicht-Key ignoriert). Gate grün.
+- **K4** ⏳ **Token-erhaltender Rotate**: Damit alte Clients während des Fensters weiter *routen*,
+  muss der Routing-Token GLEICH bleiben und nur die Origin-Identität (Key) rotieren. Braucht ein
+  `rotate`-Kommando (neue Cap = gleicher Token + neuer Origin-Pubkey, alten Key in den Dir) —
+  `mint_capability` erzeugt aktuell einen Zufalls-Token, daher separates Re-Mint nötig. Plus
+  Runbook-Prozedur + Smoke (alt+neu-Capability round-trippen mit gleichem Token, ein Key gekillt).

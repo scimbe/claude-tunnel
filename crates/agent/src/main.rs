@@ -64,15 +64,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // in the Capability. The private half stays here to terminate the E2E
     // handshake (M8.3). With CT_AGENT_ORIGIN_KEY set, the key + capability are
     // persisted/shared so multiple agents can serve one tunnel (redundancy, #8).
+    // With CT_AGENT_ORIGIN_KEY_DIR set, additional (retired) origin keys in that
+    // directory are also served, so old capabilities keep working during a key
+    // rotation window (#12).
     let origin_key_path = std::env::var("CT_AGENT_ORIGIN_KEY").ok();
-    let identity = resolve_serving_identity(origin_key_path.as_deref(), &cap_out, &config.edge.to_string())?;
+    let origin_key_dir = std::env::var("CT_AGENT_ORIGIN_KEY_DIR").ok();
+    let identity = resolve_serving_identity(
+        origin_key_path.as_deref(),
+        &cap_out,
+        &config.edge.to_string(),
+        origin_key_dir.as_deref(),
+    )?;
     eprintln!(
-        "ct-agent: edge={} origin={} capability -> {}{}",
+        "ct-agent: edge={} origin={} capability -> {} (serving {} origin identit{}){}",
         config.edge,
         config.origin,
         cap_out,
+        identity.origin_keys.len(),
+        if identity.origin_keys.len() == 1 { "y" } else { "ies" },
         match &origin_key_path {
-            Some(p) => format!(" (shared identity, origin key {p})"),
+            Some(p) => format!(", shared origin key {p}"),
             None => String::new(),
         }
     );
@@ -81,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config,
         edge_cert,
         identity.cap.token,
-        std::sync::Arc::new(vec![identity.origin_private]),
+        std::sync::Arc::new(identity.origin_keys),
     )
     .await
 }
