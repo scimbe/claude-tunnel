@@ -1216,7 +1216,15 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
     `authorize_host`/`host_bind_allowed`) und CP (`create_tunnel` → 400 bei ungültig). Frozen-Tests
     `normalize_hostname_canonicalizes_and_validates` (common), `host_normalization_collapses_trailing_dot_and_rejects_junk`
     (edge), `create_tunnel_rejects_an_invalid_hostname` (CP). Voller Workspace-Gate grün.
-  - **#40 (Feld-Bug) ✅** SNI-Passthrough routete nie zum Agenten: der Agent öffnet nach `'A'` einen SEPARATEN `'H'`-Stream, aber der Edge bearbeitete pro Verbindung nur EINEN Stream → `route_host` fand nichts. Fix: `serve_agent_connection` akzeptiert weitere Streams derselben Agent-Verbindung bis zum Close. QUIC-Integrationstest `agent_registers_and_binds_hostname_over_one_connection` (A + H über eine Verbindung → `route_host` löst auf). Der BP3b-Unit-Test hatte den 'H'-Handler direkt getrieben und den Multi-Stream-Flow verfehlt.
+  - **#41 (Feld-Bug) Browser-Plane über TLS-TCP-Fallback** — der TCP-Fallback (ADR-0004, für UDP/QUIC-blockierte Netze)
+  konnte nie einen Hostnamen binden: Single-Stream, kein separates `'H'` möglich. Dekomponiert FB1..FB3:
+  - **FB1** ✅ Neue Edge-Rolle `'B'` (Browser-Register) im TCP-Fallback (`serve_tcp_connection`):
+    `'B' | token(32) | host_len(2) | host` → registriert Tunnel **und** bindet Hostname in EINER Nachricht
+    (gleiche Gates wie QUIC-`'H'`: BP4b-Autz + Takeover-sicher), dann park+relay. Frozen-Test
+    `tcp_fallback_browser_register_binds_hostname` (In-Memory-Duplex: `'B'`+Host → `route_host` löst auf). Gate grün (ct-edge 68).
+  - **FB2** ⏳ `serve_sni_passthrough` an TCP-Fallback-Agenten relayen (`has_tcp_agent`/`deliver_to_tcp_agent` statt QUIC-`open_agent_stream`).
+  - **FB3** ⏳ Agent: im Browser-Modus über den TCP-Fallback `'B'` senden (statt `'A'`, kein separates `bind_hostname`).
+- **#40 (Feld-Bug) ✅** SNI-Passthrough routete nie zum Agenten: der Agent öffnet nach `'A'` einen SEPARATEN `'H'`-Stream, aber der Edge bearbeitete pro Verbindung nur EINEN Stream → `route_host` fand nichts. Fix: `serve_agent_connection` akzeptiert weitere Streams derselben Agent-Verbindung bis zum Close. QUIC-Integrationstest `agent_registers_and_binds_hostname_over_one_connection` (A + H über eine Verbindung → `route_host` löst auf). Der BP3b-Unit-Test hatte den 'H'-Handler direkt getrieben und den Multi-Stream-Flow verfehlt.
 - **BP4b ✅ komplett** — `:443` ist jetzt sicher exponierbar (mit `CT_EDGE_REQUIRE_HOST_AUTH`): nur CP-autorisierte,
     validierte Hostnamen; takeover-sicher (BP4a); Reconnect-fest. Review-Punkte #1 + #2 + #3 adressiert.
 - **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur

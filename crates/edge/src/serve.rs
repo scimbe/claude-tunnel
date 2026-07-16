@@ -416,6 +416,39 @@ where
                 Err(_) => Ok(()),
             }
         }
+        b'B' => {
+            // Browser register (#41 FB1): register the tunnel AND bind a public
+            // hostname in ONE message — the TLS-TCP fallback has a single stream,
+            // so it can't carry a separate 'H' bind like the QUIC path. Wire:
+            // `'B' | token(32) | host_len(2 BE) | host`.
+            let mut token_buf = [0u8; 32];
+            stream.read_exact(&mut token_buf).await?;
+            let token = RoutingToken(token_buf);
+            let mut hl = [0u8; 2];
+            stream.read_exact(&mut hl).await?;
+            let hlen = u16::from_be_bytes(hl) as usize;
+            if hlen == 0 || hlen > 253 {
+                return Err("invalid Browser-Plane hostname length".into());
+            }
+            let mut host = vec![0u8; hlen];
+            stream.read_exact(&mut host).await?;
+            let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
+            // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
+            if !state.host_bind_allowed(host, &token) || !state.register_host(host, token.clone()) {
+                stream.write_all(b"NO").await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+            stream.write_all(b"OK").await?;
+            stream.flush().await?;
+            match state.park_tcp_agent(token).await {
+                Ok(mut client) => {
+                    relay(&mut stream, &mut client).await?;
+                    Ok(())
+                }
+                Err(_) => Ok(()),
+            }
+        }
         b'C' => {
             let mut chal = [0u8; 17];
             chal[..16].copy_from_slice(&challenge.nonce);
@@ -688,6 +721,38 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_browser_register_binds_hostname() {
+        // #41 FB1: 'B' over the TLS-TCP fallback registers the tunnel AND binds the
+        // hostname in ONE message (a single stream can't carry a separate 'H').
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let token = RoutingToken([0x2b; 32]);
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        let (edge_side, mut agent_side) = tokio::io::duplex(4096);
+        let state_srv = state.clone();
+        tokio::spawn(async move {
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            let _ = serve_tcp_connection(edge_side, &state_srv, &challenge).await;
+        });
+
+        let host = "help.bunsenbrenner.org";
+        let mut msg = vec![b'B'];
+        msg.extend_from_slice(&token.0);
+        msg.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        msg.extend_from_slice(host.as_bytes());
+        agent_side.write_all(&msg).await.unwrap();
+        agent_side.flush().await.unwrap();
+
+        let mut ack = [0u8; 2];
+        agent_side.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"OK", "browser register acked over TCP");
+        assert_eq!(
+            state.route_host(host),
+            Some(token),
+            "hostname routes over the TCP fallback (was impossible before)"
+        );
     }
 
     #[tokio::test]
