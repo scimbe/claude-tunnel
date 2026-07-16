@@ -10,8 +10,8 @@ use std::time::Duration;
 use ct_client::bench::{csv_row, run_bench, run_bench_stream, run_bench_udp, summarize};
 use ct_client::config::ClientConfig;
 use ct_client::transport::{
-    client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed, dial_edge,
-    tcp_tls_connect, udp_selftest, load_cert,
+    client_forward, client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed,
+    dial_edge, tcp_tls_connect, udp_selftest, load_cert,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
@@ -111,6 +111,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         eprintln!("ct-client: P2P tunnel round-trip OK (direct={used_direct})");
         return Ok(());
+    }
+
+    // Forward mode (#22 HW2a): bind a local TCP port and bridge each connection
+    // through the tunnel to the Origin, so any TCP/TLS app (curl, a browser) can
+    // ride it — e.g. `CT_CLIENT_MODE=forward CT_CLIENT_LISTEN=127.0.0.1:8443`
+    // then `curl --cacert origin-ca.pem https://127.0.0.1:8443/`. Runs until
+    // stopped. TLS terminates at the Origin; the Edge stays provider-blind.
+    if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("forward") {
+        let listen: SocketAddr = std::env::var("CT_CLIENT_LISTEN")
+            .map_err(|_| "CT_CLIENT_LISTEN is required for forward mode (e.g. 127.0.0.1:8443)")?
+            .parse()
+            .map_err(|e| format!("invalid CT_CLIENT_LISTEN: {e}"))?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        eprintln!(
+            "ct-client: forwarding {} -> tunnel -> origin (stop with Ctrl-C)",
+            listener.local_addr()?
+        );
+        return client_forward(
+            listener,
+            edge_addr,
+            edge_cert,
+            cap.token.clone(),
+            cap,
+            client_kp.private,
+        )
+        .await;
     }
 
     // Bench mode: run N round-trips and emit a labeled CSV row. CT_BENCH_MODE

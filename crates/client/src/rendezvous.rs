@@ -568,6 +568,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_mode_bridges_a_local_tcp_connection_through_the_tunnel() {
+        // #22 HW2a: client_forward accepts a plain local TCP connection and
+        // bridges it through the tunnel to the Origin — the enabler that lets
+        // real TCP/TLS apps (curl, browsers) ride the mesh via a local port.
+        use crate::transport::client_forward;
+        use ct_agent::serve::serve_noise_stream;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let token = RoutingToken([0x3F; 32]);
+        let challenge = Challenge { nonce: [0x88; 16], difficulty: 8 };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // TCP echo Origin.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&agent_conn, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&client_conn, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            client_conn.closed().await;
+            Ok::<(), String>(())
+        });
+
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep.connect(addr, "localhost").expect("cfg").await.expect("agent conn");
+        let (mut rs, mut rr) = agent_conn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let agent_task = tokio::spawn(async move {
+            let (s, r) = agent_conn.accept_bi().await.unwrap();
+            let _ = serve_noise_stream(
+                s,
+                r,
+                origin_addr,
+                &[origin_priv],
+                Arc::new(ct_common::metrics::TunnelMetrics::new()),
+            )
+            .await;
+            agent_conn.closed().await;
+        });
+
+        // Forward proxy: bind a local port and bridge it through the tunnel.
+        let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fwd_addr = fwd_listener.local_addr().unwrap();
+        let fwd = tokio::spawn(client_forward(
+            fwd_listener,
+            addr,
+            cert,
+            token.clone(),
+            cap,
+            client_kp.private,
+        ));
+
+        // A plain local TCP client rides the forward port.
+        let mut c = TcpStream::connect(fwd_addr).await.unwrap();
+        c.write_all(b"through-the-forward").await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).await.unwrap();
+        assert_eq!(
+            got, b"through-the-forward",
+            "a local TCP connection round-trips through the tunnel via the forward proxy"
+        );
+
+        fwd.abort();
+        agent_task.abort();
+        let _ = edge.await;
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_udp_tunnels_datagrams_through_edge() {
         // Full UDP path: local UDP app <-> client_tunnel_udp <-> Edge relay <->
         // agent serve_noise_udp <-> real UDP echo Origin. Datagram boundaries

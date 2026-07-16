@@ -1147,8 +1147,15 @@ Browser Plane (öffentliches SNI + Let's Encrypt, ADR-0010) ist post-v1 → sepa
   über den Noise-Stream, vertraut NUR dem Origin-Cert (erfolgreicher Handshake = client-seitige
   Cert-Validierung), liest HTTP 200 + „hello, secured". Edge-sieht-nur-Ciphertext ist separat via
   `relay::tests::noise_e2e_through_relay_edge_sees_only_ciphertext` bewiesen. Gate grün.
-- **HW2** ⏳ `scripts/https-demo.sh` — menschlich nachvollziehbare Demo (wie demo.sh, aber HTTPS-Origin;
-  curl `--cacert` durch den Tunnel, zeigt 200 + validiertes Cert).
+- **HW2a** ✅ Client-**Forward-Modus** (`CT_CLIENT_MODE=forward` + `CT_CLIENT_LISTEN`): `client_forward`
+  bindet einen lokalen TCP-Port und brückt jede Verbindung über einen eigenen Tunnel via
+  `client_tunnel_stream` zum Origin — der Enabler, damit echte TCP/TLS-Apps (curl, Browser) über einen
+  lokalen Port den Mesh nutzen (TLS terminiert am Origin, Edge provider-blind). Frozen-Test
+  `forward_mode_bridges_a_local_tcp_connection_through_the_tunnel` (lokaler TCP-Client → Forward →
+  Tunnel → Echo-Origin). Gate grün.
+- **HW2b** ⏳ `scripts/https-demo.sh` — menschlich nachvollziehbare Demo mit HW2a: HTTPS-Origin +
+  `CT_CLIENT_MODE=forward`, dann `curl --cacert origin-ca.pem https://127.0.0.1:<listen>/` durch den
+  Tunnel, zeigt 200 + validiertes Cert.
 - **HW3** ⏳ Separates Tracking-Issue für die **Browser Plane** (ADR-0010, öffentliches SNI +
   Let's Encrypt via ADR-0003 DNS-01) — explizit post-v1, out-of-scope für #22. Danach #22 **fix-ready**
   (Kern-Akzeptanz HW1 erfüllt; HW2 optional-Demo, HW3 verlinkt den deferred Teil).

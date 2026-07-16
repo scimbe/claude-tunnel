@@ -262,6 +262,42 @@ where
     Ok(())
 }
 
+/// Local-forward proxy (#22 HW2a): accept plain TCP connections on `listener`
+/// and bridge each, over its own fresh tunnel, to the Origin via
+/// [`client_tunnel_stream`]. This turns the payload-only client into a usable
+/// local port: any TCP/TLS app (curl, a browser) can connect to `listener` and
+/// ride the tunnel, with TLS terminating **at the Origin** (the Edge stays
+/// provider-blind). One local connection = one edge connection = one tunnel, so
+/// concurrent connections are independent. Runs until cancelled.
+pub async fn client_forward(
+    listener: tokio::net::TcpListener,
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    cap: Capability,
+    client_private: [u8; 32],
+) -> Result<(), BoxError> {
+    loop {
+        let (sock, _peer) = listener.accept().await?;
+        let edge_cert = edge_cert.clone();
+        let token = token.clone();
+        let cap = cap.clone();
+        tokio::spawn(async move {
+            match dial_edge(edge_addr, edge_cert).await {
+                Ok(conn) => {
+                    if let Err(e) =
+                        client_tunnel_stream(&conn, &token, &cap, &client_private, sock).await
+                    {
+                        eprintln!("ct-client: forwarded connection ended: {e}");
+                    }
+                    conn.close(0u32.into(), b"done");
+                }
+                Err(e) => eprintln!("ct-client: forward dial failed: {e}"),
+            }
+        });
+    }
+}
+
 /// Open a **UDP** tunnel (M10.2): PoW-gated rendezvous + `Noise_IK` initiator
 /// handshake, then bridge the local (connected) UDP socket `local` to the UDP
 /// Origin over the Noise session. One datagram from `local` becomes one Noise
