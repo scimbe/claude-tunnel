@@ -1232,7 +1232,12 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   `callback_reports_bad_gateway_when_exchange_fails`, `subject_from_id_token_reads_the_sub_claim`.
   Gate grün (98 Tests, 0 Warnings). **#25 fix-ready** — SSO-Login end-to-end; die #26–#29-Portalseiten nutzen `verify_session`.
   Härtungs-Follow-up: id_token-Signaturprüfung via JWKS/`OidcVerifier`.
-### #26 Konto-Selbstverwaltung (Guthaben, Profil, Credits)
+### #26 Konto-Selbstverwaltung (Guthaben, Profil, Credits) — ✅ **fix-ready**
+- **PP2/PP3** ✅ Neues `portal_api`-Modul: `GET /portal/account` (session-gated, rendert Subject + Account-ID + Guthaben,
+  strikt selbstbezüglich) und `POST /portal/account/credits` (legt einen Payment-Intent gegen die bestehende
+  Billing-Fläche an; Gutschrift NUR über den signierten Webhook). Frozen-Tests `account_page_requires_a_session`,
+  `account_page_shows_self_scoped_account_and_balance`, `buy_credits_creates_an_intent_for_the_callers_account`,
+  `buy_credits_requires_a_session`. Gate grün (102 Tests).
 - **PP1** ✅ Daten-Fläche der Selbstbedienung: `GET /me/account` liefert jetzt `{account, balance, subject}`
   (statt nur `{account}`) — Account-ID, Credit-Guthaben (`ledger.balance`) und verifiziertes Subject.
   Strikt selbstbezüglich (Subject aus dem verifizierten Token, nie aus dem Body). Bearer-testbar, unabhängig

@@ -725,6 +725,10 @@ pub fn persistent_control_plane_router(
             crate::portal::PortalOidc::from_env(),
             webhook_secret,
         ))
+        .merge(crate::portal_api::portal_api_router(
+            webhook_secret,
+            ledger.clone(),
+        ))
         .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).

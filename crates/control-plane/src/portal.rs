@@ -335,11 +335,28 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Resolve the subject of the request's session cookie, if valid and unexpired.
 fn session_subject(st: &PortalState, headers: &HeaderMap) -> Option<String> {
+    session_subject_for(&st.session_key, headers)
+}
+
+/// Resolve the logged-in subject from a request's session cookie against `key`.
+/// Shared with the authed portal API (`portal_api`) so every portal endpoint
+/// gates on the same signed session.
+pub(crate) fn session_subject_for(key: &[u8], headers: &HeaderMap) -> Option<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    verify_session(&st.session_key, &cookie_value(headers, SESSION_COOKIE)?, now)
+    verify_session(key, &cookie_value(headers, SESSION_COOKIE)?, now)
+}
+
+/// Mint a valid session token for `subject` (test helper for sibling modules).
+#[cfg(test)]
+pub(crate) fn sign_session_for_test(key: &[u8], subject: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sign_session(key, subject, now + SESSION_TTL_SECS)
 }
 
 /// The session cookie: HttpOnly, Secure, SameSite=Lax, scoped to `/portal`.
@@ -367,7 +384,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// HTML-escape untrusted text before embedding it in the page.
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.chars()
         .flat_map(|c| match c {
             '&' => "&amp;".chars().collect::<Vec<_>>(),
