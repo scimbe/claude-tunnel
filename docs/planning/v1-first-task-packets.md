@@ -1426,3 +1426,16 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     `build_query_and_parse_txt_answers_round_trip`, `query_txt_reads_txt_records_over_tcp`. Gate grün (ct-dns 14).
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
   `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.
+
+## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
+
+Ziel: kein manuelles A-Record-Anlegen mehr — beim Setzen eines Tunnel-Hostnamens automatisch den A-Record (Host → Edge-IP)
+anlegen, beim Widerruf/Drop wieder löschen. Klinkt sich in die vorhandenen Hooks ein: BP4b-c (CP autorisiert Hostname beim
+Anlegen) + RB4b (best-effort HTTP-Push-Muster). Reuse der deSEC-Provider-Abstraktion (AD5).
+
+- **DL1** ✅ `DesecClient` um **A-Record-CRUD** erweitert: `set_a(host, ip)`/`clear_a(host)` (generalisiertes
+  `patch_rrset` mit `rtype`), + `guard_under_zone` (ein Host muss unter `DESEC_DOMAIN` liegen, sonst Fehler). Frozen-Test
+  `desec_set_and_clear_a_records_and_guard_the_zone` (Mock-deSEC: A-RRset mit IP, empty-records-Clear, Zone-Guard). Gate grün (ct-dns 15).
+- **DL2** ⏳ Control-Plane-Verdrahtung: `create_tunnel` mit Hostname → `set_a(host, CT_CP_DNS_EDGE_IP)`; `delete_tunnel`
+  → `clear_a(host)` (best-effort, logged, analog zum Revoke-/Authorize-Push). Config `DESEC_TOKEN`/`DESEC_DOMAIN` + `CT_CP_DNS_EDGE_IP`.
+- **DL3** ⏳ Design-Frage (nicht blockierend): Provider-Trait für Nicht-deSEC-Selfhoster (aktuell deSEC-only genügt).

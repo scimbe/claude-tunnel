@@ -82,19 +82,46 @@ impl DesecClient {
     /// Upsert the TXT record via a bulk PATCH (leaves other records untouched);
     /// deSEC requires TXT values wrapped in double quotes.
     pub async fn set_txt(&self, name: &str, value: &str) -> Result<(), String> {
-        self.patch_rrset(name, vec![format!("\"{value}\"")]).await
+        self.patch_rrset(name, "TXT", vec![format!("\"{value}\"")]).await
     }
 
     /// Clear the challenge TXT — an empty `records` list removes the RRset.
     pub async fn clear_txt(&self, name: &str) -> Result<(), String> {
-        self.patch_rrset(name, Vec::new()).await
+        self.patch_rrset(name, "TXT", Vec::new()).await
     }
 
-    async fn patch_rrset(&self, name: &str, records: Vec<String>) -> Result<(), String> {
+    /// Publish an `A` record for a public agent hostname (#38 DL1): `host` must be
+    /// under the configured zone. Used to make a tunnel's hostname resolvable to
+    /// the edge automatically on bind.
+    pub async fn set_a(&self, host: &str, ip: &str) -> Result<(), String> {
+        self.guard_under_zone(host)?;
+        self.patch_rrset(host, "A", vec![ip.to_string()]).await
+    }
+
+    /// Delete the `A` record for `host` (#38 DL1) — an empty `records` list
+    /// removes the RRset, so a revoked tunnel leaves no orphaned DNS.
+    pub async fn clear_a(&self, host: &str) -> Result<(), String> {
+        self.guard_under_zone(host)?;
+        self.patch_rrset(host, "A", Vec::new()).await
+    }
+
+    /// Refuse to touch a name that is not the zone or a subdomain of it — an
+    /// agent may only claim a hostname under the operator's configured zone.
+    fn guard_under_zone(&self, host: &str) -> Result<(), String> {
+        let h = host.trim_end_matches('.').to_ascii_lowercase();
+        let d = self.domain.trim_end_matches('.').to_ascii_lowercase();
+        if h == d || h.ends_with(&format!(".{d}")) {
+            Ok(())
+        } else {
+            Err(format!("{host} is not under the configured zone {}", self.domain))
+        }
+    }
+
+    async fn patch_rrset(&self, name: &str, rtype: &str, records: Vec<String>) -> Result<(), String> {
         // Bulk PATCH is an upsert of the listed RRsets only (min TTL 3600).
         let body = serde_json::json!([{
             "subname": subname_of(name, &self.domain),
-            "type": "TXT",
+            "type": rtype,
             "ttl": 3600,
             "records": records,
         }]);
@@ -214,5 +241,48 @@ mod tests {
         client.clear_txt("_acme-challenge.bunsenbrenner.org").await.unwrap();
         let (_p, _a, body) = captured.lock().unwrap().clone().unwrap();
         assert!(body.contains("\"records\":[]"), "empty records clears it");
+    }
+
+    #[tokio::test]
+    async fn desec_set_and_clear_a_records_and_guard_the_zone() {
+        // #38 DL1: A-record CRUD for a host under the zone; refuse hosts outside it.
+        type Captured = Arc<Mutex<Option<(String, String, String)>>>;
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route(
+                "/domains/:domain/rrsets/",
+                patch(
+                    |State(cap): State<Captured>, uri: axum::http::Uri, body: String| async move {
+                        *cap.lock().unwrap() = Some((uri.path().to_string(), String::new(), body));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        // set_a publishes the A record for the subname with the IP.
+        client.set_a("help.bunsenbrenner.org", "45.133.9.145").await.unwrap();
+        let (path, _a, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(path, "/domains/bunsenbrenner.org/rrsets/");
+        assert!(body.contains("\"subname\":\"help\"") && body.contains("\"type\":\"A\""));
+        assert!(body.contains("45.133.9.145"));
+
+        // clear_a sends an empty records list.
+        client.clear_a("help.bunsenbrenner.org").await.unwrap();
+        assert!(captured.lock().unwrap().clone().unwrap().2.contains("\"records\":[]"));
+
+        // A host outside the configured zone is refused before any request.
+        assert!(client.set_a("evil.example", "1.2.3.4").await.is_err());
     }
 }
