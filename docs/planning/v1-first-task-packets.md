@@ -1135,3 +1135,20 @@ Zu groß für einen Zyklus → dekomponiert.
 - **WC6** ✅ Re-Messung via `scripts/coverage.sh` (Workspace, lib-only, Gate 95): **Workspace 95.59% Zeilen**
   (Baseline 90.84%), Funktionen 94.44%, Regions 93.76%. Zeilen-Ziel erreicht → **#21 fix-ready**
   (Funktionen/Regions knapp darunter, edge/serve.rs die Restlücke — transparent kommuniziert).
+
+## #22 — HTTPS-Website als Origin durch den Tunnel (TLS-at-origin, v1/Mesh Plane)
+
+Scope (v1): TLS terminiert **am Origin**, nicht am Edge; self-signed/local-CA (hermetisch, CI-tauglich).
+Browser Plane (öffentliches SNI + Let's Encrypt, ADR-0010) ist post-v1 → separates Tracking-Issue (HW3).
+
+- **HW1** ✅ Hermetischer e2e-Test `https_website_through_the_tunnel_with_client_side_cert_validation`
+  (ct-client rendezvous): echter HTTPS-Origin via `ct_edge::transport::build_tcp_tls_listener_at`
+  (self-signed, SAN „localhost"), erreicht durch den echten Edge+Agent-Tunnel; Client fährt TLS
+  über den Noise-Stream, vertraut NUR dem Origin-Cert (erfolgreicher Handshake = client-seitige
+  Cert-Validierung), liest HTTP 200 + „hello, secured". Edge-sieht-nur-Ciphertext ist separat via
+  `relay::tests::noise_e2e_through_relay_edge_sees_only_ciphertext` bewiesen. Gate grün.
+- **HW2** ⏳ `scripts/https-demo.sh` — menschlich nachvollziehbare Demo (wie demo.sh, aber HTTPS-Origin;
+  curl `--cacert` durch den Tunnel, zeigt 200 + validiertes Cert).
+- **HW3** ⏳ Separates Tracking-Issue für die **Browser Plane** (ADR-0010, öffentliches SNI +
+  Let's Encrypt via ADR-0003 DNS-01) — explizit post-v1, out-of-scope für #22. Danach #22 **fix-ready**
+  (Kern-Akzeptanz HW1 erfüllt; HW2 optional-Demo, HW3 verlinkt den deferred Teil).

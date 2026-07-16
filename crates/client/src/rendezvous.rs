@@ -434,6 +434,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn https_website_through_the_tunnel_with_client_side_cert_validation() {
+        // #22 HW1: a real HTTPS website is the private Origin — TLS terminates AT
+        // the Origin, not the Edge. A client reaches it through the tunnel, runs
+        // the TLS handshake end-to-end (over the Noise stream), validates the
+        // Origin's cert CLIENT-SIDE, and reads a genuine HTTP 200 page. Because
+        // the client trusts ONLY the Origin's self-signed cert, a successful
+        // handshake proves the cert was validated at the client (the Edge, being
+        // provider-blind, never terminated TLS). The tunnel payload the Edge
+        // relays is TLS-over-Noise ciphertext (edge-sees-only-ciphertext is
+        // separately proven by relay::tests::noise_e2e_through_relay_edge_sees_only_ciphertext).
+        use crate::transport::client_tunnel_stream;
+        use ct_agent::serve::serve_noise_stream;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::{Capability, OriginIdentity};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{
+            build_client_endpoint, build_server_endpoint_with_cert, build_tcp_tls_listener_at,
+        };
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let token = RoutingToken([0x2C; 32]);
+        let challenge = Challenge { nonce: [0x77; 16], difficulty: 8 };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // A real HTTPS Origin on loopback: self-signed cert (SAN "localhost"),
+        // TLS terminates here, serves a tiny static page.
+        let (listener, acceptor, origin_cert) =
+            build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("https origin");
+        let origin_addr = listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.expect("origin TLS handshake");
+            let mut buf = [0u8; 1024];
+            let n = tls.read(&mut buf).await.unwrap();
+            assert!(buf[..n].starts_with(b"GET "), "origin got an HTTP request over TLS");
+            let body = "hello, secured";
+            let resp = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&agent_conn, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            serve_connection(&client_conn, &state_e, &chal_e).await.map_err(|e| e.to_string())?;
+            client_conn.closed().await;
+            Ok::<(), String>(())
+        });
+
+        // Agent: register, then stream the relayed connection to the HTTPS Origin
+        // (raw bytes — the agent is provider-blind, it never sees TLS plaintext).
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep.connect(addr, "localhost").expect("cfg").await.expect("agent conn");
+        let (mut rs, mut rr) = agent_conn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let agent_task = tokio::spawn(async move {
+            let (s, r) = agent_conn.accept_bi().await.unwrap();
+            let _ = serve_noise_stream(
+                s,
+                r,
+                origin_addr,
+                &[origin_priv],
+                Arc::new(ct_common::metrics::TunnelMetrics::new()),
+            )
+            .await;
+            agent_conn.closed().await;
+        });
+
+        // Client: open the tunnel stream, then run a TLS client over it that
+        // trusts ONLY the Origin's cert, and GET the page.
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let (app_local, app_remote) = tokio::io::duplex(64 * 1024);
+        let origin_cert_c = origin_cert.clone();
+        let tls_client = async move {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(origin_cert_c).unwrap();
+            let cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+            let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            // A successful handshake here IS the client-side cert validation.
+            let mut tls = connector
+                .connect(sni, app_remote)
+                .await
+                .expect("client validates the origin's cert and completes TLS through the tunnel");
+            tls.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await.unwrap();
+            tls.flush().await.unwrap();
+            let mut page = Vec::new();
+            tls.read_to_end(&mut page).await.unwrap();
+            String::from_utf8_lossy(&page).into_owned()
+        };
+
+        let (cres, page) = tokio::join!(
+            client_tunnel_stream(&conn, &token, &cap, &client_kp.private, app_local),
+            tls_client,
+        );
+        cres.expect("client tunnel stream ok");
+        assert!(page.contains("200 OK"), "HTTPS 200 through the tunnel: {page}");
+        assert!(page.contains("hello, secured"), "the real page body arrived: {page}");
+
+        conn.close(0u32.into(), b"done");
+        agent_task.abort();
+        let _ = edge.await;
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn client_udp_tunnels_datagrams_through_edge() {
         // Full UDP path: local UDP app <-> client_tunnel_udp <-> Edge relay <->
         // agent serve_noise_udp <-> real UDP echo Origin. Datagram boundaries
