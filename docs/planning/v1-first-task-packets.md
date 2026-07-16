@@ -1205,7 +1205,7 @@ Kundenportal: SSO-Login, Konto-Selbstverwaltung, Tunnel anlegen/verwalten, Zugri
 Server-gerendertes self-contained HTML in der Control-Plane (wie #4), OIDC/Keycloak. **Keine Secrets in Issues/Logs**;
 Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-no-secrets` vor jedem Push.
 
-### #25 Portal + SSO-Login (OIDC Authorization Code)
+### #25 Portal + SSO-Login (OIDC Authorization Code) — ✅ **fix-ready**
 - **PP1** ✅ Portal-Shell (`GET /portal`, self-contained „Sign in with SSO"-CTA) + `GET /portal/login`
   (302-Redirect zum IdP-Authorize-Endpoint: `response_type=code`, `client_id`, `redirect_uri`,
   `scope=openid`, zufälliger `state`). `PortalOidc::from_env` (`CT_OIDC_CLIENT_ID/REDIRECT_URI/ISSUER`
@@ -1224,8 +1224,14 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   `GET /portal/logout` (Cookie löschen → `/portal`). Frozen-Tests `session_sign_verify_roundtrips_and_rejects_tampering`,
   `home_requires_a_valid_session_else_redirects`, `logout_clears_the_session_cookie`,
   `session_cookie_carries_the_hardening_flags`. Session-Key = domänensepariertes Webhook-Secret. Gate grün (96 Tests, 0 Warnings).
-- **PP4** ⏳ Code→Token-Tausch am Token-Endpoint (Client-Secret aus Env, via `reqwest`, injizierbarer Exchanger für Hermetik),
-  Callback mintet Session (`sign_session`) → Redirect `/portal/home`. Danach #25 **fix-ready**.
+- **PP4** ✅ Code→Token-Tausch: `PortalOidc.token_url` (aus Issuer/Env), injizierbarer `Exchanger`
+  (Default: `reqwest`-POST an den Token-Endpoint, Client-Secret aus `CT_OIDC_CLIENT_SECRET` zur Laufzeit,
+  nie gespeichert/geloggt; `subject_from_id_token` liest `sub` aus dem id_token über den TLS-Back-Channel).
+  Callback bei gültigem `state` → Exchange → `sign_session` → Session-Cookie + Redirect `/portal/home`;
+  Fehler → 502 ohne Session. Frozen-Tests `callback_exchanges_the_code_and_mints_a_session`,
+  `callback_reports_bad_gateway_when_exchange_fails`, `subject_from_id_token_reads_the_sub_claim`.
+  Gate grün (98 Tests, 0 Warnings). **#25 fix-ready** — SSO-Login end-to-end; die #26–#29-Portalseiten nutzen `verify_session`.
+  Härtungs-Follow-up: id_token-Signaturprüfung via JWKS/`OidcVerifier`.
 ### #26 Konto-Selbstverwaltung (Guthaben, Profil, Credits)
 - **PP1** ✅ Daten-Fläche der Selbstbedienung: `GET /me/account` liefert jetzt `{account, balance, subject}`
   (statt nur `{account}`) — Account-ID, Credit-Guthaben (`ledger.balance`) und verifiziertes Subject.

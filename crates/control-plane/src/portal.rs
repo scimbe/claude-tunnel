@@ -9,6 +9,8 @@
 //!   and logout (`GET /portal/logout`). The code→token exchange that mints a
 //!   session at the callback lands in PP4.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -31,11 +33,19 @@ const SESSION_COOKIE: &str = "ct_portal_session";
 /// Session lifetime (8 hours).
 const SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 
-/// Router state: the OIDC login config plus the key that signs session cookies.
+/// Exchanges an authorization `code` for the authenticated subject (an OIDC
+/// `sub`). Injectable so the callback flow is hermetically testable without a
+/// live IdP; the production default calls the token endpoint over TLS.
+type Exchanger =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+
+/// Router state: the OIDC login config, the session-cookie signing key, and the
+/// code→subject exchanger.
 #[derive(Clone)]
 struct PortalState {
     oidc: Option<PortalOidc>,
     session_key: Arc<[u8]>,
+    exchange: Exchanger,
 }
 
 /// OIDC login configuration for the Authorization Code flow (#25). Built from
@@ -46,6 +56,9 @@ struct PortalState {
 pub struct PortalOidc {
     /// The IdP authorize endpoint (Keycloak: `<issuer>/protocol/openid-connect/auth`).
     pub authorize_url: String,
+    /// The IdP token endpoint (Keycloak: `<issuer>/protocol/openid-connect/token`),
+    /// where the callback exchanges the authorization code (PP4).
+    pub token_url: String,
     pub client_id: String,
     pub redirect_uri: String,
 }
@@ -64,12 +77,24 @@ impl PortalOidc {
         let nonempty = |k: &str| get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let client_id = nonempty("CT_OIDC_CLIENT_ID")?;
         let redirect_uri = nonempty("CT_OIDC_REDIRECT_URI")?;
+        let issuer = nonempty("CT_OIDC_ISSUER");
         let authorize_url = nonempty("CT_OIDC_AUTHORIZE_URL").or_else(|| {
-            nonempty("CT_OIDC_ISSUER")
+            issuer
+                .as_deref()
                 .map(|iss| format!("{}/protocol/openid-connect/auth", iss.trim_end_matches('/')))
         })?;
+        // Token endpoint: explicit, else issuer-derived, else swap the authorize
+        // path for the token path (Keycloak's `/auth` -> `/token`).
+        let token_url = nonempty("CT_OIDC_TOKEN_URL")
+            .or_else(|| {
+                issuer
+                    .as_deref()
+                    .map(|iss| format!("{}/protocol/openid-connect/token", iss.trim_end_matches('/')))
+            })
+            .unwrap_or_else(|| authorize_url.replace("/auth", "/token"));
         Some(Self {
             authorize_url,
+            token_url,
             client_id,
             redirect_uri,
         })
@@ -90,9 +115,16 @@ impl PortalOidc {
 /// Build the customer portal router (#25 PP1): `GET /portal` (shell) and
 /// `GET /portal/login` (SSO Authorization Code redirect).
 pub fn portal_router(oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
+    let exchange = default_exchanger(oidc.clone());
+    portal_router_with(oidc, session_key, exchange)
+}
+
+/// Router builder with an injectable exchanger (for tests).
+fn portal_router_with(oidc: Option<PortalOidc>, session_key: &[u8], exchange: Exchanger) -> Router {
     let state = PortalState {
         oidc,
         session_key: Arc::from(session_key.to_vec()),
+        exchange,
     };
     Router::new()
         .route("/portal", get(portal_home))
@@ -101,6 +133,63 @@ pub fn portal_router(oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
         .route("/portal/home", get(portal_home_authed))
         .route("/portal/logout", get(portal_logout))
         .with_state(state)
+}
+
+/// The production code→subject exchanger: POST the authorization code to the
+/// IdP token endpoint (confidential client — secret read from
+/// `CT_OIDC_CLIENT_SECRET` at call time, never stored or logged), then read the
+/// `sub` from the returned `id_token`. The id_token is obtained directly from
+/// the token endpoint over the authenticated TLS back-channel, so its `sub` is
+/// taken as-is; full JWKS signature verification is a hardening follow-up.
+fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
+    Arc::new(move |code: String| {
+        let oidc = oidc.clone();
+        Box::pin(async move {
+            let cfg = oidc.ok_or_else(|| "SSO not configured".to_string())?;
+            let secret = std::env::var("CT_OIDC_CLIENT_SECRET")
+                .map_err(|_| "missing CT_OIDC_CLIENT_SECRET".to_string())?;
+            let form = [
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", cfg.redirect_uri.as_str()),
+                ("client_id", cfg.client_id.as_str()),
+                ("client_secret", secret.as_str()),
+            ];
+            let resp = reqwest::Client::new()
+                .post(&cfg.token_url)
+                .form(&form)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("token endpoint returned {}", resp.status()));
+            }
+            let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let id_token = body
+                .get("id_token")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "token response has no id_token".to_string())?;
+            subject_from_id_token(id_token)
+        })
+    })
+}
+
+/// Extract the `sub` claim from an id_token JWT. Signature validation is disabled
+/// deliberately: the token came straight from the IdP token endpoint over TLS
+/// (see [`default_exchanger`]). Kept standalone so it is unit-tested directly.
+fn subject_from_id_token(jwt: &str) -> Result<String, String> {
+    let mut v = jsonwebtoken::Validation::default();
+    v.insecure_disable_signature_validation();
+    v.validate_exp = false;
+    v.validate_aud = false;
+    v.required_spec_claims.clear();
+    let key = jsonwebtoken::DecodingKey::from_secret(b"");
+    let data = jsonwebtoken::decode::<serde_json::Value>(jwt, &key, &v).map_err(|e| e.to_string())?;
+    data.claims
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "id_token has no sub".to_string())
 }
 
 async fn portal_home() -> Html<&'static str> {
@@ -153,11 +242,28 @@ async fn portal_callback(
     if cookie_value(&headers, STATE_COOKIE).as_deref() != Some(state) {
         return (StatusCode::FORBIDDEN, "invalid or missing CSRF state").into_response();
     }
-    // Valid. PP3: exchange `code` at the token endpoint and mint a session
-    // cookie. For now, retire the single-use state cookie and show an interstitial.
-    let mut resp = Html(CALLBACK_HTML).into_response();
-    set_cookie(&mut resp, &cleared_state_cookie());
-    resp
+    // Valid state (PP4): exchange the code for the subject, then mint a session
+    // cookie and land the customer on their home. The single-use state cookie is
+    // retired either way.
+    match (st.exchange)(code.to_string()).await {
+        Ok(subject) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let token = sign_session(&st.session_key, &subject, now + SESSION_TTL_SECS);
+            let mut resp = Redirect::to("/portal/home").into_response();
+            set_cookie(&mut resp, &session_cookie(&token));
+            set_cookie(&mut resp, &cleared_state_cookie());
+            resp
+        }
+        Err(_) => {
+            // Don't surface IdP/exchange error detail to the browser.
+            let mut resp = (StatusCode::BAD_GATEWAY, "sign-in failed").into_response();
+            set_cookie(&mut resp, &cleared_state_cookie());
+            resp
+        }
+    }
 }
 
 /// `GET /portal/home` (#25 PP3): the logged-in customer home. Gated on a valid
@@ -199,9 +305,7 @@ fn session_mac(key: &[u8], payload: &[u8]) -> Vec<u8> {
 
 /// Mint a signed session token for `subject`, valid until `exp` (unix seconds).
 /// Format: `<hex(subject)>:<exp>.<hex(hmac)>` — opaque, tamper-evident, and the
-/// subject carries no secret. Consumed by the PP4 token-exchange callback (which
-/// mints a session once it has the verified subject); exercised now by tests.
-#[allow(dead_code)]
+/// subject carries no secret. Minted at the callback once the code is exchanged.
 fn sign_session(key: &[u8], subject: &str, exp: u64) -> String {
     let payload = format!("{}:{exp}", hex(subject.as_bytes()));
     format!("{payload}.{}", hex(&session_mac(key, payload.as_bytes())))
@@ -239,8 +343,7 @@ fn session_subject(st: &PortalState, headers: &HeaderMap) -> Option<String> {
 }
 
 /// The session cookie: HttpOnly, Secure, SameSite=Lax, scoped to `/portal`.
-/// Set by the PP4 callback once a session is minted; exercised now by tests.
-#[allow(dead_code)]
+/// Set by the callback once a session is minted.
 fn session_cookie(token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; Path=/portal; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax")
 }
@@ -249,7 +352,6 @@ fn cleared_session_cookie() -> String {
     format!("{SESSION_COOKIE}=; Path=/portal; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
-#[allow(dead_code)] // used by sign_session (PP4 mint) + tests
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -378,24 +480,6 @@ const PORTAL_HTML: &str = r#"<!doctype html>
 </div>
 </body></html>"#;
 
-/// Interstitial shown after a valid callback while the session is established.
-/// PP3 replaces this with the token exchange + a redirect to the customer home.
-const CALLBACK_HTML: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-tunnel — signing in</title>
-<style>
- body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
-      display:flex;min-height:100vh;align-items:center;justify-content:center}
- .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;max-width:420px;text-align:center}
- .sub{color:#8b949e;font-size:.95rem}
-</style></head><body>
-<div class="card">
- <h1>Signing you in…</h1>
- <div class="sub">Your sign-in was verified. Completing your session.</div>
-</div>
-</body></html>"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +488,16 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_KEY: &[u8] = b"portal-test-session-key";
+
+    /// An injected exchanger returning a fixed subject.
+    fn stub_exchanger(subject: &'static str) -> Exchanger {
+        Arc::new(move |_code| Box::pin(async move { Ok(subject.to_string()) }))
+    }
+
+    /// An injected exchanger that always fails (simulates an IdP/token error).
+    fn failing_exchanger() -> Exchanger {
+        Arc::new(|_code| Box::pin(async { Err("boom".to_string()) }))
+    }
 
     #[test]
     fn from_lookup_derives_authorize_url_from_issuer() {
@@ -419,6 +513,10 @@ mod tests {
         assert_eq!(
             cfg.authorize_url,
             "https://kc.example/realms/ct/protocol/openid-connect/auth"
+        );
+        assert_eq!(
+            cfg.token_url,
+            "https://kc.example/realms/ct/protocol/openid-connect/token"
         );
         // Missing redirect_uri -> not configured.
         assert!(PortalOidc::from_lookup(|k| (k == "CT_OIDC_CLIENT_ID").then(|| "x".into())).is_none());
@@ -443,6 +541,7 @@ mod tests {
     async fn login_redirects_to_the_authorize_endpoint() {
         let cfg = PortalOidc {
             authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
             client_id: "ct-portal".into(),
             redirect_uri: "https://portal.example/portal/callback".into(),
         };
@@ -464,6 +563,7 @@ mod tests {
     fn cfg() -> PortalOidc {
         PortalOidc {
             authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
             client_id: "ct-portal".into(),
             redirect_uri: "https://portal.example/portal/callback".into(),
         }
@@ -541,8 +641,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_accepts_matching_state_and_clears_the_cookie() {
-        let app = portal_router(Some(cfg()), TEST_KEY);
+    async fn callback_exchanges_the_code_and_mints_a_session() {
+        // #25 PP4: valid state -> exchange -> session cookie -> redirect to home.
+        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger("kc-user-9"));
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
@@ -552,10 +653,72 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(cookie.starts_with("ct_portal_state=;"), "state cookie is cleared");
-        assert!(cookie.contains("Max-Age=0"), "single-use cookie retired");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "/portal/home");
+
+        // Two Set-Cookie headers: a valid session, and the state cookie cleared.
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        let session = cookies
+            .iter()
+            .find(|c| c.starts_with("ct_portal_session="))
+            .expect("session cookie set");
+        assert!(session.contains("HttpOnly") && session.contains("Secure"));
+        assert!(
+            cookies.iter().any(|c| c.starts_with("ct_portal_state=;")),
+            "state cookie cleared"
+        );
+        // The minted session verifies to the exchanged subject.
+        let token = session
+            .strip_prefix("ct_portal_session=")
+            .and_then(|s| s.split(';').next())
+            .unwrap();
+        assert_eq!(
+            verify_session(TEST_KEY, token, 0).as_deref(),
+            Some("kc-user-9")
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_reports_bad_gateway_when_exchange_fails() {
+        let app = portal_router_with(Some(cfg()), TEST_KEY, failing_exchanger());
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // No session is minted on a failed exchange; the state cookie is retired.
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(cookies.iter().all(|c| !c.starts_with("ct_portal_session=")), "no session");
+        assert!(cookies.iter().any(|c| c.starts_with("ct_portal_state=;")), "state cleared");
+    }
+
+    #[test]
+    fn subject_from_id_token_reads_the_sub_claim() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let jwt = encode(
+            &Header::default(),
+            &serde_json::json!({ "sub": "kc-user-42", "aud": "ct-portal" }),
+            &EncodingKey::from_secret(b"whatever"),
+        )
+        .unwrap();
+        // Signature is not verified (token comes over the TLS back-channel).
+        assert_eq!(subject_from_id_token(&jwt).unwrap(), "kc-user-42");
+        assert!(subject_from_id_token("garbage").is_err());
     }
 
     #[tokio::test]
