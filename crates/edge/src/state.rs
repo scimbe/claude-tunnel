@@ -5,7 +5,7 @@
 //! over the handle type (`quinn::Connection` in the daemon) to stay
 //! unit-testable. `is_known` plugs straight into `resolve_rendezvous_gated`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -46,6 +46,10 @@ pub struct EdgeState<H> {
     /// Hostnames are stored lowercased. The payload stays blind (TLS ciphertext
     /// is passed through); only the SNI hostname is visible to the Edge.
     hosts: Mutex<HashMap<String, RoutingToken>>,
+    /// Revoked routing tokens (#27 RB3): a token here is torn down and refuses
+    /// re-registration, so a customer's "revoke" actually stops the tunnel even
+    /// though the agent keeps reconnecting.
+    revoked: Mutex<HashSet<RoutingToken>>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -62,6 +66,7 @@ impl<H: Clone> EdgeState<H> {
             direct: Mutex::new(HashMap::new()),
             tcp_agents: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
+            revoked: Mutex::new(HashSet::new()),
             registrations: Counter::default(),
             relays: Counter::default(),
             relay_bytes: Counter::default(),
@@ -242,6 +247,32 @@ impl<H: Clone> EdgeState<H> {
         self.tcp_agents.lock_safe().remove(token);
     }
 
+    /// Revoke `token` (#27 RB3): tear down its live registrations and any hostname
+    /// mappings, and mark it so a reconnecting Agent cannot re-register it. This
+    /// is what makes a customer's "revoke" actually stop the tunnel — without the
+    /// revoked set, the Agent's reconnect loop would simply register again.
+    pub fn revoke_token(&self, token: &RoutingToken) {
+        self.revoked.lock_safe().insert(token.clone());
+        self.remove(token);
+        self.hosts.lock_safe().retain(|_, v| v != token);
+    }
+
+    /// Whether `token` has been revoked (#27 RB3).
+    pub fn is_revoked(&self, token: &RoutingToken) -> bool {
+        self.revoked.lock_safe().contains(token)
+    }
+
+    /// Register an Agent tunnel unless its token has been revoked (#27 RB3).
+    /// Returns the registration id, or `None` if the token is revoked — the
+    /// registration path the serve loop uses so a revoked token stays down even
+    /// as its Agent keeps reconnecting.
+    pub fn register_unless_revoked(&self, token: RoutingToken, handle: H) -> Option<u64> {
+        if self.is_revoked(&token) {
+            return None;
+        }
+        Some(self.register(token, handle))
+    }
+
     /// Whether `token` currently has at least one live Agent tunnel.
     pub fn is_known(&self, token: &RoutingToken) -> bool {
         self.agents
@@ -271,6 +302,30 @@ mod tests {
         state.register(token(1), 42u32);
         assert_eq!(state.route(&token(1)), Some(42));
         assert!(state.is_known(&token(1)));
+    }
+
+    #[test]
+    fn revoke_token_drops_registration_and_blocks_reregistration() {
+        // #27 RB3: revoke tears down the live tunnel and refuses re-registration,
+        // so a reconnecting agent can't defeat a customer's "revoke".
+        let state = EdgeState::new();
+        let t = token(9);
+        state.register_host("app.example", t.clone());
+        state.register(t.clone(), 1u32);
+        assert_eq!(state.active_tunnels(), 1);
+
+        state.revoke_token(&t);
+        assert_eq!(state.active_tunnels(), 0, "revoke drops the live registration");
+        assert!(state.is_revoked(&t));
+        assert_eq!(state.route_host("app.example"), None, "hostname mapping cleared");
+
+        // A reconnecting agent cannot re-register the revoked token.
+        assert!(state.register_unless_revoked(t.clone(), 2u32).is_none());
+        assert_eq!(state.active_tunnels(), 0, "still no tunnel after a blocked re-register");
+
+        // A different (unrevoked) token registers normally.
+        assert!(state.register_unless_revoked(token(10), 3u32).is_some());
+        assert_eq!(state.active_tunnels(), 1);
     }
 
     #[test]
