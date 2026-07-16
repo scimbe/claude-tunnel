@@ -167,12 +167,16 @@ async fn create_tunnel(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
     }
-    let hostname = form
-        .hostname
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let tunnel = match st.tunnels.create(&subject, name, hostname) {
+    // #23 BP4b-d: validate + normalize the hostname (reject non-DNS junk /
+    // trailing-dot ambiguity) so it matches what the edge binds and authorizes.
+    let hostname = match form.hostname.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => match ct_common::normalize_hostname(h) {
+            Some(n) => Some(n),
+            None => return (StatusCode::BAD_REQUEST, "invalid hostname").into_response(),
+        },
+        None => None,
+    };
+    let tunnel = match st.tunnels.create(&subject, name, hostname.as_deref()) {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -760,6 +764,16 @@ mod tests {
         let app = test_app();
         assert_eq!(
             post_form(&app, "/portal/tunnels", "alice", "name=%20").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_rejects_an_invalid_hostname() {
+        // #23 BP4b-d: a malformed hostname (empty label) is refused.
+        let app = test_app();
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=bad..host").await,
             StatusCode::BAD_REQUEST
         );
     }

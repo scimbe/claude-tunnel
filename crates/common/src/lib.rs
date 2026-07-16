@@ -104,9 +104,53 @@ pub enum ControlFrame {
     Relay { payload: Vec<u8> },
 }
 
+/// Normalize + validate a DNS hostname for Browser-Plane routing (#23 BP4b-d):
+/// trim, strip a single trailing dot, lowercase, and validate the DNS charset and
+/// label/length limits (RFC 1123). Returns the canonical form, or `None` if
+/// invalid. Applied consistently at the edge (bind / lookup / authorize) and the
+/// control plane (create) so `victim.com.` and `victim.com` can't be distinct
+/// keys and non-DNS junk never enters the routing table. (Unicode must be
+/// punycode-encoded by the caller; `xn--…` labels pass.)
+pub fn normalize_hostname(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches('.').to_ascii_lowercase();
+    if s.is_empty() || s.len() > 253 {
+        return None;
+    }
+    for label in s.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return None;
+        }
+    }
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_hostname_canonicalizes_and_validates() {
+        // Lowercase + trailing-dot strip; `x.` and `x` collapse.
+        assert_eq!(
+            normalize_hostname("Help.Bunsenbrenner.ORG."),
+            Some("help.bunsenbrenner.org".to_string())
+        );
+        assert_eq!(normalize_hostname("victim.com."), normalize_hostname("victim.com"));
+        assert_eq!(normalize_hostname("xn--nxasmq6b.example"), Some("xn--nxasmq6b.example".into()));
+        // Rejects: empty, bad chars, empty/over-long label, leading/trailing hyphen.
+        assert!(normalize_hostname("").is_none());
+        assert!(normalize_hostname("a b.com").is_none(), "space");
+        assert!(normalize_hostname("under_score.com").is_none(), "underscore not a DNS host char");
+        assert!(normalize_hostname("a..b").is_none(), "empty label");
+        assert!(normalize_hostname("-lead.com").is_none());
+        assert!(normalize_hostname("trail-.com").is_none());
+        assert!(normalize_hostname(&format!("{}.com", "a".repeat(64))).is_none(), "label too long");
+    }
 
     fn roundtrip<T>(v: &T)
     where

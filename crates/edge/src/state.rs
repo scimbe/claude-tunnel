@@ -91,7 +91,9 @@ impl<H: Clone> EdgeState<H> {
     /// conflicting bind was refused (the existing route is left untouched). The
     /// hostname is lowercased so SNI lookups are case-insensitive.
     pub fn register_host(&self, host: &str, token: RoutingToken) -> bool {
-        let key = host.to_ascii_lowercase();
+        let Some(key) = ct_common::normalize_hostname(host) else {
+            return false; // reject malformed hostnames (#23 BP4b-d)
+        };
         let mut hosts = self.hosts.lock_safe();
         match hosts.get(&key) {
             Some(existing) if *existing != token => false,
@@ -122,25 +124,31 @@ impl<H: Clone> EdgeState<H> {
     /// pushes this when a customer sets a hostname on a tunnel they own. Also
     /// enables authorization if it was not already required.
     pub fn authorize_host(&self, host: &str, token: RoutingToken) {
-        self.host_auth
-            .lock_safe()
-            .get_or_insert_with(HashMap::new)
-            .insert(host.to_ascii_lowercase(), token);
+        if let Some(key) = ct_common::normalize_hostname(host) {
+            self.host_auth
+                .lock_safe()
+                .get_or_insert_with(HashMap::new)
+                .insert(key, token);
+        }
     }
 
     /// Whether binding `host` to `token` is permitted (#23 BP4b): always true
     /// when authorization is not required; otherwise only for the authorized
     /// (hostname, token) pair.
     pub fn host_bind_allowed(&self, host: &str, token: &RoutingToken) -> bool {
+        let Some(key) = ct_common::normalize_hostname(host) else {
+            return false; // a malformed hostname is never bindable (#23 BP4b-d)
+        };
         match self.host_auth.lock_safe().as_ref() {
             None => true,
-            Some(map) => map.get(&host.to_ascii_lowercase()) == Some(token),
+            Some(map) => map.get(&key) == Some(token),
         }
     }
 
     /// Resolve a public hostname (from the TLS SNI) to its routing token.
     pub fn route_host(&self, host: &str) -> Option<RoutingToken> {
-        self.hosts.lock_safe().get(&host.to_ascii_lowercase()).cloned()
+        let key = ct_common::normalize_hostname(host)?;
+        self.hosts.lock_safe().get(&key).cloned()
     }
 
     /// Note a completed relay of `bytes` total bytes (both directions), and a
@@ -394,6 +402,17 @@ mod tests {
         assert!(state.host_bind_allowed("x.test", &token(1)), "authorized pair allowed");
         assert!(!state.host_bind_allowed("x.test", &token(2)), "wrong token refused");
         assert!(!state.host_bind_allowed("y.test", &token(1)), "unauthorized host refused");
+    }
+
+    #[test]
+    fn host_normalization_collapses_trailing_dot_and_rejects_junk() {
+        // #23 BP4b-d: bind/lookup normalize identically; malformed hosts refused.
+        let state = EdgeState::<u32>::new();
+        assert!(state.register_host("App.Example.", token(7)));
+        assert_eq!(state.route_host("app.example"), Some(token(7)));
+        assert_eq!(state.route_host("app.example."), Some(token(7)), "trailing dot collapses");
+        assert!(!state.register_host("bad host", token(8)), "malformed hostname refused at bind");
+        assert_eq!(state.route_host("bad host"), None);
     }
 
     #[test]

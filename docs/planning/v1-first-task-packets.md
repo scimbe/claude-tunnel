@@ -1211,7 +1211,13 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
     `POST /admin/authorize-host/{routing_token}/{host}` (best-effort, `edge_admin`-Config aus RB4b wiederverwendet).
     Frozen-Test `create_tunnel_with_a_hostname_authorizes_it_at_the_edge` (Mock-Edge empfängt Routing-Token + Host + Auth).
     ct-control-plane 113. **Autorisierungskette end-to-end**: Portal-Create(Hostname) → Edge-authorize → 'H'-Bind erlaubt.
-  - **BP4b-d** ⏳ Hostname-Validierung (DNS-Charset, Trailing-Dot-Normalisierung — Review-Punkt #3). Danach #23-BP4b **fertig**.
+  - **BP4b-d** ✅ Hostname-Validierung/-Normalisierung: `ct_common::normalize_hostname` (trim, Trailing-Dot strippen,
+    lowercase, RFC-1123-Charset/Label/Länge; `xn--` erlaubt) — konsistent an Edge (`register_host`/`route_host`/
+    `authorize_host`/`host_bind_allowed`) und CP (`create_tunnel` → 400 bei ungültig). Frozen-Tests
+    `normalize_hostname_canonicalizes_and_validates` (common), `host_normalization_collapses_trailing_dot_and_rejects_junk`
+    (edge), `create_tunnel_rejects_an_invalid_hostname` (CP). Voller Workspace-Gate grün.
+  - **BP4b ✅ komplett** — `:443` ist jetzt sicher exponierbar (mit `CT_EDGE_REQUIRE_HOST_AUTH`): nur CP-autorisierte,
+    validierte Hostnamen; takeover-sicher (BP4a); Reconnect-fest. Review-Punkte #1 + #2 + #3 adressiert.
 - **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job. Reale Domain jetzt verfügbar (#30: bunsenbrenner.org).
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
