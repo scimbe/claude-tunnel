@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Drive the help.bunsenbrenner.org demo to "live" in one command.
+#
+# Assumes a RUNNING plane on this host: ct-edge (with CT_EDGE_BROWSER_LISTEN=:443)
+# and ct-control-plane. This script mints a join token, brings up the Caddy origin
+# (real LE cert via deSEC DNS-01) + a Browser-Plane agent bound to the hostname,
+# then polls until the page is served over HTTPS.
+#
+# Run it on the plane host (not a restricted client). Prereqs (see docs/dns01-desec.md):
+#   - DNS: help.bunsenbrenner.org -> this host's public IP (via deSEC)
+#   - :443 open inbound; deSEC token available
+#
+# Config (env or docker/deploy/.env):
+#   HOSTNAME_FQDN   default help.bunsenbrenner.org
+#   CP_URL          control-plane URL for enrollment   (e.g. http://127.0.0.1:8090)
+#   EDGE            edge host:port for the agent        (e.g. 127.0.0.1:4433)
+#   DESEC_TOKEN     deSEC API token (for Caddy's cert)
+set -euo pipefail
+cd "$(dirname "$0")"
+
+ENV_FILE="${ENV_FILE:-../../docker/deploy/.env}"
+[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a || true
+
+HOSTNAME_FQDN="${HOSTNAME_FQDN:-help.bunsenbrenner.org}"
+CP_URL="${CP_URL:-${HELP_AGENT_CP_URL:-http://127.0.0.1:8090}}"
+EDGE="${EDGE:-${HELP_AGENT_EDGE:-127.0.0.1:4433}}"
+TENANT="${TENANT:-help-demo}"
+COMPOSE="docker compose -f compose.help-site.yml"
+
+say() { printf '\033[36m▶ %s\033[0m\n' "$*"; }
+die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# --- Prereq checks (fail early, actionable) ------------------------------------
+say "Checking prerequisites"
+[ -n "${DESEC_TOKEN:-}" ] || die "DESEC_TOKEN is not set (Caddy needs it for the cert). See docs/dns01-desec.md; put it in $ENV_FILE."
+command -v docker >/dev/null || die "docker not found."
+curl -fsS "$CP_URL/healthz" >/dev/null 2>&1 || curl -fsS "$CP_URL/status" >/dev/null 2>&1 \
+  || die "control-plane not reachable at $CP_URL (is the plane running?). Set CP_URL."
+
+RESOLVED="$(getent hosts "$HOSTNAME_FQDN" 2>/dev/null | awk '{print $1; exit}')" || true
+if [ -z "$RESOLVED" ]; then
+  echo "   ! $HOSTNAME_FQDN does not resolve yet (deSEC NS may still be propagating)."
+  echo "     The agent/edge will work locally, but a browser needs public DNS -> this host."
+else
+  echo "   $HOSTNAME_FQDN -> $RESOLVED"
+fi
+
+# --- Mint a single-use join token ----------------------------------------------
+say "Minting a join token at $CP_URL/enroll/issue"
+TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+          -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')"
+[ -n "$TOKEN" ] || die "could not mint a join token at $CP_URL/enroll/issue"
+echo "   token minted (single-use; not printed)"
+
+# --- Bring up origin + browser agent -------------------------------------------
+say "Starting the Caddy origin + Browser-Plane agent"
+HELP_JOIN_TOKEN="$TOKEN" \
+HELP_AGENT_EDGE="$EDGE" \
+HELP_AGENT_CP_URL="$CP_URL" \
+HELP_AGENT_EDGE_CERT_URL="${HELP_AGENT_EDGE_CERT_URL:-$CP_URL/pki/ca}" \
+  $COMPOSE up --build -d
+
+# --- Wait for it to serve over HTTPS -------------------------------------------
+say "Waiting for https://$HOSTNAME_FQDN/ (Caddy completes the deSEC DNS-01 challenge first) …"
+for i in $(seq 1 60); do
+  if curl -fsS --max-time 5 "https://$HOSTNAME_FQDN/" >/dev/null 2>&1; then
+    printf '\033[32m✓ LIVE — https://%s/ serves the demo with a valid certificate.\033[0m\n' "$HOSTNAME_FQDN"
+    exit 0
+  fi
+  sleep 5
+done
+
+echo "   Not reachable yet. Check:"
+echo "     - DNS: dig +short A $HOSTNAME_FQDN @1.1.1.1   (must be this host)"
+echo "     - cert: $COMPOSE logs help-origin   (deSEC DNS-01 progress)"
+echo "     - agent: $COMPOSE logs help-agent    (onboard + hostname bind)"
+echo "     - edge:  CT_EDGE_BROWSER_LISTEN=:443 set and :443 open inbound?"
+die "demo not live within the timeout (see hints above)."

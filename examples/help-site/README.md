@@ -27,16 +27,27 @@ deSEC**, so this demo does **not** depend on the in-tree ACME work (#31 FD4) yet
 3. A **running plane**: `ct-edge` with `CT_EDGE_BROWSER_LISTEN=0.0.0.0:443`, and a
    `ct-control-plane` to onboard the agent against. `:443` open inbound on the host.
 
-## Deploy (central/agent, on the plane)
+## Deploy — one command (central/agent, on the plane)
+With the plane already running (ct-edge + ct-control-plane) and `DESEC_TOKEN` in
+`docker/deploy/.env`, the driver mints the join token, brings up the origin +
+agent, and waits until the page is served over HTTPS:
 ```bash
-# in docker/deploy/.env, in addition to DESEC_TOKEN:
-#   HELP_AGENT_EDGE=<edge host:port>          e.g. edge:4433
-#   HELP_AGENT_CP_URL=<control-plane URL>
-#   HELP_JOIN_TOKEN=<fresh single-use join token>   # mint via the portal / enrollment
-#   HELP_AGENT_EDGE_CERT_URL=<control-plane>/pki/ca  # optional, self-serve edge CA
+# on the plane host:
+examples/help-site/run-demo.sh
+# override targets if needed:
+CP_URL=http://127.0.0.1:8090 EDGE=127.0.0.1:4433 examples/help-site/run-demo.sh
+```
+It prints `✓ LIVE` when `https://help.bunsenbrenner.org/` serves the demo with a
+valid certificate, or actionable hints (DNS / cert / agent / edge) if not.
 
-docker compose -f examples/help-site/compose.help-site.yml \
-  --env-file docker/deploy/.env up --build -d
+### Manual (equivalent)
+```bash
+# mint a single-use join token from the control plane:
+TOKEN=$(curl -fsS -X POST http://127.0.0.1:8090/enroll/issue \
+          -H 'content-type: application/json' -d '{"tenant":"help-demo"}' \
+          | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')
+HELP_JOIN_TOKEN=$TOKEN HELP_AGENT_EDGE=127.0.0.1:4433 HELP_AGENT_CP_URL=http://127.0.0.1:8090 \
+  docker compose -f examples/help-site/compose.help-site.yml --env-file docker/deploy/.env up --build -d
 ```
 
 ## Verify it's retrievable
