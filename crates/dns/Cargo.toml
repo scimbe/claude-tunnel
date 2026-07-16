@@ -1,0 +1,9 @@
+[package]
+name = "ct-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# AD1 is a dependency-free wire codec + store (like the edge SNI parser);
+# the UDP/:53 server and the localhost HTTP API land in later sub-packets.

@@ -62,6 +62,20 @@ the operator's own console traffic, never a customer's tunneled bytes — those
 still pass through as ciphertext with the cert terminating at the customer origin.
 The SNI demux keeps the two classes strictly separate on the wire.
 
+## DNS-01 via a self-hosted authoritative responder (`ct-dns`)
+The registrar (Strato) has no usable DNS API, so DNS-01 is served by a **minimal
+authoritative DNS run as part of the SaaS** — the `ct-dns` crate (the `acme-dns`
+pattern). It answers `_acme-challenge.<name> TXT` on `:53` from records published
+by a **localhost-only** HTTP API that the co-located ACME client calls; the
+mutation API is never public. At Strato you only delegate the challenge —
+`CNAME _acme-challenge.<zone> -> <id>.auth.<zone>` plus an `NS`/glue record
+pointing `auth.<zone>` at the plane IP ("add the IP to Strato") — while the static
+`A <zone>` / `A *.<zone>` routing records stay at Strato. This keeps the stack
+self-contained (no third-party DNS in the trust path; fits ADR-0017), at the cost
+of running public `:53` (inbound) and, for production robustness, ≥2 nameservers.
+Cloudflare (free API, anycast NS) remains the zero-code alternative if a third
+party is acceptable.
+
 ## Consequences
 - One public port (443) for auth, management, tunnels, and cert issuance — works
   in the most restrictive real networks. QUIC/UDP (`:4433`) stays as the fast path

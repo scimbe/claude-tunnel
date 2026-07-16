@@ -1384,6 +1384,13 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
   BrowserTunnel → `serve_sni_passthrough`, Reject → close. Direkte `:8090`/`:4433` bleiben.
 - **FD3** ⏳ Client-Fallback-Leiter: `QUIC :4433 → TLS-TCP :4433 → QUIC/UDP :443 → TLS-TCP :443`, pro Netz gecacht.
 - **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
-  reuse #23/ADR-0003; reale Domain via #30.
+  reuse #23/ADR-0003; reale Domain via #30. **DNS-01 via selbst-gehostetem `ct-dns`** (acme-dns-Pattern, Strato hat keine API):
+  - **AD1** ✅ Neue Crate `ct-dns`: hand-rolled DNS-Wire-Codec (`message::parse_query`/`build_response`, TXT, bounds-checked,
+    panikfrei wie der SNI-Parser) + `store::AcmeDnsStore` (challenge-name → TXT, poison-safe, case-insensitive, add/set/clear/txt).
+    Frozen-Tests `parse_query_reads_the_question`, `build_response_carries_the_txt_answer`,
+    `build_response_is_empty_for_a_non_txt_or_unknown_name`, `store_publishes_accumulates_and_clears_case_insensitively`. Gate grün (ct-dns 5).
+  - **AD2** ⏳ Autoritativer UDP+TCP-`:53`-Responder (liest Store, antwortet TXT; SOA/NS-Minimum).
+  - **AD3** ⏳ Localhost-HTTP-API (publish/clear TXT) + Bindung an `127.0.0.1`; Integration mit dem ACME-Client (FD4).
+  - **AD4** ⏳ Strato-Delegation dokumentieren (`CNAME _acme-challenge`→`auth.<zone>` + NS/Glue = „IP zu Strato hinzufügen").
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
   `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.
