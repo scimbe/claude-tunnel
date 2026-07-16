@@ -10,6 +10,7 @@
 //! the UDP `:53` server and the HTTP API are later sub-packets.
 
 pub mod message;
+pub mod server;
 pub mod store;
 
 /// Stable crate identifier.

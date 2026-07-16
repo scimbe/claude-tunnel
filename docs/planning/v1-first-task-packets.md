@@ -1389,7 +1389,9 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     panikfrei wie der SNI-Parser) + `store::AcmeDnsStore` (challenge-name → TXT, poison-safe, case-insensitive, add/set/clear/txt).
     Frozen-Tests `parse_query_reads_the_question`, `build_response_carries_the_txt_answer`,
     `build_response_is_empty_for_a_non_txt_or_unknown_name`, `store_publishes_accumulates_and_clears_case_insensitively`. Gate grün (ct-dns 5).
-  - **AD2** ⏳ Autoritativer UDP+TCP-`:53`-Responder (liest Store, antwortet TXT; SOA/NS-Minimum).
+  - **AD2** ✅ Autoritativer UDP+TCP-`:53`-Responder (`server`): `respond(store, query)` (pure: parse→lookup→build),
+    `serve_udp`/`serve_tcp` (+ `udp_loop`-Test-Seam; TCP mit 2-Byte-Längenpräfix); Malformed wird verworfen, nie Panik.
+    Frozen-Tests `respond_serves_a_stored_txt_and_drops_malformed`, `udp_server_round_trips_a_query`. Gate grün (ct-dns 7).
   - **AD3** ⏳ Localhost-HTTP-API (publish/clear TXT) + Bindung an `127.0.0.1`; Integration mit dem ACME-Client (FD4).
   - **AD4** ⏳ Strato-Delegation dokumentieren (`CNAME _acme-challenge`→`auth.<zone>` + NS/Glue = „IP zu Strato hinzufügen").
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +

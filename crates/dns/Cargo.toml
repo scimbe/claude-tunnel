@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# AD1 is a dependency-free wire codec + store (like the edge SNI parser);
-# the UDP/:53 server and the localhost HTTP API land in later sub-packets.
+# AD1 codec + store are dependency-free; AD2 adds the UDP+TCP :53 responder.
+tokio = { version = "1", features = ["net", "rt", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
