@@ -40,6 +40,20 @@ CP_URL=http://127.0.0.1:8090 EDGE=127.0.0.1:4433 examples/help-site/run-demo.sh
 It prints `✓ LIVE` when `https://help.bunsenbrenner.org/` serves the demo with a
 valid certificate, or actionable hints (DNS / cert / agent / edge) if not.
 
+### With hostname authorization on a public `:443` (recommended, #23 BP4b)
+Before exposing `:443`, enable authorization on the edge and give the control
+plane's admin config to the driver — it then authorizes `help.` and pins the
+agent's routing token so the bind is accepted:
+```bash
+# edge:  CT_EDGE_REQUIRE_HOST_AUTH=1  CT_EDGE_ADMIN_TOKEN=<64-hex>  CT_EDGE_ADMIN_LISTEN=127.0.0.1:9443
+# in docker/deploy/.env (same values the control plane uses):
+#   CT_CP_EDGE_ADMIN_URL=http://127.0.0.1:9443
+#   CT_CP_EDGE_ADMIN_TOKEN=<same 64-hex as CT_EDGE_ADMIN_TOKEN>
+examples/help-site/run-demo.sh    # authorizes help. at the edge, then deploys
+```
+Without those vars the driver falls back to the BP4a-only path (takeover-safe;
+fine for a single hostname, but leave `CT_EDGE_REQUIRE_HOST_AUTH` **off** then).
+
 ### Manual (equivalent)
 ```bash
 # mint a single-use join token from the control plane:

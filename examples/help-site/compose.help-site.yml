@@ -33,6 +33,10 @@ services:
     environment:
       - CT_AGENT_MODE=browser                       # SNI passthrough to the origin
       - CT_AGENT_HOSTNAME=help.bunsenbrenner.org     # bound at the edge via 'H'
+      # #23 BP4b: when set (by run-demo.sh after authorizing the hostname), the
+      # agent registers under this routing token so the bind is authorized. Empty
+      # -> the agent mints its own token (BP4a-only path).
+      - CT_AGENT_TOKEN=${HELP_AGENT_TOKEN:-}
       - CT_AGENT_ORIGIN=help-origin:443              # forward raw TLS here
       - CT_AGENT_ORIGIN_PROTO=tcp
       - CT_AGENT_EDGE=${HELP_AGENT_EDGE:?edge host:port, e.g. edge:4433}

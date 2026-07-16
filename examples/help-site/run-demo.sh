@@ -26,6 +26,12 @@ CP_URL="${CP_URL:-${HELP_AGENT_CP_URL:-http://127.0.0.1:8090}}"
 EDGE="${EDGE:-${HELP_AGENT_EDGE:-127.0.0.1:4433}}"
 TENANT="${TENANT:-help-demo}"
 COMPOSE="docker compose -f compose.help-site.yml"
+# Edge admin endpoint for hostname-ownership authorization (#23 BP4b). Reuses the
+# same URL+secret the control plane uses for the revoke/authorize push. When set,
+# the demo authorizes `help.` and pins the agent's routing token so it works with
+# CT_EDGE_REQUIRE_HOST_AUTH enabled. When unset, relies on BP4a (fine for one host).
+EDGE_ADMIN_URL="${CT_CP_EDGE_ADMIN_URL:-}"
+EDGE_ADMIN_TOKEN="${CT_CP_EDGE_ADMIN_TOKEN:-}"
 
 say() { printf '\033[36m▶ %s\033[0m\n' "$*"; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -52,9 +58,24 @@ TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/
 [ -n "$TOKEN" ] || die "could not mint a join token at $CP_URL/enroll/issue"
 echo "   token minted (single-use; not printed)"
 
+# --- Authorize the hostname at the edge (#23 BP4b), if configured ---------------
+HELP_AGENT_TOKEN=""
+if [ -n "$EDGE_ADMIN_URL" ] && [ -n "$EDGE_ADMIN_TOKEN" ]; then
+  command -v openssl >/dev/null || die "openssl needed to mint a routing token (or unset CT_CP_EDGE_ADMIN_URL to use BP4a)."
+  HELP_AGENT_TOKEN="$(openssl rand -hex 32)"
+  say "Authorizing $HOSTNAME_FQDN at the edge (hostname-ownership, BP4b)"
+  curl -fsS -X POST "${EDGE_ADMIN_URL%/}/admin/authorize-host/$HELP_AGENT_TOKEN/$HOSTNAME_FQDN" \
+       -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" >/dev/null \
+    || die "edge authorize-host failed (check CT_CP_EDGE_ADMIN_URL / token / that the edge admin listener is up)."
+  echo "   authorized — agent will register under this routing token (CT_AGENT_TOKEN)."
+else
+  echo "   ! edge host-auth not configured (CT_CP_EDGE_ADMIN_URL/TOKEN) — relying on BP4a (fine for one hostname)."
+fi
+
 # --- Bring up origin + browser agent -------------------------------------------
 say "Starting the Caddy origin + Browser-Plane agent"
 HELP_JOIN_TOKEN="$TOKEN" \
+HELP_AGENT_TOKEN="$HELP_AGENT_TOKEN" \
 HELP_AGENT_EDGE="$EDGE" \
 HELP_AGENT_CP_URL="$CP_URL" \
 HELP_AGENT_EDGE_CERT_URL="${HELP_AGENT_EDGE_CERT_URL:-$CP_URL/pki/ca}" \
