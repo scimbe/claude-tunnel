@@ -1,0 +1,26 @@
+# Origin for the help.bunsenbrenner.org demo. Caddy terminates TLS with a real
+# Let's Encrypt certificate obtained via DNS-01 against deSEC — so it needs NO
+# inbound :80/:443 of its own (the origin is only reachable through the tunnel).
+# The agent (Browser Plane) forwards the raw TLS to this Caddy; TLS terminates
+# here, at the origin, keeping the edge/plane payload-blind.
+#
+# While testing, uncomment the staging CA to avoid Let's Encrypt rate limits.
+{
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+	email admin@bunsenbrenner.org
+}
+
+help.bunsenbrenner.org {
+	root * /srv
+	file_server
+	encode gzip
+	tls {
+		# DNS-01 via deSEC (token from the environment; see docs/dns01-desec.md).
+		dns desec {env.DESEC_TOKEN}
+		resolvers ns1.desec.io ns2.desec.org
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+	}
+}

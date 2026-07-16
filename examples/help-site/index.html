@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-tunnel — Projektüberblick</title>
+<style>
+ :root{--bg:#0e1116;--card:#161b22;--line:#30363d;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#238636}
+ *{box-sizing:border-box}
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:var(--bg);color:var(--fg);line-height:1.6}
+ .wrap{max-width:760px;margin:0 auto;padding:2.5rem 1.25rem 4rem}
+ header{text-align:center;margin-bottom:2rem}
+ h1{font-size:2rem;margin:.2rem 0}
+ .tag{color:var(--muted);font-size:1.05rem}
+ .disc{background:#341a00;border:1px solid #7d4e00;color:#f0c674;border-radius:10px;padding:.8rem 1rem;margin:1.5rem 0;font-size:.92rem}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1.4rem 1.5rem;margin:1rem 0}
+ h2{font-size:1.15rem;margin:.2rem 0 .6rem}
+ p{margin:.5rem 0} .muted{color:var(--muted)}
+ ul{margin:.4rem 0 .4rem 1.1rem;padding:0} li{margin:.3rem 0}
+ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+ .btn{display:inline-block;background:var(--green);color:#fff;padding:.7rem 1.3rem;border-radius:8px;font-weight:600;margin-top:.4rem}
+ .btn:hover{background:#2ea043;text-decoration:none}
+ code{background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:.1rem .4rem;font-size:.9em}
+ .grid{display:grid;gap:.6rem}
+ footer{color:var(--muted);font-size:.82rem;text-align:center;margin-top:2rem;border-top:1px solid var(--line);padding-top:1.2rem}
+ .pill{display:inline-block;background:#0d1117;border:1px solid var(--line);border-radius:999px;padding:.2rem .7rem;font-size:.8rem;color:var(--muted);margin:.15rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>claude-tunnel</h1>
+    <div class="tag">Ein provider-blinder Zero-Knowledge-Tunnel — akademisches Testbett &amp; Produkt</div>
+  </header>
+
+  <div class="disc">
+    <strong>Hinweis:</strong> Die verlinkte Bachelorarbeit sowie große Teile dieses Projekts wurden
+    <strong>mit Unterstützung eines Large Language Models (LLM) generiert</strong>. Inhalte, Zahlen und
+    Formulierungen sind entsprechend kritisch zu prüfen.
+  </div>
+
+  <div class="card">
+    <h2>Worum geht es?</h2>
+    <p>
+      <code>claude-tunnel</code> baut einen Tunnel, bei dem der <em>Betreiber der Vermittlungs­infrastruktur
+      („Plane“) die transportierten Nutzdaten nicht lesen kann</em>. Die Nutzlast bleibt Ende-zu-Ende
+      verschlüsselt (Noise_IK); die Plane sieht nur Routing- und Abrechnungs-Metadaten.
+    </p>
+    <ul>
+      <li><strong>Mesh Plane:</strong> Routing über ein <em>opakes Routing-Token</em> — kein öffentlicher
+        Hostname, kein SNI. Es gibt bewusst nichts, das eine öffentliche CA zertifizieren müsste.</li>
+      <li><strong>Browser Plane:</strong> öffentlicher Hostname per <em>SNI-Passthrough</em> — TLS terminiert
+        am Origin (nicht an der Plane), sodass ein Browser eine ganz normale HTTPS-Seite durch den Tunnel lädt.</li>
+      <li><strong>Universal :443:</strong> alles über Port 443 multiplext, damit der Tunnel auch aus
+        restriktiven Netzen erreichbar bleibt.</li>
+    </ul>
+    <p class="muted">
+      Diese Seite selbst wird über einen Demo-Tunnel (Browser Plane) ausgeliefert und mit einem
+      öffentlich vertrauenswürdigen Zertifikat (Let's Encrypt) am Origin terminiert.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Bachelorarbeit</h2>
+    <p>Die schriftliche Ausarbeitung (LaTeX-Quellen und Aufbau) liegt im GitHub-Repository:</p>
+    <div class="grid">
+      <a class="btn" href="https://github.com/scimbe/claude-tunnel/tree/main/docs/thesis">BA-Arbeit auf GitHub ansehen →</a>
+      <span class="muted">Repository: <a href="https://github.com/scimbe/claude-tunnel">github.com/scimbe/claude-tunnel</a></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Technik-Stack</h2>
+    <div>
+      <span class="pill">Rust</span><span class="pill">Noise_IK (E2E)</span><span class="pill">QUIC + TLS-TCP-Fallback</span>
+      <span class="pill">SNI-Routing</span><span class="pill">Let's Encrypt / ACME</span><span class="pill">provider-blind</span>
+    </div>
+  </div>
+
+  <footer>
+    Demo über die Browser Plane von claude-tunnel · Nutzlast Ende-zu-Ende verschlüsselt ·
+    LLM-unterstützt erstellt
+  </footer>
+</div>
+</body>
+</html>
