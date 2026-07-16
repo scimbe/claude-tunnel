@@ -1153,9 +1153,10 @@ Browser Plane (öffentliches SNI + Let's Encrypt, ADR-0010) ist post-v1 → sepa
   lokalen Port den Mesh nutzen (TLS terminiert am Origin, Edge provider-blind). Frozen-Test
   `forward_mode_bridges_a_local_tcp_connection_through_the_tunnel` (lokaler TCP-Client → Forward →
   Tunnel → Echo-Origin). Gate grün.
-- **HW2b** ⏳ `scripts/https-demo.sh` — menschlich nachvollziehbare Demo mit HW2a: HTTPS-Origin +
-  `CT_CLIENT_MODE=forward`, dann `curl --cacert origin-ca.pem https://127.0.0.1:<listen>/` durch den
-  Tunnel, zeigt 200 + validiertes Cert.
+- **HW2b** ✅ `scripts/https-demo.sh` — menschlich nachvollziehbare Demo mit HW2a: self-signed HTTPS-Origin
+  (openssl s_server, SAN IP:127.0.0.1) + Agent + Client-Forward, dann `curl --cacert` durch den Tunnel.
+  **Lokal end-to-end verifiziert** gegen die laufende ct-selfhost-Central: HTTP 200 über TLS, Cert
+  client-seitig validiert, Origin liefert echtes HTML. `bash -n` grün.
 - **HW3** ⏳ Separates Tracking-Issue für die **Browser Plane** (ADR-0010, öffentliches SNI +
   Let's Encrypt via ADR-0003 DNS-01) — explizit post-v1, out-of-scope für #22. Danach #22 **fix-ready**
   (Kern-Akzeptanz HW1 erfüllt; HW2 optional-Demo, HW3 verlinkt den deferred Teil).
