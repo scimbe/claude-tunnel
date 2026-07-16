@@ -45,10 +45,28 @@ You have two choices:
    touch challenge records.
 3. Copy the token value (shown once).
 
-## 4. Configure the `.env`
-Copy `config/desec.env.example` to your `.env` and fill it in
-(**never commit the real token**):
+## 4. Configure the `.env` — which file, exactly
 
+The vars must go in the `.env` that the **running service actually loads** — this
+differs by deployment mode, so put them in the right place:
+
+- **Self-host Compose** (the usual case): the stack loads **`docker/deploy/.env`**
+  (`compose.selfhost.yml` runs with `--env-file docker/deploy/.env`). A root
+  `./.env` is **NOT** read by the containers — a token placed there is silently
+  ignored. Put the deSEC vars in `docker/deploy/.env`:
+  ```bash
+  # first-time setup copies the deploy example (then you edit secrets):
+  cp docker/deploy/.env.example docker/deploy/.env       # if not already done
+  # append the deSEC block from the reference template, then edit the token:
+  cat config/desec.env.example >> docker/deploy/.env
+  ${EDITOR:-nano} docker/deploy/.env                     # set DESEC_TOKEN=...
+  ```
+
+- **Standalone / bare process**: export the vars in the environment of whatever
+  launches the ACME client (systemd `EnvironmentFile=`, a shell `export`, etc.).
+  `config/desec.env.example` is the reference template for the exact variable names.
+
+Required keys (**never commit the real token**):
 ```dotenv
 CT_ACME_DNS_PROVIDER=desec
 DESEC_TOKEN=<your deSEC API token>
@@ -56,7 +74,9 @@ DESEC_DOMAIN=bunsenbrenner.org
 # DESEC_API_BASE=https://desec.io/api/v1   # default; only override for testing
 ```
 
-The token is read at startup and never logged. What the client does under the
+The token is read at startup and never logged. The service that **consumes**
+`DESEC_TOKEN` (the ACME client) lands with **#31 FD4**; the authoritative location
+above is stable, so you can set the token now. What the client does under the
 hood (for reference): a bulk **`PATCH https://desec.io/api/v1/domains/<zone>/rrsets/`**
 with `Authorization: Token <token>` and a body like
 `[{"subname":"_acme-challenge","type":"TXT","ttl":3600,"records":["\"<value>\""]}]`
