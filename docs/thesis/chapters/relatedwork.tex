@@ -1,0 +1,151 @@
+\chapter{Verwandte Arbeiten}
+\label{ch:relatedwork}
+
+Dieses Kapitel ordnet \texttt{claude-tunnel} in bestehende Systeme ein und
+schärft die zentrale Unterscheidung der Arbeit heraus: die
+\emph{Providerblindheit}. Betrachtet werden vier Familien verwandter Systeme ---
+klassische VPNs (Abschnitt~\ref{sec:rw-vpn}), Reverse-Tunnel-Dienste
+(Abschnitt~\ref{sec:rw-reverse}), Anonymitäts- und Zensurumgehungssysteme
+(Abschnitt~\ref{sec:rw-anon}) sowie QUIC-basierte Relays
+(Abschnitt~\ref{sec:rw-quic}). Der abschließende Abschnitt~\ref{sec:rw-abgrenzung}
+verdichtet die Abgrenzung in einer Gegenüberstellung. Leitfrage ist durchgehend:
+\emph{Wer terminiert die Verschlüsselung, und wer kann folglich Klartext lesen
+oder die Verbindung kappen?}
+
+\section{Klassische VPNs und WireGuard}
+\label{sec:rw-vpn}
+
+Klassische VPNs stellen einen verschlüsselten Tunnel zwischen zwei Endpunkten
+her. Bei WireGuard etwa terminiert die Verschlüsselung an den beiden Peers
+selbst: Der Tunnel verbindet einen Client mit einem Server, der zugleich
+Gegenstelle und Vertrauensanker ist. Für den hier verfolgten Anwendungsfall ---
+ein kundeneigenes Origin hinter einer restriktiven Netzgrenze ohne öffentliche
+Adresse erreichbar zu machen --- ist dieses Modell nur bedingt geeignet: Es
+existiert kein providerblindes \emph{Relay} zwischen den Parteien, das Verkehr
+vermittelt, ohne selbst Endpunkt zu sein. Wer einen VPN-Server als
+Vermittlungsknoten betreibt, terminiert dessen Verschlüsselung und sieht den
+weitergeleiteten Verkehr im Klartext. WireGuard löst die Transport- und
+Schlüsselfrage elegant, adressiert aber gerade nicht die Trennung von blinder
+Vermittlung und kundenseitig verankerter Ende-zu-Ende-Sicherheit, die den Kern
+dieser Arbeit bildet. \texttt{claude-tunnel} übernimmt die Idee moderner,
+schlanker Handshakes --- die Datenebene nutzt Noise~\cite{noiseprotocol} ---,
+verschiebt die Terminierung jedoch vom Vermittler an das kundeneigene Ziel.
+
+\section{Reverse-Tunnel-Dienste}
+\label{sec:rw-reverse}
+
+Reverse-Tunnel-Dienste wie Cloudflare Tunnel, ngrok oder Tailscale Funnel lösen
+dieselbe Erreichbarkeitsaufgabe: Ein Agent im privaten Netz baut eine
+ausgehende Verbindung zu einer Anbieter-Infrastruktur auf, über die eingehender
+Verkehr an das interne Ziel zurückgereicht wird. Damit entfällt die
+Notwendigkeit eingehender Firewall-Freigaben. Entscheidend für die Abgrenzung ist
+jedoch, \emph{wo die Transport\-verschlüsselung terminiert}: Bei diesen Diensten
+endet die TLS-Sitzung beim Anbieter. Der Betreiber steht als vollwertiger
+Man-in-the-Middle im Pfad, sieht den Klartext des vermittelten Verkehrs und kann
+einzelne Tunnel jederzeit inhaltlich inspizieren oder kappen. Adressiert werden
+die Tunnel überdies typischerweise über öffentliche Hostnamen, deren Zuordnung
+der Anbieter kennt und kontrolliert.
+
+Genau dieses Vertrauensmodell ist das \emph{Gegenmodell} zu \texttt{claude-tunnel}.
+Der providerblinde Ansatz kehrt die Eigenschaft um: Das Relay leitet
+ausschließlich Chiffretext weiter, hält keinen Schlüssel zur Nutzlast und
+adressiert Tunnel nicht über einen Hostnamen, sondern über ein opakes
+\emph{Routing-Token} ohne SNI-Information. Der Betreiber bleibt damit von Inhalt
+und Vermittlungsziel abgeschnitten und ist als Druck- oder Zensurpunkt entwertet
+--- die funktionale Bequemlichkeit des Reverse-Tunnels wird ohne die
+Vertrauensbürde des klartextsichtigen Anbieters erreicht.
+
+\section{Anonymität und Zensurumgehung}
+\label{sec:rw-anon}
+
+Tor und allgemeiner das Onion-Routing verfolgen ein anderes Bedrohungsmodell:
+Ziel ist die \emph{Anonymität} der kommunizierenden Parteien, erreicht durch
+mehrstufige, geschichtete Verschlüsselung über mehrere unabhängige Relays, sodass
+kein einzelner Knoten Sender und Empfänger zugleich kennt. \emph{Pluggable
+transports} wie obfs4 oder Shadowsocks ergänzen dies um Verschleierung des
+Verkehrsmusters, um Deep-Packet-Inspection und Protokollfilter zu unterlaufen.
+Diese Systeme schützen also primär die \emph{Identität} und die
+\emph{Beobachtbarkeit} der Kommunikation gegenüber Netzbeobachtern.
+
+\texttt{claude-tunnel} zielt demgegenüber nicht auf Anonymität, sondern auf
+\emph{Providerblindheit}: Der Betreiber darf durchaus wissen, \emph{dass} ein
+Tunnel existiert und grobe Zeit- und Volumenzähler sehen --- er darf nur die
+Nutzlast weder lesen noch das Origin-Schlüsselmaterial erlangen. Die
+Bedrohungsmodelle sind damit komplementär, nicht deckungsgleich. Verwandt bleiben
+gleichwohl die Fragen der \emph{Metadaten}-Minimierung (welche strukturellen
+Spuren ein Vermittler zwangsläufig sieht) und der \emph{Denial-of-Service}-
+Resistenz eines offenen, KYC-freien Zugangs. Wo Tor auf Netzwerk- und
+Reputationsmechanismen setzt, verwendet \texttt{claude-tunnel} ein
+Proof-of-Work-Rendezvous~\cite{back2002hashcash} mit tokenweiser Ratenbegrenzung
+als primären Sybil- und Flutungs-Schutz.
+
+\section{QUIC-Relays und MASQUE}
+\label{sec:rw-quic}
+
+Auf der Transportebene ist \texttt{claude-tunnel} den QUIC-basierten
+Relay-Ansätzen verwandt. QUIC~\cite{rfc9000} bündelt Verbindungsaufbau,
+Verschlüsselung und Multiplexing über UDP und eignet sich damit für den
+schnellen Aufbau vieler kurzlebiger Tunnel. Das MASQUE-Framework baut auf QUIC
+und HTTP/3 auf, um Proxy- und Tunneldienste über eine QUIC-Verbindung zu
+transportieren --- konzeptionell ein Relay, das UDP- oder IP-Verkehr für einen
+Client weiterreicht. Die Datenebene dieser Arbeit teilt diese Transportbasis:
+QUIC (via \texttt{quinn}) ist der primäre Transport, ergänzt um einen
+TLS-über-TCP-Rückfall für Umgebungen, in denen UDP blockiert ist.
+
+Der Unterschied liegt erneut in der Terminierung und der Schlüsselverankerung:
+Ein MASQUE-Proxy terminiert die QUIC-Verbindung des Clients bei sich und ist
+somit prinzipiell klartextsichtig auf der Proxy-Sitzung. \texttt{claude-tunnel}
+legt über den QUIC-Transport eine zweite, providerblinde Schicht: eine
+Ende-zu-Ende-Noise-Sitzung zwischen Client und Origin, deren Chiffretext das
+Relay lediglich durchreicht. Der Transport ist verwandt; das Vertrauensmodell ist
+es nicht.
+
+\section{Abgrenzung}
+\label{sec:rw-abgrenzung}
+
+Tabelle~\ref{tab:rw-abgrenzung} stellt die vier Familien anhand der
+entscheidenden Merkmale gegenüber. Der Unterschied bündelt sich in einer Zeile:
+Bei WireGuard, Cloudflare Tunnel und Tor liegt die für den Nutzlastschutz
+relevante Terminierung entweder beim Vermittler oder ist gar nicht als blindes
+Relay konzipiert; nur \texttt{claude-tunnel} verbindet ein nutzlast-blindes Relay
+mit einer kundenseitig am Origin verankerten Terminierung.
+
+\begin{table}[t]
+\centering
+\caption{Abgrenzung entlang von Terminierung, Klartextsicht, Kappbarkeit und
+Adressierung.}
+\label{tab:rw-abgrenzung}
+\begin{tabular}{llll}
+\toprule
+Eigenschaft & WireGuard & Cloudflare Tunnel & Tor \\
+\midrule
+Wer terminiert TLS/Krypto & Peer/Server & Anbieter & Origin (mehrfach) \\
+Wer sieht Klartext & Server-Peer & Anbieter & kein Einzelknoten \\
+Wer kann kappen & Server-Peer & Anbieter & jedes Relay (Pfad) \\
+Öffentl. Hostname nötig & Server-Endpunkt & ja & nein \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Die Alleinstellung von \texttt{claude-tunnel} ergibt sich aus der Kombination
+vierer Bausteine, die in dieser Zusammenstellung bei keinem der verglichenen
+Systeme auftritt:
+
+\begin{itemize}
+  \item ein \emph{nutzlast-blindes Relay}, das ausschließlich Chiffretext
+    weiterleitet und keinen Schlüssel zur Nutzlast besitzt;
+  \item ein \emph{opakes Routing-Token} statt eines Hostnamens, das dem
+    Betreiber auch das Vermittlungsziel verbirgt (keine SNI- oder
+    Hostnamen-Information);
+  \item ein \emph{Proof-of-Work-Rendezvous} mit tokenweiser Ratenbegrenzung als
+    KYC-freier Zugangs- und DoS-Schutz~\cite{back2002hashcash};
+  \item \emph{kundenseitig verankerte Noise-Schlüssel ohne
+    PKI}~\cite{noiseprotocol} --- die Ende-zu-Ende-Sicherheit terminiert am
+    kundeneigenen Origin und benötigt weder eine Zertifikatshierarchie noch einen
+    anbieterseitigen Vertrauensanker.
+\end{itemize}
+
+Für \texttt{claude-tunnel} bedeutet dies: Die funktionale Erreichbarkeit eines
+Reverse-Tunnels wird mit dem Vertrauensmodell eines providerblinden Relays
+zusammengeführt --- der Betreiber vermittelt, ohne Endpunkt oder Vertrauensanker
+zu sein.

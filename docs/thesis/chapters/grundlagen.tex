@@ -1,11 +1,21 @@
 \chapter{Grundlagen}
 \label{ch:grundlagen}
 
-Dieses Kapitel führt die vier technischen Bausteine ein, auf denen der Entwurf
-aufsetzt: das Prinzip providerblinder Relays (Abschnitt~\ref{sec:providerblind}),
-QUIC als Transport (Abschnitt~\ref{sec:quic}), das Noise-Protokoll für die
-Ende-zu-Ende-Sicherheit (Abschnitt~\ref{sec:noise}) und Proof-of-Work als
-Zugangsschutz (Abschnitt~\ref{sec:pow}).
+Dieses Kapitel führt die technischen Bausteine ein, auf denen der Entwurf
+aufsetzt. Die ersten vier Abschnitte behandeln die tragenden Mechanismen des
+Datenpfades: das Prinzip providerblinder Relays
+(Abschnitt~\ref{sec:providerblind}), QUIC als Transport
+(Abschnitt~\ref{sec:quic}), das Noise-Protokoll für die Ende-zu-Ende-Sicherheit
+(Abschnitt~\ref{sec:noise}) und Proof-of-Work als Zugangsschutz
+(Abschnitt~\ref{sec:pow}). Die vier weiteren Abschnitte ergänzen die
+konzeptionellen Voraussetzungen, auf die spätere Kapitel zurückgreifen: das
+außerbandig verteilte Capability-Modell (Abschnitt~\ref{sec:capabilities}), das
+Prinzip der Schlüsselrotation (Abschnitt~\ref{sec:rotation}), die für einen
+providerblinden Betreiber legitime Beobachtbarkeit
+(Abschnitt~\ref{sec:observability}) und die selbst-hostbare, schlüsselfreie
+Steuerebene (Abschnitt~\ref{sec:controlplane}). Alle Bausteine werden hier
+\emph{konzeptionell} eingeführt; ihre konkrete Umsetzung und quantitative
+Bewertung folgen in den späteren Kapiteln.
 
 \section{Providerblinde Relays und das Zero-Knowledge-Prinzip}
 \label{sec:providerblind}
@@ -28,6 +38,19 @@ wird ein Tunnel nicht über einen Hostnamen, sondern über ein opakes
 bleibt. Diese Trennung von blinder Nutzlast und sichtbaren Metadaten ist der
 konzeptionelle Kern der Arbeit.
 
+Es ist wichtig, die Blindheit nicht mit \emph{Anonymität} zu verwechseln. Der
+Betreiber sieht weiterhin, dass \emph{zwischen bestimmten Netzadressen} ein Tunnel
+besteht, und kann daran grobe Aktivitätsmuster ablesen; verborgen bleibt allein,
+\emph{was} übertragen wird und \emph{welchem} logischen Ziel das Routing-Token
+zugeordnet ist. Damit richtet sich die Eigenschaft gegen zwei konkrete
+Bedrohungen: gegen einen kompromittierten oder unter Druck gesetzten Betreiber
+sowie gegen einen Angreifer, der sich Zugang zum Relay verschafft. In beiden
+Fällen liegt kein entschlüsselungsfähiges Material vor, das herausgegeben werden
+könnte. Der Entwurf formalisiert diese Trennung in zwei Architekturentscheidungen:
+einem providerblinden Ende-zu-Ende-Datenpfad (ADR-0001) und einer explizit
+gezogenen Zero-Knowledge-Grenze (ADR-0002), die festhält, welche Information den
+Betreiber legitim erreicht und welche ihn niemals erreichen darf.
+
 \section{QUIC als Transport}
 \label{sec:quic}
 
@@ -39,30 +62,58 @@ Verbindungsmigration bei wechselnden IP-Adressen und es erlaubt einen schnellen
 Verbindungsaufbau. Im hier verfolgten Entwurf baut der Agent die Verbindung
 \emph{ausgehend} zum Edge auf, sodass auf der Kundenseite keine eingehenden Ports
 geöffnet werden müssen; eine Client-Verbindung bildet sich auf einen QUIC-Strom
-ab. Wo ausgehendes UDP/443 blockiert ist, ist ein Rückfall auf HTTP/2 über
-TCP/443 vorgesehen. Die innere, providerblinde Sitzung
-(Abschnitt~\ref{sec:noise}) läuft byteweise über diesen Transport und ist von der
-QUIC-eigenen TLS-Sicherung des Agent$\leftrightarrow$Edge-Abschnitts
-unabhängig.
+ab. Die innere, providerblinde Sitzung (Abschnitt~\ref{sec:noise}) läuft byteweise
+über diesen Transport und ist von der QUIC-eigenen TLS-Sicherung des
+Agent$\leftrightarrow$Edge-Abschnitts unabhängig.
+
+\subsection{Transportfallback über TCP}
+\label{sec:quic-fallback}
+
+Der ausgehende UDP-Verkehr, auf dem QUIC beruht, ist in restriktiven Netzen nicht
+immer verfügbar: Firmen-Firewalls, Captive Portals und einzelne Mobilfunknetze
+blockieren UDP/443 oder drosseln es so stark, dass ein Verbindungsaufbau
+scheitert. Damit der Dienst auch dort nutzbar bleibt, sieht der Entwurf einen
+Rückfall auf einen TLS-Strom über TCP/443 vor (ADR-0004). Dieser Pfad tarnt sich
+gegenüber einem einfachen Portfilter wie gewöhnlicher HTTPS-Verkehr und trägt
+denselben inneren Tunnel: Die providerblinde Noise-Sitzung ist gegenüber dem
+Untenliegenden agnostisch und läuft byteorientiert über QUIC \emph{oder} TCP,
+ohne dass sich an der Ende-zu-Ende-Sicherheit etwas ändert. Der Transport ist
+damit eine austauschbare Schicht; die für den Kunden relevante Sicherheitsaussage
+ist von der Wahl QUIC gegenüber TCP entkoppelt. Der Preis des Fallbacks ist der
+Verlust der QUIC-spezifischen Vorteile -- insbesondere wird das
+Head-of-Line-Blocking von TCP unter Paketverlust wieder wirksam --, weshalb QUIC
+der bevorzugte und TCP der subsidiäre Weg bleibt.
 
 \section{Das Noise-Protokoll}
 \label{sec:noise}
 
 Die Ende-zu-Ende-Sicherheit zwischen Client und Origin stellt das
 Noise-Protokoll-Framework~\cite{noiseprotocol} her -- konkret ein Muster vom Typ
-\texttt{Noise\_IK} mit statischen X25519-Schlüsselpaaren. Der Client kennt und
-\emph{pinnt} den statischen öffentlichen Schlüssel des Origin (die
+\texttt{Noise\_IK} mit statischen X25519-Schlüsselpaaren, symmetrischer
+Verschlüsselung über ChaCha20-Poly1305 und BLAKE2s als Hashfunktion. Der Client
+kennt und \emph{pinnt} den statischen öffentlichen Schlüssel des Origin (die
 \emph{Origin Identity}); beide Seiten authentisieren sich über ihre statischen
 Schlüssel. Das Ergebnis ist ein gegenseitig authentisierter, vorwärtsgeheimer
-Kanal \emph{ohne} Zertifizierungsstelle oder PKI. Gerade das Fehlen eines
-externen Ausstellers ist für die Zensurresistenz wesentlich: Es gibt keine
-Instanz, die zur Sperrung oder zum Ausstellen falscher Identitäten gedrängt
-werden könnte. Die Noise-Sitzung ist ein \emph{innerer} Handshake über den
-QUIC-Strom und damit unabhängig von der Transportsicherung. Der Preis dieser
-Entkopplung ist, dass die Schlüsselverteilung in der Verantwortung des Kunden
-liegt: Clients müssen die Origin Identity außerhalb des Bandes erhalten, und der
-Schlüsseltausch (Rotation) ist eine explizite Operation ohne
-Ablauf-/Erneuerungsautomatik.
+Kanal \emph{ohne} Zertifizierungsstelle oder PKI.
+
+Die Wahl des Musters \texttt{Noise\_IK} ist bewusst: Das Kürzel \enquote{I}
+bezeichnet die \emph{immediate}, aber verschlüsselt übertragene statische
+Identität des Initiators, \enquote{K} die dem Initiator vorab \emph{known}
+(bekannte) statische Identität des Responders. Genau diese Vorabkenntnis passt
+zum Bedrohungsmodell: Der Client soll ausschließlich mit dem gepinnten Origin
+sprechen und nicht auf eine vom Betreiber untergeschobene Identität hereinfallen.
+Da der Responder-Schlüssel bereits vor dem ersten Paket feststeht, kann der
+Handshake in einem Umlauf abgeschlossen werden.
+
+Gerade das Fehlen eines externen Ausstellers ist für die Zensurresistenz
+wesentlich: Es gibt keine Instanz, die zur Sperrung oder zum Ausstellen falscher
+Identitäten gedrängt werden könnte. Die Noise-Sitzung ist ein \emph{innerer}
+Handshake über den Transportstrom und damit unabhängig von der Transportsicherung.
+Der Preis dieser Entkopplung ist, dass die Schlüsselverteilung in der
+Verantwortung des Kunden liegt: Clients müssen die Origin Identity außerhalb des
+Bandes erhalten (Abschnitt~\ref{sec:capabilities}), und der Schlüsseltausch ist
+eine explizite Operation ohne Ablauf- oder Erneuerungsautomatik
+(Abschnitt~\ref{sec:rotation}).
 
 \section{Proof-of-Work als Zugangsschutz}
 \label{sec:pow}
@@ -73,11 +124,130 @@ Denial-of-Service und Sybil-Angriffe. Als Ersatz dient ein gestaffeltes Schema,
 dessen Kern ein \emph{Proof-of-Work} (PoW) ist~\cite{back2002hashcash}: Teure
 Operationen -- eine Rendezvous-Anfrage oder das Belegen eines Relay-Platzes --
 erfordern den Nachweis einer verrichteten Rechenarbeit, typischerweise das Finden
-einer Nonce, deren Hash eine geforderte Schwierigkeit erfüllt. Ergänzt wird der
-Nachweis durch \emph{Ratenbegrenzung} pro Token sowie durch Kapazitätsreserven.
-Der PoW ist zugleich der primäre Sybil-Schutz in Abwesenheit von KYC. Seine
-Grenze ist bekannt und wird in dieser Arbeit nicht ausgeblendet: Die
-Schwierigkeit muss Fluten abschrecken, ohne legitime Nutzung zu behindern, und
-ein hinreichend finanzierter Angreifer kann die Kosten schlicht bezahlen --
+einer Nonce, deren Hash eine geforderte Schwierigkeit erfüllt. Die Prüfung des
+Nachweises ist für den Betreiber billig, seine Erzeugung für den Anfragenden
+teuer; diese Asymmetrie verteuert das Fluten, ohne einzelne legitime Aufbauten
+spürbar zu belasten.
+
+Ergänzt wird der Nachweis durch \emph{Ratenbegrenzung} pro Token sowie durch
+Kapazitätsreserven. Der PoW ist zugleich der primäre Sybil-Schutz in Abwesenheit
+von KYC. Seine Grenze ist bekannt und wird in dieser Arbeit nicht ausgeblendet:
+Die Schwierigkeit muss Fluten abschrecken, ohne legitime Nutzung zu behindern,
+und ein hinreichend finanzierter Angreifer kann die Kosten schlicht bezahlen --
 missbrauchs- und abrechnungsseitige Sybil-Resistenz bleibt ein offener Punkt
-(Kapitel~\ref{ch:fazit}).
+(Kapitel~\ref{ch:fazit}). Die Schwierigkeit ist ein Betriebsparameter und
+gehört damit zu den in der Evaluation variierten Größen; sie geht als fester
+Zusatzaufwand in die Latenz des Tunnelaufbaus ein. Der Zusammenhang von
+PoW-Kosten, Aufbaulatenz und Blind-DoS-Resistenz wird im Entwurf als eigene
+Entscheidung geführt (ADR-0018) und in der Auswertung experimentell beleuchtet.
+
+\section{Capability- und Credential-Modell}
+\label{sec:capabilities}
+
+Weil weder Betreiber noch eine PKI als Vertrauensanker dienen, muss ein Client
+alles, was er für die Kontaktaufnahme mit einem bestimmten Origin braucht, in
+gebündelter Form erhalten. Diese Bündelung nennt der Entwurf eine
+\emph{Capability}: ein selbsttragendes Berechtigungsobjekt, das mindestens das
+opake Routing-Token (zum Adressieren des Tunnels beim Betreiber) und die zu
+pinnende Origin Identity (zur Ende-zu-Ende-Authentisierung im Noise-Handshake)
+zusammenfasst. Wer eine gültige Capability besitzt, kann den zugehörigen Tunnel
+nutzen; wer sie nicht besitzt, kann das Ziel nicht einmal benennen, da anstelle
+eines Hostnamens nur das opake Token existiert.
+
+Entscheidend ist der Verteilweg: Capabilities werden \emph{außerhalb des Bandes}
+übergeben (ADR-0014), also nicht über den Betreiber und nicht über den Datenpfad,
+den sie erst erschließen. Der Kunde entscheidet selbst, über welchen
+vertrauenswürdigen Kanal er sie an berechtigte Clients ausliefert. Diese
+Entkopplung ist die logische Konsequenz der Providerblindheit: Ginge die
+Berechtigung durch die Hände des Betreibers, wäre dieser wieder ein
+Vertrauensanker und ein Druckpunkt. Der bewusste Verzicht auf einen
+betreibergestützten Verteildienst verschiebt die Verantwortung für die
+Schlüssel- und Berechtigungsverteilung damit vollständig zum Kunden -- ein
+Nachteil an Komfort, der im Gegenzug die Zero-Knowledge-Grenze wahrt. Eine eng
+umrissene Ausnahme betrifft nicht-geheimes Material: Die \emph{öffentliche}
+CA-Wurzel des Edge kann über die Steuerebene bereitgestellt werden
+(Abschnitt~\ref{sec:controlplane}), da ihre Kenntnis keine Berechtigung verleiht.
+
+\section{Schlüsselrotation}
+\label{sec:rotation}
+
+Da die Origin Identity nicht abläuft, muss ein Betreiberwechsel des
+Schlüsselmaterials -- etwa bei Verdacht auf Kompromittierung oder als Routine --
+als explizite Operation möglich sein, und zwar ohne den laufenden Betrieb zu
+unterbrechen. Das tragende Prinzip lautet: \emph{gleiches Routing-Token, neue
+Origin-Identität.} Die Rotation trennt die beiden Bestandteile einer Capability
+sauber voneinander. Das Routing-Token, über das der Betreiber vermittelt, bleibt
+unverändert -- der Tunnel behält seine Adresse, und bereits verteilte Clients
+routen weiterhin korrekt. Erneuert wird allein das kryptographische
+Origin-Schlüsselpaar, das der Noise-Handshake authentisiert.
+
+Damit während der Umstellung keine Verbindung abreißt, hält der Origin für ein
+begrenztes \emph{Rotationsfenster} sowohl den zurückgezogenen als auch den neuen
+Schlüssel bereit. Ein Client mit einer alten Capability handshaked in diesem
+Fenster noch gegen den retirierten Schlüssel, ein Client mit einer bereits
+aktualisierten Capability gegen den neuen -- beide erreichen dasselbe Origin.
+Nach Ablauf des Fensters wird der alte Schlüssel entfernt, und nur noch die neue
+Origin Identity ist gültig. So entsteht eine unterbrechungsfreie Rotation, bei
+der die Verteilung der \emph{neuen} Origin Identity an die Clients wiederum über
+den außerbandigen Capability-Kanal (Abschnitt~\ref{sec:capabilities}) erfolgt.
+Weil das Routing-Token stabil bleibt, erfährt der Betreiber von der Rotation
+nichts; für ihn ist der Tunnel schlicht durchgehend erreichbar. Die praktische
+Wirksamkeit dieses Verfahrens wird in der Evaluation über ein
+Rotationsexperiment belegt.
+
+\section{Beobachtbarkeit unter Providerblindheit}
+\label{sec:grdl-observability}
+
+Auch ein providerblinder Betreiber muss seinen Dienst betreiben können: Er
+benötigt Kennzahlen zu Auslastung, Fehlern und Kapazität. Die Kernfrage lautet,
+\emph{welche} Beobachtung mit der Zero-Knowledge-Grenze verträglich ist. Der
+Leitgedanke: Erlaubt ist ausschließlich \emph{strukturelle} Telemetrie, die sich
+aus dem legitim sichtbaren Metadatenanteil (Abschnitt~\ref{sec:providerblind})
+speist und keinerlei Rückschluss auf Nutzlast, Origin-Ziel oder
+Schlüsselmaterial gestattet.
+
+Der Entwurf exponiert diese Telemetrie im etablierten Prometheus-Textformat:
+Zeitreihen, die durch periodisches Abfragen (\emph{Scraping}) eines
+\texttt{/metrics}-Endpunkts eingesammelt werden. Jede Zeile trägt einen
+Metriknamen, optionale Beschriftungen (\emph{Labels}) und einen Zahlenwert;
+\emph{Gauges} bilden momentane Zustände ab (etwa die Zahl aktiver Tunnel oder
+registrierter Agenten), \emph{Counter} kumulieren monoton wachsende Ereignisse
+(etwa die Gesamtzahl an Registrierungen, Relay-Vorgängen, relayten Bytes oder
+Failover-Ereignissen). Charakteristisch für die providerblinde Ausprägung ist,
+dass diese Reihen bewusst \emph{grob} bleiben: Ein summierter Byte-Zähler misst
+Volumen, ohne den Inhalt zu berühren; ein Tunnelzähler belegt Existenz, ohne ein
+Ziel zu benennen. Auf inhaltsnahe oder pro-Ziel aufgelöste Beschriftungen wird
+verzichtet, da sie die Metadatensparsamkeit unterlaufen würden. Ergänzend hält
+die Steuerebene eine aggregierte Statussicht bereit, deren Tunnelzahl aus genau
+diesen Edge-Zählern gespeist wird und nicht aus einer separaten, feiner
+auflösenden Registratur (ADR-0016). Damit wird Beobachtbarkeit zu einem
+first-class-Entwurfsziel, das dieselbe Grenze respektiert wie der Datenpfad.
+
+\section{Selbst-hostbare Steuerebene}
+\label{sec:controlplane}
+
+Der Datenpfad braucht eine \emph{Steuerebene} für Aufgaben, die nicht
+sicherheitskritisch am Chiffretext hängen: Kontenverwaltung, Guthaben- bzw.
+Zahlungsnachweise, das Veröffentlichen der öffentlichen CA-Wurzel und eine
+aggregierte Statussicht. Der Entwurf hält diese Steuerebene bewusst
+\emph{dünn} und \emph{selbst-hostbar} (ADR-0017): Sie hält \emph{keine}
+Schlüssel und \emph{keine} Nutzlast und liegt damit vollständig außerhalb der
+Zero-Knowledge-Grenze. Fiele sie aus oder würde sie kompromittiert, blieben
+Vertraulichkeit und Integrität der Tunnel unberührt, weil beide allein am
+Ende-zu-Ende-Noise-Kanal hängen.
+
+Die \emph{Selbst-Hostbarkeit} ist dabei mehr als ein Betriebsmerkmal: Sie
+verhindert, dass ein zentraler, notwendig vertrauenswürdiger Dienst zum
+Single Point of Trust und damit zum Zensur- oder Druckpunkt wird. Wer dem
+Anbieter der Steuerebene nicht vertrauen will, betreibt sie selbst; die
+providerblinde Sicherheitsaussage des Datenpfades ändert sich dadurch nicht.
+Für den regulären, gehosteten Betrieb bindet die Steuerebene die
+Kontenverwaltung an eine externe Identitätsinstanz (OIDC bzw.\ Keycloak) an,
+über die nutzerbezogene Endpunkte authentisiert werden, und führt ein
+Guthaben-/Kredit-Ledger für die abrechnungsseitige Zugangssteuerung. Diese
+Funktionen sind vom Datenpfad entkoppelt: Der Edge relayt Chiffretext auch dann
+korrekt, wenn die Steuerebene nichts über den Inhalt oder das Ziel eines Tunnels
+weiß. Die klare Zweiteilung -- schlüsselfreie, ersetzbare Steuerebene neben
+providerblindem Datenpfad -- ist die organisatorische Entsprechung der
+technischen Zero-Knowledge-Grenze und wird in den folgenden Kapiteln zum
+Architekturprinzip ausgebaut.

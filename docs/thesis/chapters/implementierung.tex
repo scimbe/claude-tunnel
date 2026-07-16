@@ -4,8 +4,17 @@
 Dieses Kapitel dokumentiert den Prototyp: den Aufbau des Rust-Workspace
 (Abschnitt~\ref{sec:workspace}), die kryptographischen Bausteine
 (Abschnitt~\ref{sec:bausteine}), das Rollen-Dispatch am Edge
-(Abschnitt~\ref{sec:impl-dispatch}) sowie Agent und Client
-(Abschnitt~\ref{sec:impl-agentclient}).
+(Abschnitt~\ref{sec:impl-dispatch}), Agent und Client
+(Abschnitt~\ref{sec:impl-agentclient}) sowie die darüber hinaus ausgelieferten
+Betriebsfunktionen: Agent-Redundanz mit Failover
+(Abschnitt~\ref{sec:impl-redundanz}), Observability am Edge
+(Abschnitt~\ref{sec:impl-metrics}), die selbstbediente Verteilung des CA-Roots
+(Abschnitt~\ref{sec:impl-pki}), die unterbrechungsfreie Schlüsselrotation
+(Abschnitt~\ref{sec:impl-rotation}), das Wiederverbinden des Agenten
+(Abschnitt~\ref{sec:impl-reconnect}), das transportübergreifende Relay
+(Abschnitt~\ref{sec:impl-crosstransport}) und den HTTPS-Betrieb am Origin
+(Abschnitt~\ref{sec:impl-https}). Abschnitt~\ref{sec:impl-qualitaet} fasst die
+Qualitätssicherung zusammen.
 
 \section{Aufbau des Workspace}
 \label{sec:workspace}
@@ -18,6 +27,17 @@ benötigten Bausteine: \texttt{quinn} für QUIC, \texttt{rustls} (mit dem
 Noise-Handshake, \texttt{ed25519-dalek} für Signaturen, \texttt{sha2} für den
 Proof-of-Work, \texttt{rcgen} für selbstsignierte Zertifikate und \texttt{tokio}
 als asynchrone Laufzeit.
+
+Die Schnittebene zwischen den Crates folgt der Zonentrennung aus
+Kapitel~\ref{ch:architektur}: \texttt{ct-common} enthält ausschließlich reine,
+zustandslose Bausteine ohne Netzwerk- oder Dateisystemzugriff und ist daher zu
+100~\% mit Einheitstests abdeckbar; die drei Rollen-Binaries
+(\texttt{ct-edge}, \texttt{ct-agent}, \texttt{ct-client}) halten je einen
+schmalen \texttt{main}-Einstiegspunkt, dessen eigentliche Logik in einer
+Bibliotheks\-schicht liegt, damit sie ohne echten Prozessstart integrativ
+getestet werden kann. \texttt{ct-control-plane} ist die einzige Komponente mit
+persistentem Zustand (Konto- und Kreditregister, Enrollment-Registry) und hält
+gemäß ADR-0017 weder Schlüssel noch Nutzlast.
 
 \begin{table}[t]
   \centering
@@ -49,6 +69,26 @@ einzigen Hash, das Lösen wächst exponentiell mit der Schwierigkeit
 Origin-Seite über \texttt{snow}), die signierten Credentials
 (\texttt{ed25519-dalek}) und eine Fenster-basierte Ratenbegrenzung pro Token.
 
+Der Noise-Handshake nutzt das Muster \texttt{Noise\_IK} mit der Suite
+X25519~/~ChaCha20-Poly1305~/~BLAKE2s (ADR-0013). \texttt{IK} passt zum
+Bedrohungsmodell (Kapitel~\ref{ch:architektur}): Der Client kennt die statische
+öffentliche Origin-Identität aus seiner Capability vorab (\texttt{I}~=~known),
+während er selbst dem Origin gegenüber erst im Handshake identifiziert wird.
+Das Routing-Token ist ein opakes Byte-Feld ohne Bezug zu SNI oder Hostname;
+der Edge löst darüber nur die Zielverbindung auf und kann aus dem Token weder
+den Origin noch den Kunden ableiten. Die Ratenbegrenzung führt pro Token ein
+gleitendes Zeitfenster, sodass sich der Proof-of-Work-Aufwand nicht durch
+Wiederholung derselben gelösten Challenge umgehen lässt --- Challenge-Nonce und
+Fenster zusammen bilden die primäre Sybil- und DoS-Schranke (ADR-0018) in
+Abwesenheit einer KYC-Prüfung.
+
+Der Proof-of-Work folgt der Hashcash-Konstruktion~\cite{back2002hashcash}: Ein
+Löser sucht eine Zahl, deren Hash mit hinreichend vielen führenden Nullbits
+beginnt; die Prüfung ist ein einzelner Hashvergleich. Damit lässt sich die
+Zutrittskosten eines Rendezvous über einen einzelnen Parameter
+(\texttt{EDGE\_POW\_DIFFICULTY}) skalieren, ohne dass die Verifikation am Edge
+teurer wird.
+
 \begin{lstlisting}[caption={Asymmetrischer Proof-of-Work: Prüfen ist billig, Lösen teuer (\texttt{ct-common::pow}).},label={lst:pow}]
 // Verify: ein einziger Hash.
 pub fn verify(challenge: &Challenge, solution: u64) -> bool {
@@ -75,7 +115,9 @@ Ein Agent (\texttt{'A'}) meldet sein Token an und wird in die Registry
 (\texttt{EdgeState}) eingetragen; ein Client (\texttt{'C'}) erhält die
 PoW-Challenge, sein Request wird geprüft, das Token zur Agent-Verbindung
 aufgelöst und beide QUIC-Ströme werden byteweise gekoppelt. Der Edge hält damit
-nur die Abbildung Token~$\rightarrow$~Verbindung und sieht nie den Klartext.
+nur die Abbildung Token~$\rightarrow$~Verbindung und sieht nie den Klartext:
+Zwischen Client und Origin liegt der \texttt{Noise\_IK}-Kanal, dessen
+Chiffretext der Edge lediglich weiterreicht (ADR-0001, ADR-0002).
 
 \begin{lstlisting}[caption={Rollen-Dispatch am Edge (gekürzt, \texttt{ct-edge::serve}).},label={lst:dispatch}]
 match role[0] {
@@ -105,12 +147,283 @@ weitergeleiteten QUIC-Strom mittels \texttt{copy\_bidirectional} auf eine
 TCP-Verbindung zum lokalen Origin. Der Client (\texttt{ct-client}) wählt den
 Edge, durchläuft das PoW-Rendezvous (\texttt{'C'}), tunnelt seine Nutzlast und
 verifiziert die Antwort; ein zusätzlicher Bench-Modus misst die
-Roundtrip-Latenz über mehrere Iterationen und dient als Datenquelle der
-Evaluation (Kapitel~\ref{ch:evaluation}). Alle drei Binaries beziehen ihre
-Konfiguration aus Umgebungsvariablen und koordinieren sich im Testbett über ein
-geteiltes Volume (Edge-Zertifikat, Capability).
+Roundtrip-Latenz über mehrere Iterationen (\texttt{CT\_CLIENT\_ITERATIONS}) und
+gibt eine beschriftete CSV-Zeile mit Mittelwert, Minimum, Maximum, den
+Perzentilen p50/p95/p99, Standardabweichung und 95~\%-Konfidenzintervall aus.
+Diese Zeile ist die Datenquelle der Evaluation (Kapitel~\ref{ch:evaluation}).
+Alle drei Binaries beziehen ihre Konfiguration aus Umgebungsvariablen und
+koordinieren sich im Testbett über ein geteiltes Volume (Edge-Zertifikat,
+Capability).
 
-Die Umsetzung ist testgetrieben entstanden: Der Workspace umfasst 94
-automatisierte Tests -- von den reinen Kodierungs- und PoW-Funktionen bis zu
-Integrationstests, die einen vollständigen Client$\rightarrow$Edge$\rightarrow$Agent-Roundtrip
-über echtes QUIC ausführen.
+Der primäre Transport ist QUIC über \texttt{quinn} (ADR-0004). Ist UDP im Netz
+blockiert, fällt der Client auf eine TLS-über-TCP-Verbindung nach Port~443
+zurück; dieselbe Tunnel-Semantik wird dann über den TCP-Pfad getragen. Der
+Fallback lässt sich zur Reproduktion erzwingen
+(\texttt{CT\_CLIENT\_FORCE\_TCP=1}); der Cross-Host-Rauchtest bestätigt für
+beide Pfade einen erfolgreichen Roundtrip (\enquote{SMOKE OK via=quic} bzw.
+\enquote{via=tcp}).
+
+\section{Agent-Redundanz und Failover (\texttt{ct-edge})}
+\label{sec:impl-redundanz}
+
+Damit ein Origin mehr als einen anmeldenden Agenten tragen kann, ist die
+Registry nicht als \texttt{1:1}-Abbildung, sondern als
+\texttt{HashMap<RoutingToken,\ Vec<(id,\ Connection)>>} ausgelegt. Mehrere
+Agenten teilen sich also dieselbe Origin-Identität und dasselbe Routing-Token
+und tragen sich als getrennte Einträge derselben Liste ein. Beim Auflösen eines
+Client-Requests wählt \texttt{route} den zuletzt registrierten Eintrag zuerst
+(\emph{newest-first}) und probiert die weiteren als Rückfallebene durch.
+
+Fällt der bedienende Agent hart aus (Prozessabbruch ohne QUIC-\texttt{CLOSE}),
+kann der Edge dies nicht sofort erkennen, weil keine ordentliche
+Verbindungstrennung eintrifft. Deshalb setzt der Edge-Server für jede
+eingehende Verbindung \texttt{keep\_alive} auf 3~s und
+\texttt{max\_idle\_timeout} auf 10~s: Bleibt eine Registrierung länger als das
+Leerlauffenster stumm, verwirft QUIC die Verbindung, und der Eintrag wird aus
+der Liste entfernt (Eviction). Der nächste Client-Roundtrip löst dann auf die
+überlebende Registrierung auf. Der Rauchtest \texttt{redundancy-smoke.sh}
+belegt dies: Zwei Agenten teilen eine Origin-Identität, der bedienende Agent
+wird getötet, und nach Ablauf des Erkennungsfensters gelingt der Roundtrip
+erneut \enquote{via=quic} über den zweiten Agenten (\enquote{REDUNDANCY OK}).
+
+\section{Observability am Edge (\texttt{ct-edge})}
+\label{sec:impl-metrics}
+
+Der Edge exponiert einen \texttt{/metrics}-Endpunkt im Prometheus-Textformat
+(ADR-0016). Gemessen werden zwei Momentanwerte (Gauges) --- die Zahl der aktiven
+Tunnel (\texttt{ct\_edge\_active\_tunnels}) und der aktuell registrierten
+Agenten (\texttt{ct\_edge\_active\_agents}) --- sowie vier kumulative Zähler
+(Counter): abgeschlossene Registrierungen
+(\texttt{ct\_edge\_registrations\_total}), aufgebaute Relays
+(\texttt{ct\_edge\_relays\_total}), das über Relays getragene Byte-Volumen
+(\texttt{ct\_edge\_relay\_bytes\_total}) und die Zahl der Failover-Ereignisse
+(\texttt{ct\_edge\_failovers\_total}). Alle Werte sind bewusst \emph{strukturell}:
+Sie beschreiben Existenz, grobe Zeit und Volumen von Tunneln, aber niemals deren
+Inhalt --- der Edge bleibt damit auch in der Observability zonentreu (ADR-0002).
+
+Eine reale Momentaufnahme des laufenden Selbst-Hosts zeigt das Zusammenspiel:
+zum Scrape-Zeitpunkt war kein Agent angemeldet
+(\texttt{ct\_edge\_active\_tunnels}~0, \texttt{ct\_edge\_active\_agents}~0), über
+die Laufzeit wurden aber 7~Registrierungen und 2~Relays mit zusammen 8369~Byte
+Nutzvolumen gezählt, bei 0~Failovern. Die dünne Steuerkomponente greift diese
+Zahlen auf: Ihre Statusseite und der \texttt{/status}-Endpunkt melden die
+\emph{live} vom Edge gescrapte Tunnelzahl (nicht den Inhalt der
+Rendezvous-Registry) und ergänzen betriebliche Kennzahlen der Steuerebene ---
+in derselben Aufnahme 45~Agenten insgesamt, 4~Konten und 2~bestätigte
+Zahlungen. Eine selbsttragende HTML-Landeseite (Feature~\#4) rendert diese
+Zählwerte ohne externe Abhängigkeiten für den Betreiber.
+
+\section{Selbstbediente Verteilung des CA-Roots (\texttt{ct-control-plane})}
+\label{sec:impl-pki}
+
+Damit Agenten und Clients dem Edge-Transport vertrauen können, benötigen sie
+dessen CA-Root-Zertifikat. Statt es außerhalb des Systems zu kopieren,
+veröffentlicht die Steuerkomponente das Edge-CA-Root unter \texttt{/pki/ca}.
+Agenten und Clients holen es beim Start von dort. Der Bezug betrifft
+ausschließlich das öffentliche Transport-Root der Steuerebene; die
+end-to-end-relevanten Origin-Schlüssel bleiben davon unberührt und werden gemäß
+ADR-0014 als Out-of-Band-Capabilities in der Verantwortung des Kunden
+verteilt. Die Steuerebene hält damit weiterhin keinerlei geheimes
+Schlüsselmaterial des Datenpfads.
+
+\section{Unterbrechungsfreie Schlüsselrotation (\texttt{ct-agent})}
+\label{sec:impl-rotation}
+
+Die Rotation der Origin-Identität ist so entworfen, dass laufende Clients nicht
+brechen. Der Kniff ist die Trennung von \emph{Routing} und \emph{Identität}:
+Bei einer Rotation behält der Origin sein Routing-Token, erhält aber eine neue
+Origin-Identität; die Capability wird über \texttt{mint\_capability\_with\_token}
+mit unverändertem Token neu ausgestellt. Weil das Token gleich bleibt, routen
+bereits verteilte (alte) Clients weiterhin auf denselben Origin.
+
+Für ein Zeitfenster bedient der Agent parallel den zurückgezogenen Schlüssel:
+Alte Schlüssel wandern in ein Verzeichnis retirierter Schlüssel
+(\texttt{CT\_AGENT\_ORIGIN\_KEY\_DIR}), gegen die der Agent den
+\texttt{Noise\_IK}-Handshake während der Übergangszeit weiterhin abschließt. So
+handshaken alte Clients noch die retirierte Identität, während neue Clients die
+neue Identität nutzen. Der Rauchtest \texttt{rotation-smoke.sh} weist beides
+nach: Nach der Rotation mit demselben Token schließen \emph{sowohl} die alte
+\emph{als auch} die neue Capability einen vollständigen Tunnel-Roundtrip ab
+(\enquote{ROTATION OK}). Die Rotation ist explizit und ohne automatischen
+Ablauf --- der Zeitpunkt der endgültigen Ausmusterung bleibt eine bewusste
+Betreiberentscheidung.
+
+\section{Wiederverbinden des Agenten (\texttt{ct-agent})}
+\label{sec:impl-reconnect}
+
+Ein Agent muss transiente Netzstörungen und Edge-Neustarts überstehen, ohne
+seinen Tunnel dauerhaft zu verlieren. Bricht die QUIC-Verbindung zum Edge ab,
+versucht der Agent, sie erneut aufzubauen und sich neu zu registrieren. Die
+Wiederverbindungsversuche folgen einem exponentiellen Backoff mit oberer
+Schranke: Die Wartezeit verdoppelt sich nach jedem Fehlversuch, bis eine
+Obergrenze erreicht ist, ab der in konstantem Abstand weiter versucht wird. Das
+begrenzt die Last auf einen gerade neu startenden Edge und vermeidet zugleich,
+dass ein länger gestörter Agent unnötig lange offline bleibt. In Verbindung mit
+der Eviction aus Abschnitt~\ref{sec:impl-redundanz} ergibt sich ein
+selbstheilendes Verhalten: Ein zwischenzeitlich ausgefallener Agent trägt sich
+nach Wiederkehr erneut in die Registry ein.
+
+\section{Transportübergreifendes Relay (\texttt{ct-edge})}
+\label{sec:impl-crosstransport}
+
+Client und Agent müssen nicht denselben Transport benutzen. Der Edge koppelt
+die beiden Seiten eines Tunnels unabhängig davon, ob sie über QUIC oder über
+den TLS-über-TCP-Fallback (Abschnitt~\ref{sec:impl-agentclient}) angebunden
+sind. So kann ein QUIC-Client einen Agenten erreichen, der nur über den
+TCP-Fallback am Edge hängt (Feature~\#13), und umgekehrt. Da der Edge lediglich
+Chiffretext zwischen den beiden Strömen weiterreicht und den
+\texttt{Noise\_IK}-Kanal nicht terminiert, ist die Transportwahl der einen Seite
+für die andere transparent; die Ende-zu-Ende-Sicherung bleibt in jedem Fall
+zwischen Client und Origin bestehen.
+
+\section{HTTPS am Origin und Client-Forward-Modus (\texttt{ct-client})}
+\label{sec:impl-https}
+
+Ein zentrales Ziel der Zonentrennung ist, dass TLS am Origin terminiert und der
+Edge auch dann nur Chiffretext sieht, wenn der Origin selbst HTTPS spricht. Der
+Prototyp weist dies end-to-end nach: Eine reale, selbstsignierte HTTPS-Seite
+(SAN~\texttt{127.0.0.1}) auf Loopback wird durch den Tunnel erreicht, und
+\texttt{curl\ --cacert} liefert HTTP~200 mit \emph{client-seitig} validiertem
+Zertifikat des Origins (Rauchtest \texttt{https-demo.sh}). Die TLS-Sitzung
+läuft dabei zwischen Browser bzw.\ Client und Origin; der Edge relayt nur das
+in Noise gekapselte TLS-Chiffretext. Der gefrorene Integrationstest
+\texttt{https\_website\_through\_the\_tunnel\_with\_client\_side\_cert\_validation}
+sichert dieses Verhalten dauerhaft ab.
+
+Damit beliebige TCP/TLS-Anwendungen den Tunnel nutzen können, kennt der Client
+einen Weiterleitungsmodus (\texttt{CT\_CLIENT\_MODE=forward}): Er öffnet einen
+lokalen Port, über den jede Anwendung ihren Verkehr in den Tunnel schickt,
+anstatt selbst die Nutzlast zu formen (Listing~\ref{lst:forward}). Erst dieser
+Modus macht aus dem Tunnel ein universelles Transport-Werkzeug statt eines
+demonstrativen Roundtrip-Klienten.
+
+\begin{lstlisting}[caption={Client-Forward-Modus: lokaler Port in den Tunnel (gekürzt, \texttt{ct-client}).},label={lst:forward}]
+let listener = TcpListener::bind(local_addr).await?;
+loop {
+    let (mut app, _) = listener.accept().await?;   // lokale App
+    let mut tunnel = open_tunnel(&edge, &cap).await?; // Noise ueber QUIC
+    copy_bidirectional(&mut app, &mut tunnel).await?; // koppeln
+}
+\end{lstlisting}
+
+Damit ist die im Bedrohungsmodell geforderte Eigenschaft belegt, dass TLS am
+Origin terminiert; die weitergehende \emph{Browser Plane} mit öffentlichem
+Hostnamen und Let's-Encrypt-Zertifikaten über SNI ist bewusst auf die Zeit nach
+v1 verschoben (ADR-0010).
+
+\section{Qualitätssicherung}
+\label{sec:impl-qualitaet}
+
+Die Umsetzung ist testgetrieben entstanden. Der Workspace umfasst 266
+automatisierte Tests, die hermetisch bestehen --- verteilt auf \texttt{ct-common}
+(40), \texttt{ct-agent} (65), \texttt{ct-client} (30), \texttt{ct-edge} (52) und
+\texttt{ct-control-plane} (79). Sie reichen von den reinen Kodierungs- und
+PoW-Funktionen bis zu Integrationstests, die einen vollständigen
+Client~$\rightarrow$~Edge~$\rightarrow$~Agent-Roundtrip über echtes QUIC
+ausführen. Die auf die Bibliotheksschicht bezogene Zeilenabdeckung (ohne die
+dünnen Einstiegspunkte, gemessen mit \texttt{cargo-llvm-cov}) beträgt
+95,57~\% der Zeilen, 94,44~\% der Funktionen und 93,74~\% der Regionen; das
+Skript \texttt{scripts/coverage.sh} erzwingt eine untere Schranke von 95~\%
+Zeilenabdeckung.
+
+Als Regressionsschranke dient ein hermetisches Docker-Gate: Bau und Test des
+gesamten Workspace laufen in einem \texttt{rust:1-slim}-Container mit
+\texttt{RUSTFLAGS="-D\ warnings"} und schlagen bei der ersten Warnung fehl; der
+Prototyp durchläuft dieses Gate mit 0~Warnungen. Zusammen mit den in den
+vorangehenden Abschnitten genannten Rauchtests
+(\texttt{e2e-smoke.sh}, \texttt{redundancy-smoke.sh}, \texttt{rotation-smoke.sh},
+\texttt{https-demo.sh}) ergibt sich eine reproduzierbare Qualitätsbasis, auf der
+die Evaluation in Kapitel~\ref{ch:evaluation} aufsetzt.
+
+\section{Ausgewählte Implementierungsdetails}
+\label{sec:impl-details}
+
+Die vorangehenden Abschnitte beschreiben die Mechanismen auf Verhaltensebene.
+Dieser Abschnitt vertieft drei Bausteine bis auf die Datenstruktur- und
+Wire-Ebene, weil sich an ihnen die Zonentrennung konkret ablesen lässt: die
+Registry am Edge (Abschnitt~\ref{sec:impl-registry}), das gerenderte
+\texttt{/metrics}-Dokument (Abschnitt~\ref{sec:impl-exposition}) und die
+Kopplung im Client-Forward-Modus (Abschnitt~\ref{sec:impl-forward-detail}).
+
+\subsection{Die EdgeState-Registry: Typ, Failover, Eviction}
+\label{sec:impl-registry}
+
+Die zentrale Datenstruktur des Edge ist eine einzige Abbildung vom opaken
+Routing-Token auf eine Liste registrierter Agent-Verbindungen
+(Listing~\ref{lst:registry}). Der Werttyp ist bewusst ein \texttt{Vec} aus
+Paaren \texttt{(id,\ Connection)} und keine skalare Verbindung: Dadurch können
+sich mehrere Agenten unter demselben Token eintragen (Grundlage der Redundanz
+aus Abschnitt~\ref{sec:impl-redundanz}), und die \texttt{id} identifiziert einen
+konkreten Eintrag eindeutig für dessen spätere Entfernung. Die Abbildung enthält
+ausschließlich das Token und einen Verbindungshandle --- keinen Origin-Namen,
+keinen Schlüssel, keine Nutzlast; sie ist die vollständige Sicht des Edge auf
+einen Tunnel.
+
+\begin{lstlisting}[caption={Registry-Typ und Newest-First-Auflösung (gekürzt, \texttt{ct-edge::EdgeState}).},label={lst:registry}]
+type Registry = HashMap<RoutingToken, Vec<(u64, Connection)>>;
+
+fn route(&self, token: &RoutingToken) -> Option<Connection> {
+    let list = self.map.lock().get(token)?;
+    // newest-first: zuletzt registrierter Agent zuerst
+    list.iter().rev().map(|(_, c)| c.clone()).next()
+}
+\end{lstlisting}
+
+Die Auflösung wählt den \emph{zuletzt} eingetragenen Agenten zuerst
+(\texttt{rev()} über die Einfügereihenfolge). Das Failover greift, sobald ein
+toter Eintrag entfernt wurde: Ein hart abgebrochener Agent sendet kein
+QUIC-\texttt{CLOSE}, sodass der Edge den Ausfall nicht unmittelbar sieht. Der
+über \texttt{keep\_alive}~3~s und \texttt{max\_idle\_timeout}~10~s parametrierte
+Transport verwirft die stumme Verbindung jedoch nach dem Leerlauffenster; das an
+\texttt{conn.closed()} gehängte Aufräumen entfernt daraufhin genau diesen
+Eintrag aus der Liste (Listing~\ref{lst:eviction}). Der nächste Client-Request
+löst dann per \texttt{route} auf die überlebende Registrierung auf.
+
+\begin{lstlisting}[caption={Idle-Timeout-Eviction eines Agenten ohne QUIC-CLOSE (gekürzt, \texttt{ct-edge}).},label={lst:eviction}]
+// Bei der Registrierung: Aufraeumen an das Verbindungsende haengen.
+let state = state.clone();
+tokio::spawn(async move {
+    conn.closed().await;                 // erst nach max_idle_timeout
+    state.remove_registration(&token, id);
+});
+\end{lstlisting}
+
+\subsection{Rendern des \texttt{/metrics}-Dokuments}
+\label{sec:impl-exposition}
+
+Der \texttt{/metrics}-Endpunkt (Abschnitt~\ref{sec:impl-metrics}) serialisiert
+den Zählerstand als Prometheus-Expositionstext: je eine Zeile pro Metrik, Name
+und Wert durch Leerzeichen getrennt. Listing~\ref{lst:exposition} zeigt die
+reale Momentaufnahme des laufenden Selbst-Hosts. Zum Scrape-Zeitpunkt war kein
+Agent angemeldet, weshalb beide Gauges \texttt{0} führen; die Counter halten die
+kumulierten 7~Registrierungen, 2~Relays und 8369~Byte Relay-Volumen bei
+0~Failovern fest. Das Format ist absichtlich flach und ohne Labels, denn jede
+zusätzliche Dimension (etwa pro Token) würde strukturelle Metadaten preisgeben
+und die Zonentreue (ADR-0002) unterlaufen.
+
+\begin{lstlisting}[caption={Reale \texttt{/metrics}-Ausgabe des Edge (Prometheus-Exposition, Scrape 2026-07-16).},label={lst:exposition}]
+ct_edge_active_tunnels 0
+ct_edge_active_agents 0
+ct_edge_registrations_total 7
+ct_edge_relays_total 2
+ct_edge_relay_bytes_total 8369
+ct_edge_failovers_total 0
+\end{lstlisting}
+
+\subsection{Kopplung im Client-Forward-Modus}
+\label{sec:impl-forward-detail}
+
+Der Forward-Modus (Abschnitt~\ref{sec:impl-https}) macht aus dem Client einen
+lokalen TCP-Vorschalter: Er bindet einen lokalen Port und akzeptiert dort
+beliebige Anwendungsverbindungen. Für \emph{jede} akzeptierte TCP-Verbindung
+öffnet der Client einen eigenen Tunnel --- eigenes PoW-Rendezvous, eigener
+\texttt{Noise\_IK}-Kanal über QUIC --- und koppelt Anwendungs-Socket und Tunnel
+bidirektional (Listing~\ref{lst:forward}, Abschnitt~\ref{sec:impl-https}). Weil
+der Client die Nutzlast nicht mehr selbst formt, sondern nur unveränderte Bytes
+durchreicht, kann jedes TCP-/TLS-fähige Programm den Tunnel benutzen: Ein
+\texttt{curl} oder ein Browser richtet sich auf den lokalen Port und spricht
+sein eigenes HTTPS mit dem Origin. Genau das trägt den HTTPS-am-Origin-Nachweis
+(Feature~\#22): Die TLS-Sitzung entsteht zwischen der lokalen Anwendung und dem
+Origin, während der Edge nur den in Noise gekapselten TLS-Chiffretext relayt ---
+die client-seitige Zertifikatsvalidierung mit \texttt{curl\ --cacert} gelingt
+dadurch unverändert durch den Tunnel hindurch.

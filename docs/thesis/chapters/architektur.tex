@@ -4,8 +4,17 @@
 Dieses Kapitel beschreibt den Systementwurf: die Komponenten und ihr
 Zusammenspiel (Abschnitt~\ref{sec:komponenten}), die tragenden Flüsse
 (Abschnitt~\ref{sec:fluesse}), das am Edge implementierte Rollen-Dispatch
-(Abschnitt~\ref{sec:dispatch}) und die wesentlichen Entwurfsentscheidungen
-(Abschnitt~\ref{sec:entscheidungen}).
+(Abschnitt~\ref{sec:dispatch}), die Verfügbarkeits- und Resilienzmechanik
+(Abschnitt~\ref{sec:resilienz}), die Beobachtbarkeit
+(Abschnitt~\ref{sec:observability}), die self-serve
+Vertrauensverteilung und Schlüsselrotation (Abschnitt~\ref{sec:trust}),
+die Transport- und Applikationsflexibilität
+(Abschnitt~\ref{sec:transport}) und schließlich die wesentlichen
+Entwurfsentscheidungen (Abschnitt~\ref{sec:entscheidungen}). Der Entwurf ist
+durchgängig \emph{providerblind}: Der öffentlich erreichbare Knoten sieht zu
+keinem Zeitpunkt Klartext, Schlüsselmaterial oder Zielidentitäten, sondern
+ausschließlich strukturelle Metadaten. Diese Leitentscheidung (ADR-0001,
+ADR-0002) prägt jede der folgenden Komponenten.
 
 \section{Komponenten und Topologie}
 \label{sec:komponenten}
@@ -16,20 +25,36 @@ Der Entwurf kennt vier Datenpfad-Rollen und eine Steuerkomponente
 \begin{description}
   \item[Origin.] Der private Dienst, den der Kunde exponieren will. Hier
     terminiert die Verschlüsselung; das Origin-Schlüsselmaterial verlässt diesen
-    Bereich nie.
+    Bereich nie. Der Origin kann ein einfacher TCP-Dienst sein oder --- wie in
+    Abschnitt~\ref{sec:transport} gezeigt --- selbst TLS terminieren, sodass die
+    Zertifikatsvalidierung clientseitig erfolgt.
   \item[Agent.] Die kundenbetriebene, rein ausgehend verbindende Software. Sie
     ist Verwahrer des Origin-Schlüssels, prägt \emph{Capabilities} und leitet
-    Verkehr an den lokalen Origin weiter.
+    Verkehr an den lokalen Origin weiter. Weil der Agent nur ausgehende
+    Verbindungen aufbaut, benötigt der Kunde keine eingehende Firewall-Regel und
+    keine öffentliche IP; die Erreichbarkeit entsteht allein am Edge.
   \item[Edge.] Der betreiberbetriebene, öffentlich erreichbare Knoten. Er
-    koordiniert das Rendezvous und leitet -- als Rückfall -- ausschließlich
+    koordiniert das Rendezvous und leitet --- als Rückfall --- ausschließlich
     Chiffretext weiter. Er kann nicht entschlüsseln und routet über ein opakes
-    Routing-Token.
+    Routing-Token. Er trägt weder SNI noch Hostnamen; ein Beobachter des Edge
+    lernt lediglich, \emph{dass} ein Tunnel existiert, nicht \emph{wohin} er
+    führt.
   \item[Client.] Der Endpunkt, der einen Origin erreichen möchte. Er hält eine
-    Capability und pinnt die Origin Identity.
+    Capability und pinnt die Origin Identity. Der Client kann als
+    Einmal-Tunnel (\enquote{single one-shot}) oder als lokaler
+    Weiterleitungs-Port (\emph{forward mode}) betrieben werden.
   \item[Control Plane.] Eine dünne, self-hosting-fähige Steuerkomponente für
-    Enrollment, Tunnel-Registry und Rendezvous-Endpunkt. Sie hält weder
-    Vertrauensmaterial noch Nutzlast.
+    Enrollment, Tunnel-Registry und Rendezvous-Endpunkt (ADR-0017). Sie hält
+    weder Vertrauensmaterial noch Nutzlast. Über OIDC/Keycloak-verifizierte
+    \texttt{/me/*}-Endpunkte verwaltet sie Konten und ein Kredit-Ledger und
+    veröffentlicht die CA-Wurzel des Edge (Abschnitt~\ref{sec:trust}).
 \end{description}
+
+Die Rollen sind bewusst so geschnitten, dass Vertrauen und Erreichbarkeit
+entkoppelt sind: Der Edge stellt Erreichbarkeit bereit, ohne Vertrauen zu
+besitzen; der Agent besitzt Vertrauen, ohne erreichbar zu sein. Der Client
+verbindet beide, indem er eine Capability vorlegt, die genau die für seine
+Sitzung nötige Autorität transportiert und nicht mehr.
 
 \begin{figure}[t]
   \centering
@@ -61,17 +86,29 @@ Der Entwurf kennt vier Datenpfad-Rollen und eine Steuerkomponente
 \begin{enumerate}
   \item \textbf{Agent-Enrollment.} Ein einmaliges Join-Token bindet einen neu
     erzeugten Agent-Identitätsschlüssel an einen Mandanten; im Betrieb
-    authentisiert sich der Agent über kurzlebiges mTLS.
+    authentisiert sich der Agent über kurzlebiges mTLS. Die dafür nötige
+    CA-Wurzel bezieht der Agent self-serve über die Control Plane
+    (Abschnitt~\ref{sec:trust}), sodass kein manuelles Kopieren von
+    Vertrauensmaterial mehr erforderlich ist.
   \item \textbf{Capability-Minting.} Der Agent erzeugt eine selbsttragende
-    \emph{Capability} -- Routing-Token, Origin Identity und Edge-Adresse -- die
-    der Kunde außerhalb des Bandes an berechtigte Clients verteilt. Besitz
-    genügt, um einen Origin zu erreichen und zu authentisieren.
+    \emph{Capability} --- Routing-Token, Origin Identity und Edge-Adresse ---
+    die der Kunde außerhalb des Bandes an berechtigte Clients verteilt
+    (ADR-0014). Besitz genügt, um einen Origin zu erreichen und zu
+    authentisieren. Weil die Capability den öffentlichen Schlüssel des Origin
+    (Origin Identity) mitführt, ist der Client-seitige Vertrauensanker in ihr
+    enthalten und muss nicht über eine CA-Hierarchie hergeleitet werden.
   \item \textbf{Verbindungsaufbau.} Der Client legt seine Capability vor,
     durchläuft ein PoW- und ratenbegrenztes Rendezvous am Edge, wird über sein
     Routing-Token an den registrierten Agent geroutet und führt schließlich den
-    Noise-Handshake zum Origin, gepinnt auf die Origin Identity.
+    Noise-Handshake zum Origin, gepinnt auf die Origin Identity. Der
+    PoW-Nachweis (nach dem Hashcash-Prinzip~\cite{back2002hashcash}) verteuert
+    Verbindungsversuche und ist damit die erste Verteidigungslinie gegen
+    Sybil-/DoS-Fluten (ADR-0018).
   \item \textbf{Revocation.} Widerruf erfolgt durch Rotation des Tokens
-    und/oder des Origin-Schlüssels.
+    und/oder des Origin-Schlüssels. Die Schlüsselrotation ist so entworfen, dass
+    sie ohne Ausfallzeit erfolgt und bestehende Clients während eines
+    definierten Fensters weiter bedient werden
+    (Abschnitt~\ref{sec:trust}).
 \end{enumerate}
 
 \section{Rollen-Dispatch am Edge}
@@ -83,7 +120,10 @@ eingehender Verbindung anhand eines ersten Rollen-Bytes verzweigt:
 \begin{description}
   \item[Rolle \texttt{'A'} (Agent).] Der Agent meldet auf einem Kontrollstrom
     sein Routing-Token an; der Edge trägt die Tunnel-Verbindung in die
-    Registry ein und quittiert. Das Token wird damit routbar.
+    Registry ein und quittiert. Das Token wird damit routbar. Meldet sich ein
+    zweiter Agent mit demselben Token an, ergänzt der Edge dessen Registrierung,
+    statt die erste zu ersetzen --- die Grundlage der Redundanz aus
+    Abschnitt~\ref{sec:resilienz}.
   \item[Rolle \texttt{'C'} (Client).] Der Client durchläuft das
     PoW-Rendezvous, präsentiert sein Routing-Token, woraufhin der Edge die
     passende Agent-Verbindung nachschlägt, einen Strom zu ihr öffnet und beide
@@ -92,16 +132,363 @@ eingehender Verbindung anhand eines ersten Rollen-Bytes verzweigt:
 
 Dieses Dispatch bildet die Trennung von Registrierung und Nutzung auf einem
 gemeinsamen QUIC-Transport ab und hält den Edge zustandsarm: Er kennt nur die
-Abbildung Token~$\rightarrow$~Agent-Verbindung, nie den Klartext.
+Abbildung Token~$\rightarrow$~Agent-Verbindungen, nie den Klartext. Der Relay
+selbst ist rein bidirektionales Byte-Kopieren über die Noise-Chiffretexte; der
+Edge interpretiert den Inhalt weder noch kann er ihn interpretieren, da der
+Sitzungsschlüssel nur Client und Origin bekannt ist (ADR-0013).
+
+\section{Verfügbarkeit: Redundanz, Failover und Reconnect}
+\label{sec:resilienz}
+
+Ein einzelner Agent ist ein Single Point of Failure für den von ihm bedienten
+Origin. Der Entwurf adressiert dies auf drei Ebenen, die zusammen die
+Blind-DoS-Resistenz und Verfügbarkeit aus ADR-0018 tragen.
+
+\subsection{EdgeState-Registry und newest-first Failover}
+\label{subsec:registry}
+
+Statt eine Eins-zu-eins-Abbildung Token~$\rightarrow$~Agent zu führen, hält der
+Edge für jedes Routing-Token eine \emph{Liste} registrierter Agent-Verbindungen
+(konzeptionell \texttt{Map}\,$\langle$\,Routing-Token,
+Liste\,$\langle$\,(Agent-Id, Verbindung)\,$\rangle$\,$\rangle$). Mehrere Agenten
+teilen sich dieselbe Origin-Identität und dasselbe Token; jeder von ihnen kann
+denselben privaten Origin bedienen. Trifft eine Client-Anfrage ein, wählt der
+Edge die \emph{neueste} Registrierung (newest-first) und leitet den Verkehr auf
+sie. Ist diese Verbindung nicht mehr nutzbar, rückt die nächste in der Liste
+nach. Abbildung~\ref{fig:failover} skizziert diese Registry.
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      box/.style={draw, rounded corners, minimum width=2.0cm,
+                  minimum height=0.8cm, align=center},
+      reg/.style={draw, minimum width=2.6cm, minimum height=0.7cm,
+                  align=center, font=\small},
+      >={Stealth[]}, node distance=0.9cm and 1.7cm]
+    \node[box] (client) {Client};
+    \node[box, right=of client] (edge) {Edge};
+    \node[reg, right=2.0cm of edge] (a1) {Agent A (neu)};
+    \node[reg, below=of a1] (a2) {Agent B (alt)};
+    \draw[->] (client) -- node[above,font=\small]{Token $t$} (edge);
+    \draw[->] (edge) -- node[above,font=\small]{aktiv} (a1);
+    \draw[dashed,->] (edge) -- node[below,font=\small]{Failover} (a2);
+  \end{tikzpicture}
+  \caption{EdgeState-Registry für ein Routing-Token $t$. Der Edge routet
+    newest-first auf Agent~A; fällt dessen Verbindung aus, übernimmt Agent~B.
+    Beide Agenten bedienen denselben privaten Origin unter derselben Identität.}
+  \label{fig:failover}
+\end{figure}
+
+\subsection{Erkennung toter Agenten}
+\label{subsec:deadagent}
+
+Ein hart terminierter Agent sendet kein QUIC-\texttt{CLOSE}; ohne Gegenmaßnahme
+bliebe seine Registrierung als \enquote{Geisterroute} in der Liste. Der Edge
+löst dies transportnah: Der QUIC-Server aktiviert am Edge einen
+\texttt{keep\_alive} von 3\,s und ein \texttt{max\_idle\_timeout} von 10\,s.
+Eine Verbindung, über die innerhalb des Idle-Fensters kein Verkehr und keine
+Keep-Alive-Antwort mehr fließt, wird vom Edge verworfen und ihre Registrierung
+aus der Token-Liste entfernt. Anschließend routet das newest-first-Verfahren aus
+Abschnitt~\ref{subsec:registry} automatisch auf die überlebende Registrierung.
+
+Dieses Verhalten wurde im Testbett verifiziert
+(Kapitel~\ref{ch:evaluation}): Zwei Agenten teilen eine Origin-Identität, der
+Basisverbindungsaufbau erfolgt \texttt{via=quic}; nach dem gezielten Abschuss
+des bedienenden Agenten schlägt der nächste Client-Round-Trip zunächst fehl, und
+nach Ablauf des Idle-Fensters gelingt er erneut \texttt{via=quic} über den
+verbliebenen Agenten (\enquote{REDUNDANCY OK}). Das Fenster ist damit die
+Obergrenze der Ausfalldauer bei stillem Agent-Verlust.
+
+\subsection{Reconnect-on-drop}
+\label{subsec:reconnect}
+
+Symmetrisch zur edge-seitigen Eviktion behandelt der Agent den Verlust seiner
+Kontrollverbindung (\#5): Bricht die QUIC-Verbindung zum Edge ab, versucht der
+Agent den erneuten Aufbau mit exponentiellem Backoff und einer Obergrenze
+(\emph{capped exponential backoff}). So kehrt ein nur vorübergehend gestörter
+Agent selbsttätig in die Registry zurück, ohne den Edge mit Verbindungsstürmen
+zu belasten. Redundanz (mehrere Agenten) und Reconnect (Selbstheilung eines
+Agenten) ergänzen sich: Erstere überbrückt den harten Ausfall sofort, letztere
+stellt die volle Kapazität ohne manuellen Eingriff wieder her.
+
+\section{Beobachtbarkeit}
+\label{sec:observability}
+
+Weil der Edge providerblind ist, darf Beobachtbarkeit ausschließlich auf
+strukturellen Metadaten beruhen --- niemals auf Nutzlast (ADR-0016). Der Edge
+exponiert daher einen Prometheus-kompatiblen Endpunkt \texttt{/metrics} mit
+Zählern und Gauges, die genau diese unbedenklichen Größen abbilden:
+
+\begin{description}
+  \item[\texttt{ct\_edge\_active\_tunnels}] (Gauge) aktuell gekoppelte
+    Client-Agent-Relays.
+  \item[\texttt{ct\_edge\_active\_agents}] (Gauge) aktuell registrierte
+    Agent-Verbindungen.
+  \item[\texttt{ct\_edge\_registrations\_total}] (Counter) kumulierte
+    Agent-Registrierungen.
+  \item[\texttt{ct\_edge\_relays\_total}] und
+    \texttt{ct\_edge\_relay\_bytes\_total} (Counter) Anzahl bzw. Bytevolumen der
+    Relays.
+  \item[\texttt{ct\_edge\_failovers\_total}] (Counter) Anzahl der Failover-Ereignisse.
+\end{description}
+
+Keiner dieser Werte offenbart, \emph{wer} mit \emph{wem} kommuniziert oder
+\emph{was} übertragen wird; sie zählen lediglich Ereignisse und Volumina. Ein
+realer Scrape des laufenden Self-Hosts belegte etwa
+\texttt{ct\_edge\_registrations\_total}~$=7$,
+\texttt{ct\_edge\_relays\_total}~$=2$ und
+\texttt{ct\_edge\_relay\_bytes\_total}~$=8369$, bei zum Scrape-Zeitpunkt keinem
+registrierten Agenten (Gauges $=0$); die Zahlen sind in
+Kapitel~\ref{ch:evaluation} eingeordnet.
+
+Ergänzend bietet die Control Plane einen \texttt{/status}-Endpunkt und eine
+self-contained Operator-Landingpage (\#4) unter \texttt{/}: eine eigenständige
+HTML-Seite ohne externe Abhängigkeiten, die ihre Kennzahlen aus
+\texttt{/status} bezieht. Wichtig für die Blindheit: Die Statusseite meldet die
+\emph{live} Tunnelzahl, die aus dem Edge-\texttt{/metrics}-Gauge
+\texttt{ct\_edge\_active\_tunnels} stammt, nicht aus der Rendezvous-Registry.
+Der \texttt{/status}-Korpus umfasst zusätzlich betriebliche Aggregate wie
+Bereitschaftsflag, registrierte Agenten, Konten und bestätigte Zahlungen ---
+allesamt zählende, nicht inhaltliche Größen.
+
+\section{Vertrauensverteilung und Schlüsselrotation}
+\label{sec:trust}
+
+\subsection{Self-serve CA-Root-Verteilung}
+\label{subsec:pki}
+
+Damit sich Agenten per mTLS gegenüber dem Edge authentisieren können, benötigen
+sie dessen CA-Wurzel. Anstatt dieses Vertrauensmaterial außerhalb des Bandes zu
+kopieren, veröffentlicht die Control Plane es self-serve unter \texttt{/pki/ca}
+(\#11). Agenten und Clients beziehen die CA-Wurzel dort und pinnen sie. Das
+reduziert Fehlkonfiguration und macht das Enrollment reproduzierbar, ohne die
+Zero-Knowledge-Grenze zu verletzen: Die CA-Wurzel ist öffentliches
+Vertrauensmaterial, kein Geheimnis; der Edge bleibt ohne Kenntnis von
+Origin-Schlüsseln oder Nutzlast.
+
+\subsection{Zero-Downtime-Schlüsselrotation}
+\label{subsec:rotation}
+
+Die Rotation eines Origin-Schlüssels muss Bestandsclients nicht abwerfen. Der
+Entwurf trennt dazu \emph{Routing} von \emph{Identität}: Das Routing-Token
+bleibt bei der Rotation erhalten, während der Agent eine \emph{neue}
+Origin-Identität einführt und den alten Schlüssel für ein definiertes Fenster
+weiter vorhält (\emph{Retired-Key-Fenster}, verwaltet über ein
+Schlüsselverzeichnis am Agenten). Während dieses Fensters gilt:
+
+\begin{itemize}
+  \item Weil das Token unverändert bleibt, routen \emph{alte} Clients weiterhin
+    ohne Neuverteilung ihrer Capability.
+  \item Der Agent bedient sowohl den \emph{alten} (retired) als auch den
+    \emph{neuen} Schlüssel: Ein alter Client vollzieht den Noise-Handshake gegen
+    den retired key, ein neuer Client gegen die frische Identität.
+\end{itemize}
+
+Im Testbett schlossen sowohl die \emph{alte} als auch die \emph{neue} Capability
+nach der Rotation je einen vollständigen Tunnel-Round-Trip ab
+(\enquote{ROTATION OK}). Nach Ablauf des Fensters entfällt der retired key, und
+nur die neue Identität bleibt gültig --- ein expliziter, kundengesteuerter
+Widerruf ohne Auto-Ablauf (ADR-0014). Rotation ist damit zugleich der
+Revocation-Mechanismus aus Abschnitt~\ref{sec:fluesse}.
+
+\section{Transport- und Applikationsflexibilität}
+\label{sec:transport}
+
+\subsection{QUIC-Primärtransport mit TLS-über-TCP-Rückfall}
+\label{subsec:transport}
+
+Der Datenpfad nutzt QUIC (quinn) als Primärtransport (ADR-0004). Ist UDP
+blockiert --- etwa in restriktiven Netzen ---, greift ein Rückfall auf
+TLS-über-TCP an Port~443, der denselben Tunnel trägt. Der Client kann den
+Rückfall erzwingen; im Testbett lieferte der Standardpfad
+\enquote{SMOKE OK via=quic}, der erzwungene Rückfall
+\enquote{SMOKE OK via=tcp} --- beide transportieren denselben
+Ende-zu-Ende-Tunnel. Die Transportwahl ist für die Sicherheit unerheblich, da
+die Noise-Sitzung oberhalb des Transports liegt.
+
+\subsection{Cross-Transport-Relay}
+\label{subsec:crosstransport}
+
+Da der Edge nur Chiffretext koppelt, müssen Client und Agent nicht denselben
+Transport verwenden. Ein QUIC-Client kann einen Agenten erreichen, der im
+TCP-Rückfall registriert ist (\#13); der Edge überbrückt die beiden Transporte,
+indem er die Ströme auf Byteebene verbindet. Damit ist die Transportwahl eine
+lokale Eigenschaft jedes Endpunkts und keine Eigenschaft des Tunnels als
+Ganzem.
+
+\subsection{TLS-at-origin und Client-Forward-Modus}
+\label{subsec:tlsatorigin}
+
+Der Tunnel ist inhaltsneutral und trägt daher beliebigen TCP-Verkehr,
+einschließlich einer bereits durch TLS geschützten Verbindung. Im
+\emph{HTTPS-at-origin}-Szenario (\#22) terminiert ein realer HTTPS-Dienst das TLS
+am Origin selbst; der Edge relayt nur den TLS-über-Noise-Chiffretext und sieht
+weder das innere TLS noch dessen Klartext. Die Zertifikatsvalidierung geschieht
+\emph{clientseitig}: Ein Aufruf mit gepinnter CA validiert das Origin-Zertifikat
+und erhält eine reguläre HTTP-200-Antwort durch den Tunnel. Der
+\emph{Client-Forward-Modus} macht dies allgemein nutzbar --- er öffnet einen
+lokalen TCP-Port, über den eine beliebige TCP-/TLS-Anwendung den Tunnel
+mitbenutzt, ohne den Tunnel zu \enquote{kennen}. Das demonstriert die
+providerblinde Zusicherung besonders deutlich: Selbst der TLS-Handshake der
+Anwendung bleibt für den Edge undurchsichtig, weil er innerhalb der
+Noise-Sitzung liegt.
+
+\section{Ablauf des Verbindungsaufbaus}
+\label{sec:ablauf}
+
+Die vorstehenden Komponenten und Flüsse greifen beim eigentlichen
+Verbindungsaufbau in einer festen Reihenfolge ineinander.
+Abbildung~\ref{fig:ablauf} stellt diesen als zeitlichen Ablauf über die vier
+Datenpfad-Rollen dar; die Zeit läuft nach unten, die gestrichelten Linien sind
+die \enquote{Lebenslinien} der Beteiligten.
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[>={Stealth[]}, font=\small,
+      head/.style={draw, rounded corners, minimum width=1.6cm,
+                   minimum height=0.7cm}]
+    \node[head] (c) at (0,0) {Client};
+    \node[head] (e) at (3.4,0) {Edge};
+    \node[head] (a) at (6.8,0) {Agent};
+    \node[head] (o) at (10.2,0) {Origin};
+    \draw[dashed] (c) -- (0,-8.4);
+    \draw[dashed] (e) -- (3.4,-8.4);
+    \draw[dashed] (a) -- (6.8,-8.4);
+    \draw[dashed] (o) -- (10.2,-8.4);
+    \draw[->] (6.8,-1.1) -- node[above,font=\footnotesize]
+      {Rolle \texttt{'A'}: Token anmelden} (3.4,-1.1);
+    \draw[->] (0,-2.2) -- node[above,font=\footnotesize]
+      {Rolle \texttt{'C'}: Verbindungswunsch} (3.4,-2.2);
+    \draw[->] (3.4,-3.3) -- node[above,font=\footnotesize]
+      {PoW-Challenge} (0,-3.3);
+    \draw[->] (0,-4.4) -- node[above,font=\footnotesize]
+      {PoW-Lösung $+$ Token} (3.4,-4.4);
+    \draw[->] (3.4,-5.5) -- node[above,font=\footnotesize]
+      {Nachschlag, Ströme koppeln} (6.8,-5.5);
+    \draw[<->] (0,-6.8) -- node[above,font=\footnotesize]
+      {Noise\_IK-Handshake (gepinnte Origin-Identity)} (10.2,-6.8);
+    \draw[<->] (0,-8.0) -- node[above,font=\footnotesize]
+      {providerblinder Relay-Verkehr} (10.2,-8.0);
+  \end{tikzpicture}
+  \caption{Zeitlicher Ablauf des Verbindungsaufbaus. Zuerst meldet der Agent
+    unter Rolle \texttt{'A'} sein Routing-Token an; anschließend durchläuft der
+    Client (Rolle \texttt{'C'}) das PoW-Rendezvous und wird mit dem Agenten
+    gekoppelt. Die beiden untersten Pfeile sind logisch Ende-zu-Ende zwischen
+    Client und Origin --- der Edge kreuzt sie lediglich als providerblinder
+    Relay und sieht ausschließlich Chiffretext.}
+  \label{fig:ablauf}
+\end{figure}
+
+Voraussetzung des Ablaufs ist, dass sich mindestens ein Agent bereits unter
+Rolle \texttt{'A'} beim Edge angemeldet und damit sein Routing-Token routbar
+gemacht hat. Wünscht ein Client eine Verbindung, meldet er sich unter Rolle
+\texttt{'C'}; der Edge antwortet mit einer PoW-Challenge, die der Client löst und
+zusammen mit seinem Routing-Token vorlegt. Erst nach diesem ratenbegrenzten,
+nach dem Hashcash-Prinzip~\cite{back2002hashcash} verteuerten Rendezvous
+schlägt der Edge die zum Token passende Agent-Registrierung nach, öffnet einen
+Strom zu ihr und koppelt die beiden Ströme byteweise. Bis zu diesem Punkt hat
+der Edge nur strukturelle Metadaten gesehen: das opake Token, den PoW-Nachweis
+und die schiere Existenz einer Kopplung.
+
+Auf der so hergestellten Byte-Brücke vollzieht der Client anschließend den
+\texttt{Noise\_IK}-Handshake direkt mit dem Origin, gepinnt auf die in der
+Capability mitgeführte Origin Identity; der Edge relayt dabei nur Chiffretext und
+kann den Handshake weder lesen noch verändern (ADR-0013). Ist die Sitzung
+etabliert, fließt der eigentliche Nutzverkehr als \emph{providerblinder} Relay:
+Client und Origin teilen den Sitzungsschlüssel, während Edge und Agent
+ausschließlich verschlüsselte Bytes weiterreichen. Damit realisiert der Ablauf
+die Zero-Knowledge-Grenze aus ADR-0002 über die gesamte Lebensdauer der
+Verbindung, nicht nur während des Aufbaus.
+
+\section{Ablauf des Failovers}
+\label{sec:ablauf-failover}
+
+Der in Abschnitt~\ref{sec:resilienz} beschriebene Verfügbarkeitsentwurf wird beim
+Ausfall des bedienenden Agenten in einer festen Sequenz wirksam. Sie verbindet
+die redundante Registry (Abschnitt~\ref{subsec:registry}) mit der transportnahen
+Erkennung toter Agenten (Abschnitt~\ref{subsec:deadagent}) zu einem
+selbstheilenden Failover:
+
+\begin{enumerate}
+  \item Zwei Agenten teilen dieselbe Origin-Identität und dasselbe Routing-Token
+    und melden sich beide unter Rolle \texttt{'A'} an; der Edge führt sie als
+    zwei Einträge in der Token-Liste.
+  \item Der Edge routet newest-first auf den zuletzt registrierten, bedienenden
+    Agenten; der Basis-Round-Trip des Clients gelingt \texttt{via=quic}.
+  \item Der bedienende Agent stirbt hart und sendet kein QUIC-\texttt{CLOSE}; die
+    tote Verbindung verbleibt zunächst als \enquote{Geisterroute} in der Liste,
+    und der unmittelbar folgende Client-Round-Trip schlägt fehl.
+  \item Nach Ablauf des Idle-Fensters (\texttt{keep\_alive}~3\,s,
+    \texttt{max\_idle\_timeout}~10\,s) verwirft der Edge die stille Verbindung
+    und entfernt ihre Registrierung aus der Token-Liste.
+  \item Das newest-first-Routing wählt nun den überlebenden Agenten; der nächste
+    Client-Round-Trip gelingt erneut \texttt{via=quic}
+    (\enquote{REDUNDANCY OK}).
+\end{enumerate}
+
+Das Idle-Fenster ist damit die Obergrenze der Ausfalldauer bei stillem
+Agent-Verlust: Solange mindestens ein Agent dieselbe Origin-Identität bedient,
+überbrückt die Redundanz den harten Ausfall automatisch, ohne Neuverteilung von
+Capabilities und ohne manuellen Eingriff. Ergänzend führt der
+Reconnect-on-drop-Mechanismus (Abschnitt~\ref{subsec:reconnect}) einen nur
+vorübergehend gestörten Agenten selbsttätig in die Registry zurück, sodass die
+volle Redundanz nach der Störung wiederhergestellt ist. Zusammen tragen diese
+Schritte die Verfügbarkeits- und Blind-DoS-Härtung aus ADR-0018, ohne die
+providerblinde Zusicherung aufzuweichen.
 
 \section{Entwurfsentscheidungen}
 \label{sec:entscheidungen}
 
 Die Architektur folgt einigen bewusst getroffenen Entscheidungen, die in
-Architecture Decision Records festgehalten sind: ein providerblinder,
-Ende-zu-Ende-verschlüsselter Datenpfad; QUIC als Transport mit
-TCP-Rückfall; die Noise-basierte, PKI-freie Mesh-Authentisierung; ein
-einregionaler Edge um eine erststufige Tunnel-Registry; sowie eine dünne,
-self-hosting-fähige Control Plane, die weder Schlüssel noch Nutzlast sieht.
-Kapitel~\ref{ch:implementierung} zeigt, wie diese Entscheidungen in den Rust-Crates
-umgesetzt sind.
+Architecture Decision Records festgehalten sind:
+
+\begin{itemize}
+  \item ein providerblinder, Ende-zu-Ende-verschlüsselter Datenpfad (ADR-0001)
+    mit klar definierter Zero-Knowledge-Grenze (ADR-0002);
+  \item agentgehaltene Zertifikate und out-of-band verteilte Capabilities
+    (ADR-0003, ADR-0014);
+  \item QUIC~\cite{rfc9000,rfc9001} als Transport mit TLS-über-TCP-Rückfall
+    (ADR-0004) und responsiver Terminierung (ADR-0008);
+  \item die Noise-basierte, PKI-freie Mesh-Authentisierung
+    (ADR-0013,~\cite{noiseprotocol}) mit Mesh-Plane-First-Zuschnitt (ADR-0010);
+  \item agentseitige Beobachtbarkeit auf reinen Metadaten (ADR-0016);
+  \item ein einregionaler Edge um eine erststufige Tunnel-Registry (ADR-0006)
+    mit Verfügbarkeits- und Blind-DoS-Härtung (ADR-0018);
+  \item sowie eine dünne, self-hosting-fähige Control Plane, die weder Schlüssel
+    noch Nutzlast sieht (ADR-0017).
+\end{itemize}
+
+Diese Entscheidungen greifen ineinander und lassen sich entlang der beiden
+tragenden Ziele --- \emph{Providerblindheit} und \emph{Verfügbarkeit} ---
+gruppieren. Die Providerblindheit ruht auf ADR-0001 und ADR-0002: Der Datenpfad
+ist Ende-zu-Ende verschlüsselt, und die Zero-Knowledge-Grenze legt formal fest,
+welche Größen der Edge überhaupt sehen darf (opakes Token, PoW-Ereignisse,
+strukturelle Zähler) und welche nicht (Klartext, Schlüssel, Zielidentität). Die
+Transportentscheidung ADR-0004 ist dieser Grenze bewusst untergeordnet: Ob der
+Tunnel über QUIC oder den TLS-über-TCP-Rückfall läuft, ist sicherheitsneutral,
+weil die \texttt{Noise\_IK}-Sitzung oberhalb des Transports liegt; der
+Cross-Transport-Relay und der TLS-at-origin-Fall in Abschnitt~\ref{sec:transport}
+sind unmittelbare Folgen davon. Dass die Control Plane dünn und self-hosting-fähig
+bleibt (ADR-0017), erweitert dieselbe Blindheit auf die Steuerebene: Sie
+vermittelt Enrollment und Rendezvous, hält aber weder Schlüsselmaterial noch
+Nutzlast, sodass auch ein Betreiber der Steuerkomponente keine Vertraulichkeit
+brechen kann.
+
+Der Verfügbarkeitsentwurf ordnet sich derselben Leitlinie unter, statt sie
+aufzuweichen. Der einregionale Edge um eine erststufige Tunnel-Registry
+(ADR-0006) hält den Zustand am Edge bewusst klein --- nur die Abbildung
+Token~$\rightarrow$~Agent-Verbindungen --- und macht so die newest-first-Redundanz
+und die transportnahe Erkennung toter Agenten (Abschnitt~\ref{sec:resilienz})
+überhaupt erst zustandsarm umsetzbar. ADR-0018 ergänzt diese Basis um die
+Verfügbarkeits- und Blind-DoS-Härtung: Das PoW-Rendezvous ist die erste
+Verteidigungslinie gegen Fluten, ohne dass der Edge Identitäten oder KYC benötigt
+und damit seine Blindheit preisgäbe. Der bewusst schmale v1-Zuschnitt schließlich
+--- Mesh-Plane-First mit zurückgestellter Browser Plane (ADR-0010) --- hält den
+Prototyp auf genau den Eigenschaften fokussiert, die die providerblinde
+Zusicherung belegen. Bewusst zurückgestellt ist die \emph{Browser Plane}
+(öffentlicher Hostname mit
+Let's-Encrypt-Zertifikat über SNI); v1 beweist stattdessen, dass TLS am Origin
+terminiert (ADR-0010). Ebenso ist der Multi-Region-/Mesh-P2P-Ausbau (ADR-0015)
+nur teilweise realisiert (Direktpfad-Kandidat mit Relay-Rückfall).
+Kapitel~\ref{ch:implementierung} zeigt, wie diese Entscheidungen in den
+Rust-Crates umgesetzt sind.

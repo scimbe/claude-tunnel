@@ -1,0 +1,125 @@
+\chapter{Anforderungen}\label{ch:anforderungen}
+
+Aus der Motivation, dem Bedrohungsmodell und den Forschungsfragen leiten sich die
+funktionalen und nichtfunktionalen Anforderungen an \texttt{claude-tunnel} ab. Jede
+Anforderung wird nachfolgend benannt, begründet und auf ein tatsächlich realisiertes
+Merkmal des Systems zurückgeführt. Die Rückverfolgbarkeit fasst
+Tabelle~\ref{tab:traceability} zusammen; sie verweist auf die real durchgeführten
+Experimente und die zugehörigen Artefakte.
+
+\section{Funktionale Anforderungen}\label{sec:funktionale-anforderungen}
+
+\begin{description}
+  \item[FA1 --- Providerblinder Relay-Pfad] Nutzdaten müssen entlang der Kette
+    Client~$\rightarrow$~Edge~$\rightarrow$~Agent~$\rightarrow$~Origin transportiert
+    werden, ohne dass der Edge Klartext oder Origin-Schlüssel erhält. Realisiert durch
+    die providerblinde Datenebene (ADR-0001/0002); der Edge relayt ausschließlich
+    Noise-Chiffrat.
+  \item[FA2 --- PoW-gestütztes, ratenbegrenztes Rendezvous] Der Zugang zum Rendezvous
+    muss durch einen Proof-of-Work (PoW) mit einstellbarer Schwierigkeit und eine
+    Ratenbegrenzung pro Routing-Token geschützt sein, um Fluten zu erschweren.
+  \item[FA3 --- Selbsttragende Capabilities] Berechtigungen müssen out-of-band als
+    selbsttragende Capabilities übergeben werden (ADR-0014); ein opakes Routing-Token
+    ersetzt Hostnamen bzw.\ SNI.
+  \item[FA4 --- Agenten-Redundanz und Failover] Mehrere Agenten müssen sich unter einer
+    Origin-Identität registrieren; fällt der bedienende Agent aus, muss das Routing auf
+    eine überlebende Registrierung umschalten. Realisiert über die Edge-Registry
+    (\texttt{HashMap<RoutingToken, Vec<(id, Connection)>>}) mit \emph{newest-first}-Failover
+    und Eviction toter Verbindungen via \texttt{keep\_alive}~3\,s und
+    \texttt{max\_idle\_timeout}~10\,s.
+  \item[FA5 --- Beobachtbarkeit] Der Betreiber muss den Systemzustand über
+    \texttt{/metrics} (Prometheus-Gauges und -Counter am Edge) und \texttt{/status}
+    (Kontrollebene) einsehen können, inklusive einer selbsttragenden HTML-Landingpage.
+  \item[FA6 --- Zero-Downtime-Schlüsselrotation] Der Origin-Schlüssel muss unter
+    Beibehaltung desselben Routing-Tokens rotiert werden können; während eines Fensters
+    müssen alte und neue Capability weiterhin einen Tunnel aufbauen.
+  \item[FA7 --- QUIC primär mit TLS-über-TCP-Fallback] Der Datenpfad muss primär über
+    QUIC laufen und bei blockiertem UDP transparent auf TLS-über-TCP (Port~443)
+    zurückfallen (ADR-0004), ohne die Tunnelsemantik zu ändern.
+  \item[FA8 --- Cross-Transport-Relay] Ein QUIC-Client muss einen Agenten erreichen
+    können, der auf dem TCP-Fallback läuft (\#13); der Edge vermittelt zwischen den
+    Transporten.
+  \item[FA9 --- Self-hostbare Steuerebene] Die Kontrollebene muss dünn und
+    selbst-hostbar sein (ADR-0017), keine Schlüssel oder Nutzdaten halten und
+    OIDC/Keycloak-verifizierte Endpunkte sowie ein Konto-/Kredit-Ledger bereitstellen.
+  \item[FA10 --- TLS-at-origin durch den Tunnel] HTTPS-Endpunkte müssen durch den Tunnel
+    erreichbar sein, wobei TLS am Origin terminiert und die Zertifikatsprüfung
+    client-seitig erfolgt; der Edge sieht nur TLS-über-Noise-Chiffrat.
+\end{description}
+
+\section{Nichtfunktionale Anforderungen}\label{sec:nichtfunktionale-anforderungen}
+
+\begin{description}
+  \item[NFA1 --- Zero-Knowledge / Providerblindheit] Der Edge darf strukturell nur
+    Metadaten (Existenz eines Tunnels, grobe Zeit-/Volumenzähler, Rendezvous-Ereignisse)
+    beobachten, niemals Nutzdaten oder Schlüssel (ADR-0001/0002).
+  \item[NFA2 --- Kleiner, vorhersagbarer Latenz-Overhead] Der durch Tunnelaufbau
+    (QUIC~+~PoW~+~Noise\_IK~+~Relay) verursachte Zusatzaufwand soll gering und über
+    Netzbedingungen hinweg vorhersagbar bleiben. Belegt durch die Latenzmatrix
+    (\texttt{scripts/sweep.sh}), in der der mittlere Round-Trip bei 0\,\% Verlust
+    nahezu linear mit der emulierten Verzögerung skaliert.
+  \item[NFA3 --- Verfügbarkeit / Hochverfügbarkeit] Der Dienst muss den Ausfall eines
+    Agenten überstehen (Failover, vgl.\ FA4), ohne dass der Client den Tunnel manuell
+    neu aufbauen muss.
+  \item[NFA4 --- Betreibbarkeit und Beobachtbarkeit] Der Betrieb muss ohne
+    Instrumentierung durch Dritte diagnostizierbar sein; Zähler und Statusseite müssen
+    ausreichen, um Registrierungen, Relays und Failover nachzuvollziehen (ADR-0016).
+  \item[NFA5 --- Sicherheit ohne PKI-Zwang] Die Ende-zu-Ende-Vertraulichkeit muss auf
+    Noise\_IK (X25519/ChaChaPoly/BLAKE2s) beruhen und ohne öffentliche PKI auskommen;
+    Vertrauen wird über die out-of-band verteilte Capability bzw.\ die self-serve
+    CA-Root-Verteilung (\#11) hergestellt.
+  \item[NFA6 --- DoS-/Sybil-Widerstand ohne KYC] Das System muss Fluten ohne
+    Identitätsprüfung erschweren; der PoW ist der primäre Sybil-/DoS-Schutz (ADR-0018).
+    Der PoW-Schwierigkeitsknopf muss so einstellbar sein, dass er Fluten abschreckt,
+    ohne legitime Clients zu bestrafen.
+\end{description}
+
+\section{Abgrenzung und Nicht-Ziele}\label{sec:abgrenzung}
+
+\begin{itemize}
+  \item \textbf{Browser-Ebene zurückgestellt.} Ein öffentlich adressierbarer
+    Browser-Pfad mit öffentlichem SNI und Let's-Encrypt-Zertifikaten ist \emph{nicht}
+    Ziel von v1; er ist post-v1 zurückgestellt (ADR-0010, Issue~\#23). v1 belegt
+    stattdessen, dass TLS am Origin terminiert (FA10).
+  \item \textbf{Anonymität ist kein Ziel.} \texttt{claude-tunnel} stellt
+    Providerblindheit gegenüber dem Edge her, jedoch keine Anonymität der Endpunkte im
+    Sinne eines Anonymisierungsnetzes; Verkehrsflussanalyse durch globale Beobachter ist
+    ausdrücklich außerhalb des Bedrohungsmodells.
+  \item \textbf{Schlüsselverteilung liegt beim Kunden.} Die Verteilung der Capabilities
+    erfolgt out-of-band (ADR-0014); Rotation ist explizit und ohne automatische
+    Ablauflogik (FA6).
+\end{itemize}
+
+\section{Rückverfolgbarkeit}\label{sec:traceability}
+
+Tabelle~\ref{tab:traceability} führt jede Anforderung auf das realisierende Merkmal und
+das belegende Experiment zurück. Alle genannten Experimente wurden real ausgeführt; die
+zugehörigen Skripte, Zähler und Zeitreihen sind im Repository hinterlegt.
+
+\begin{table}[t]
+  \centering
+  \caption{Rückverfolgbarkeit: Anforderung $\rightarrow$ realisierendes Merkmal / Experiment.}
+  \label{tab:traceability}
+  \begin{tabular}{lll}
+    \toprule
+    Anforderung & Realisierendes Merkmal & Beleg / Experiment \\
+    \midrule
+    FA1  & Providerblinder Datenpfad (ADR-0001/0002) & \texttt{e2e-smoke.sh} (\#6) \\
+    FA2  & PoW + Ratenbegrenzung pro Token           & PoW-Studie \texttt{sweep.sh} \\
+    FA3  & Out-of-band Capabilities (ADR-0014)       & opakes Routing-Token \\
+    FA4  & Edge-Registry + Failover                  & \texttt{redundancy-smoke.sh} (\#8) \\
+    FA5  & \texttt{/metrics} + \texttt{/status}      & Metrik-Scrape (\#10) \\
+    FA6  & Origin-Schlüsselrotation                  & \texttt{rotation-smoke.sh} (\#12) \\
+    FA7  & QUIC + TLS-über-TCP-Fallback (ADR-0004)   & \texttt{via=quic/tcp} (\#6) \\
+    FA8  & Cross-Transport-Relay                     & QUIC-Client zu TCP-Agent (\#13) \\
+    FA9  & Dünne self-hostbare Steuerebene (ADR-0017)& \texttt{/status}, OIDC (\#10) \\
+    FA10 & TLS-at-origin durch den Tunnel            & \texttt{https-demo.sh} (\#22) \\
+    NFA1 & Zero-Knowledge-Grenze (ADR-0002)          & nur strukturelle Metadaten \\
+    NFA2 & Latenz-Overhead klein/vorhersagbar        & Latenzmatrix \texttt{sweep.sh} \\
+    NFA3 & HA / Failover                             & \texttt{redundancy-smoke.sh} (\#8) \\
+    NFA4 & Betreibbarkeit / Beobachtbarkeit          & Zähler + Landingpage (\#4,\#10) \\
+    NFA5 & Noise\_IK, kein PKI-Zwang                 & CA-Root-Verteilung (\#11) \\
+    NFA6 & PoW-Sybil-/DoS-Schutz (ADR-0018)          & PoW-Studie \texttt{sweep.sh} \\
+    \bottomrule
+  \end{tabular}
+\end{table}

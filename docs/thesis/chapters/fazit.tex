@@ -7,51 +7,157 @@
 Diese Arbeit hat einen providerblinden, zensurresistenten Netzwerktunnel
 entworfen, prototypisch in Rust auf Basis von QUIC implementiert und in einem
 vollständig containerisierten Testbett unter emulierten Netzbedingungen
-evaluiert. Gemessen an den drei Forschungsfragen ergibt sich folgendes Bild.
+evaluiert. Über den Kernentwurf hinaus wurde der Prototyp zu einem betreibbaren
+Dienst ausgebaut: Der Datenpfad
+Client$\rightarrow$Edge$\rightarrow$Agent$\rightarrow$Origin trägt heute reale
+Ende-zu-Ende-Verbindungen, und die für einen Produktivbetrieb nötigen
+Eigenschaften -- Hochverfügbarkeit, Beobachtbarkeit, Selbstbedienungs-PKI,
+unterbrechungsfreie Schlüsselrotation und HTTPS bis zum Origin -- sind
+implementiert und in echten Läufen nachgewiesen. Gemessen an den drei
+Forschungsfragen ergibt sich das folgende Bild.
+
+\paragraph{Realisierter Entwurf.} Der Prototyp umfasst fünf Rust-Crates
+(\texttt{ct-common}, \texttt{ct-edge}, \texttt{ct-agent}, \texttt{ct-client},
+\texttt{ct-control-plane}). Der Vermittlungspfad ist providerblind
+(ADR-0001/0002): Der Edge sieht ausschließlich strukturelle Metadaten --
+Existenz eines Tunnels, grobe Zeit- und Volumenzähler, Rendezvous-Ereignisse --,
+niemals Nutzlast oder Origin-Schlüssel. Die Ende-zu-Ende-Vertraulichkeit trägt
+ein \texttt{Noise\_IK}-Handshake (X25519/ChaChaPoly/BLAKE2s, ADR-0013); der Edge
+relayed nur das über Noise verkapselte Chiffrat. Als Transport dient ein
+einheitlicher QUIC-Kanal (\texttt{quinn}) mit Rollen-Dispatch am Edge und einem
+TLS-über-TCP-Rückfall für blockiertes UDP (ADR-0004). Das Rendezvous nutzt ein
+opakes Routing-Token ohne SNI oder Hostname, abgesichert durch Proof-of-Work und
+tokenweise Ratenbegrenzung (ADR-0018). Die dünne, selbst-hostbare Steuerungsebene
+(ADR-0017) hält weder Schlüssel noch Nutzlast; sie verifiziert Konten über
+OIDC/Keycloak und führt ein Konten- und Guthabenbuch.
 
 \paragraph{FF1 -- Realisierbarkeit.} Ein providerblinder Tunnel lässt sich aus
-etablierten Bausteinen schlüssig zusammensetzen. Der Prototyp realisiert den
-providerblinden Vermittlungspfad Client$\rightarrow$Edge$\rightarrow$Agent$\rightarrow$Origin
-mit einem PoW-gestützten, ratenbegrenzten Rendezvous über einen einheitlichen
-QUIC-Transport mit Rollen-Dispatch am Edge; die kryptographischen Bausteine --
-Noise-Handshake, signierte Credentials, Proof-of-Work, Ratenbegrenzung -- sind
-in \texttt{ct-common} umgesetzt und durch 94 automatisierte Tests, bis hin zu
-End-to-End-Roundtrips über echtes QUIC, abgesichert. Die Realisierbarkeit ist
-damit für Architektur und Kernmechanismen belegt; als offener Integrationsschritt
-verbleibt, die Noise-Ende-zu-Ende-Sitzung auf dem Live-Datenpfad zu verankern
-(Abschnitt~\ref{sec:ausblick}).
+etablierten Bausteinen schlüssig zusammensetzen \emph{und} betreiben. Die
+Realisierbarkeit ist nicht nur architektonisch argumentiert, sondern durch
+266~automatisierte Tests abgesichert, die hermetisch bestehen (\texttt{ct-agent}
+65, \texttt{ct-client} 30, \texttt{ct-common} 40, \texttt{ct-control-plane} 79,
+\texttt{ct-edge} 52) und eine bibliotheksbezogene Zeilenabdeckung von
+95{,}57\,\% (94{,}44\,\% Funktionen, 93{,}74\,\% Regionen) erreichen, erzwungen
+durch eine Abdeckungsschwelle von 95\,\%. Der Bau- und Testlauf erfolgt im
+Container unter \texttt{RUSTFLAGS="-D warnings"} und ist damit warnungsfrei.
+Entscheidend über die Testsuite hinaus sind vier reale Läufe gegen die
+selbst-gehostete Live-Instanz, die die produktiven Eigenschaften belegen
+(Tabelle~\ref{tab:fazit-features}): der geräteübergreifende
+Ende-zu-Ende-Roundtrip inklusive TCP-Rückfall (\#6), das Failover auf einen
+zweiten Agenten (\#8), die ausfallfreie Origin-Schlüsselrotation (\#12) und ein
+echtes HTTPS-Angebot, das clientseitig validiert durch den Tunnel erreicht wird
+(\#22). Die Realisierbarkeit ist damit sowohl für Architektur und
+Kernmechanismen als auch für den Betrieb belegt.
+
+\begin{table}[t]
+\centering
+\caption{Nachgewiesene Produktivfunktionen (reale Läufe gegen die Live-Instanz,
+2026-07-16).}
+\label{tab:fazit-features}
+\begin{tabular}{lll}
+\toprule
+Funktion & Nachweis & Ergebnis \\
+\midrule
+Cross-Host-E2E (\#6)        & \texttt{e2e-smoke.sh}        & SMOKE OK (via=quic / via=tcp) \\
+Redundanz \& Failover (\#8) & \texttt{redundancy-smoke.sh} & REDUNDANCY OK \\
+Schlüsselrotation (\#12)    & \texttt{rotation-smoke.sh}   & ROTATION OK (alt + neu) \\
+HTTPS am Origin (\#22)      & \texttt{https-demo.sh}       & HTTP 200, clientseitig geprüft \\
+Edge-Observability (\#10)   & \texttt{/metrics}-Scrape     & Prometheus-Gauges/Counter \\
+Self-Serve-CA (\#11)        & \texttt{/pki/ca}             & CA-Root-Verteilung \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Hochverfügbarkeit und Beobachtbarkeit.} Das Failover ruht auf einer
+Edge-Registry, die pro Routing-Token mehrere Agenten-Registrierungen führt und
+neueste zuerst adressiert. Ein hart beendeter Agent schickt kein QUIC-CLOSE; der
+Edge setzt daher \texttt{keep\_alive} auf 3\,s und \texttt{max\_idle\_timeout}
+auf 10\,s, sodass die tote Verbindung nach dem Leerlauf-Fenster geräumt und die
+Vermittlung auf die überlebende Registrierung umgeleitet wird -- der Client-Roundtrip
+gelingt anschließend wieder \enquote{via=quic}. Die Beobachtbarkeit (\#10) stellt
+der Edge über einen Prometheus-Endpunkt bereit
+(\texttt{ct\_edge\_active\_tunnels}, \texttt{ct\_edge\_active\_agents},
+\texttt{ct\_edge\_registrations\_total}, \texttt{ct\_edge\_relays\_total},
+\texttt{ct\_edge\_relay\_bytes\_total}, \texttt{ct\_edge\_failovers\_total}); die
+Statusseite der Steuerungsebene meldet dabei den live vom Edge abgegriffenen
+Tunnelzählwert, nicht die Registry. Bemerkenswert für die Providerblindheit ist,
+dass diese Metriken bewusst grob bleiben: Sie zählen Ereignisse und Bytes, ohne
+Ziele, Inhalte oder Identitäten preiszugeben.
 
 \paragraph{FF2 und FF3 -- Latenz.} Der Eigen-Overhead des Tunnels ist im
-unbelasteten Fall gering (Mittel 6{,}8\,ms) und skaliert linear mit der
-Netzverzögerung ($\text{RT} \approx 6{,}8 + 4{,}2 \cdot d$); der Faktor erklärt
-sich aus dem mehrfachen Queren der verzögerten Strecke pro Roundtrip. Paketverlust
-von 2\,\% wirkt sich erst bei großer Umlaufzeit spürbar aus und dort primär im
-Tail (p95 bei 50\,ms um rund 18\,\% erhöht), nicht im Median. Die Schutzziele
-Providerblindheit und Zensurresistenz sind also mit einem berechenbaren, im
-Wesentlichen von der Netzstrecke dominierten Latenzaufschlag vereinbar.
+unbelasteten Fall gering: Über das Loopback misst \texttt{ct-client} im
+Mittel 8{,}4\,ms (30~Iterationen, PoW-Schwierigkeit~8) für den vollständigen
+Einmal-Tunnel aus QUIC-Aufbau, PoW-Rendezvous, \texttt{Noise\_IK}-Handshake und
+Relay. Bei 0\,\% Verlust skaliert die mittlere Umlaufzeit nahezu linear mit der
+emulierten Einweg-Verzögerung: von rund 8{,}4\,ms über 129{,}0\,ms (20\,ms),
+311{,}2\,ms (50\,ms) bis 613{,}4\,ms (100\,ms). Der Aufschlag erklärt sich daraus,
+dass der Verbindungsaufbau eine feste Anzahl von Roundtrips über die verzögerte,
+je Knoten impairte Strecke kostet; die Ausbreitung dominiert, nicht die
+Rechenlast des Tunnels. Paketverlust verändert nicht den Median, sondern den
+Tail: Bei 0\,ms und 5\,\% Verlust steigt der Mittelwert durch
+QUIC-/Handshake-Retransmits auf 80{,}8\,ms mit einem p95 von 1010{,}7\,ms,
+während der p50 nahe dem verlustfreien Wert bleibt; bei 100\,ms und 5\,\% liegt
+der Mittelwert bei 788{,}9\,ms und der p95 bei 1708{,}0\,ms. Verlust bläht also
+die Tail-Latenz weit stärker auf als die typische Latenz. Die Schutzziele
+Providerblindheit und Zensurresistenz sind damit mit einem berechenbaren, im
+Wesentlichen von der Netzstrecke bestimmten Latenzaufschlag vereinbar.
 
 \section{Ausblick}
 \label{sec:ausblick}
 
-\paragraph{Prototyp.} Der nächste Schritt ist die Verankerung der
-Noise-Ende-zu-Ende-Sitzung auf dem Live-Pfad sowie der \emph{direkte}
-Peer-to-Peer-Datenpfad mit NAT-Hole-Punching und Edge-Relay nur als Rückfall --
-im aktuellen Prototyp läuft der Verkehr stets über das Relay. Hinzu kommen der
-HTTP/2-über-TCP-Rückfall für blockiertes UDP sowie eine belastbarere Evaluation:
-größere Stichproben, symmetrische und bidirektionale Impairment,
-Bandbreitenbegrenzung und ein Keep-Alive-Datenpfad neben dem
-Frisch-Verbindungsaufbau.
+\paragraph{Browser-Plane.} Die v1 beweist bewusst, dass TLS am Origin
+terminiert: Ein Client, der eine Anwendung anbietet, bringt sein eigenes
+Zertifikat mit, das der Nutzer clientseitig prüft. Für einen anonymen
+Browserzugang unter einem öffentlichen Hostnamen fehlt hingegen eine
+\emph{Browser-Plane}, die per SNI-Passthrough und Let's-Encrypt-Zertifikaten
+arbeitet. Sie ist als eigenständiges Vorhaben nach v1 zurückgestellt (ADR-0010)
+und im Projekt als Issue~\#23 verfolgt. Die Herausforderung liegt darin, den
+öffentlichen Namen und die automatische Zertifikatsausstellung mit der
+Providerblindheit zu versöhnen, ohne dem Edge zusätzliche Sichtbarkeit auf Ziele
+oder Inhalte einzuräumen.
 
-\paragraph{Offene Risiken.} Unabhängig von der Technik bleiben drei Fragen
-offen, die über die Betreibbarkeit der Zensurresistenz-Haltung entscheiden: die
-abrechnungsseitige Sybil-/Missbrauchsresistenz (Proof-of-Work deckt Fluten, aber
-keinen finanzierten Angreifer ab), die Wahl von Jurisdiktion, Hosting und
-Zahlungswegen sowie ein konkreter operativer Prozess für die einzige
-Durchsetzungsgrundlage an der rechtlichen Grenze.
+\paragraph{Multi-Region und Mesh.} Der Prototyp betreibt einen einzelnen
+Edge (ADR-0006). Ein mehrregionaler Betrieb würde Ausfallsicherheit und Nähe zum
+Nutzer verbessern; der dezentrale, direkte Peer-to-Peer-Datenpfad mit
+NAT-Hole-Punching und Edge-Relay nur als Rückfall (ADR-0015) ist bislang nur
+teilweise realisiert (Direktpfad-Kandidat plus Relay-Rückfall). Beide Punkte
+gehören zusammen: Erst mit mehreren Edges und einer belastbaren Mesh-Koordination
+wird die Providerblindheit auch gegen den Ausfall oder die Kompromittierung eines
+einzelnen Standorts robust.
 
-\paragraph{Zurückgestellte Funktionen.} Über die v1 hinaus vorgesehen sind die
-Browser-Plane (anonymer Browserzugang per SNI-Passthrough), vollständige
-Selbst-Hostbarkeit und dezentrale Koordination, Agent-Redundanz sowie
-komfortable Abläufe für die Schlüsselrotation. Diese Punkte sind im Backlog des
-Projekts festgehalten und bewusst von der v1 getrennt, um den Kern -- einen
-belegbar providerblinden Tunnel -- zuerst tragfähig zu machen.
+\paragraph{Abrechnungsseitige Sybil-Resistenz.} Proof-of-Work deckt das Fluten
+des Rendezvous ab, aber keinen finanziell ausgestatteten Angreifer: Wer den
+Rechenaufwand bezahlt, umgeht die Schranke. Solange auf KYC verzichtet wird,
+bleibt die abrechnungsseitige Missbrauchs- und Sybil-Resistenz die
+entscheidende offene Frage für einen tragfähigen Betrieb. Denkbar sind an das
+Guthabenbuch der Steuerungsebene gekoppelte Kosten- oder Reputationssignale, die
+Missbrauch verteuern, ohne die Pseudonymität am Datenpfad aufzugeben.
+
+\paragraph{Breitere Evaluation.} Die Messreihe deckt Verzögerung und Verlust in
+einem symmetrischen Einmal-Tunnel ab. Aussagekräftiger wären größere
+Stichproben, ein Keep-Alive-Datenpfad neben dem Frisch-Verbindungsaufbau,
+Bandbreitenbegrenzung sowie asymmetrische und bidirektionale Impairment. Auch
+eine gezielte Vermessung des Failover-Fensters und der Rotationsdauer unter Last
+würde die Betriebsaussagen quantitativ untermauern.
+
+\section{Grenzen der Arbeit}
+\label{sec:grenzen}
+
+Die Ergebnisse sind an mehreren Stellen bewusst begrenzt. \emph{Erstens} ist die
+Providerblindheit strukturell, nicht metadatenfrei: Der Edge kann Nutzlast weder
+lesen noch verändern und erlangt keine Origin-Schlüssel, sieht aber die Existenz
+eines Tunnels sowie grobe Zeit- und Volumenzähler; ein Beobachter mit Zugriff auf
+diese Zähler kann daraus statistische Rückschlüsse ziehen. \emph{Zweitens} ist
+die Schlüsselverteilung Sache des Kunden: Fähigkeiten werden außerhalb des
+Kanals ausgetauscht (ADR-0014), und die Rotation ist explizit -- es gibt keine
+automatische Ablaufzeit, sondern ein bewusst getriggertes Fenster, in dem der
+zurückgezogene Schlüssel noch bedient wird. \emph{Drittens} ist die Evaluation im
+Docker-Testbett mit \texttt{tc~netem} emuliert und auf einer einzelnen Maschine
+ausgeführt; sie modelliert reale Wide-Area-Pfade nur näherungsweise und lässt
+Konkurrenzverkehr, reale Routerpuffer und Mehrbenutzerlast außen vor.
+\emph{Viertens} bleiben die oben genannten offenen Punkte -- finanzierter
+Angreifer, Einregion-Betrieb, teilweise realisierte Mesh-Ebene -- ausdrücklich
+außerhalb der Belege dieser Arbeit. Der Kern ist gleichwohl erreicht: ein
+belegbar providerblinder Tunnel, der als betreibbarer Dienst mit
+Hochverfügbarkeit, Beobachtbarkeit, Selbstbedienungs-PKI, ausfallfreier
+Schlüsselrotation und HTTPS bis zum Origin real nachgewiesen ist.

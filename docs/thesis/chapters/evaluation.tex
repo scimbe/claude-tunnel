@@ -3,29 +3,72 @@
 
 Dieses Kapitel wertet die Roundtrip-Latenz des Tunnels im Docker-Testbett unter
 emulierten Netzbedingungen aus und beantwortet damit die Forschungsfragen FF2
-(Latenz-Overhead) und FF3 (Verhalten unter Netzbedingungen).
+(Grund-Overhead) und FF3 (Skalierung und Verhalten unter Netzbedingungen).
+Über die reine Latenzmessung hinaus belegt es die Funktionsfähigkeit der
+Kernmechanismen -- Transport-Fallback, Redundanz/Failover, unterbrechungsfreie
+Schlüsselrotation und clientseitige Zertifikatsvalidierung -- durch reproduzierbare
+Funktionsexperimente, wertet die Betriebsbeobachtbarkeit des Edge aus und ordnet
+die Ergebnisse anschließend in ein Bedrohungsmodell sowie eine Diskussion der
+Validitätsbedrohungen ein.
 
 \section{Testbett und Methodik}
 \label{sec:testbett}
 
-Das Testbett ist vollständig containerisiert (Docker Compose): Edge, Agent,
-Origin (ein TCP-Echo-Dienst) und Client laufen auf einem statischen Netz. Die
-Link-Impairment wird mit \texttt{tc netem} auf der Egress-Schnittstelle des Edge
-gesetzt und ist über Umgebungsvariablen (Verzögerung, Verlust, Bandbreite)
-parametrisiert. Der Client misst im Bench-Modus je Bedingung $n=5$ vollständige
-Roundtrips -- Verbindungsaufbau, PoW-Rendezvous, Tunnel und Echo-Verifikation --
-jeweils mit \emph{frisch aufgebauter} QUIC-Verbindung.
+Das Testbett ist vollständig containerisiert (Docker Compose,
+\texttt{docker/docker-compose.yml}) und spannt eine Bridge-Topologie im
+Netz \texttt{ct-net} (10.5.0.0/24) auf. Vier Rollen sind statisch adressiert:
+der Edge (10.5.0.2), der Origin (10.5.0.3, ein \texttt{alpine}/\texttt{socat}
+TCP-Echo-Dienst auf Port~8080), der Agent (10.5.0.4) und der Client. Der Client
+baut je Bedingung einen vollständigen Tunnel auf -- QUIC-Verbindungsaufbau,
+PoW-Rendezvous, \texttt{Noise\_IK}-Handschlag und Relay-Pfad
+Client~$\rightarrow$~Edge~$\rightarrow$~Agent~$\rightarrow$~Origin und zurück --
+und verifiziert das Echo.
 
-Die Auswertung ist vollständig reproduzierbar und ihrerseits containerisiert:
-\texttt{scripts/sweep.sh} fährt die Bedingungsmatrix ab und sammelt die Ergebnisse
-als CSV, \texttt{scripts/plot.sh} erzeugt die Abbildungen (Matplotlib in einem
-Python-Container) und \texttt{scripts/tabulate.py} die Tabelle. Vermessen wurde
-die Matrix Verzögerung $\in \{0, 20, 50\}$\,ms $\times$ Verlust $\in \{0, 2\}$\,\%.
+\paragraph{Link-Impairment.} Die Netzbedingungen werden pro Knoten über
+\texttt{tc netem} durch ein \texttt{netem-entrypoint.sh}-Skript gesetzt, das die
+Umgebungsvariablen \texttt{CT\_NETEM\_DELAY}, \texttt{CT\_NETEM\_LOSS} und
+\texttt{CT\_NETEM\_RATE} auf die Egress-Schnittstelle abbildet. Die
+PoW-Schwierigkeit des Rendezvous wird über \texttt{EDGE\_POW\_DIFFICULTY}
+gesteuert und ist für alle Latenzmessungen auf~8 festgelegt. Wichtig für die
+Interpretation: \texttt{netem}-Verzögerung ist \emph{einseitig} und wird pro
+Knoten angewendet, sodass ein Anwendungs-Roundtrip die verzögerte Strecke
+mehrfach quert.
 
-\section{Ergebnisse}
+\paragraph{Messverfahren.} Die Latenz misst der Client im Bench-Modus, gesteuert
+über \texttt{CT\_CLIENT\_ITERATIONS}. Der Client gibt eine beschriftete
+\texttt{RESULT}-CSV-Zeile aus, die pro Bedingung Mittelwert, Minimum, Maximum,
+p50, p95, Standardabweichung, 95\%-Konfidenzintervall und p99 enthält. Die
+Statistiken werden über $n$ Stichproben je Bedingung berechnet; die vollständige
+Matrix wurde mit $n=30$ Iterationen je Bedingung im Betriebsmodus
+\texttt{single} (jeweils frisch aufgebauter One-Shot-Tunnel) vermessen. Weil pro
+Iteration frisch verbunden wird, enthält jede gemessene Latenz den vollen
+Handschlag-Anteil und ist damit eine konservative (obere) Schätzung gegenüber
+einem gehaltenen Datenpfad.
+
+\paragraph{Reproduzierbarkeit.} Die gesamte Pipeline ist skriptgesteuert und
+selbst containerisiert. \texttt{scripts/sweep.sh} fährt die Bedingungsmatrix ab
+und sammelt die Ergebnisse als CSV
+(\texttt{docs/thesis/data/latency.csv}), \texttt{scripts/plot.sh} erzeugt die
+Abbildungen (Matplotlib in einem Python-Container) und
+\texttt{scripts/tabulate.py} die Ergebnistabelle. Vermessen wurde die Matrix
+Verzögerung $\in \{0, 20, 50, 100\}$\,ms $\times$ Verlust $\in \{0, 1, 5\}$\,\%
+(zwölf Bedingungen).
+
+\paragraph{Host-Umgebung.} Alle Läufe wurden auf einem Einzel-Host ausgeführt:
+Linux~6.8.0 auf einem Intel Core i9-9980XE (36~Kerne bei 3{,}00\,GHz) mit
+Docker~29.4.0; Build und Test erfolgten in \texttt{rust:1-slim}. Die
+zugehörige Codebasis besteht aus fünf Rust-Crates (\texttt{ct-common},
+\texttt{ct-edge}, \texttt{ct-agent}, \texttt{ct-client},
+\texttt{ct-control-plane}) und ist durch 266~hermetisch bestehende Unit- und
+Integrationstests bei einer Zeilenabdeckung (lib-only) von 95{,}57\,\% abgesichert;
+die Gate-Konfiguration übersetzt mit \texttt{RUSTFLAGS="-D warnings"} (null
+Warnungen). Diese Kennzahlen belegen, dass die vermessene Software dem im
+Kapitel~\ref{ch:implementierung} beschriebenen Stand entspricht.
+
+\section{Grund-Overhead und Latenz-Skalierung}
 \label{sec:ergebnisse}
 
-Tabelle~\ref{tab:latency} fasst alle Messpunkte zusammen;
+Tabelle~\ref{tab:latency} fasst alle zwölf Messpunkte zusammen;
 Abbildung~\ref{fig:latency-delay} zeigt die Latenz über der Verzögerung,
 Abbildung~\ref{fig:latency-loss} über dem Paketverlust.
 
@@ -48,40 +91,443 @@ Abbildung~\ref{fig:latency-loss} über dem Paketverlust.
   \label{fig:latency-loss}
 \end{figure}
 
-\section{Diskussion}
-\label{sec:diskussion}
+\paragraph{FF2 -- Grund-Overhead.} Ohne emulierte Netzverzögerung und ohne
+Verlust beträgt der Roundtrip im Mittel 8{,}39\,ms
+($\pm$0{,}53\,ms 95\%-KI, p50~8{,}0\,ms, p95~11{,}85\,ms, p99~12{,}46\,ms bei
+$n=30$). Dies ist der Eigenanteil des Tunnels über den Loopback: die Summe aus
+QUIC-Verbindungsaufbau, PoW-Rendezvous, \texttt{Noise\_IK}-Handschlag und dem
+Mehrsprung-Relay. Die geringe Standardabweichung (1{,}48\,ms) und das enge
+Konfidenzintervall belegen, dass dieser Grund-Overhead stabil und
+vorhersagbar ist -- eine Voraussetzung dafür, dass die restlichen Bedingungen
+als Aufschläge auf einen bekannten Sockel gelesen werden können.
 
-\paragraph{FF2 -- Latenz-Overhead.} Ohne Netzverzögerung beträgt der
-Roundtrip im Mittel 6{,}8\,ms; dies ist der Eigenanteil des Tunnels aus
-QUIC-Handshake, PoW-Rendezvous und Mehrsprung-Relay. Über die Messpunkte
-(0\,ms~$\rightarrow$~6{,}8; 20\,ms~$\rightarrow$~92{,}7; 50\,ms~$\rightarrow$~217{,}9)
-skaliert die Latenz näherungsweise linear:
-$\text{RT} \approx 6{,}8 + 4{,}2 \cdot d$ mit $d$ = einseitige Edge-Verzögerung
-in Millisekunden. Der Faktor~$\approx$~4{,}2 spiegelt wider, dass jeder
-Anwendungs-Roundtrip die verzögerte Egress mehrfach quert (Verbindungsaufbau,
-Rendezvous und der Relay-Pfad Client$\rightarrow$Edge$\rightarrow$Agent$\rightarrow$Origin
-und zurück). Da pro Iteration frisch verbunden wird, trägt der Handshake einen
-festen Vielfachen der Umlaufzeit bei.
+\paragraph{FF3 -- Skalierung mit der Verzögerung.} Bei 0\,\% Verlust skaliert
+der mittlere Roundtrip nahezu linear mit der einseitigen
+\texttt{netem}-Verzögerung: 8{,}39\,ms (0\,ms) $\rightarrow$ 128{,}97\,ms
+(20\,ms) $\rightarrow$ 311{,}20\,ms (50\,ms) $\rightarrow$ 613{,}44\,ms
+(100\,ms). Die Zunahme entspricht rund 6\,ms Roundtrip je 1\,ms einseitiger
+Verzögerung und spiegelt wider, dass der Tunnelaufbau eine feste Zahl von
+Umläufen kostet, die jeweils die verzögerte Strecke mehrfach queren
+(Verbindungsaufbau, Rendezvous sowie der Relay-Pfad Client$\rightarrow$Edge$\rightarrow$Agent$\rightarrow$Origin und zurück).
+Weil der einzelne Umlauf durch mehrere \texttt{netem}-Instanzen läuft, ist der
+Multiplikator deutlich größer als~2; er ist jedoch über den gesamten
+Verzögerungsbereich konstant, was die lineare Skalierung erklärt. In diesem
+verlustfreien Regime sind Mittelwert und p95 praktisch deckungsgleich (etwa
+613{,}44\,ms gegenüber 613{,}30\,ms bei 100\,ms), d.\,h. die Verteilung ist eng
+und ohne nennenswerten Tail.
 
-\paragraph{FF3 -- Verhalten unter Paketverlust.} Bei niedriger Umlaufzeit
-(0\,ms, 20\,ms) ist ein Verlust von 2\,\% im Mittel nicht messbar
-(6{,}8$\rightarrow$6{,}9\,ms bzw.\ 92{,}7$\rightarrow$92{,}2\,ms, innerhalb der
-Streuung). Bei 50\,ms hingegen steigt der Mittelwert um rund 9\,\%
-(217{,}9$\rightarrow$237{,}5\,ms) und das p95 um rund 18\,\%
-(260{,}4$\rightarrow$306{,}5\,ms), während der Median nahezu unverändert bleibt
-(p50~$\approx$~207\,ms). Verlustbedingte Neuübertragungen wirken sich also
-proportional zur Umlaufzeit aus und zeigen sich primär im Tail (p95), nicht im
-Median.
+\paragraph{FF3 -- Verhalten unter Paketverlust.} Verlust verändert nicht den
+Median, sondern den Tail. Bei jeder Verzögerungsstufe bleibt der p50 nahe am
+verlustfreien Wert (z.\,B. 100\,ms/5\,\%: p50~610{,}2\,ms gegenüber
+609{,}9\,ms bei 0\,\%), während p95 und p99 stark ansteigen: 100\,ms/5\,\%
+erreicht p95~1708{,}0\,ms und p99~1711{,}0\,ms bei einem Mittelwert von
+788{,}9\,ms und einer Standardabweichung von 327{,}7\,ms. Der extremste Fall
+tritt bei niedriger Grundlatenz und hohem Verlust auf: 0\,ms/5\,\% hat einen
+Median von nur 9{,}3\,ms, aber ein p95 von 1010{,}7\,ms und ein p99 von
+1039{,}7\,ms (Mittel~80{,}8\,ms, Standardabweichung 256{,}9\,ms). Die Ursache
+sind Neuübertragungen im QUIC- und Handschlag-Aufbau: Geht ein
+handschlagkritisches Paket verloren, greift der Retransmission-Timer, dessen
+Wartezeit die Latenz einzelner Iterationen um Größenordnungen anhebt, ohne die
+Mehrzahl der verlustfreien Iterationen zu berühren. Praktisch bedeutet dies,
+dass Verlust die \emph{Schwanzlatenz} weit stärker aufbläht als die typische
+Latenz -- eine für die Dimensionierung von Timeouts relevante Eigenschaft.
+Ein einzelner Ausreißer (100\,ms/1\,\%) wurde mit $n=29$ statt $n=30$
+ausgewertet, weil eine Iteration nicht innerhalb des Messfensters
+abgeschlossen wurde; dies ist in Tabelle~\ref{tab:latency} vermerkt und ändert
+die qualitative Aussage nicht.
 
-\section{Limitierungen}
+\section{Funktionsexperimente}
+\label{sec:funktionsexperimente}
+
+Neben der Latenz belegen vier reproduzierbare End-zu-End-Experimente die
+funktionale Korrektheit der Kernmechanismen. Sie wurden am 2026-07-16 gegen die
+selbst gehostete zentrale Instanz mit den \texttt{target/debug}-Binaries
+ausgeführt und sind jeweils als Skript hinterlegt.
+
+\paragraph{Transport-Fallback (\#6).} \texttt{scripts/e2e-smoke.sh} führt einen
+knotenübergreifenden End-zu-End-Durchlauf aus und meldet
+\enquote{SMOKE OK via=quic}, d.\,h. der Standardpfad über QUIC. Wird
+\texttt{CT\_CLIENT\_FORCE\_TCP=1} gesetzt, meldet derselbe Durchlauf
+\enquote{SMOKE OK via=tcp}: der TLS-über-TCP/443-Fallback (ADR-0004) trägt
+denselben Tunnel, wenn UDP blockiert ist. Damit ist nachgewiesen, dass beide
+Transporte denselben logischen Tunnel bedienen und der Fallback keine
+funktionale Regression darstellt.
+
+\paragraph{Redundanz und Failover (\#8).} \texttt{scripts/redundancy-smoke.sh}
+registriert zwei Agenten, die sich eine Origin-Identität und ein Routing-Token
+teilen. Nach einem Basis-Roundtrip \enquote{via=quic} wird der bedienende Agent
+getötet. Da ein getöteter Agent kein QUIC-\texttt{CLOSE} sendet, greift die
+Totverbindungs-Erkennung des Edge: Dieser setzt \texttt{keep\_alive}~3\,s und
+\texttt{max\_idle\_timeout}~10\,s, sodass die tote Registrierung nach dem
+Idle-Timeout geräumt wird. Anschließend routet der Edge auf die überlebende
+Registrierung um, und der Client-Roundtrip gelingt erneut \enquote{via=quic}
+(\enquote{REDUNDANCY OK}). Der \texttt{ct\_edge\_failovers\_total}-Zähler bleibt
+in der separaten Beobachtbarkeitsmessung bei~0, weil dort kein Failover
+provoziert wurde (Abschnitt~\ref{sec:beobachtbarkeit}).
+
+\paragraph{Unterbrechungsfreie Schlüsselrotation (\#12).}
+\texttt{scripts/rotation-smoke.sh} rotiert den Origin-Schlüssel unter Beibehaltung
+\emph{desselben} Routing-Tokens. Im Rotationsfenster schließen sowohl die
+\emph{alte} als auch die \emph{neue} Capability einen Tunnel-Roundtrip ab
+(\enquote{ROTATION OK}): Bestandsclients routen weiter, weil das Token erhalten
+bleibt, und handeln den zurückgezogenen Schlüssel während des Fensters aus. Das
+belegt, dass ein Schlüsselwechsel ohne Ausfallzeit und ohne erzwungene
+Neukonfiguration der Clients möglich ist.
+
+\paragraph{HTTPS am Origin (\#22).} \texttt{scripts/https-demo.sh} betreibt eine
+echte selbstsignierte HTTPS-Site (SAN 127.0.0.1) auf dem Loopback und erreicht
+sie durch den Tunnel. \texttt{curl --cacert} liefert HTTP~200, wobei das
+Zertifikat des Origin \emph{clientseitig} validiert wird -- TLS terminiert am
+Origin, der Edge relayt ausschließlich TLS-über-\texttt{Noise}-Chiffretext. Der
+zugehörige eingefrorene Test
+\texttt{https\_website\_through\_the\_tunnel\_with\_client\_side\_cert\_validation}
+verankert dieses Verhalten. Der Client-Weiterleitungsmodus
+\texttt{CT\_CLIENT\_MODE=forward} exponiert den Tunnel als lokalen Port und lässt
+so beliebige TCP-/TLS-Anwendungen mitfahren. Dieses Experiment ist der zentrale
+Beleg für die Provider-Blindheit auf der Datenebene: Der Edge kann die
+Nutzlast weder lesen noch verändern, weil er den TLS-Sitzungsschlüssel nie
+sieht.
+
+\section{Beobachtbarkeit}
+\label{sec:beobachtbarkeit}
+
+Der Edge exponiert Betriebskennzahlen im Prometheus-Format (\#10). Eine reale
+Abfrage vom 2026-07-16 (Control-Plane auf Port~8090, Edge auf Port~9600) ergab
+die in Tabelle~\ref{tab:metrics} gezeigten Werte. Zum Zeitpunkt der Abfrage war
+kein Agent registriert, weshalb die beiden Gauges \texttt{ct\_edge\_active\_tunnels}
+und \texttt{ct\_edge\_active\_agents} auf~0 stehen; die Counter sind hingegen
+kumulativ und dokumentieren die vorangegangene Aktivität.
+
+\begin{table}[t]
+  \centering
+  \caption{Reale Edge-\texttt{/metrics}-Abfrage (2026-07-16). Gauges sind
+    Momentaufnahmen, Counter kumulativ.}
+  \label{tab:metrics}
+  \begin{tabular}{lrl}
+    \toprule
+    Kennzahl & Wert & Typ \\
+    \midrule
+    \texttt{ct\_edge\_active\_tunnels} & 0 & Gauge \\
+    \texttt{ct\_edge\_active\_agents} & 0 & Gauge \\
+    \texttt{ct\_edge\_registrations\_total} & 7 & Counter \\
+    \texttt{ct\_edge\_relays\_total} & 2 & Counter \\
+    \texttt{ct\_edge\_relay\_bytes\_total} & 8369 & Counter \\
+    \texttt{ct\_edge\_failovers\_total} & 0 & Counter \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Die sieben Registrierungen gegenüber zwei Relays zeigen, dass Agenten sich
+häufiger an- und abmelden, als tatsächlich Tunnel bedient werden -- ein für
+Testläufe mit wiederholtem Auf- und Abbau erwartbares Verhältnis. Der
+Byte-Zähler (8369) belegt, dass nur \emph{strukturelle} Volumeninformation
+sichtbar ist, nicht der Inhalt: Der Edge zählt weitergeleitete Bytes, kann sie
+aber nicht entschlüsseln. Entscheidend für das Zero-Knowledge-Design ist, dass
+diese Kennzahlen ausschließlich \emph{grobe} Metadaten offenlegen -- Existenz
+eines Tunnels, ungefähres Volumen, Rendezvous-Ereignisse -- und keine Inhalte,
+Ziel-Hostnamen oder Schlüssel. Die Control-Plane meldet unter \texttt{/status}
+zusätzlich \texttt{\{"ready":true, "agents":45, "accounts":4,
+"payments\_confirmed":2\}}, wobei der dort ausgewiesene Tunnel-Zählstand aus dem
+live vom Edge geschabten \texttt{ct\_edge\_active\_tunnels} stammt und nicht aus
+der Rendezvous-Registrierung.
+
+\section{Sicherheitsdiskussion und Bedrohungsmodell}
+\label{sec:sicherheit}
+
+Die Sicherheitsziele des Systems lassen sich entlang der Grenze der
+Provider-Blindheit strukturieren.
+
+\paragraph{Datenebene (provider-blind).} Der Edge kann die Nutzlast weder lesen
+noch verändern und erlangt keine Origin-Schlüssel; er sieht ausschließlich
+strukturelle Metadaten (Existenz eines Tunnels, grobe Zeit- und Volumenzähler,
+Rendezvous-Ereignisse). Getragen wird dies durch \texttt{Noise\_IK}
+(X25519/ChaChaPoly/BLAKE2s) als End-zu-End-Schicht (ADR-0013), über die der
+Edge nur Chiffretext relayt (ADR-0001, ADR-0002). Das HTTPS-am-Origin-Experiment
+(\#22) ist der empirische Beleg: Weil TLS erst am Origin terminiert, hätte ein
+neugieriger Edge keinen Zugriff auf den Klartext, selbst wenn er es versuchte.
+
+\paragraph{Rendezvous und Sybil-/DoS-Abwehr.} In Abwesenheit von KYC ist ein
+Proof-of-Work-Rendezvous (in der Tradition von \cite{back2002hashcash}) die
+primäre Schranke gegen Sybil- und DoS-Angriffe, ergänzt um eine
+Ratenbegrenzung pro Token. Ein opakes Routing-Token ersetzt jede SNI- oder
+Hostnamen-Angabe, sodass am Edge kein Zielname sichtbar wird. Die Grenze dieses
+Ansatzes ist ökonomischer Natur: Ein hinreichend finanzierter Angreifer kann die
+PoW-Kosten bezahlen; eine abrechnungsseitige Sybil-Resistenz bleibt daher eine
+offene Frage.
+
+\paragraph{Schlüsselverteilung.} Die Verteilung der Capabilities liegt in der
+Verantwortung des Kunden (out-of-band, ADR-0014); die Rotation ist explizit und
+kennt keine automatische Ablauffrist (belegt durch \#12). Die self-serve
+Verteilung des Edge-CA-Roots über \texttt{/pki/ca} (\#11) reduziert den
+out-of-band-Aufwand für das reine Vertrauensanker-Material, verschiebt aber nicht
+die Verantwortung für die eigentlichen Origin-Capabilities. Die Control-Plane
+bleibt bewusst dünn und selbst hostbar (ADR-0017): Sie hält weder Schlüssel noch
+Nutzlast, verifiziert OIDC/Keycloak-gestützte \texttt{/me/*}-Endpunkte und führt
+das Konto-/Kredit-Ledger.
+
+\section{Limitierungen und Validitätsbedrohungen}
 \label{sec:limitierungen}
 
-Die Ergebnisse sind unter drei Einschränkungen zu lesen. Erstens wirkt die
-Impairment nur auf der Edge-Egress und damit nicht symmetrisch; die absolute
-Latenz ist eine untere Schranke für eine voll bidirektional verzögerte Strecke.
-Zweitens dient $n=5$ hier der Demonstration der reproduzierbaren Mess-Pipeline,
-nicht einer statistisch belastbaren Aussage -- größere Stichproben und eine
-breitere Matrix (inklusive Bandbreitenbegrenzung) sind über dieselben Skripte
-unmittelbar zugänglich. Drittens überzeichnet der Frisch-Verbindungsaufbau je
-Iteration den Handshake-Anteil; ein Keep-Alive-Datenpfad läge niedriger. Diese
-Punkte greift der Ausblick (Kapitel~\ref{ch:fazit}) auf.
+Die Ergebnisse sind unter mehreren Einschränkungen zu lesen, die die interne und
+externe Validität betreffen.
+
+\begin{description}
+  \item[Einzel-Host-Emulation.] Alle Messungen liefen auf einem einzigen Host
+    über die Docker-Bridge. Reale geografische Distanz, konkurrierender
+    Cross-Traffic und heterogene Hardware sind nicht abgebildet; die absoluten
+    Latenzen charakterisieren die Emulation, nicht ein Weitverkehrsnetz. Die
+    lineare Skalierung mit der Verzögerung (FF3) ist jedoch ein
+    strukturelles Ergebnis, das von dieser Einschränkung nur im Absolutwert,
+    nicht in der Form berührt wird.
+  \item[Einseitige \texttt{netem}-Verzögerung.] \texttt{netem} verzögert je
+    Knoten einseitig auf der Egress. Die gemessene Latenz ist damit eine untere
+    Schranke gegenüber einer voll bidirektional verzögerten Strecke; der
+    beobachtete Multiplikator zwischen einseitiger Verzögerung und Roundtrip ist
+    eine Eigenschaft der Emulation, keine allgemeine Konstante.
+  \item[Frisch-Verbindungsaufbau je Iteration.] Der Betriebsmodus
+    \texttt{single} baut pro Iteration einen vollständigen Tunnel auf und
+    überzeichnet damit den Handschlag-Anteil. Ein gehaltener Keep-Alive-Datenpfad
+    läge niedriger; die berichteten Werte sind konservativ.
+  \item[Bezahlbare PoW-Kosten.] Wie in Abschnitt~\ref{sec:sicherheit} dargelegt,
+    ist PoW ökonomisch überwindbar. Die Sybil-Resistenz auf Abrechnungsebene ist
+    nicht Gegenstand dieser Evaluation.
+  \item[Zurückgestellte Browser-Ebene.] Die Browser-Ebene (öffentlicher
+    Hostname mit Let's-Encrypt-Zertifikat über SNI) ist bewusst post-v1
+    zurückgestellt (ADR-0010, Issue~\#23). Die v1 belegt stattdessen die
+    Terminierung von TLS am Origin (\#22); eine Aussage über den
+    Browser-Direktzugang ist damit nicht getroffen.
+  \item[Einzelregion-Edge.] Der Edge ist einregionig (ADR-0006); ein
+    mehrregionales Mesh-P2P (ADR-0015) ist nur teilweise realisiert
+    (Direktpfad-Kandidat mit Relay-Fallback). Aussagen zur Skalierung über
+    mehrere Regionen sind daher nicht Teil dieser Arbeit.
+\end{description}
+
+Diese Punkte greift der Ausblick (Kapitel~\ref{ch:fazit}) auf; insbesondere
+sind größere Stichproben, eine breitere Matrix inklusive Bandbreitenbegrenzung
+(\texttt{CT\_NETEM\_RATE}) und ein gehaltener Datenpfad über dieselben Skripte
+unmittelbar zugänglich.
+
+\subsection{Interne und externe Validität im Überblick}
+\label{sec:limitierungen-validitaet}
+
+Ordnet man die vorstehenden Einschränkungen nach ihrer Wirkrichtung, so betreffen
+sie teils die interne, teils die externe Validität der Ergebnisse.
+
+\paragraph{Interne Validität.} Die Latenzmatrix beruht auf $n=30$ Iterationen je
+Bedingung -- eine moderate Stichprobengröße. Im verlustfreien Regime ist das
+unkritisch, weil die Verteilung eng ist; unter Paketverlust erzeugt die
+rechtsschiefe Verteilung jedoch breite Konfidenzintervalle (etwa 100\,ms/5\,\%:
+$\pm$117{,}261\,ms 95\%-KI), sodass insbesondere die absoluten Tail-Kennzahlen
+(p95, p99) mit Vorsicht als Punktschätzer zu lesen sind und ihre \emph{Richtung}
+belastbarer ist als ihr \emph{Betrag}. Hinzu kommt, dass ausschließlich der
+Betriebsmodus \texttt{single} latenzvermessen wurde. Die weiteren Datenpfade --
+der \texttt{stream}-Modus, der UDP-Transport und der TLS-über-TCP-Fallback --
+sind funktional nachgewiesen (Abschnitt~\ref{sec:funktionsexperimente}), aber
+nicht latenzvermessen; über ihren Overhead trifft diese Arbeit daher keine
+quantitative Aussage.
+
+\paragraph{Externe Validität.} Die Single-Host-Emulation über die Docker-Bridge
+bildet kein echtes Weitverkehrsnetz ab, und \texttt{netem} verzögert einseitig
+je Knoten; die absoluten Latenzen sind daher nicht unmittelbar auf reale WAN-Pfade
+übertragbar. Für das DoS-Argument ist zudem einschränkend, dass die PoW-Kosten
+bezahlbar sind (Abschnitt~\ref{sec:sicherheit}): Ein hinreichend finanzierter
+Angreifer kann sie aufbringen, weshalb die Zugangsschranke keine absolute,
+sondern eine ökonomische Grenze zieht. Schließlich ist die Browser-Ebene bewusst
+post-v1 zurückgestellt (ADR-0010), sodass über den direkten Browser-Zugang keine
+empirische Aussage vorliegt.
+
+\section{Kosten des Proof-of-Work-Zugangsschutzes}
+\label{sec:eval-pow}
+
+Der PoW-Rendezvous (Abschnitt~\ref{sec:sicherheit}) ist die primäre
+Zugangsschranke, aber er ist zugleich ein Latenz- und Ressourcenkostenfaktor auf
+dem kritischen Verbindungsaufbaupfad. Um diesen Stellhebel zu quantifizieren,
+wurde die Rendezvous-Schwierigkeit -- die Zahl der geforderten führenden
+Nullbits im Hash -- systematisch variiert, während alle übrigen Bedingungen
+konstant gehalten wurden (Verzögerung 0\,ms, Verlust 0\,\%, Betriebsmodus
+\texttt{single}, $n=30$ Iterationen je Stufe, \texttt{scripts/sweep.sh}). Die
+Rohdaten liegen unter \texttt{docs/thesis/data/pow-latency.csv}.
+Tabelle~\ref{tab:pow-latency} stellt die drei vermessenen Schwierigkeitsstufen
+gegenüber.
+
+\begin{table}[t]
+  \centering
+  \caption{Reale PoW-Schwierigkeitsstudie: Tunnel-Roundtrip über der geforderten
+    Rendezvous-Schwierigkeit (führende Nullbits), 0\,ms Verzögerung, 0\,\%
+    Verlust, $n=30$ je Stufe.}
+  \label{tab:pow-latency}
+  \begin{tabular}{rrrrr}
+    \toprule
+    Schwierigkeit & Mittel (ms) & p50 (ms) & p95 (ms) & Std.-Abw. (ms) \\
+    \midrule
+    8  & 5{,}998   & 6{,}309   & 9{,}536   & 2{,}305   \\
+    16 & 31{,}321  & 21{,}685  & 80{,}042  & 27{,}726  \\
+    20 & 334{,}571 & 268{,}924 & 947{,}483 & 273{,}656 \\
+    \bottomrule
+  \end{tabular}
+
+  \medskip
+  \begin{tabular}{rr}
+    \toprule
+    Schwierigkeit & p99 (ms) \\
+    \midrule
+    8  & 9{,}785   \\
+    16 & 147{,}116 \\
+    20 & 972{,}335 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Nahezu exponentielles Wachstum.} Die mittlere Latenz steigt mit der
+Schwierigkeit steil an: von 5{,}998\,ms (Schwierigkeit~8) über 31{,}321\,ms
+(Schwierigkeit~16) auf 334{,}571\,ms (Schwierigkeit~20). Das ist die erwartete
+Signatur eines Hashcash-artigen Verfahrens: Jedes zusätzliche geforderte Nullbit
+verdoppelt im Erwartungswert die Zahl der nötigen Hash-Versuche, sodass die
+Lösekosten geometrisch mit der Bitzahl wachsen. Als Analyse der Tabellenwerte
+ergibt sich zwischen Stufe~8 und~16 ein Faktor von rund 5{,}2, zwischen~16 und~20
+ein Faktor von rund 10{,}7 und über die gesamte Spanne von~8 auf~20 ein Faktor
+von etwa 55{,}8. Dass die gemessenen Faktoren unter dem rein rechnerischen
+Verdopplungsprodukt liegen, ist plausibel: Der Messwert enthält bei jeder Stufe
+denselben festen Tunnel-Grundanteil (Verbindungsaufbau, Handschlag, Relay), der
+bei Schwierigkeit~8 den Roundtrip noch dominiert (rund 6\,ms, vergleichbar dem
+Grund-Overhead aus Abschnitt~\ref{sec:ergebnisse}), während er bei
+Schwierigkeit~20 gegenüber der reinen Suchzeit verschwindet.
+
+\paragraph{Hohe Varianz aus der geometrischen Suche.} Der PoW ist eine
+probabilistische Suche: Die Zahl der Versuche bis zum ersten Treffer ist
+geometrisch verteilt, was eine breite, rechtsschiefe Latenzverteilung erzeugt.
+Die Standardabweichung wächst entsprechend von 2{,}305\,ms (Schwierigkeit~8) auf
+27{,}726\,ms (Schwierigkeit~16) und 273{,}656\,ms (Schwierigkeit~20); bei
+Stufe~20 liegt sie damit in derselben Größenordnung wie der Mittelwert selbst.
+Sichtbar wird die Schiefe auch im Abstand zwischen Median und oberen
+Perzentilen: Bei Schwierigkeit~20 steht einem p50 von 268{,}924\,ms ein p95 von
+947{,}483\,ms und ein p99 von 972{,}335\,ms gegenüber -- ein einzelner
+Rendezvous-Versuch kann also spürbar länger dauern als der Median, ohne dass ein
+Fehler vorliegt.
+
+\paragraph{Auslegungs-Kompromiss.} Diese Zahlen quantifizieren den in
+Abschnitt~\ref{sec:sicherheit} qualitativ benannten Stellhebel. Die
+Schwierigkeit muss hoch genug sein, um DoS-/Sybil-Fluten wirtschaftlich
+abzuschrecken, darf aber legitime Clients nicht unverhältnismäßig bestrafen. Bei Schwierigkeit~8 ist der PoW mit rund 6\,ms
+vernachlässigbar und verschwindet im Grund-Overhead; bei Schwierigkeit~20
+dominiert er mit rund 335\,ms den gesamten Roundtrip und würde die
+Verbindungsaufbaulatenz für ehrliche Nutzer mehr als verfünfzigfachen. Die
+angemessene Schwierigkeit ist damit kein Sicherheitskonstante, sondern ein
+betrieblich einstellbarer Parameter (\texttt{EDGE\_POW\_DIFFICULTY}), der an die
+beobachtete Missbrauchslast anzupassen ist: niedrig im Normalbetrieb, temporär
+erhöht unter Last. Dass die Kosten pro zusätzlichem Bit geometrisch steigen,
+macht diesen Regler wirksam -- wenige Bits mehr heben die Angreiferkosten stark
+an --, aber auch heikel, weil dieselbe Steilheit legitime Latenz ebenso schnell
+in den dreistelligen Millisekundenbereich treibt.
+
+\subsection{Zerlegung des Fix-Overheads: Handschlag über der Propagation}
+\label{sec:eval-fixcost}
+
+Die Skalierungsaussage aus Abschnitt~\ref{sec:ergebnisse} lässt sich schärfer
+fassen, wenn man die verlustfreie Zeile der Latenzmatrix als affines Modell der
+Verzögerung liest. Über die vier Stützstellen bei 0\,\% Verlust
+-- 8{,}39\,ms (0\,ms), 128{,}97\,ms (20\,ms), 311{,}20\,ms (50\,ms) und
+613{,}44\,ms (100\,ms) -- ergibt die Analyse der Zuwächse einen nahezu
+konstanten Anstieg je zusätzlicher einseitiger Verzögerung:
+\begin{align*}
+  \frac{128{,}97 - 8{,}39}{20 - 0}   &\approx 6{,}03, &
+  \frac{311{,}20 - 128{,}97}{50 - 20} &\approx 6{,}07, &
+  \frac{613{,}44 - 311{,}20}{100 - 50} &\approx 6{,}05.
+\end{align*}
+Der Roundtrip lässt sich damit gut durch $\mathrm{RTT}(d) \approx a + b\cdot d$
+beschreiben, mit einem Achsenabschnitt von $a \approx 8{,}39$\,ms und einer
+Steigung von $b \approx 6{,}05$ (Millisekunden Roundtrip je Millisekunde
+einseitiger Verzögerung). Beide Terme sind Ausdruck ein und derselben festen
+Aufbaukosten: Der Achsenabschnitt~$a$ ist der propagationsfreie Eigenanteil
+(loopbacknahe Verarbeitung von QUIC-Aufbau, PoW-Rendezvous,
+\texttt{Noise\_IK}-Handschlag und Relay), und die Steigung~$b$ ist die feste
+Zahl verzögerter Streckenquerungen, die dieselbe Aufbausequenz erzwingt. Dass
+$b$ über den gesamten Bereich praktisch konstant bleibt, ist der eigentliche
+Befund: Der Handschlag kostet eine \emph{feste Anzahl von Umläufen}, die
+\emph{oben auf} die Propagation aufsetzen; er addiert keine verzögerungsabhängige
+Zusatzarbeit. Die Verbindungsaufbaukosten des Zero-Knowledge-Stacks sind damit
+strukturell -- eine Konstante mal die Wegverzögerung --, nicht ein mit der
+Distanz überproportional wachsender Aufschlag.
+
+\paragraph{Warum Verlust das p99 stärker aufbläht als das p50.} Dieselbe
+Zerlegung erklärt, warum Paketverlust die Verteilung asymmetrisch verzerrt. Der
+Median folgt weiterhin dem Fix-Overhead-Modell, weil die Mehrheit der
+Iterationen keinen handschlagkritischen Verlust erleidet: Bei 100\,ms bleibt der
+p50 mit 610{,}2\,ms (5\,\% Verlust) praktisch auf dem verlustfreien Wert von
+609{,}9\,ms. Die oberen Perzentile hingegen fangen genau jene Iterationen ein, in
+denen ein Aufbaupaket verloren geht und ein Retransmission-Timer ablaufen muss,
+bevor der Handschlag fortschreiten kann -- eine Wartezeit, die den betroffenen
+Umlauf um Hunderte von Millisekunden verlängert. Bei 100\,ms/5\,\% treibt dieser
+Mechanismus das p95 auf 1708{,}0\,ms und das p99 auf 1711{,}0\,ms, während der
+Mittelwert (788{,}9\,ms) zwischen dem unveränderten Median und dem schweren
+Tail liegt. Am deutlichsten zeigt sich der Effekt bei niedriger Grundlatenz, wo
+die Retransmit-Wartezeit im Verhältnis riesig ist: 0\,ms/5\,\% hat einen p50 von
+nur 9{,}3\,ms, aber ein p99 von 1039{,}7\,ms -- ein Faktor von über hundert
+zwischen typischer und Schwanzlatenz. Für die Betriebsauslegung folgt daraus,
+dass Zeitüberschreitungen für den Verbindungsaufbau nicht am Median, sondern am
+p99 zu bemessen sind, da erst dieser die verlustinduzierten Retransmit-Tails
+erfasst.
+
+\section{Synthese der Forschungsfragen}
+\label{sec:eval-synthese}
+
+Die vorstehenden Abschnitte erlauben eine geschlossene Beantwortung der vier
+Forschungsfragen. Tabelle~\ref{tab:ff-synthese} ordnet jeder Frage den Kernbefund
+und den empirischen Beleg zu; der anschließende Fließtext fasst die Argumentation
+je Frage zusammen.
+
+\begin{table}[t]
+  \centering
+  \caption{Synthese: Forschungsfrage, Kernbefund und empirischer Beleg.}
+  \label{tab:ff-synthese}
+  \small
+  \begin{tabular}{@{}lp{0.40\linewidth}p{0.32\linewidth}@{}}
+    \toprule
+    FF & Kernbefund & Beleg \\
+    \midrule
+    FF1 -- Realisierbarkeit & Ein provider-blinder Zero-Knowledge-Tunnel ist
+      realisierbar (Antwort: ja). & 266~Tests, 95{,}57\,\% Zeilenabdeckung; reale
+      e2e-, Failover-, Rotations- und HTTPS-Läufe \\
+    FF2 -- Grund-Overhead & Fester Eigenanteil von 8{,}392\,ms im Mittel
+      (p95~11{,}850\,ms) über den Loopback. & Abschnitt~\ref{sec:ergebnisse},
+      Tabelle~\ref{tab:latency} \\
+    FF3 -- Skalierung & Nahezu lineare Skalierung mit der Verzögerung
+      ($8{,}39 \rightarrow 129 \rightarrow 311 \rightarrow 613$\,ms bei
+      0/20/50/100\,ms); Verlust treibt das p99, nicht das p50. &
+      Abschnitte~\ref{sec:ergebnisse} und \ref{sec:eval-fixcost} \\
+    FF4 -- Betreibbarkeit & Failover überlebt den Agent-Kill (\enquote{via=quic}),
+      Beobachtbarkeit über \texttt{/metrics}, self-hostbare Control-Plane. &
+      Abschnitte~\ref{sec:funktionsexperimente} und \ref{sec:beobachtbarkeit} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{FF1 -- Realisierbarkeit.} Ein provider-blinder Tunnel lässt sich
+realisieren; die Antwort ist \emph{ja}. Der Beleg ist doppelt: Die Codebasis ist
+durch 266~hermetisch bestehende Tests bei 95{,}57\,\% Zeilenabdeckung (lib-only)
+abgesichert, und vier reale End-zu-End-Läufe -- knotenübergreifender e2e-Durchlauf,
+Redundanz/Failover, unterbrechungsfreie Schlüsselrotation und HTTPS am Origin --
+belegen die Kernmechanismen im Betrieb (Abschnitt~\ref{sec:funktionsexperimente}).
+
+\paragraph{FF2 -- Grund-Overhead.} Der Eigenanteil des Tunnels über den Loopback
+beträgt im Mittel 8{,}392\,ms bei einem p95 von 11{,}850\,ms
+(Abschnitt~\ref{sec:ergebnisse}). Dieser Sockel aus QUIC-Aufbau, PoW-Rendezvous,
+\texttt{Noise\_IK}-Handschlag und Mehrsprung-Relay ist stabil und vorhersagbar
+und bildet die Bezugsgröße, gegen die alle Netzbedingungen als Aufschläge zu
+lesen sind.
+
+\paragraph{FF3 -- Skalierung.} Bei 0\,\% Verlust skaliert der mittlere Roundtrip
+nahezu linear mit der einseitigen Verzögerung
+($8{,}39 \rightarrow 129 \rightarrow 311 \rightarrow 613$\,ms bei 0/20/50/100\,ms);
+die Handschlag-Kosten setzen als feste Zahl von Umläufen \emph{oben auf} die
+Propagation auf (Abschnitt~\ref{sec:eval-fixcost}). Paketverlust verändert nicht
+den Median, sondern den Tail: Er treibt das p99, während das p50 nahe am
+verlustfreien Wert bleibt.
+
+\paragraph{FF4 -- Betreibbarkeit und Verfügbarkeit.} Das System ist betreibbar und
+verfügbar: Der Failover überlebt das Töten des bedienenden Agenten und liefert den
+Roundtrip erneut \enquote{via=quic} von der überlebenden Registrierung
+(Abschnitt~\ref{sec:funktionsexperimente}); die Beobachtbarkeit ist über die
+Prometheus-Endpunkt-Abfrage \texttt{/metrics} gegeben
+(Abschnitt~\ref{sec:beobachtbarkeit}); und die dünne Control-Plane ist self-hostbar
+(ADR-0017), sodass der Betrieb ohne Fremdvertrauen möglich bleibt.

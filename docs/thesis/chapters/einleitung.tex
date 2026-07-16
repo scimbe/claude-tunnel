@@ -11,6 +11,19 @@ dieser den Klartext einsehen und die Verbindung auf Zuruf kappen kann. Für
 Nutzer mit einem Schutzbedarf gegen Zensur ist ein Anbieter, der den Datenverkehr
 \emph{sehen} oder \emph{unterbrechen} kann, jedoch selbst ein Angriffspunkt.
 
+Dieses Vertrauensproblem lässt sich anhand dreier Rollen präzisieren, die
+handelsübliche Tunneldienste in einer einzigen Instanz bündeln. Erstens
+terminiert der Anbieter die Transportverschlüsselung und liest damit die
+Nutzlast im Klartext; zweitens hält er die kryptographischen Identitäten
+(Zertifikate, Schlüssel) und ist damit die Wurzel des Vertrauens; drittens
+kontrolliert er den Datenpfad und kann einzelne Verbindungen selektiv
+unterbrechen. Wer gegen Zensur oder erzwungene Herausgabe geschützt sein will,
+muss jeder dieser drei Rollen misstrauen -- und genau dieses Misstrauen ist bei
+einem terminierenden Anbieter technisch nicht durchsetzbar, sondern nur
+vertraglich zugesichert. Ein Betreiber, der den Klartext technisch nicht sehen
+kann, kann ihn auch unter Zwang nicht herausgeben; ein Betreiber, der die
+Schlüssel nicht hält, ist kein lohnendes Ziel für ihre Erpressung.
+
 Diese Arbeit verfolgt den entgegengesetzten Entwurf: einen
 \emph{providerblinden} (zero-knowledge) Tunnel, bei dem der Betreiber
 bewusst aus drei Dingen herausgehalten wird -- dem \emph{Inhalt} (die
@@ -23,11 +36,56 @@ Relay-Fall -- grobe Zeit- und Volumenzähler bleiben sichtbar. Durchsetzung
 reduziert sich auf einen einzigen, groben Hebel (Terminierung eines Tokens),
 der nur an einer eng definierten \emph{rechtlichen Grenze} greift.
 
+Damit diese Grenze nicht durch Umgehung des Anbieters ausgehebelt werden kann,
+verwendet der Entwurf einen \emph{opaken Routing-Token} statt eines Hostnamens:
+Der Edge sieht weder eine SNI-Kennung noch einen DNS-Namen, sondern nur eine
+undurchsichtige Zeichenfolge, die eine Registrierung adressiert. Der Zugang zum
+Rendezvous wird durch einen \emph{Proof-of-Work} (in der Tradition von
+Hashcash~\cite{back2002hashcash}) und eine Ratenbegrenzung pro Token
+verteuert, sodass ein anonymer, betreiberblinder Dienst nicht trivial für
+Missbrauch geflutet werden kann. Die Ende-zu-Ende-Sicherheit ruht auf dem
+Noise-Protokoll-Rahmen~\cite{noiseprotocol}, der Transport auf
+QUIC~\cite{rfc9000} mit TLS-1.3-Schlüsselverhandlung~\cite{rfc9001}; wo UDP
+blockiert ist, trägt ein TLS-über-TCP-Fallback denselben Tunnel.
+
 Aus dieser Haltung ergibt sich ein Spannungsfeld: Providerblindheit und
 Zensurresistenz erkauft man sich mit zusätzlichen Vermittlungsschritten
 (Rendezvous, Relay) und kryptographischem Aufwand. Ob und in welchem Umfang
 diese Schutzziele die Latenz eines Tunnels belasten, ist die zentrale empirische
 Frage dieser Arbeit.
+
+\subsection{Vom Testbett zum selbst-hostbaren Produkt}
+\label{sec:vom-testbett-zum-produkt}
+
+Ein providerblinder Tunnel ist als reines Forschungsartefakt wenig aussagekräftig:
+Erst der Anspruch, ihn tatsächlich \emph{zu betreiben}, macht sichtbar, welche
+Eigenschaften über die Kryptographie hinaus notwendig sind. Die Arbeit betrachtet
+den Prototyp deshalb nicht nur als Latenz-Messobjekt, sondern als eine erste,
+selbst-hostbare Version~1 mit den Betriebseigenschaften, ohne die ein
+Zero-Knowledge-Design in der Praxis nicht tragfähig wäre:
+
+\begin{itemize}
+  \item \emph{Redundanz und Failover.} Ein einzelner Agent ist ein
+    Ausfallpunkt zwischen Edge und Origin. Der Entwurf erlaubt es mehreren
+    Agenten, sich unter derselben Origin-Identität zu registrieren; fällt der
+    bedienende Agent aus, übernimmt nach einem Erkennungsfenster ein
+    überlebender.
+  \item \emph{Beobachtbarkeit.} Ein betreiberblinder Dienst darf zwar keine
+    Nutzlast einsehen, muss aber dennoch betreibbar sein. Der Edge exponiert
+    daher ausschließlich \emph{strukturelle} Kennzahlen (aktive Tunnel und
+    Agenten, Registrierungs-, Relay- und Failover-Zähler) über einen
+    Prometheus-Endpunkt, ohne die Zero-Knowledge-Grenze zu verletzen.
+  \item \emph{Selbst-Hosting.} Die dünne Kontrollebene hält keine Schlüssel und
+    keine Nutzlast; sie lässt sich vom Kunden selbst betreiben und verteilt
+    unter anderem die CA-Wurzel des Edge, sodass der Vertrauensanker nicht mehr
+    außerhalb des Systems von Hand kopiert werden muss.
+\end{itemize}
+
+Diese Erweiterungen werden bewusst \emph{ohne Überzeichnung} eingeführt: Der
+Prototyp bleibt eine Version~1 mit einer einzelnen Edge-Region und einem
+explizit gehaltenen Bedrohungsmodell (Abschnitt in Kapitel~\ref{ch:evaluation}).
+Ziel ist nicht ein produktionsreifer Dienst, sondern der Nachweis, dass sich
+Providerblindheit und Betreibbarkeit im selben Entwurf vereinen lassen.
 
 \section{Zielsetzung}
 \label{sec:zielsetzung}
@@ -42,10 +100,24 @@ Bewertung erfolgt in einem vollständig Docker-basierten Testbett, in dem
 Netzbedingungen (Verzögerung, Paketverlust, Bandbreite) mit \texttt{tc netem}
 emuliert und die Roundtrip-Latenz reproduzierbar vermessen werden.
 
+Über den reinen Latenzpfad hinaus umfasst die Umsetzung die Betriebseigenschaften
+aus Abschnitt~\ref{sec:vom-testbett-zum-produkt}: die Agenten-Redundanz mit
+Failover, die zustandslose Zero-Downtime-Rotation des Origin-Schlüssels bei
+unverändertem Routing-Token, den strukturellen Beobachtbarkeits-Endpunkt sowie
+die dünne, selbst-hostbare Kontrollebene. Der Umfang des Codes ist zugleich sein
+Qualitätsmaßstab: Das Rust-Workspace besteht aus fünf Crates, die durch $266$
+hermetisch laufende Unit- und Integrationstests mit einer bibliotheksbezogenen
+Zeilenabdeckung von $95{,}57\,\%$ abgesichert sind. Alle in dieser Arbeit
+berichteten Kennzahlen entstammen realen, reproduzierbaren Läufen; es werden
+keine Werte geschätzt oder extrapoliert.
+
 \section{Forschungsfragen}
 \label{sec:forschungsfragen}
 
-Die Arbeit gliedert sich an drei Forschungsfragen:
+Die Arbeit gliedert sich an vier Forschungsfragen. FF1 bis FF3 betreffen den
+Kern des providerblinden Tunnels -- seine Realisierbarkeit und sein
+Latenzverhalten; FF4 ergänzt die Frage nach der Betreibbarkeit, die aus dem
+Übergang vom Testbett zum selbst-hostbaren Produkt erwächst.
 
 \begin{description}
   \item[FF1 -- Realisierbarkeit.] Lässt sich ein providerblinder,
@@ -57,15 +129,31 @@ Die Arbeit gliedert sich an drei Forschungsfragen:
     Mehrsprung-Relay) gegenüber einer direkten Verbindung?
   \item[FF3 -- Verhalten unter Netzbedingungen.] Wie skaliert die
     Tunnel-Roundtrip-Latenz mit Netzverzögerung und Paketverlust?
+  \item[FF4 -- Betreibbarkeit und Verfügbarkeit.] Lassen sich die
+    Betriebseigenschaften eines selbst-hostbaren Dienstes -- Hochverfügbarkeit
+    durch Agenten-Failover, strukturelle Beobachtbarkeit ohne Bruch der
+    Zero-Knowledge-Grenze und Selbst-Hosting einer schlüssellosen Kontrollebene
+    -- innerhalb des providerblinden Entwurfs realisieren und funktional
+    nachweisen?
 \end{description}
 
 \section{Aufbau der Arbeit}
 \label{sec:aufbau}
 
-Kapitel~\ref{ch:grundlagen} führt die technischen Grundlagen ein
-(providerblinde Relays, Noise, QUIC, Proof-of-Work). Kapitel~\ref{ch:architektur}
-beschreibt den Systementwurf und dessen Entwurfsentscheidungen.
-Kapitel~\ref{ch:implementierung} dokumentiert die Umsetzung des Prototyps.
-Kapitel~\ref{ch:evaluation} stellt das Testbett und die Messergebnisse vor und
-beantwortet FF2 und FF3. Kapitel~\ref{ch:fazit} fasst die Ergebnisse zusammen
-und gibt einen Ausblick auf die offenen Punkte.
+Kapitel~\ref{ch:relatedwork} grenzt den Entwurf gegen verwandte Systeme ab und
+Kapitel~\ref{ch:anforderungen} leitet die funktionalen und nichtfunktionalen
+Anforderungen ab. Kapitel~\ref{ch:grundlagen} führt die technischen Grundlagen ein
+(providerblinde Relays, das Noise-Protokoll, QUIC und der TLS-über-TCP-Fallback
+sowie Proof-of-Work als Zugangsschutz) und ordnet FF1 begrifflich ein.
+Kapitel~\ref{ch:architektur} beschreibt den Systementwurf und seine
+Entwurfsentscheidungen -- den providerblinden Datenpfad, die Zero-Knowledge-Grenze,
+die Agenten-Redundanz sowie die dünne, selbst-hostbare Kontrollebene -- und legt
+damit die Grundlage für FF1 und FF4. Kapitel~\ref{ch:implementierung}
+dokumentiert die Umsetzung des Rust-Prototyps einschließlich der
+Beobachtbarkeit, der Schlüsselrotation und der Betriebswerkzeuge.
+Kapitel~\ref{ch:evaluation} stellt das Docker-Testbett und die Messmethodik vor,
+beantwortet FF2 und FF3 anhand der Latenzmatrix, weist die Betriebseigenschaften
+zu FF4 experimentell nach und diskutiert das Bedrohungsmodell und die Grenzen des
+Prototyps. Kapitel~\ref{ch:fazit} fasst die Ergebnisse entlang der vier
+Forschungsfragen zusammen und gibt einen Ausblick auf die offenen Punkte, unter
+anderem die post-v1 zurückgestellte Browser-Ebene und die Mehr-Regionen-Erweiterung.
