@@ -1245,7 +1245,7 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   Gate grün (84 Tests, 0 Warnings).
 - **PP2** ⏳ Portal-Konto-Seite (server-gerendertes HTML) rendert die Session-Account-Daten (braucht #25 PP2-Session).
 - **PP3** ⏳ „Credits kaufen": UI-Anbindung an `/payment/intent` + `/me/issue` (Guthaben-Anzeige aktualisiert nach Webhook-Top-up).
-### #27 Tunnel-Verwaltung (anlegen, auflisten, widerrufen)
+### #27 Tunnel-Verwaltung (anlegen, auflisten, widerrufen) — ✅ **fix-ready**
 - **PP2** ✅ Session-gated Portal-HTTP in `portal_api`: `GET /portal/tunnels` (Liste eigener Tunnel + Anlage-Formular),
   `POST /portal/tunnels` (anlegen: name + optional hostname), `POST /portal/tunnels/:id/delete` (Widerruf).
   Strikt selbstbezüglich (Subject aus Session; `revoke` nur eigene). „Install"-Button pro Tunnel → #28-Endpoint.
@@ -1259,7 +1259,15 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   `subject_tunnel_store_is_self_scoped_for_create_list_revoke`. Gate grün (85 Tests, 0 Warnings).
 - **PP2** ⏳ Authed HTTP: `POST /portal/tunnels` (Anlage → einmalige Token/Capability-Anzeige), `GET /portal/tunnels` (Liste), `DELETE /portal/tunnels/:id` (Widerruf) — Subject aus Session/Token.
 - **PP3** ⏳ Live-Status je Tunnel via Edge `/metrics` (`ct_edge_active_tunnels`, #17) + Widerruf nutzt Token-Rotation (#12).
-### #28 Per-OS One-Liner-Installer
+### #28 Per-OS One-Liner-Installer — ✅ **fix-ready** (Portal-Seite)
+- **PP2** ✅ `GET /portal/tunnels/:id/install?os=` (session-gated, **owner-only** via `SqliteTunnelStore::owns`):
+  prägt pro Anforderung ein **frisches, einmaliges** Join-Token (`enrollment.issue_join_token`, Subject als Tenant),
+  rendert die Per-OS-One-Liner (`installer::install_one_liner`, Token via Env). Token wird einmalig dem eingeloggten
+  Besitzer gezeigt, **nie geloggt/persistiert**; Tests mit generierten Token. Frozen-Tests
+  `install_page_is_owner_only_and_renders_per_os_one_liners`, `install_mints_a_fresh_single_use_token_each_request`.
+  Gate grün (106 Tests).
+- **PP3** ⏳ Deployment-Follow-up: ausgelieferte `install.sh`/`install.ps1` + gehostetes `ct-agent`-Binary
+  (der Einzeiler onboardet dann in field: CA-Root via `/pki/ca` #11, `onboard` mit `CT_JOIN_TOKEN`, Serve-Loop).
 - **PP1** ✅ Reiner Renderer `installer::install_one_liner(portal_base, join_token, os)` + `InstallOs{Unix,Windows}`/`parse`.
   Unix: `curl -fsSL <base>/install.sh | CT_JOIN_TOKEN=<tok> sh`; Windows: `$env:CT_JOIN_TOKEN='<tok>'; irm <base>/install.ps1 | iex`.
   **Secret-sicher**: Token wird per **Env-Variable** übergeben (nie als argv-Positionsargument), und der Renderer prägt/loggt/speichert

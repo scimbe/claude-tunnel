@@ -645,6 +645,13 @@ impl SqliteTunnelStore {
         Ok(affected > 0)
     }
 
+    /// Whether `subject` is the owner of `tunnel_id` (not merely a grantee).
+    /// Used to gate agent onboarding — only the owner installs an agent for a
+    /// tunnel (#28).
+    pub fn owns(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
+        Ok(Self::owner_of(&self.conn.lock_safe(), tunnel_id)?.as_deref() == Some(subject))
+    }
+
     /// The owner subject of a tunnel, or `None` if the id is unknown.
     fn owner_of(conn: &Connection, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
         conn.query_row(

@@ -716,7 +716,7 @@ pub fn persistent_control_plane_router(
     let pki = pki_router(
         std::env::var("CT_CP_EDGE_CERT_PATH").unwrap_or_else(|_| "/shared/edge-cert.der".to_string()),
     );
-    let mut app = enrollment_router_sqlite(enrollment)
+    let mut app = enrollment_router_sqlite(enrollment.clone())
         .merge(registry_router_sqlite(registry))
         .merge(billing)
         .merge(payment_webhook_router(ledger.clone(), verifier))
@@ -730,6 +730,8 @@ pub fn persistent_control_plane_router(
             webhook_secret,
             ledger.clone(),
             tunnels.clone(),
+            enrollment.clone(),
+            &std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
         ))
         .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC

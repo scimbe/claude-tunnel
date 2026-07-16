@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -15,8 +15,10 @@ use axum::Router;
 use serde::Deserialize;
 
 use crate::accounts::AccountId;
+use crate::installer::{install_one_liner, InstallOs};
 use crate::portal::{escape, session_subject_for};
-use crate::storage::{SqliteLedger, SqliteTunnelStore};
+use crate::storage::{SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
+use ct_common::TenantId;
 
 /// Shared state for the authed portal API.
 #[derive(Clone)]
@@ -24,24 +26,32 @@ struct ApiState {
     session_key: Arc<[u8]>,
     ledger: Arc<SqliteLedger>,
     tunnels: Arc<SqliteTunnelStore>,
+    enrollment: Arc<SqliteEnrollment>,
+    /// Public portal origin (e.g. `https://portal.example`) baked into installers.
+    portal_base: Arc<str>,
 }
 
-/// Build the authenticated portal API router (#26 account, #27 tunnels).
+/// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
 pub fn portal_api_router(
     session_key: &[u8],
     ledger: Arc<SqliteLedger>,
     tunnels: Arc<SqliteTunnelStore>,
+    enrollment: Arc<SqliteEnrollment>,
+    portal_base: &str,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
         ledger,
         tunnels,
+        enrollment,
+        portal_base: Arc::from(portal_base),
     };
     Router::new()
         .route("/portal/account", get(account_page))
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
+        .route("/portal/tunnels/:id/install", get(install_page))
         .with_state(state)
 }
 
@@ -165,6 +175,62 @@ async fn delete_tunnel(
     Redirect::to("/portal/tunnels").into_response()
 }
 
+/// Which OS installer to show; absent = show all.
+#[derive(Deserialize)]
+struct InstallQuery {
+    os: Option<String>,
+}
+
+/// `GET /portal/tunnels/:id/install` (#28): render the copy-paste one-liner(s)
+/// that install + onboard an agent for one of the caller's own tunnels. A fresh,
+/// single-use join token is minted per request and embedded via an env var.
+///
+/// The token is a secret: it is shown once to the authenticated owner and never
+/// logged, cached or persisted anywhere in cleartext.
+async fn install_page(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<InstallQuery>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    // Only the tunnel's owner may onboard an agent for it.
+    match st.tunnels.owns(&subject, &id) {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    // Mint a fresh single-use join token bound to the customer (subject as tenant).
+    let token = match st.enrollment.issue_join_token(&TenantId(subject.clone())) {
+        Ok(t) => hex(&t.0),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let oses = match q.os.as_deref().and_then(InstallOs::parse) {
+        Some(os) => vec![os],
+        None => vec![InstallOs::Unix, InstallOs::Windows],
+    };
+    let blocks = oses
+        .iter()
+        .map(|os| {
+            let label = match os {
+                InstallOs::Unix => "Linux / macOS",
+                InstallOs::Windows => "Windows (PowerShell)",
+            };
+            let cmd = install_one_liner(&st.portal_base, &token, *os);
+            format!("<h2>{label}</h2><pre><code>{}</code></pre>", escape(&cmd))
+        })
+        .collect::<String>();
+    let body = format!(
+        r#"<h1>Install an agent</h1>
+<p class="k"><strong>Single-use token — copy the command now; it is shown only once.</strong></p>
+{blocks}
+<a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
+    );
+    Html(page("install", &body)).into_response()
+}
+
 fn tunnels_html(tunnels: &[crate::storage::SubjectTunnel]) -> String {
     let rows = if tunnels.is_empty() {
         "<p class=\"k\">No tunnels yet. Create one below.</p>".to_string()
@@ -273,7 +339,8 @@ mod tests {
     fn test_app() -> Router {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        portal_api_router(KEY, ledger, tunnels)
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        portal_api_router(KEY, ledger, tunnels, enrollment, "https://portal.example")
     }
 
     #[tokio::test]
@@ -422,5 +489,52 @@ mod tests {
             post_form(&app, "/portal/tunnels", "alice", "name=%20").await,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn install_page_is_owner_only_and_renders_per_os_one_liners() {
+        let app = test_app();
+        post_form(&app, "/portal/tunnels", "alice", "name=web").await;
+        let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
+
+        // Non-owner (bob) is refused; unauthenticated is bounced.
+        assert_eq!(
+            get(&app, &format!("/portal/tunnels/{id}/install"), Some("bob")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(&app, &format!("/portal/tunnels/{id}/install"), None).await.0,
+            StatusCode::SEE_OTHER
+        );
+
+        // Owner sees both one-liners with the portal base and env-carried token.
+        let (status, html) = get(&app, &format!("/portal/tunnels/{id}/install"), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("curl -fsSL https://portal.example/install.sh"));
+        assert!(html.contains("CT_JOIN_TOKEN="), "token carried via env");
+        assert!(html.contains("irm https://portal.example/install.ps1 | iex"));
+        assert!(html.contains("single-use") || html.contains("Single-use"), "warns token is single-use");
+
+        // os filter renders just one block.
+        let (_s, only_win) = get(&app, &format!("/portal/tunnels/{id}/install?os=windows"), Some("alice")).await;
+        assert!(only_win.contains("irm ") && !only_win.contains("curl -fsSL"));
+    }
+
+    #[tokio::test]
+    async fn install_mints_a_fresh_single_use_token_each_request() {
+        let app = test_app();
+        post_form(&app, "/portal/tunnels", "alice", "name=web").await;
+        let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
+        let extract = |h: &str| {
+            h.split("CT_JOIN_TOKEN=")
+                .nth(1)
+                .and_then(|s| s.split(|c| c == ' ' || c == '<').next())
+                .unwrap()
+                .to_string()
+        };
+        let a = extract(&get(&app, &format!("/portal/tunnels/{id}/install?os=linux"), Some("alice")).await.1);
+        let b = extract(&get(&app, &format!("/portal/tunnels/{id}/install?os=linux"), Some("alice")).await.1);
+        assert_ne!(a, b, "a fresh token is minted per request");
+        assert!(!a.is_empty());
     }
 }
