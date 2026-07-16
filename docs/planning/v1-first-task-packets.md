@@ -1157,6 +1157,8 @@ Browser Plane (öffentliches SNI + Let's Encrypt, ADR-0010) ist post-v1 → sepa
   (openssl s_server, SAN IP:127.0.0.1) + Agent + Client-Forward, dann `curl --cacert` durch den Tunnel.
   **Lokal end-to-end verifiziert** gegen die laufende ct-selfhost-Central: HTTP 200 über TLS, Cert
   client-seitig validiert, Origin liefert echtes HTML. `bash -n` grün.
-- **HW3** ⏳ Separates Tracking-Issue für die **Browser Plane** (ADR-0010, öffentliches SNI +
-  Let's Encrypt via ADR-0003 DNS-01) — explizit post-v1, out-of-scope für #22. Danach #22 **fix-ready**
-  (Kern-Akzeptanz HW1 erfüllt; HW2 optional-Demo, HW3 verlinkt den deferred Teil).
+- **HW3** ✅ Separates Tracking-Issue **#23** für die **Browser Plane** (ADR-0010 öffentliches SNI +
+  ADR-0003 DNS-01 Let's Encrypt) angelegt, Label `enhancement,deferred` (Loop baut es NICHT). Verlinkt
+  den bewusst zurückgestellten post-v1-Teil, damit #22 schließen kann ohne „fehlt/kaputt" zu implizieren.
+  **→ #22 fix-ready** (HW1 Test + HW2 Demo decken die v1-Akzeptanz; TLS-terminiert-am-Origin durch den
+  Tunnel, Cert client-seitig validiert, Edge ciphertext-only).
