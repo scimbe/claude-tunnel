@@ -1218,8 +1218,14 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   ab. Frozen-Tests `login_binds_state_in_an_httponly_cookie_matching_the_redirect`,
   `callback_rejects_missing_params_and_mismatched_state`, `callback_accepts_matching_state_and_clears_the_cookie`,
   `callback_reports_unconfigured_without_oidc`. Gate grün (92 Tests, 0 Warnings).
-- **PP3** ⏳ Code→Token-Tausch am Token-Endpoint (Client-Secret aus Env, via `reqwest`, injizierbarer Exchanger für Hermetik),
-  signiertes HttpOnly/Secure Session-Cookie, Logout + eingeloggter Kunden-Home.
+- **PP3** ✅ Signiertes **Session-Primitive**: `sign_session`/`verify_session` (HMAC-SHA256, domänensepariert via `SESSION_CTX`,
+  konstantzeitiger Vergleich, 8 h TTL), Session-Cookie `ct_portal_session` (HttpOnly/Secure/SameSite=Lax/`/portal`).
+  `GET /portal/home` (auf gültige Session gegated, sonst Redirect auf `/portal`, zeigt HTML-escaptes Subject),
+  `GET /portal/logout` (Cookie löschen → `/portal`). Frozen-Tests `session_sign_verify_roundtrips_and_rejects_tampering`,
+  `home_requires_a_valid_session_else_redirects`, `logout_clears_the_session_cookie`,
+  `session_cookie_carries_the_hardening_flags`. Session-Key = domänensepariertes Webhook-Secret. Gate grün (96 Tests, 0 Warnings).
+- **PP4** ⏳ Code→Token-Tausch am Token-Endpoint (Client-Secret aus Env, via `reqwest`, injizierbarer Exchanger für Hermetik),
+  Callback mintet Session (`sign_session`) → Redirect `/portal/home`. Danach #25 **fix-ready**.
 ### #26 Konto-Selbstverwaltung (Guthaben, Profil, Credits)
 - **PP1** ✅ Daten-Fläche der Selbstbedienung: `GET /me/account` liefert jetzt `{account, balance, subject}`
   (statt nur `{account}`) — Account-ID, Credit-Guthaben (`ledger.balance`) und verifiziertes Subject.
