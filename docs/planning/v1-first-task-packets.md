@@ -1216,7 +1216,8 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
     `authorize_host`/`host_bind_allowed`) und CP (`create_tunnel` → 400 bei ungültig). Frozen-Tests
     `normalize_hostname_canonicalizes_and_validates` (common), `host_normalization_collapses_trailing_dot_and_rejects_junk`
     (edge), `create_tunnel_rejects_an_invalid_hostname` (CP). Voller Workspace-Gate grün.
-  - **BP4b ✅ komplett** — `:443` ist jetzt sicher exponierbar (mit `CT_EDGE_REQUIRE_HOST_AUTH`): nur CP-autorisierte,
+  - **#40 (Feld-Bug) ✅** SNI-Passthrough routete nie zum Agenten: der Agent öffnet nach `'A'` einen SEPARATEN `'H'`-Stream, aber der Edge bearbeitete pro Verbindung nur EINEN Stream → `route_host` fand nichts. Fix: `serve_agent_connection` akzeptiert weitere Streams derselben Agent-Verbindung bis zum Close. QUIC-Integrationstest `agent_registers_and_binds_hostname_over_one_connection` (A + H über eine Verbindung → `route_host` löst auf). Der BP3b-Unit-Test hatte den 'H'-Handler direkt getrieben und den Multi-Stream-Flow verfehlt.
+- **BP4b ✅ komplett** — `:443` ist jetzt sicher exponierbar (mit `CT_EDGE_REQUIRE_HOST_AUTH`): nur CP-autorisierte,
     validierte Hostnamen; takeover-sicher (BP4a); Reconnect-fest. Review-Punkte #1 + #2 + #3 adressiert.
 - **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job. Reale Domain jetzt verfügbar (#30: bunsenbrenner.org).

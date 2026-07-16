@@ -356,6 +356,28 @@ pub async fn serve_connection(
     }
 }
 
+/// Serve a whole QUIC connection: the first stream, then — if it was an Agent
+/// registration (`'A'`) — every subsequent control stream the Agent opens on the
+/// same connection until it closes (#40). An Agent binds its Browser-Plane
+/// hostname with a **separate** `'H'` stream *after* `'A'`; handling only the
+/// first stream left that bind unaccepted, so `route_host` never resolved.
+/// Returns the registration (from the `'A'` stream) for eviction on drop. A
+/// non-Agent first stream (a Client `'C'`, a direct query) is served once as
+/// before.
+pub async fn serve_agent_connection(
+    conn: &Connection,
+    state: &EdgeState<Connection>,
+    challenge: &Challenge,
+) -> Result<Option<(RoutingToken, u64)>, BoxError> {
+    let registered = serve_connection(conn, state, challenge).await;
+    if matches!(registered, Ok(Some(_))) {
+        // Keep accepting the Agent's further streams ('H' bind, re-register);
+        // the loop ends when accept_bi errors as the connection closes.
+        while serve_connection(conn, state, challenge).await.is_ok() {}
+    }
+    registered
+}
+
 /// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
 /// by dispatching on the first byte's role:
 ///
@@ -555,7 +577,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let mut nonce = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 let challenge = Challenge { nonce, difficulty };
-                let registered = serve_connection(&conn, &state, &challenge).await;
+                let registered = serve_agent_connection(&conn, &state, &challenge).await;
                 conn.closed().await;
                 // Evict exactly this dropped agent's registration so a later
                 // Client route() fails fast instead of hitting a dead handle (#2)
@@ -617,6 +639,53 @@ mod tests {
             state.candidate(&token).is_some(),
             "agent peer candidate recorded at registration"
         );
+        conn.close(0u32.into(), b"done");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn agent_registers_and_binds_hostname_over_one_connection() {
+        // #40: an Agent opens 'A' (register) then a SEPARATE 'H' (bind hostname)
+        // on the same connection. The edge must accept BOTH so route_host resolves
+        // — the Browser-Plane demo failed because only the first stream was served.
+        let token = RoutingToken([9u8; 32]);
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let state_srv = state.clone();
+        let server_task = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            let _ = serve_agent_connection(&conn, &state_srv, &challenge).await;
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+
+        // 'A' — register the tunnel.
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        let mut a = vec![b'A'];
+        a.extend_from_slice(&token.0);
+        s.write_all(&a).await.unwrap();
+        s.finish().unwrap();
+        assert_eq!(r.read_to_end(8).await.unwrap(), b"OK", "register acked");
+
+        // 'H' — bind the public hostname on a SECOND stream.
+        let host = "help.bunsenbrenner.org";
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        let mut h = vec![b'H'];
+        h.extend_from_slice(&token.0);
+        h.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        h.extend_from_slice(host.as_bytes());
+        s.write_all(&h).await.unwrap();
+        s.finish().unwrap();
+        assert_eq!(r.read_to_end(8).await.unwrap(), b"OK", "hostname bind acked (was never accepted before)");
+
+        // The hostname now routes to the tunnel — the #40 fix.
+        assert_eq!(state.route_host(host), Some(token.clone()), "SNI now routes to the agent");
+        assert!(state.is_known(&token));
+
         conn.close(0u32.into(), b"done");
         let _ = server_task.await;
     }
