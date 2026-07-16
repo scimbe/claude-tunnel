@@ -272,6 +272,39 @@ where
     }
 }
 
+/// Register **and** bind a public hostname in one message over a TLS-TCP stream
+/// (issue #41 FB3): the Browser Plane's TCP fallback. Sends the `'B'` frame —
+/// `'B' | token(32) | host_len(u16 BE) | host` — so a UDP-blocked browser-mode
+/// agent both registers its token and claims its hostname atomically, mirroring
+/// the QUIC path's separate `'A'` register + `'H'` bind. Awaits the 2-byte "OK".
+pub async fn register_tunnel_stream_browser<S>(
+    stream: &mut S,
+    token: &RoutingToken,
+    host: &str,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let host_bytes = host.as_bytes();
+    let host_len: u16 = host_bytes
+        .len()
+        .try_into()
+        .map_err(|_| "hostname too long for the browser-register frame")?;
+    let mut msg = vec![b'B'];
+    msg.extend_from_slice(&token.0);
+    msg.extend_from_slice(&host_len.to_be_bytes());
+    msg.extend_from_slice(host_bytes);
+    stream.write_all(&msg).await?;
+    stream.flush().await?;
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+    if &ack == b"OK" {
+        Ok(())
+    } else {
+        Err("edge rejected browser hostname registration".into())
+    }
+}
+
 /// Connect to the Edge over **TLS-over-TCP** — the UDP-blocked fallback dialer
 /// (issue #3 / P1.2c-4), trusting `edge_cert` (the CA root). Mirrors the Client's
 /// `tcp_tls_connect`; the returned stream is then used with
@@ -450,6 +483,38 @@ mod tests {
         register_tunnel_stream(&mut agent_side, &token)
             .await
             .expect("register over a TLS-TCP-style stream");
+        edge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_tunnel_stream_browser_sends_b_frame_token_and_host() {
+        // issue #41 FB3: the browser-mode TCP fallback writes a single
+        // 'B' | token(32) | host_len(u16 BE) | host frame and accepts the OK.
+        let (mut agent_side, mut edge_side) = tokio::io::duplex(1024);
+        let token = RoutingToken([0x37; 32]);
+        let host = "help.bunsenbrenner.org";
+
+        let t = token.clone();
+        let edge = tokio::spawn(async move {
+            let mut role = [0u8; 1];
+            edge_side.read_exact(&mut role).await.unwrap();
+            assert_eq!(role[0], b'B', "browser register role byte");
+            let mut tok = [0u8; 32];
+            edge_side.read_exact(&mut tok).await.unwrap();
+            assert_eq!(&tok, &t.0, "token echoed");
+            let mut len = [0u8; 2];
+            edge_side.read_exact(&mut len).await.unwrap();
+            let n = u16::from_be_bytes(len) as usize;
+            let mut host_buf = vec![0u8; n];
+            edge_side.read_exact(&mut host_buf).await.unwrap();
+            assert_eq!(host_buf, b"help.bunsenbrenner.org", "hostname echoed");
+            edge_side.write_all(b"OK").await.unwrap();
+            edge_side.flush().await.unwrap();
+        });
+
+        register_tunnel_stream_browser(&mut agent_side, &token, host)
+            .await
+            .expect("browser-register over a TLS-TCP-style stream");
         edge.await.unwrap();
     }
 

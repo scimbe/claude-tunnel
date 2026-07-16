@@ -160,12 +160,60 @@ pub async fn route_and_relay(
 /// ClientHello, and relay the raw TLS bytes both ways. TLS terminates at the
 /// Origin (which holds the certificate); the Edge sees only the hostname and
 /// ciphertext, so the payload stays provider-blind.
+/// A byte stream that yields `pre` (already-read bytes) first, then delegates to
+/// `inner` — used to hand a TCP-fallback agent the browser's buffered ClientHello
+/// followed by the rest of the connection (#41 FB2).
+struct Prepend<S> {
+    pre: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prepend<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.pre.len() {
+            let rem = &self.pre[self.pos..];
+            let n = rem.len().min(buf.remaining());
+            buf.put_slice(&rem[..n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prepend<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 pub async fn serve_sni_passthrough<S>(
     mut inbound: S,
     state: &EdgeState<Connection>,
 ) -> Result<(), BoxError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (hello, sni) = crate::sni::read_client_hello(&mut inbound)
         .await
@@ -173,6 +221,20 @@ where
     let token = state
         .route_host(&sni)
         .ok_or_else(|| format!("no tunnel registered for host '{sni}'"))?;
+    // #41 FB2: a TCP-fallback agent (UDP/QUIC blocked) is parked with no QUIC
+    // connection — hand it the browser stream (buffered ClientHello + the rest)
+    // directly, rather than opening a QUIC stream it doesn't have.
+    if state.has_tcp_agent(&token) {
+        let joined: crate::state::BoxedStream = Box::new(Prepend {
+            pre: hello,
+            pos: 0,
+            inner: inbound,
+        });
+        return match state.deliver_to_tcp_agent(&token, joined) {
+            Ok(()) => Ok(()),
+            Err(_) => Err("tcp-fallback agent vanished before delivery".into()),
+        };
+    }
     let (mut agent_send, agent_recv) = open_agent_stream(state, &token).await?;
     // Replay the buffered ClientHello to the Agent first, then relay the rest so
     // the browser<->origin TLS handshake completes end-to-end through the tunnel.

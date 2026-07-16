@@ -21,7 +21,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use crate::config::{AgentConfig, OriginProto};
 use crate::transport::{
     bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel, register_tunnel_stream,
-    tcp_tls_connect,
+    register_tunnel_stream_browser, tcp_tls_connect,
 };
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake, origin_handshake_any};
@@ -46,9 +46,20 @@ pub async fn serve_stream_to_origin(
     quic_recv: RecvStream,
     origin: SocketAddr,
 ) -> Result<(), BoxError> {
+    serve_duplex_to_origin(join(quic_recv, quic_send), origin).await
+}
+
+/// Raw-forward any relayed duplex byte stream to the Origin verbatim (issue #41
+/// FB3): the transport-agnostic core of [`serve_stream_to_origin`]. The QUIC
+/// path joins its two half-streams; the TLS-TCP fallback hands its whole stream
+/// straight in. Either way the browser's TLS terminates AT the Origin — the
+/// Edge only ever relays opaque bytes.
+pub async fn serve_duplex_to_origin<T>(mut client: T, origin: SocketAddr) -> Result<(), BoxError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let mut tcp = TcpStream::connect(origin).await?;
-    let mut quic = join(quic_recv, quic_send);
-    copy_bidirectional(&mut quic, &mut tcp).await?;
+    copy_bidirectional(&mut client, &mut tcp).await?;
     Ok(())
 }
 
@@ -466,6 +477,21 @@ async fn tcp_connect_register_serve(
     metrics: &Arc<TunnelMetrics>,
 ) -> Result<(), BoxError> {
     let mut stream = tcp_tls_connect(config.edge, edge_cert.clone()).await?;
+    // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
+    // hostname in one 'B' frame, then raw-forward the relayed browser stream to
+    // the Origin verbatim — the browser's TLS terminates AT the Origin, so this
+    // agent never speaks Noise. Mirrors the QUIC browser path in serve_quic_connection.
+    if config.browser_forward {
+        if let Some(host) = &config.hostname {
+            register_tunnel_stream_browser(&mut stream, token, host).await?;
+            eprintln!(
+                "ct-agent: browser-registered '{host}' over the TLS-TCP fallback (UDP blocked), \
+                 raw-forwarding to {}",
+                config.origin
+            );
+            return serve_duplex_to_origin(stream, config.origin).await;
+        }
+    }
     register_tunnel_stream(&mut stream, token).await?;
     eprintln!(
         "ct-agent: registered over the TLS-TCP fallback (UDP blocked), serving one tunnel to {}",
