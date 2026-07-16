@@ -447,6 +447,22 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     {
         state.set_admin_token(tok);
         eprintln!("ct-edge: tunnel revocation enabled (CT_EDGE_ADMIN_TOKEN set)");
+        // #27 RB4: serve the authenticated admin API (POST /admin/revoke/:token)
+        // the control plane calls on a customer revoke — only when an admin
+        // listener is configured, and bind it to a private interface in prod.
+        if let Ok(addr) = std::env::var("CT_EDGE_ADMIN_LISTEN") {
+            match addr.parse::<SocketAddr>() {
+                Ok(listen) => {
+                    let astate = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::admin::serve_admin(astate, listen).await {
+                            eprintln!("ct-edge: admin endpoint on {listen} exited: {e}");
+                        }
+                    });
+                }
+                Err(e) => eprintln!("ct-edge: invalid CT_EDGE_ADMIN_LISTEN '{addr}': {e}"),
+            }
+        }
     }
     let difficulty = config.pow_difficulty;
 

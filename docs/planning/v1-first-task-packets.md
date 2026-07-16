@@ -1272,7 +1272,14 @@ keinen Kontrollkanal Control-Plane→Edge. Behebung ist Cross-Crate, mehrzyklig 
   `admin_revoke_ok` (konstantzeitig) und ruft `revoke_token`. `run_edge` liest `CT_EDGE_ADMIN_TOKEN` (64-hex) →
   `set_admin_token`; ohne Secret bleibt Revocation deaktiviert. Frozen-Test `admin_revoke_ok_requires_the_configured_secret`.
   Gate grün (ct-edge 59 Tests).
-- **RB4** ⏳ Control-Plane `delete_tunnel` ruft den Edge-'R'-Op für das Tunnel-Routing-Token → `ct_edge_active_tunnels` fällt.
+- **RB4a** ✅ Edge-Admin-HTTP-Endpoint (`crate::admin`): `POST /admin/revoke/:token`, authentifiziert via
+  `x-ct-admin-token` (konstantzeitig, reused RB3b `admin_revoke_ok`) → `revoke_token`. Eigener Listener
+  `CT_EDGE_ADMIN_LISTEN` (privates Interface). HTTP-Gegenstück zum QUIC-'R'-Op, damit die HTTP-basierte Control-Plane
+  ihn per `reqwest` ruft (kein quinn-Client nötig). Frozen-Test `revoke_endpoint_authenticates_then_revokes`
+  (401 ohne/falsche Auth, 200 + revoked mit korrektem Secret, 400 bei Malformed). Gate grün (ct-edge 60 Tests).
+- **RB4b** ⏳ Control-Plane `delete_tunnel` ruft `POST {CT_CP_EDGE_ADMIN_URL}/admin/revoke/{routing_token}` (Header
+  `x-ct-admin-token`) via `reqwest` für das von `revoke` zurückgegebene Token → `ct_edge_active_tunnels` fällt.
+  Danach #27 **fix-ready** + Feld-Live-Repro.
 - **RB4** ⏳ `delete_tunnel` ruft den Edge-Revoke für das Tunnel-Token (und/oder Rotation via #12) → Agent wird deregistriert;
   Live-Repro (`ct_edge_active_tunnels` fällt) grün → **fix-ready**.
 

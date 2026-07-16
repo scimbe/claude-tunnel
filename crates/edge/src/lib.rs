@@ -1,6 +1,7 @@
 //! Claude Tunnel Edge — operator-run, public. Coordinates Rendezvous and relays
 //! ciphertext only as fallback; never in the trust path. See ADR-0004/0015.
 
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod observe;
