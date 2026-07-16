@@ -1240,5 +1240,9 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
 - **PP2** ⏳ Authed `GET /portal/tunnels/:id/install?os=…`: prägt pro Anforderung ein **frisches, einmaliges, kurzlebiges** Join-Token
   (server-seitig, nie geloggt) und rendert den Einzeiler; Subject aus Session, nur für eigene Tunnel (#27).
 - **PP3** ⏳ Ausgelieferte `install.sh`/`install.ps1` (ct-agent holen, `onboard` mit `CT_JOIN_TOKEN`, CA-Root via `/pki/ca` #11, Serve-Loop).
-### #29 Zugriffsrechte/Sharing
-- folgt nach #28 (PP-Kette), dekomponiert; Grants strikt selbstbezüglich, keine Secrets in Issues/Logs.
+### #29 Zugriffsrechte/Sharing (Grants pro Tunnel)
+- **PP1** ✅ Grant-Datenschicht auf `SqliteTunnelStore`: `grant`/`revoke_grant`/`list_grants` (nur der Besitzer, sonst
+  `GrantError::NotOwner`) + `is_authorized(subject, tunnel_id)` = Besitzer ODER Grantee. Tunnel-Widerruf löscht die
+  Grants mit (keine Waisen). Frozen-Test `tunnel_grants_are_owner_managed_and_gate_authorization`. Gate grün (88 Tests, 0 Warnings).
+- **PP2** ⏳ Authed HTTP: `POST`/`DELETE`/`GET /portal/tunnels/:id/grants` — nur der Besitzer verwaltet; Subject aus Session.
+- **PP3** ⏳ Capability-Ausgabe respektiert `is_authorized` (nur berechtigte, eingeloggte Subjects erhalten den Zugang eines geteilten Tunnels).

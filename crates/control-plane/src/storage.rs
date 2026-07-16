@@ -509,9 +509,41 @@ pub struct SubjectTunnel {
     pub created_at: i64,
 }
 
+/// Why a tunnel-grant operation failed: the caller is not the tunnel's owner, or
+/// the database errored (#29).
+#[derive(Debug)]
+pub enum GrantError {
+    /// The caller does not own the tunnel (or it does not exist) — only the
+    /// owner may manage its grants.
+    NotOwner,
+    /// The underlying database operation failed.
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for GrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GrantError::NotOwner => write!(f, "not the tunnel owner"),
+            GrantError::Db(e) => write!(f, "storage error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for GrantError {}
+
+impl From<rusqlite::Error> for GrantError {
+    fn from(e: rusqlite::Error) -> Self {
+        GrantError::Db(e)
+    }
+}
+
 /// SQLite-backed per-subject tunnel store (#27): a customer creates, lists and
 /// revokes their **own** tunnels. Every operation is scoped by `subject` (from
 /// the verified token), so one customer can never see or revoke another's tunnel.
+///
+/// It also holds per-tunnel access **grants** (#29): the owner shares a tunnel
+/// with other subjects, and [`is_authorized`](Self::is_authorized) answers
+/// whether a subject may use it.
 pub struct SqliteTunnelStore {
     conn: Mutex<Connection>,
 }
@@ -537,7 +569,12 @@ impl SqliteTunnelStore {
                  created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_subject_tunnels_subject
-                 ON subject_tunnels (subject);",
+                 ON subject_tunnels (subject);
+             CREATE TABLE IF NOT EXISTS tunnel_grants (
+                 tunnel_id TEXT NOT NULL,
+                 grantee   TEXT NOT NULL,
+                 PRIMARY KEY (tunnel_id, grantee)
+             );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -592,13 +629,100 @@ impl SqliteTunnelStore {
 
     /// Revoke a tunnel by id, but only if it belongs to `subject`. Returns
     /// `true` if a row was removed — `false` when the id is unknown or owned by
-    /// someone else (no cross-subject deletion).
+    /// someone else (no cross-subject deletion). Also clears the tunnel's access
+    /// grants (#29) so none are orphaned.
     pub fn revoke(&self, subject: &str, id: &str) -> rusqlite::Result<bool> {
-        let affected = self.conn.lock_safe().execute(
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let affected = tx.execute(
             "DELETE FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
             params![id, subject],
         )?;
+        if affected > 0 {
+            tx.execute("DELETE FROM tunnel_grants WHERE tunnel_id = ?1", params![id])?;
+        }
+        tx.commit()?;
         Ok(affected > 0)
+    }
+
+    /// The owner subject of a tunnel, or `None` if the id is unknown.
+    fn owner_of(conn: &Connection, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        conn.query_row(
+            "SELECT subject FROM subject_tunnels WHERE id = ?1",
+            params![tunnel_id],
+            |r| r.get(0),
+        )
+        .optional()
+    }
+
+    /// Grant `grantee` access to a tunnel the caller owns (#29). Idempotent —
+    /// re-granting the same subject is a no-op. Fails with
+    /// [`GrantError::NotOwner`] unless `owner` actually owns `tunnel_id`.
+    pub fn grant(&self, owner: &str, tunnel_id: &str, grantee: &str) -> Result<(), GrantError> {
+        let conn = self.conn.lock_safe();
+        match Self::owner_of(&conn, tunnel_id)? {
+            Some(s) if s == owner => {}
+            _ => return Err(GrantError::NotOwner),
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO tunnel_grants (tunnel_id, grantee) VALUES (?1, ?2)",
+            params![tunnel_id, grantee],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke a subject's grant on a tunnel the caller owns. Returns `true` if a
+    /// grant was removed. Fails with [`GrantError::NotOwner`] for non-owners.
+    pub fn revoke_grant(
+        &self,
+        owner: &str,
+        tunnel_id: &str,
+        grantee: &str,
+    ) -> Result<bool, GrantError> {
+        let conn = self.conn.lock_safe();
+        match Self::owner_of(&conn, tunnel_id)? {
+            Some(s) if s == owner => {}
+            _ => return Err(GrantError::NotOwner),
+        }
+        let affected = conn.execute(
+            "DELETE FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
+            params![tunnel_id, grantee],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// List the subjects granted access to a tunnel the caller owns, sorted.
+    /// Fails with [`GrantError::NotOwner`] for non-owners (so a non-owner cannot
+    /// even enumerate who a tunnel is shared with).
+    pub fn list_grants(&self, owner: &str, tunnel_id: &str) -> Result<Vec<String>, GrantError> {
+        let conn = self.conn.lock_safe();
+        match Self::owner_of(&conn, tunnel_id)? {
+            Some(s) if s == owner => {}
+            _ => return Err(GrantError::NotOwner),
+        }
+        let mut stmt = conn.prepare(
+            "SELECT grantee FROM tunnel_grants WHERE tunnel_id = ?1 ORDER BY grantee",
+        )?;
+        let rows = stmt.query_map(params![tunnel_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>().map_err(GrantError::Db)
+    }
+
+    /// Whether `subject` may use `tunnel_id`: `true` if it is the owner or holds
+    /// a grant (#29). This is the authorization gate for capability access to a
+    /// shared tunnel — `false` for an unknown tunnel.
+    pub fn is_authorized(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        if Self::owner_of(&conn, tunnel_id)?.as_deref() == Some(subject) {
+            return Ok(true);
+        }
+        let granted: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(granted.is_some())
     }
 }
 
@@ -649,6 +773,46 @@ mod tests {
         // Revoking an unknown id is a no-op false; bob's tunnel is untouched.
         assert!(!store.revoke("alice", "deadbeef").unwrap());
         assert_eq!(store.list_for_subject("bob").unwrap(), vec![b1]);
+    }
+
+    #[test]
+    fn tunnel_grants_are_owner_managed_and_gate_authorization() {
+        // #29 PP1: only the owner manages grants; is_authorized = owner or grantee.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "web", None).unwrap();
+
+        // Owner is authorized; strangers are not.
+        assert!(store.is_authorized("alice", &t.id).unwrap(), "owner authorized");
+        assert!(!store.is_authorized("bob", &t.id).unwrap());
+        assert!(!store.is_authorized("bob", "no-such-tunnel").unwrap());
+
+        // Only the owner may grant — bob (a stranger) cannot.
+        assert!(matches!(
+            store.grant("bob", &t.id, "carol"),
+            Err(GrantError::NotOwner)
+        ));
+        assert!(matches!(
+            store.list_grants("bob", &t.id),
+            Err(GrantError::NotOwner),
+        ), "non-owner cannot even enumerate grants");
+
+        // Owner grants bob -> bob becomes authorized; carol still is not.
+        store.grant("alice", &t.id, "bob").unwrap();
+        store.grant("alice", &t.id, "bob").unwrap(); // idempotent
+        assert!(store.is_authorized("bob", &t.id).unwrap());
+        assert!(!store.is_authorized("carol", &t.id).unwrap());
+        assert_eq!(store.list_grants("alice", &t.id).unwrap(), vec!["bob".to_string()]);
+
+        // Owner revokes bob's grant -> no longer authorized.
+        assert!(store.revoke_grant("alice", &t.id, "bob").unwrap());
+        assert!(!store.is_authorized("bob", &t.id).unwrap());
+        assert!(!store.revoke_grant("alice", &t.id, "bob").unwrap(), "second revoke is a no-op");
+
+        // Revoking the tunnel clears its grants (no orphans).
+        store.grant("alice", &t.id, "bob").unwrap();
+        assert!(store.revoke("alice", &t.id).unwrap());
+        assert!(!store.is_authorized("bob", &t.id).unwrap(), "grant gone with the tunnel");
+        assert!(!store.is_authorized("alice", &t.id).unwrap(), "owner gone with the tunnel");
     }
 
     #[test]
