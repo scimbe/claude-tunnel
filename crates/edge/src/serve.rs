@@ -258,6 +258,27 @@ pub async fn serve_connection(
             send.finish()?;
             Ok(None)
         }
+        b'H' => {
+            // Browser Plane (#23 BP3): bind a public hostname to a routing token
+            // so an SNI-routed browser connection reaches this tunnel. Wire
+            // format: 'H' | token(32) | host_len(2 BE) | host. A browser-mode
+            // agent declares its hostname after registering the tunnel ('A').
+            let mut token = [0u8; 32];
+            recv.read_exact(&mut token).await?;
+            let mut hl = [0u8; 2];
+            recv.read_exact(&mut hl).await?;
+            let hlen = u16::from_be_bytes(hl) as usize;
+            if hlen == 0 || hlen > 253 {
+                return Err("invalid Browser-Plane hostname length".into());
+            }
+            let mut host = vec![0u8; hlen];
+            recv.read_exact(&mut host).await?;
+            let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
+            state.register_host(host, RoutingToken(token));
+            send.write_all(b"OK").await?;
+            send.finish()?;
+            Ok(None)
+        }
         b'P' => {
             // Client queries the Agent's advertised direct endpoint (M11.4b-ii):
             // reply `[0]` if none, else `[1] addr_len(1) addr cert_len(2 BE) cert`.
@@ -397,6 +418,32 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 eprintln!("ct-edge: metrics endpoint on {listen} (GET /metrics)");
             }
             Err(e) => eprintln!("ct-edge: invalid CT_EDGE_METRICS_LISTEN '{addr}': {e}"),
+        }
+    }
+
+    // Browser Plane public listener (#23 BP3): a RAW TCP listener that routes an
+    // incoming browser TLS connection to a tunnel by its SNI hostname WITHOUT
+    // terminating TLS (serve_sni_passthrough) — TLS terminates at the Origin, so
+    // the Edge stays payload-blind. Off by default; set
+    // CT_EDGE_BROWSER_LISTEN=0.0.0.0:443. Hostnames are bound by agents via 'H'.
+    if let Ok(addr) = std::env::var("CT_EDGE_BROWSER_LISTEN") {
+        match addr.parse::<SocketAddr>() {
+            Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
+                Ok(bl) => {
+                    let bstate = state.clone();
+                    tokio::spawn(async move {
+                        while let Ok((tcp, _)) = bl.accept().await {
+                            let state = bstate.clone();
+                            tokio::spawn(async move {
+                                let _ = serve_sni_passthrough(tcp, &state).await;
+                            });
+                        }
+                    });
+                    eprintln!("ct-edge: Browser-Plane SNI listener on {listen}");
+                }
+                Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_BROWSER_LISTEN {listen}: {e}"),
+            },
+            Err(e) => eprintln!("ct-edge: invalid CT_EDGE_BROWSER_LISTEN '{addr}': {e}"),
         }
     }
 
@@ -1138,5 +1185,39 @@ mod tests {
         agent_task.abort();
         edge_srv.abort();
         origin.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_binds_a_hostname_via_the_h_role() {
+        // #23 BP3: an agent binds host -> token over the edge protocol (role 'H'),
+        // so an SNI-routed browser can later reach this tunnel. Case-insensitive.
+        let token = RoutingToken([0x5A; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().unwrap();
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            let _ = serve_connection(&conn, &state_e, &challenge).await;
+            conn.closed().await;
+        });
+        let ep = build_client_endpoint(cert).expect("client");
+        let conn = ep.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        let host = b"Shop.Example.Test";
+        s.write_all(b"H").await.unwrap();
+        s.write_all(&token.0).await.unwrap();
+        s.write_all(&(host.len() as u16).to_be_bytes()).await.unwrap();
+        s.write_all(host).await.unwrap();
+        s.finish().unwrap();
+        assert_eq!(r.read_to_end(8).await.unwrap(), b"OK");
+        assert_eq!(
+            state.route_host("shop.example.test"),
+            Some(token),
+            "host bound case-insensitively to the token"
+        );
+        conn.close(0u32.into(), b"done");
+        edge.abort();
     }
 }

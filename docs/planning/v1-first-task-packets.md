@@ -1182,8 +1182,13 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   Origin. Frozen-Tests `from_env_browser_mode_enables_raw_forward` und
   `serve_stream_to_origin_carries_a_full_tls_session` (rustls-„Browser" über einen QUIC-Stream →
   serve_stream_to_origin → TLS-Origin: voller Handshake + HTTP 200 überlebt die rohe Weiterleitung). Gate grün.
-- **BP3** ⏳ **Öffentlicher :443-Browser-Listener** am Edge (SNI-Peek → `serve_sni_passthrough`) +
-  Hostname-Bindung über die Control-Plane (Hostname→Token registrieren, autorisiert).
+- **BP3** ✅ **Öffentlicher :443-Browser-Listener + Hostname-Bindung (Mechanismus)**: `run_edge` bindet
+  bei gesetztem `CT_EDGE_BROWSER_LISTEN` einen ROHEN TCP-Listener (keine TLS-Terminierung) → jede
+  Browser-Verbindung geht an `serve_sni_passthrough`. Neue Edge-Protokoll-Rolle `'H'`
+  (`'H' | token(32) | host_len(2) | host`) in `serve_connection` bindet Hostname→Token
+  (`state.register_host`, case-insensitive). Frozen-Test `agent_binds_a_hostname_via_the_h_role`. Gate grün.
+  (Autorisierung — Control-Plane prüft, dass der Agent den Hostnamen besitzt — ist Härtung/Folgepaket;
+  Agent-seitiges Senden von `'H'` via `CT_AGENT_HOSTNAME` kommt in BP3b/BP4.)
 - **BP4** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job.
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
