@@ -19,6 +19,7 @@ use crate::enrollment::{Enrollment, JoinToken};
 use crate::payment::{PaymentError, PaymentId, PaymentIntake};
 use crate::registry::{TunnelInfo, TunnelRegistry};
 use ct_common::{AgentId, RoutingToken, TenantId};
+use ct_common::sync::MutexExt;
 
 /// Shared enrollment state behind the HTTP handlers.
 pub type SharedEnrollment = Arc<Mutex<Enrollment>>;
@@ -41,7 +42,7 @@ struct IssueResp {
 }
 
 async fn issue(State(enr): State<SharedEnrollment>, Json(req): Json<IssueReq>) -> Json<IssueResp> {
-    let token = enr.lock().unwrap().issue_join_token(TenantId(req.tenant));
+    let token = enr.lock_safe().issue_join_token(TenantId(req.tenant));
     Json(IssueResp {
         token: hex_encode(&token.0),
     })
@@ -67,8 +68,7 @@ async fn redeem(
     let pubkey = hex_decode_32(&req.pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "malformed pubkey".to_string()))?;
     let tenant = enr
-        .lock()
-        .unwrap()
+        .lock_safe()
         .redeem(&JoinToken(token), AgentId(req.agent), pubkey)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(RedeemResp { tenant: tenant.0 }))
@@ -112,7 +112,7 @@ async fn register_tunnel(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let token = hex_decode_32(&req.token)
         .ok_or((StatusCode::BAD_REQUEST, "malformed token".to_string()))?;
-    reg.lock().unwrap().register(
+    reg.lock_safe().register(
         RoutingToken(token),
         TunnelInfo {
             tenant: TenantId(req.tenant),
@@ -133,7 +133,7 @@ async fn resolve_tunnel(
     Path(token_hex): Path<String>,
 ) -> Result<Json<ResolveResp>, StatusCode> {
     let token = hex_decode_32(&token_hex).ok_or(StatusCode::BAD_REQUEST)?;
-    let guard = reg.lock().unwrap();
+    let guard = reg.lock_safe();
     let info = guard.lookup(&RoutingToken(token)).ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(ResolveResp {
         tenant: info.tenant.0.clone(),
@@ -175,7 +175,7 @@ struct AccountResp {
 }
 
 async fn open_account(State(state): State<SharedBilling>) -> Json<AccountResp> {
-    let account = state.lock().unwrap().ledger.open_account();
+    let account = state.lock_safe().ledger.open_account();
     Json(AccountResp {
         account: hex_encode(&account.0),
     })
@@ -198,8 +198,7 @@ async fn create_payment_intent(
     let account = hex_decode_32(&req.account)
         .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
     let id = state
-        .lock()
-        .unwrap()
+        .lock_safe()
         .intake
         .create_intent(AccountId(account), req.credits);
     Ok(Json(IntentResp {
@@ -222,7 +221,7 @@ async fn confirm_payment(
 ) -> Result<Json<BalanceResp>, (StatusCode, String)> {
     let payment = hex_decode_32(&req.payment)
         .ok_or((StatusCode::BAD_REQUEST, "malformed payment".to_string()))?;
-    let mut guard = state.lock().unwrap();
+    let mut guard = state.lock_safe();
     let BillingState { ledger, intake } = &mut *guard;
     let balance = intake
         .confirm_payment(&PaymentId(payment), ledger)
@@ -252,7 +251,7 @@ async fn buy_token(
 ) -> Result<Json<TokenResp>, (StatusCode, String)> {
     let account = hex_decode_32(&req.account)
         .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
-    let token = issue_token_for_payment(&mut state.lock().unwrap().ledger, &AccountId(account), req.price)
+    let token = issue_token_for_payment(&mut state.lock_safe().ledger, &AccountId(account), req.price)
         .map_err(|e| {
             let code = match e {
                 LedgerError::UnknownAccount => StatusCode::NOT_FOUND,

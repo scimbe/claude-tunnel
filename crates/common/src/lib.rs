@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod noise;
 pub mod pow;
 pub mod ratelimit;
+pub mod sync;
 
 /// Stable crate identifier, used by downstream smoke tests.
 pub const CRATE_NAME: &str = "ct-common";

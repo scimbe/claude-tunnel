@@ -22,6 +22,7 @@ use crate::enrollment::{AgentPublicKey, EnrollError, JoinToken};
 use crate::payment::{PaymentError, PaymentId};
 use crate::registry::TunnelInfo;
 use ct_common::{AgentId, RoutingToken, TenantId};
+use ct_common::sync::MutexExt;
 
 /// Why a persisted redemption failed: an enrollment rule or the database.
 #[derive(Debug)]
@@ -87,7 +88,7 @@ impl SqliteEnrollment {
     pub fn issue_join_token(&self, tenant: &TenantId) -> rusqlite::Result<JoinToken> {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
-        self.conn.lock().unwrap().execute(
+        self.conn.lock_safe().execute(
             "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
             params![&bytes[..], tenant.0],
         )?;
@@ -103,7 +104,7 @@ impl SqliteEnrollment {
         agent: &AgentId,
         pubkey: AgentPublicKey,
     ) -> Result<TenantId, RedeemError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_safe();
         let row: Option<(String, i64)> = conn
             .query_row(
                 "SELECT tenant, redeemed FROM join_tokens WHERE token = ?1",
@@ -132,8 +133,7 @@ impl SqliteEnrollment {
         agent: &AgentId,
     ) -> rusqlite::Result<Option<(TenantId, AgentPublicKey)>> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row(
                 "SELECT tenant, pubkey FROM agent_bindings WHERE agent = ?1",
                 params![agent.0],
@@ -151,8 +151,7 @@ impl SqliteEnrollment {
     /// Number of enrolled agents (bound public keys) — for the status view (F4.1).
     pub fn agent_count(&self) -> rusqlite::Result<i64> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row("SELECT COUNT(*) FROM agent_bindings", [], |r| r.get(0))
     }
 }
@@ -190,7 +189,7 @@ impl SqliteRegistry {
 
     /// Register (or replace) the tunnel served by `token`.
     pub fn register(&self, token: &RoutingToken, info: &TunnelInfo) -> rusqlite::Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock_safe().execute(
             "INSERT OR REPLACE INTO tunnels (token, tenant, agent) VALUES (?1, ?2, ?3)",
             params![&token.0[..], info.tenant.0, info.agent.0],
         )?;
@@ -200,8 +199,7 @@ impl SqliteRegistry {
     /// Resolve `token` to its tunnel, if registered (the Rendezvous lookup).
     pub fn lookup(&self, token: &RoutingToken) -> rusqlite::Result<Option<TunnelInfo>> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row(
                 "SELECT tenant, agent FROM tunnels WHERE token = ?1",
                 params![&token.0[..]],
@@ -217,7 +215,7 @@ impl SqliteRegistry {
 
     /// Remove the tunnel for `token` (idempotent).
     pub fn unregister(&self, token: &RoutingToken) -> rusqlite::Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock_safe().execute(
             "DELETE FROM tunnels WHERE token = ?1",
             params![&token.0[..]],
         )?;
@@ -227,8 +225,7 @@ impl SqliteRegistry {
     /// Number of registered tunnels — for the status view (F4.1).
     pub fn tunnel_count(&self) -> rusqlite::Result<i64> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row("SELECT COUNT(*) FROM tunnels", [], |r| r.get(0))
     }
 }
@@ -334,7 +331,7 @@ impl SqliteLedger {
     pub fn open_account(&self) -> rusqlite::Result<AccountId> {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
-        self.conn.lock().unwrap().execute(
+        self.conn.lock_safe().execute(
             "INSERT INTO accounts (account, balance) VALUES (?1, 0)",
             params![&bytes[..]],
         )?;
@@ -347,7 +344,7 @@ impl SqliteLedger {
     /// authenticated users have one stable account. The lookup + creation run in
     /// a transaction so a subject can never end up with two accounts.
     pub fn account_for_subject(&self, subject: &str) -> Result<AccountId, LedgerOpError> {
-        let mut guard = self.conn.lock().unwrap();
+        let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
         let existing: Option<Vec<u8>> = tx
             .query_row(
@@ -380,24 +377,21 @@ impl SqliteLedger {
     /// Cheap liveness check that the database is reachable (readiness probe).
     pub fn ping(&self) -> rusqlite::Result<()> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row("SELECT 1", [], |_| Ok(()))
     }
 
     /// Number of open accounts — for the status view (F4.1).
     pub fn account_count(&self) -> rusqlite::Result<i64> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
     }
 
     /// Number of confirmed payments — for the status view (F4.1).
     pub fn confirmed_payment_count(&self) -> rusqlite::Result<i64> {
         self.conn
-            .lock()
-            .unwrap()
+            .lock_safe()
             .query_row("SELECT COUNT(*) FROM payments WHERE confirmed = 1", [], |r| {
                 r.get(0)
             })
@@ -405,7 +399,7 @@ impl SqliteLedger {
 
     /// Current balance, or [`LedgerError::UnknownAccount`].
     pub fn balance(&self, id: &AccountId) -> Result<u64, LedgerOpError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_safe();
         Self::balance_of(&conn, id)?
             .map(|b| b as u64)
             .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))
@@ -413,7 +407,7 @@ impl SqliteLedger {
 
     /// Add prepaid credit (saturating); returns the new balance.
     pub fn credit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_safe();
         let bal = Self::balance_of(&conn, id)?
             .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
         let new = bal.saturating_add(amount as i64);
@@ -427,7 +421,7 @@ impl SqliteLedger {
     /// Spend credit; fails with [`LedgerError::InsufficientCredit`] and leaves
     /// the balance unchanged when the account cannot cover `amount`.
     pub fn debit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_safe();
         let bal = Self::balance_of(&conn, id)?
             .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
         let bal_u = bal as u64;
@@ -450,7 +444,7 @@ impl SqliteLedger {
     pub fn create_intent(&self, account: &AccountId, credits: u64) -> rusqlite::Result<PaymentId> {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
-        self.conn.lock().unwrap().execute(
+        self.conn.lock_safe().execute(
             "INSERT INTO payments (payment, account, credits, confirmed) VALUES (?1, ?2, ?3, 0)",
             params![&bytes[..], &account.0[..], credits as i64],
         )?;
@@ -461,7 +455,7 @@ impl SqliteLedger {
     /// second confirmation returns [`PaymentError::AlreadyConfirmed`] and does
     /// not credit again. Returns the new balance.
     pub fn confirm_payment(&self, payment: &PaymentId) -> Result<u64, PaymentOpError> {
-        let mut guard = self.conn.lock().unwrap();
+        let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
         let row: Option<(Vec<u8>, i64, i64)> = tx
             .query_row(

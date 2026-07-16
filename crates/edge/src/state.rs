@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use ct_common::metrics::Counter;
 use ct_common::RoutingToken;
+use ct_common::sync::MutexExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -72,14 +73,13 @@ impl<H: Clone> EdgeState<H> {
     /// hostname is lowercased so SNI lookups are case-insensitive.
     pub fn register_host(&self, host: &str, token: RoutingToken) {
         self.hosts
-            .lock()
-            .unwrap()
+            .lock_safe()
             .insert(host.to_ascii_lowercase(), token);
     }
 
     /// Resolve a public hostname (from the TLS SNI) to its routing token.
     pub fn route_host(&self, host: &str) -> Option<RoutingToken> {
-        self.hosts.lock().unwrap().get(&host.to_ascii_lowercase()).cloned()
+        self.hosts.lock_safe().get(&host.to_ascii_lowercase()).cloned()
     }
 
     /// Note a completed relay of `bytes` total bytes (both directions), and a
@@ -110,7 +110,7 @@ impl<H: Clone> EdgeState<H> {
     /// The agent then relays its own stream to the received one.
     pub fn park_tcp_agent(&self, token: RoutingToken) -> oneshot::Receiver<BoxedStream> {
         let (tx, rx) = oneshot::channel();
-        self.tcp_agents.lock().unwrap().insert(token, tx);
+        self.tcp_agents.lock_safe().insert(token, tx);
         rx
     }
 
@@ -122,7 +122,7 @@ impl<H: Clone> EdgeState<H> {
         token: &RoutingToken,
         stream: BoxedStream,
     ) -> Result<(), BoxedStream> {
-        let tx = self.tcp_agents.lock().unwrap().remove(token);
+        let tx = self.tcp_agents.lock_safe().remove(token);
         match tx {
             Some(tx) => tx.send(stream),
             None => Err(stream),
@@ -131,18 +131,18 @@ impl<H: Clone> EdgeState<H> {
 
     /// Whether a TCP-fallback agent is currently parked for `token`.
     pub fn has_tcp_agent(&self, token: &RoutingToken) -> bool {
-        self.tcp_agents.lock().unwrap().contains_key(token)
+        self.tcp_agents.lock_safe().contains_key(token)
     }
 
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
     /// the address and cert DER a Client uses to connect directly.
     pub fn advertise_direct(&self, token: RoutingToken, addr: SocketAddr, cert: Vec<u8>) {
-        self.direct.lock().unwrap().insert(token, (addr, cert));
+        self.direct.lock_safe().insert(token, (addr, cert));
     }
 
     /// The Agent's advertised direct-path `(addr, cert)` for `token`, if any.
     pub fn direct_endpoint(&self, token: &RoutingToken) -> Option<(SocketAddr, Vec<u8>)> {
-        self.direct.lock().unwrap().get(token).cloned()
+        self.direct.lock_safe().get(token).cloned()
     }
 
     /// Register an Agent tunnel serving `token`, returning a **registration id**.
@@ -153,8 +153,7 @@ impl<H: Clone> EdgeState<H> {
     pub fn register(&self, token: RoutingToken, handle: H) -> u64 {
         let id = self.next_reg.fetch_add(1, Ordering::Relaxed);
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .entry(token)
             .or_default()
             .push((id, handle));
@@ -171,13 +170,13 @@ impl<H: Clone> EdgeState<H> {
         handle: H,
         candidate: SocketAddr,
     ) -> u64 {
-        self.candidates.lock().unwrap().insert(token.clone(), candidate);
+        self.candidates.lock_safe().insert(token.clone(), candidate);
         self.register(token, handle)
     }
 
     /// The Agent's Edge-observed peer candidate for `token`, if recorded.
     pub fn candidate(&self, token: &RoutingToken) -> Option<SocketAddr> {
-        self.candidates.lock().unwrap().get(token).copied()
+        self.candidates.lock_safe().get(token).copied()
     }
 
     /// Route `token` to a live Agent tunnel handle, if any. Returns the **most
@@ -186,8 +185,7 @@ impl<H: Clone> EdgeState<H> {
     /// (the next takes over on its drop).
     pub fn route(&self, token: &RoutingToken) -> Option<H> {
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get(token)
             .and_then(|v| v.last().map(|(_, h)| h.clone()))
     }
@@ -196,26 +194,26 @@ impl<H: Clone> EdgeState<H> {
     /// the failover order for the relay: try the newest, fall back to older ones
     /// if its `open_bi()` fails (#8 R2, covers the dead-but-not-yet-evicted race).
     pub fn routes(&self, token: &RoutingToken) -> Vec<H> {
-        self.agents.lock().unwrap().get(token).map_or_else(Vec::new, |v| {
+        self.agents.lock_safe().get(token).map_or_else(Vec::new, |v| {
             v.iter().rev().map(|(_, h)| h.clone()).collect()
         })
     }
 
     /// Number of redundant Agent registrations currently serving `token` (#8).
     pub fn registration_count(&self, token: &RoutingToken) -> usize {
-        self.agents.lock().unwrap().get(token).map_or(0, Vec::len)
+        self.agents.lock_safe().get(token).map_or(0, Vec::len)
     }
 
     /// Distinct routing tokens with at least one live Agent — the number of
     /// tunnels the Edge is currently serving (observability gauge, #10).
     pub fn active_tunnels(&self) -> usize {
-        self.agents.lock().unwrap().values().filter(|v| !v.is_empty()).count()
+        self.agents.lock_safe().values().filter(|v| !v.is_empty()).count()
     }
 
     /// Total live Agent registrations across all tokens — redundant Agents (#8)
     /// counted separately (observability gauge, #10).
     pub fn total_registrations(&self) -> usize {
-        self.agents.lock().unwrap().values().map(Vec::len).sum()
+        self.agents.lock_safe().values().map(Vec::len).sum()
     }
 
     /// Evict exactly the registration `id` for `token` — an Agent whose
@@ -223,14 +221,14 @@ impl<H: Clone> EdgeState<H> {
     /// The token's candidate/direct entries are cleared only when the **last**
     /// Agent for the token is gone.
     pub fn remove_registration(&self, token: &RoutingToken, id: u64) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock_safe();
         if let Some(v) = agents.get_mut(token) {
             v.retain(|(rid, _)| *rid != id);
             if v.is_empty() {
                 agents.remove(token);
                 drop(agents);
-                self.candidates.lock().unwrap().remove(token);
-                self.direct.lock().unwrap().remove(token);
+                self.candidates.lock_safe().remove(token);
+                self.direct.lock_safe().remove(token);
             }
         }
     }
@@ -238,17 +236,16 @@ impl<H: Clone> EdgeState<H> {
     /// Remove **all** Agent tunnels (and candidate + direct + tcp) for `token` —
     /// a full teardown, regardless of how many redundant Agents serve it.
     pub fn remove(&self, token: &RoutingToken) {
-        self.agents.lock().unwrap().remove(token);
-        self.candidates.lock().unwrap().remove(token);
-        self.direct.lock().unwrap().remove(token);
-        self.tcp_agents.lock().unwrap().remove(token);
+        self.agents.lock_safe().remove(token);
+        self.candidates.lock_safe().remove(token);
+        self.direct.lock_safe().remove(token);
+        self.tcp_agents.lock_safe().remove(token);
     }
 
     /// Whether `token` currently has at least one live Agent tunnel.
     pub fn is_known(&self, token: &RoutingToken) -> bool {
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .get(token)
             .is_some_and(|v| !v.is_empty())
     }

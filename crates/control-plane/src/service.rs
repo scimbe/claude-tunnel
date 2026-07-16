@@ -25,6 +25,7 @@ use crate::storage::{
 };
 use ct_common::ratelimit::KeyedRateLimiter;
 use ct_common::{AgentId, RoutingToken, TenantId};
+use ct_common::sync::MutexExt;
 
 /// Build the persistent enrollment router: `POST /enroll/issue`,
 /// `POST /enroll/redeem`, backed by a durable [`SqliteEnrollment`].
@@ -428,7 +429,7 @@ async fn me_issue(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() / ISSUE_WINDOW_SECS)
         .unwrap_or(0);
-    if !state.issue_limiter.lock().unwrap().allow(&sub, window) {
+    if !state.issue_limiter.lock_safe().allow(&sub, window) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "issue rate limit exceeded".to_string(),
