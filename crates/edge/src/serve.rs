@@ -58,6 +58,19 @@ fn token_hex(token: &RoutingToken) -> String {
     token.0.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// Parse a 64-hex admin token (`CT_EDGE_ADMIN_TOKEN`) into 32 bytes, if valid (#27 RB3).
+fn parse_admin_token_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut t = [0u8; 32];
+    for (i, b) in t.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(t)
+}
+
 /// Emit an Edge-side diagnostic line when `CT_EDGE_TRACE` is set. Off by default
 /// (no overhead / noise in production); enabled for a lockstep cross-host capture.
 fn edge_trace(args: std::fmt::Arguments<'_>) {
@@ -188,6 +201,13 @@ pub async fn serve_connection(
             let mut token = [0u8; 32];
             recv.read_exact(&mut token).await?;
             let token = RoutingToken(token);
+            // #27 RB3: a revoked token stays down even though the agent keeps
+            // reconnecting — refuse the registration instead of accepting it.
+            if state.is_revoked(&token) {
+                send.write_all(b"NO").await?;
+                send.finish()?;
+                return Ok(None);
+            }
             let reg = state.register_with_candidate(token.clone(), conn.clone(), conn.remote_address());
             send.write_all(b"OK").await?;
             send.finish()?;
@@ -301,6 +321,23 @@ pub async fn serve_connection(
             send.finish()?;
             Ok(None)
         }
+        b'R' => {
+            // #27 RB3: authenticated revoke — `'R' | admin_token(32) | routing_token(32)`.
+            // The control plane calls this when a customer revokes a tunnel; the
+            // edge tears the tunnel down and blocks its re-registration.
+            let mut auth = [0u8; 32];
+            recv.read_exact(&mut auth).await?;
+            let mut token = [0u8; 32];
+            recv.read_exact(&mut token).await?;
+            if state.admin_revoke_ok(&auth) {
+                state.revoke_token(&RoutingToken(token));
+                send.write_all(b"OK").await?;
+            } else {
+                send.write_all(b"NO").await?;
+            }
+            send.finish()?;
+            Ok(None)
+        }
         other => Err(format!("unknown role byte: {other}").into()),
     }
 }
@@ -401,6 +438,16 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     save_cert(cert_out, &ca_root)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
+    // #27 RB3: enable the authenticated revoke op only when the shared admin
+    // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
+    // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
+    if let Some(tok) = std::env::var("CT_EDGE_ADMIN_TOKEN")
+        .ok()
+        .and_then(|s| parse_admin_token_hex(&s))
+    {
+        state.set_admin_token(tok);
+        eprintln!("ct-edge: tunnel revocation enabled (CT_EDGE_ADMIN_TOKEN set)");
+    }
     let difficulty = config.pow_difficulty;
 
     // Optional observability endpoint (#10): serve GET /metrics with the Edge's

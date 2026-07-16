@@ -1267,8 +1267,11 @@ keinen Kontrollkanal Control-Plane→Edge. Behebung ist Cross-Crate, mehrzyklig 
   in `revoked`-Set aufnehmen), `is_revoked`, `register_unless_revoked` (None bei revoked). Kern-Erkenntnis: ohne das
   `revoked`-Set würde der Reconnect-Loop des Agenten den Tunnel einfach neu registrieren — das Set verhindert genau das.
   Frozen-Test `revoke_token_drops_registration_and_blocks_reregistration`. Gate grün (ct-edge 58 Tests).
-- **RB3b** ⏳ Edge-Serve-Layer: 'A'-Handler nutzt `register_unless_revoked` (Reconnect eines revoked Token wird abgewiesen)
-  + authentifizierter 'R'-Rollen-Op (`'R' | admin-token | routing-token`) ruft `revoke_token` (shared `CT_EDGE_ADMIN_TOKEN`).
+- **RB3b** ✅ Edge-Serve-Layer: 'A'-Handler weist revoked Token ab (sendet `NO` → Agent-`register_tunnel` failt →
+  Reconnect-Loop bleibt draußen); neuer authentifizierter 'R'-Op (`'R' | admin-token(32) | routing-token(32)`) prüft
+  `admin_revoke_ok` (konstantzeitig) und ruft `revoke_token`. `run_edge` liest `CT_EDGE_ADMIN_TOKEN` (64-hex) →
+  `set_admin_token`; ohne Secret bleibt Revocation deaktiviert. Frozen-Test `admin_revoke_ok_requires_the_configured_secret`.
+  Gate grün (ct-edge 59 Tests).
 - **RB4** ⏳ Control-Plane `delete_tunnel` ruft den Edge-'R'-Op für das Tunnel-Routing-Token → `ct_edge_active_tunnels` fällt.
 - **RB4** ⏳ `delete_tunnel` ruft den Edge-Revoke für das Tunnel-Token (und/oder Rotation via #12) → Agent wird deregistriert;
   Live-Repro (`ct_edge_active_tunnels` fällt) grün → **fix-ready**.

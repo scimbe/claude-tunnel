@@ -50,6 +50,9 @@ pub struct EdgeState<H> {
     /// re-registration, so a customer's "revoke" actually stops the tunnel even
     /// though the agent keeps reconnecting.
     revoked: Mutex<HashSet<RoutingToken>>,
+    /// Shared admin secret authenticating the control plane's `'R'` revoke op
+    /// (#27 RB3). `None` = revocation disabled (no `CT_EDGE_ADMIN_TOKEN`).
+    admin_token: Mutex<Option<[u8; 32]>>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -67,6 +70,7 @@ impl<H: Clone> EdgeState<H> {
             tcp_agents: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashSet::new()),
+            admin_token: Mutex::new(None),
             registrations: Counter::default(),
             relays: Counter::default(),
             relay_bytes: Counter::default(),
@@ -262,6 +266,23 @@ impl<H: Clone> EdgeState<H> {
         self.revoked.lock_safe().contains(token)
     }
 
+    /// Configure the shared admin secret that authenticates the `'R'` revoke op
+    /// (#27 RB3). Set from `CT_EDGE_ADMIN_TOKEN` at startup.
+    pub fn set_admin_token(&self, token: [u8; 32]) {
+        *self.admin_token.lock_safe() = Some(token);
+    }
+
+    /// Constant-time check that `auth` matches the configured admin secret.
+    /// Always `false` when no admin token is configured (revocation disabled).
+    pub fn admin_revoke_ok(&self, auth: &[u8; 32]) -> bool {
+        match self.admin_token.lock_safe().as_ref() {
+            Some(expected) => {
+                auth.iter().zip(expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+            }
+            None => false,
+        }
+    }
+
     /// Register an Agent tunnel unless its token has been revoked (#27 RB3).
     /// Returns the registration id, or `None` if the token is revoked — the
     /// registration path the serve loop uses so a revoked token stays down even
@@ -302,6 +323,20 @@ mod tests {
         state.register(token(1), 42u32);
         assert_eq!(state.route(&token(1)), Some(42));
         assert!(state.is_known(&token(1)));
+    }
+
+    #[test]
+    fn admin_revoke_ok_requires_the_configured_secret() {
+        // #27 RB3: the 'R' revoke op authenticates against CT_EDGE_ADMIN_TOKEN.
+        let state = EdgeState::<u32>::new();
+        let secret = [0x11u8; 32];
+        // Unconfigured -> revocation disabled, every auth rejected.
+        assert!(!state.admin_revoke_ok(&secret));
+        state.set_admin_token(secret);
+        assert!(state.admin_revoke_ok(&secret), "correct secret accepted");
+        let mut wrong = secret;
+        wrong[31] ^= 1;
+        assert!(!state.admin_revoke_ok(&wrong), "wrong secret rejected");
     }
 
     #[test]
