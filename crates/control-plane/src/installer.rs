@@ -34,21 +34,28 @@ impl InstallOs {
 
 /// Render the copy-paste one-liner that installs + onboards a `ct-agent`.
 ///
-/// `portal_base` is the public portal origin (e.g. `https://portal.example`);
-/// `join_token` is a freshly-minted, single-use join token supplied by the
-/// caller. The token is carried in an environment variable so it never lands in
-/// the piped shell's argument vector.
-pub fn install_one_liner(portal_base: &str, join_token: &str, os: InstallOs) -> String {
+/// `portal_base` is the public portal origin (e.g. `https://portal.example`).
+/// `join_token` is a freshly-minted, single-use join token. `routing_token` is
+/// the tunnel's persistent routing token (#27 RB1) so the agent registers at the
+/// edge under the token the portal knows — the linkage a revocation acts on
+/// (#27 RB2). Both are carried in environment variables so they never land in the
+/// piped shell's argument vector.
+pub fn install_one_liner(
+    portal_base: &str,
+    join_token: &str,
+    routing_token: &str,
+    os: InstallOs,
+) -> String {
     let base = portal_base.trim_end_matches('/');
     match os {
-        // curl the installer, hand the token to it via the environment, run it.
-        InstallOs::Unix => {
-            format!("curl -fsSL {base}/install.sh | CT_JOIN_TOKEN={join_token} sh")
-        }
-        // Set the env var for the child scope, then fetch + invoke the script.
-        InstallOs::Windows => {
-            format!("$env:CT_JOIN_TOKEN='{join_token}'; irm {base}/install.ps1 | iex")
-        }
+        // curl the installer, hand the tokens to it via the environment, run it.
+        InstallOs::Unix => format!(
+            "curl -fsSL {base}/install.sh | CT_JOIN_TOKEN={join_token} CT_AGENT_TOKEN={routing_token} sh"
+        ),
+        // Set the env vars for the child scope, then fetch + invoke the script.
+        InstallOs::Windows => format!(
+            "$env:CT_JOIN_TOKEN='{join_token}'; $env:CT_AGENT_TOKEN='{routing_token}'; irm {base}/install.ps1 | iex"
+        ),
     }
 }
 
@@ -65,28 +72,33 @@ mod tests {
     }
 
     #[test]
-    fn one_liners_embed_the_token_via_env_per_os() {
-        // #28 PP1: dummy token only — never a real secret in tests.
-        let tok = "dummy-join-token-xyz";
+    fn one_liners_embed_both_tokens_via_env_per_os() {
+        // #28/#27 RB2: dummy tokens only — never a real secret in tests.
+        let jt = "dummy-join-token-xyz";
+        let rt = "dummy-routing-token-abc";
         let base = "https://portal.example/"; // trailing slash must be trimmed
 
-        let unix = install_one_liner(base, tok, InstallOs::Unix);
+        let unix = install_one_liner(base, jt, rt, InstallOs::Unix);
         assert_eq!(
             unix,
-            "curl -fsSL https://portal.example/install.sh | CT_JOIN_TOKEN=dummy-join-token-xyz sh"
+            "curl -fsSL https://portal.example/install.sh | \
+             CT_JOIN_TOKEN=dummy-join-token-xyz CT_AGENT_TOKEN=dummy-routing-token-abc sh"
         );
-        // Token carried via env, not as a positional argument to sh.
-        assert!(unix.contains("CT_JOIN_TOKEN="));
-        assert!(!unix.contains("sh -s -- dummy-join-token"), "token is not a CLI arg");
+        // Tokens carried via env, not as positional arguments to sh.
+        assert!(unix.contains("CT_JOIN_TOKEN=") && unix.contains("CT_AGENT_TOKEN="));
+        assert!(!unix.contains("sh -s -- dummy"), "tokens are not CLI args");
 
-        let win = install_one_liner(base, tok, InstallOs::Windows);
+        let win = install_one_liner(base, jt, rt, InstallOs::Windows);
         assert_eq!(
             win,
-            "$env:CT_JOIN_TOKEN='dummy-join-token-xyz'; irm https://portal.example/install.ps1 | iex"
+            "$env:CT_JOIN_TOKEN='dummy-join-token-xyz'; \
+             $env:CT_AGENT_TOKEN='dummy-routing-token-abc'; irm https://portal.example/install.ps1 | iex"
         );
 
-        // Each command embeds the given token exactly once.
-        assert_eq!(unix.matches(tok).count(), 1);
-        assert_eq!(win.matches(tok).count(), 1);
+        // Each command embeds each token exactly once.
+        for cmd in [&unix, &win] {
+            assert_eq!(cmd.matches(jt).count(), 1);
+            assert_eq!(cmd.matches(rt).count(), 1);
+        }
     }
 }

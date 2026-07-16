@@ -198,12 +198,13 @@ async fn install_page(
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    // Only the tunnel's owner may onboard an agent for it.
-    match st.tunnels.owns(&subject, &id) {
-        Ok(true) => {}
-        Ok(false) => return (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
+    // The tunnel's routing token doubles as the ownership gate: `None` when the
+    // tunnel is unknown or owned by someone else (only the owner may onboard).
+    let routing_token = match st.tunnels.routing_token(&subject, &id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    };
     // Mint a fresh single-use join token bound to the customer (subject as tenant).
     let token = match st.enrollment.issue_join_token(&TenantId(subject.clone())) {
         Ok(t) => hex(&t.0),
@@ -220,7 +221,7 @@ async fn install_page(
                 InstallOs::Unix => "Linux / macOS",
                 InstallOs::Windows => "Windows (PowerShell)",
             };
-            let cmd = install_one_liner(&st.portal_base, &token, *os);
+            let cmd = install_one_liner(&st.portal_base, &token, &routing_token, *os);
             format!("<h2>{label}</h2><pre><code>{}</code></pre>", escape(&cmd))
         })
         .collect::<String>();
@@ -609,7 +610,8 @@ mod tests {
         let (status, html) = get(&app, &format!("/portal/tunnels/{id}/install"), Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("curl -fsSL https://portal.example/install.sh"));
-        assert!(html.contains("CT_JOIN_TOKEN="), "token carried via env");
+        assert!(html.contains("CT_JOIN_TOKEN="), "join token carried via env");
+        assert!(html.contains("CT_AGENT_TOKEN="), "tunnel routing token carried via env (#27 RB2)");
         assert!(html.contains("irm https://portal.example/install.ps1 | iex"));
         assert!(html.contains("single-use") || html.contains("Single-use"), "warns token is single-use");
 

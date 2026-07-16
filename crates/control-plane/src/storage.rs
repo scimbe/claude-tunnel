@@ -673,6 +673,20 @@ impl SqliteTunnelStore {
         Ok(Self::owner_of(&self.conn.lock_safe(), tunnel_id)?.as_deref() == Some(subject))
     }
 
+    /// The routing token of a tunnel the caller owns, or `None` if the id is
+    /// unknown or owned by someone else (#27 RB2). Owner-scoped so a non-owner
+    /// cannot read another customer's routing token.
+    pub fn routing_token(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT routing_token FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// The owner subject of a tunnel, or `None` if the id is unknown.
     fn owner_of(conn: &Connection, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
         conn.query_row(
