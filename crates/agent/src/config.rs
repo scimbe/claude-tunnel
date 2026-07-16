@@ -41,6 +41,11 @@ pub struct AgentConfig {
     /// If set, the Agent serves its Prometheus `/metrics` endpoint on this
     /// address (M14.2). `None` disables the endpoint.
     pub metrics_listen: Option<SocketAddr>,
+    /// Browser Plane (#23): when true the Agent forwards each relayed stream to
+    /// the Origin **verbatim** (raw TLS passthrough) instead of terminating a
+    /// Noise session — the browser's TLS terminates at the Origin. Set with
+    /// `CT_AGENT_MODE=browser`. Default `false` (Mesh Plane / Noise).
+    pub browser_forward: bool,
 }
 
 impl AgentConfig {
@@ -57,6 +62,7 @@ impl AgentConfig {
             origin_proto: OriginProto::default(),
             direct_advertise_ip: None,
             metrics_listen: None,
+            browser_forward: false,
         })
     }
 
@@ -96,6 +102,9 @@ impl AgentConfig {
             ),
             _ => None,
         };
+        // Browser Plane (#23): CT_AGENT_MODE=browser -> raw TLS passthrough.
+        cfg.browser_forward =
+            get("CT_AGENT_MODE").map(|m| m.trim().eq_ignore_ascii_case("browser")) == Some(true);
         Ok(cfg)
     }
 }
@@ -197,6 +206,14 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains(needle), "{var}: unexpected error {err}");
         }
+    }
+
+    #[test]
+    fn from_env_browser_mode_enables_raw_forward() {
+        // #23 BP2: CT_AGENT_MODE=browser -> raw TLS passthrough; default off.
+        assert!(!AgentConfig::from_env_with(|_| None).unwrap().browser_forward);
+        let c = AgentConfig::from_env_with(get_from(&[("CT_AGENT_MODE", "Browser")])).unwrap();
+        assert!(c.browser_forward, "CT_AGENT_MODE=browser enables raw forward");
     }
 
     #[test]

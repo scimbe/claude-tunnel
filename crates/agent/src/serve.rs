@@ -362,6 +362,7 @@ pub async fn run_agent(
             &conn,
             config.origin,
             config.origin_proto,
+            config.browser_forward,
             &origin_keys,
             Arc::clone(&metrics),
         )
@@ -385,6 +386,7 @@ async fn serve_quic_connection(
     conn: &Connection,
     origin: SocketAddr,
     proto: OriginProto,
+    browser_forward: bool,
     origin_keys: &[[u8; 32]],
     metrics: Arc<TunnelMetrics>,
 ) {
@@ -393,6 +395,14 @@ async fn serve_quic_connection(
             Ok(x) => x,
             Err(_) => return,
         };
+        // Browser Plane (#23): forward the relayed stream to the Origin verbatim
+        // (raw TLS passthrough); the browser's TLS terminates at the Origin.
+        if browser_forward {
+            tokio::spawn(async move {
+                let _ = serve_stream_to_origin(send, recv, origin).await;
+            });
+            continue;
+        }
         let keys = origin_keys.to_vec();
         let m = Arc::clone(&metrics);
         tokio::spawn(async move {
@@ -1085,6 +1095,7 @@ mod tests {
             origin_proto: OriginProto::Tcp,
             direct_advertise_ip: None,
             metrics_listen: None,
+            browser_forward: false,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
@@ -1097,5 +1108,83 @@ mod tests {
         assert!(state.is_known(&token), "agent registered its tunnel");
         agent.abort();
         let _ = origin.await;
+    }
+
+    #[tokio::test]
+    async fn serve_stream_to_origin_carries_a_full_tls_session() {
+        // #23 BP2: the Agent's browser-forward mode pipes a relayed stream to the
+        // Origin verbatim, so a browser's TLS terminates AT the Origin. Prove a
+        // full TLS handshake + HTTP exchange survives serve_stream_to_origin.
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["browser.test".to_string()]).unwrap();
+        let origin_cert = certified.cert.der().clone();
+        let origin_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![origin_cert.clone()], origin_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let ol = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (s, _) = ol.accept().await.unwrap();
+            let mut tls = acceptor.accept(s).await.expect("origin TLS handshake");
+            let mut b = [0u8; 1024];
+            let n = tls.read(&mut b).await.unwrap();
+            assert!(b[..n].starts_with(b"GET "), "origin got an HTTP request over TLS");
+            tls.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        // Agent under test: QUIC server; accept a bi-stream, raw-forward to origin.
+        let (server, cert) =
+            ct_edge::transport::build_server_endpoint_with_cert().expect("agent quic");
+        let agent_addr = server.local_addr().unwrap();
+        let agent = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (send, recv) = conn.accept_bi().await.unwrap();
+            let _ = serve_stream_to_origin(send, recv, origin_addr).await;
+            conn.closed().await;
+        });
+
+        // "Browser" over a QUIC bi-stream (standing in for the edge relay).
+        let ep = ct_edge::transport::build_client_endpoint(cert).expect("client");
+        let conn = ep
+            .connect(agent_addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn");
+        let (send, recv) = conn.open_bi().await.unwrap();
+        let stream = tokio::io::join(recv, send);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(origin_cert).unwrap();
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let sni = rustls::pki_types::ServerName::try_from("browser.test").unwrap();
+        let mut tls = connector
+            .connect(sni, stream)
+            .await
+            .expect("browser TLS completes end-to-end through the raw forward");
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: browser.test\r\n\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let page = String::from_utf8_lossy(&resp);
+        assert!(
+            page.contains("200 OK") && page.contains("hello"),
+            "HTTP 200 over TLS survives the agent raw forward: {page}"
+        );
+        conn.close(0u32.into(), b"done");
+        agent.abort();
+        origin.abort();
     }
 }

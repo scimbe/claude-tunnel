@@ -1176,8 +1176,12 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   `peek_sni_*`, `read_client_hello_*`, und `sni_passthrough_routes_a_browser_tls_connection_to_the_origin`
   (rustls-„Browser" erreicht einen public-hostname HTTPS-Origin durch den Tunnel, validiert das Cert
   client-seitig, HTTP 200 — Edge terminiert nie TLS). Gate grün.
-- **BP2** ⏳ **Agent-Browser-Forward-Modus**: der reale Agent reicht den Tunnel-Stream roh zum Origin
-  durch (kein Noise) — der Produktions-Gegenpart zum Mock-Agent im BP1-Test.
+- **BP2** ✅ **Agent-Browser-Forward-Modus**: `CT_AGENT_MODE=browser` (`AgentConfig.browser_forward`) →
+  `serve_quic_connection` reicht jeden relayed Stream via `serve_stream_to_origin` (raw
+  `copy_bidirectional`) roh zum Origin durch statt Noise zu terminieren; die Browser-TLS terminiert am
+  Origin. Frozen-Tests `from_env_browser_mode_enables_raw_forward` und
+  `serve_stream_to_origin_carries_a_full_tls_session` (rustls-„Browser" über einen QUIC-Stream →
+  serve_stream_to_origin → TLS-Origin: voller Handshake + HTTP 200 überlebt die rohe Weiterleitung). Gate grün.
 - **BP3** ⏳ **Öffentlicher :443-Browser-Listener** am Edge (SNI-Peek → `serve_sni_passthrough`) +
   Hostname-Bindung über die Control-Plane (Hostname→Token registrieren, autorisiert).
 - **BP4** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
