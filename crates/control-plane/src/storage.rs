@@ -687,6 +687,69 @@ impl SqliteTunnelStore {
             .optional()
     }
 
+    /// The routing token of a tunnel `subject` is **authorized** to use — as its
+    /// owner or via a grant (#29) — or `None` otherwise. This is what lets a
+    /// grantee obtain the shared tunnel's install/connection material, giving a
+    /// grant real effect rather than only bookkeeping.
+    pub fn routing_token_if_authorized(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock_safe();
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT subject, routing_token FROM subject_tunnels WHERE id = ?1",
+                params![tunnel_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((owner, token)) = row else {
+            return Ok(None);
+        };
+        if owner == subject {
+            return Ok(Some(token));
+        }
+        let granted: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(granted.map(|_| token))
+    }
+
+    /// List every tunnel `subject` is authorized to use — the ones they own plus
+    /// the ones shared with them (#29) — each flagged with whether they own it
+    /// (owned tunnels get the management actions; shared ones are read-only).
+    pub fn list_authorized_for_subject(
+        &self,
+        subject: &str,
+    ) -> rusqlite::Result<Vec<(SubjectTunnel, bool)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hostname, created_at, routing_token, subject = ?1
+             FROM subject_tunnels
+             WHERE subject = ?1
+                OR id IN (SELECT tunnel_id FROM tunnel_grants WHERE grantee = ?1)
+             ORDER BY created_at DESC, id",
+        )?;
+        let rows = stmt.query_map(params![subject], |r| {
+            Ok((
+                SubjectTunnel {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    hostname: r.get(2)?,
+                    created_at: r.get(3)?,
+                    routing_token: r.get(4)?,
+                },
+                r.get::<_, i64>(5)? != 0,
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// The owner subject of a tunnel, or `None` if the id is unknown.
     fn owner_of(conn: &Connection, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
         conn.query_row(
@@ -836,6 +899,34 @@ mod tests {
         assert_eq!(store.revoke("alice", &a.id).unwrap(), Some(a.routing_token));
         // A second revoke of the same id yields nothing.
         assert_eq!(store.revoke("alice", &a.id).unwrap(), None);
+    }
+
+    #[test]
+    fn granted_tunnels_are_visible_and_authorized_to_the_grantee() {
+        // #29 fix: a grant gives real effect — the grantee sees the tunnel and can
+        // obtain its routing token; a non-grantee gets neither.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "web", None).unwrap();
+        store.grant("alice", &t.id, "bob").unwrap();
+
+        // Grantee: authorized for the token, and sees it flagged not-owned.
+        assert_eq!(
+            store.routing_token_if_authorized("bob", &t.id).unwrap(),
+            Some(t.routing_token.clone())
+        );
+        let bob_list = store.list_authorized_for_subject("bob").unwrap();
+        assert_eq!(bob_list.len(), 1);
+        assert_eq!(bob_list[0].0.id, t.id);
+        assert!(!bob_list[0].1, "shared tunnel is not owned by the grantee");
+
+        // Owner: authorized + flagged owned.
+        let alice_list = store.list_authorized_for_subject("alice").unwrap();
+        assert_eq!(alice_list.len(), 1);
+        assert!(alice_list[0].1, "owner flagged as owner");
+
+        // A non-grantee: neither authorized nor able to see it.
+        assert_eq!(store.routing_token_if_authorized("carol", &t.id).unwrap(), None);
+        assert!(store.list_authorized_for_subject("carol").unwrap().is_empty());
     }
 
     #[test]

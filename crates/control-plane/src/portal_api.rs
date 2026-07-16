@@ -148,7 +148,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    match st.tunnels.list_for_subject(&subject) {
+    match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(tunnels) => Html(tunnels_html(&tunnels)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -233,9 +233,9 @@ async fn install_page(
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    // The tunnel's routing token doubles as the ownership gate: `None` when the
-    // tunnel is unknown or owned by someone else (only the owner may onboard).
-    let routing_token = match st.tunnels.routing_token(&subject, &id) {
+    // Authorized = owner OR grantee (#29): a shared-with subject may also install
+    // an agent for the tunnel. `None` when unknown or the caller isn't authorized.
+    let routing_token = match st.tunnels.routing_token_if_authorized(&subject, &id) {
         Ok(Some(t)) => t,
         Ok(None) => return (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -364,28 +364,36 @@ fn grants_html(id: &str, grantees: &[String]) -> String {
     page("share tunnel", &body)
 }
 
-fn tunnels_html(tunnels: &[crate::storage::SubjectTunnel]) -> String {
+fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
     let rows = if tunnels.is_empty() {
         "<p class=\"k\">No tunnels yet. Create one below.</p>".to_string()
     } else {
         tunnels
             .iter()
-            .map(|t| {
+            .map(|(t, owned)| {
                 let host = t
                     .hostname
                     .as_deref()
                     .map(|h| format!(" · <code>{}</code>", escape(h)))
                     .unwrap_or_default();
+                let id = escape(&t.id);
+                // Owner-only actions (share/revoke) are hidden on shared tunnels;
+                // an authorized grantee can still install an agent for it.
+                let owner_actions = if *owned {
+                    format!(
+                        r#" <a class="btn sec" href="/portal/tunnels/{id}/grants">Share</a>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/delete">
+  <button class="sec" type="submit">Revoke</button></form>"#
+                    )
+                } else {
+                    " <span class=\"k\">(shared with you)</span>".to_string()
+                };
                 format!(
                     r#"<div class="row"><span class="v">{name}{host}</span><span>
- <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
- <a class="btn sec" href="/portal/tunnels/{id}/grants">Share</a>
- <form class="inline" method="post" action="/portal/tunnels/{id}/delete">
-  <button class="sec" type="submit">Revoke</button></form>
+ <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>{owner_actions}
 </span></div>"#,
                     name = escape(&t.name),
                     host = host,
-                    id = escape(&t.id),
                 )
             })
             .collect::<String>()
@@ -741,6 +749,36 @@ mod tests {
         );
         let (_s, after) = get(&app, &format!("/portal/tunnels/{id}/grants"), Some("alice")).await;
         assert!(after.contains("Not shared with anyone"), "grant removed");
+    }
+
+    #[tokio::test]
+    async fn a_grant_lets_the_grantee_see_and_install_the_shared_tunnel() {
+        // #29 fix: grants have real effect — the grantee sees the tunnel (read-only)
+        // and is authorized to install an agent for it; a non-grantee gets neither.
+        let app = test_app();
+        post_form(&app, "/portal/tunnels", "alice", "name=web").await;
+        let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{id}/grants"), "alice", "grantee=bob").await,
+            StatusCode::SEE_OTHER
+        );
+
+        // bob sees the shared tunnel, marked, without owner actions.
+        let (_s, bob_list) = get(&app, "/portal/tunnels", Some("bob")).await;
+        assert!(bob_list.contains("web") && bob_list.contains("shared with you"));
+        assert!(!bob_list.contains(&format!("/portal/tunnels/{id}/delete")), "no revoke for a grantee");
+        // ...and can install an agent for it (authorized, not just owner).
+        assert_eq!(
+            get(&app, &format!("/portal/tunnels/{id}/install"), Some("bob")).await.0,
+            StatusCode::OK
+        );
+
+        // carol (no grant) sees nothing and cannot install.
+        assert!(!get(&app, "/portal/tunnels", Some("carol")).await.1.contains("web"));
+        assert_eq!(
+            get(&app, &format!("/portal/tunnels/{id}/install"), Some("carol")).await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

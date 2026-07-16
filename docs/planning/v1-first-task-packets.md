@@ -1319,7 +1319,14 @@ Env bleibt der Revoke „nur DB-Zeile weg" (Legacy-Verhalten) — mit ihnen fäl
 - **PP2** ⏳ Authed `GET /portal/tunnels/:id/install?os=…`: prägt pro Anforderung ein **frisches, einmaliges, kurzlebiges** Join-Token
   (server-seitig, nie geloggt) und rendert den Einzeiler; Subject aus Session, nur für eigene Tunnel (#27).
 - **PP3** ⏳ Ausgelieferte `install.sh`/`install.ps1` (ct-agent holen, `onboard` mit `CT_JOIN_TOKEN`, CA-Root via `/pki/ca` #11, Serve-Loop).
-### #29 Zugriffsrechte/Sharing (Grants pro Tunnel) — ✅ **fix-ready** (Verwaltung)
+### #29 Zugriffsrechte/Sharing (Grants pro Tunnel) — ✅ **fix-ready** (Feld-Bug behoben)
+- **Feld-Bug**: `is_authorized` hatte NULL Produktions-Call-Sites — Grants waren rein kosmetisch; ein Grantee
+  konnte den geteilten Tunnel weder sehen noch installieren. **Fix**: `SqliteTunnelStore::routing_token_if_authorized`
+  (Owner ODER Grantee) gated jetzt `install_page` (statt owner-only `routing_token`); `list_authorized_for_subject`
+  (eigene + geteilte Tunnel, mit `owned`-Flag) speist `tunnels_page` — geteilte Tunnel erscheinen read-only
+  („shared with you", keine Share/Revoke-Buttons), aber mit Install. Frozen-Tests
+  `granted_tunnels_are_visible_and_authorized_to_the_grantee` (storage),
+  `a_grant_lets_the_grantee_see_and_install_the_shared_tunnel` (portal). Voller Workspace-Gate grün (112 CP-Tests).
 - **PP2** ✅ Session-gated Grant-HTTP in `portal_api` (owner-only, sonst 404): `GET /portal/tunnels/:id/grants`
   (Liste + Add-Formular), `POST …/grants` (Grant), `POST …/grants/:grantee/delete` (Entzug). „Share"-Button je Tunnel.
   Frozen-Tests `grants_are_owner_managed_via_http`, `add_grant_rejects_empty_subject`. Gate grün (108 Tests).
