@@ -1246,6 +1246,11 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
 - **PP2** ⏳ Portal-Konto-Seite (server-gerendertes HTML) rendert die Session-Account-Daten (braucht #25 PP2-Session).
 - **PP3** ⏳ „Credits kaufen": UI-Anbindung an `/payment/intent` + `/me/issue` (Guthaben-Anzeige aktualisiert nach Webhook-Top-up).
 ### #27 Tunnel-Verwaltung (anlegen, auflisten, widerrufen)
+- **PP2** ✅ Session-gated Portal-HTTP in `portal_api`: `GET /portal/tunnels` (Liste eigener Tunnel + Anlage-Formular),
+  `POST /portal/tunnels` (anlegen: name + optional hostname), `POST /portal/tunnels/:id/delete` (Widerruf).
+  Strikt selbstbezüglich (Subject aus Session; `revoke` nur eigene). „Install"-Button pro Tunnel → #28-Endpoint.
+  Frozen-Tests `tunnels_are_created_listed_and_revoked_self_scoped`, `create_tunnel_rejects_an_empty_name`. Gate grün (104 Tests).
+- **PP3** ⏳ Live-Status je Tunnel via Edge `/metrics` (#17) + Widerruf per Rotation (#12) — Härtungs-Follow-up.
 - **PP1** ✅ Per-Subject-Tunnel-Store (`storage::SqliteTunnelStore`): `create`/`list_for_subject`/`revoke`,
   jede Operation nach `subject` gescopt — ein Kunde sieht/widerruft nur seine EIGENEN Tunnel (kein
   Cross-Subject-Delete). **Secret-frei by design**: gespeichert werden nur `id`, `name`, optionaler

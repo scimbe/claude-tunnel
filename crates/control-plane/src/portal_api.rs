@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Form, State};
+use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -16,24 +16,32 @@ use serde::Deserialize;
 
 use crate::accounts::AccountId;
 use crate::portal::{escape, session_subject_for};
-use crate::storage::SqliteLedger;
+use crate::storage::{SqliteLedger, SqliteTunnelStore};
 
 /// Shared state for the authed portal API.
 #[derive(Clone)]
 struct ApiState {
     session_key: Arc<[u8]>,
     ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
 }
 
-/// Build the authenticated portal API router (#26: account page + buy credits).
-pub fn portal_api_router(session_key: &[u8], ledger: Arc<SqliteLedger>) -> Router {
+/// Build the authenticated portal API router (#26 account, #27 tunnels).
+pub fn portal_api_router(
+    session_key: &[u8],
+    ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
+) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
         ledger,
+        tunnels,
     };
     Router::new()
         .route("/portal/account", get(account_page))
         .route("/portal/account/credits", post(buy_credits))
+        .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
+        .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .with_state(state)
 }
 
@@ -99,6 +107,100 @@ provider's signed webhook confirms the payment.</p>
         intent = escape(&hex(&intent.0)),
     );
     Html(page("buy credits", &body)).into_response()
+}
+
+/// A new tunnel from the create form.
+#[derive(Deserialize)]
+struct CreateTunnelForm {
+    name: String,
+    hostname: Option<String>,
+}
+
+/// `GET /portal/tunnels` (#27): list the caller's own tunnels + a create form.
+async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.list_for_subject(&subject) {
+        Ok(tunnels) => Html(tunnels_html(&tunnels)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /portal/tunnels` (#27): create a tunnel owned by the caller.
+async fn create_tunnel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateTunnelForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let name = form.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
+    }
+    let hostname = form
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Err(e) = st.tunnels.create(&subject, name, hostname) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    Redirect::to("/portal/tunnels").into_response()
+}
+
+/// `POST /portal/tunnels/{id}/delete` (#27): revoke one of the caller's tunnels.
+/// Self-scoped: `revoke` only removes a row owned by this subject.
+async fn delete_tunnel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let _ = st.tunnels.revoke(&subject, &id);
+    Redirect::to("/portal/tunnels").into_response()
+}
+
+fn tunnels_html(tunnels: &[crate::storage::SubjectTunnel]) -> String {
+    let rows = if tunnels.is_empty() {
+        "<p class=\"k\">No tunnels yet. Create one below.</p>".to_string()
+    } else {
+        tunnels
+            .iter()
+            .map(|t| {
+                let host = t
+                    .hostname
+                    .as_deref()
+                    .map(|h| format!(" · <code>{}</code>", escape(h)))
+                    .unwrap_or_default();
+                format!(
+                    r#"<div class="row"><span class="v">{name}{host}</span><span>
+ <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/delete">
+  <button class="sec" type="submit">Revoke</button></form>
+</span></div>"#,
+                    name = escape(&t.name),
+                    host = host,
+                    id = escape(&t.id),
+                )
+            })
+            .collect::<String>()
+    };
+    let body = format!(
+        r#"<h1>Your tunnels</h1>
+{rows}
+<h2>Create a tunnel</h2>
+<form method="post" action="/portal/tunnels">
+ <input type="text" name="name" placeholder="name" required>
+ <input type="text" name="hostname" placeholder="hostname (optional, browser plane)">
+ <button type="submit">Create</button>
+</form>"#,
+    );
+    page("your tunnels", &body)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -168,10 +270,15 @@ mod tests {
         format!("ct_portal_session={}", sign_session_for_test(KEY, subject))
     }
 
+    fn test_app() -> Router {
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        portal_api_router(KEY, ledger, tunnels)
+    }
+
     #[tokio::test]
     async fn account_page_requires_a_session() {
-        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
-        let app = portal_api_router(KEY, ledger);
+        let app = test_app();
         let resp = app
             .oneshot(Request::get("/portal/account").body(Body::empty()).unwrap())
             .await
@@ -182,8 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn account_page_shows_self_scoped_account_and_balance() {
-        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
-        let app = portal_api_router(KEY, ledger);
+        let app = test_app();
         let resp = app
             .oneshot(
                 Request::get("/portal/account")
@@ -204,8 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn buy_credits_creates_an_intent_for_the_callers_account() {
-        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
-        let app = portal_api_router(KEY, ledger);
+        let app = test_app();
         let resp = app
             .oneshot(
                 Request::post("/portal/account/credits")
@@ -225,8 +330,7 @@ mod tests {
 
     #[tokio::test]
     async fn buy_credits_requires_a_session() {
-        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
-        let app = portal_api_router(KEY, ledger);
+        let app = test_app();
         let resp = app
             .oneshot(
                 Request::post("/portal/account/credits")
@@ -237,5 +341,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    }
+
+    async fn get(app: &Router, path: &str, subject: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::get(path);
+        if let Some(s) = subject {
+            req = req.header("cookie", session_header(s));
+        }
+        let resp = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn post_form(app: &Router, path: &str, subject: &str, form: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::post(path)
+                    .header("cookie", session_header(subject))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn first_id(html: &str) -> String {
+        html.split("/portal/tunnels/")
+            .nth(1)
+            .and_then(|s| s.split('/').next())
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn tunnels_are_created_listed_and_revoked_self_scoped() {
+        let app = test_app();
+        let count = |h: &str| h.matches("/delete").count();
+
+        // Unauthenticated -> bounced.
+        assert_eq!(get(&app, "/portal/tunnels", None).await.0, StatusCode::SEE_OTHER);
+
+        // alice creates two tunnels (one with a browser-plane hostname); bob one.
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=app.example").await,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(post_form(&app, "/portal/tunnels", "alice", "name=ssh").await, StatusCode::SEE_OTHER);
+        assert_eq!(post_form(&app, "/portal/tunnels", "bob", "name=db").await, StatusCode::SEE_OTHER);
+
+        // alice sees exactly her two; bob sees exactly his one.
+        let (_s, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(count(&html), 2, "alice sees her two tunnels");
+        assert!(html.contains("web") && html.contains("app.example") && html.contains("ssh"));
+        assert_eq!(count(&get(&app, "/portal/tunnels", Some("bob")).await.1), 1, "bob sees only his own");
+
+        // alice revokes one of her tunnels -> one remains.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/delete", first_id(&html)), "alice", "").await,
+            StatusCode::SEE_OTHER
+        );
+        let (_s, after) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(count(&after), 1, "one tunnel removed");
+
+        // bob cannot revoke alice's remaining tunnel (self-scoped) — it survives.
+        post_form(&app, &format!("/portal/tunnels/{}/delete", first_id(&after)), "bob", "").await;
+        assert_eq!(
+            count(&get(&app, "/portal/tunnels", Some("alice")).await.1),
+            1,
+            "self-scoped: bob cannot revoke alice's tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_rejects_an_empty_name() {
+        let app = test_app();
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=%20").await,
+            StatusCode::BAD_REQUEST
+        );
     }
 }

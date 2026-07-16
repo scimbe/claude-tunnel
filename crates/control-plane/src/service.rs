@@ -686,6 +686,7 @@ pub fn persistent_control_plane_router(
     let enrollment = Arc::new(SqliteEnrollment::open(db_path)?);
     let registry = Arc::new(SqliteRegistry::open(db_path)?);
     let ledger = Arc::new(SqliteLedger::open(db_path)?);
+    let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open(db_path)?);
     let verifier = Arc::new(WebhookVerifier::new(
         webhook_secret.to_vec(),
         WEBHOOK_TOLERANCE_SECS,
@@ -728,6 +729,7 @@ pub fn persistent_control_plane_router(
         .merge(crate::portal_api::portal_api_router(
             webhook_secret,
             ledger.clone(),
+            tunnels.clone(),
         ))
         .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
