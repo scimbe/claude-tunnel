@@ -1194,8 +1194,17 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   `bind_hostname_sends_h_and_surfaces_the_ack` (OK/Reject/leerer-Host-Guard). Damit läuft die Kette
   Agent→Edge (Token+Host) → Edge-`:443`-Listener → SNI→Token→Agent→Origin end-to-end (BP1–BP3b).
   Gate grün.
-- **BP4** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
-  LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job.
+- **BP4a** ✅ **Host-Binding-Härtung** (Feld-Review-Punkt #2): `register_host` ist jetzt **takeover-sicher** —
+  ein bereits gebundener Hostname kann nicht durch einen Bind auf ein *anderes* Token übernommen werden (erster
+  Bind gewinnt; Same-Token-Rebind bei Reconnect idempotent); der 'H'-Handler antwortet bei Konflikt mit `NO`.
+  Stale-Bindings werden beim Agent-Drop (letzte Registrierung weg) und bei `revoke_token`/`remove` via
+  `clear_hosts_for` aufgeräumt. Frozen-Test `host_binding_is_takeover_safe_and_cleared_on_agent_drop`. Gate grün (ct-edge 61).
+- **BP4b** ⏳ **Hostname-Ownership-Autorisierung** (Feld-Review-Punkt #1): Control-Plane autorisiert Hostname↔Token
+  (Quelle: `subject_tunnels.hostname` + `routing_token`); Edge akzeptiert 'H'-Binds nur mit gültigem Claim → ein
+  halb-konfigurierter Edge nimmt keine anonymen Binds an. **MUSS landen, bevor `:443` in einem erreichbaren Deployment
+  aktiviert wird.** (+ Hostname-Validierung: DNS-Charset, Trailing-Dot-Normalisierung — Review-Punkt #3.)
+- **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
+  LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job. Reale Domain jetzt verfügbar (#30: bunsenbrenner.org).
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
   vertrautem Cert durch den Tunnel). Erst wenn BP1–BP5 erfüllt → **#23 fix-ready**.
 

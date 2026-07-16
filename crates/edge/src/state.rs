@@ -78,12 +78,28 @@ impl<H: Clone> EdgeState<H> {
         }
     }
 
-    /// Map a public hostname to a routing token (Browser Plane, #23). The
+    /// Bind a public hostname to a routing token (Browser Plane, #23), **unless**
+    /// the hostname is already bound to a *different* token — a takeover-safe bind
+    /// (#23 BP4a). Rebinding the same token (an agent reconnecting) is idempotent
+    /// and succeeds. Returns `true` when the binding is in place, `false` when a
+    /// conflicting bind was refused (the existing route is left untouched). The
     /// hostname is lowercased so SNI lookups are case-insensitive.
-    pub fn register_host(&self, host: &str, token: RoutingToken) {
-        self.hosts
-            .lock_safe()
-            .insert(host.to_ascii_lowercase(), token);
+    pub fn register_host(&self, host: &str, token: RoutingToken) -> bool {
+        let key = host.to_ascii_lowercase();
+        let mut hosts = self.hosts.lock_safe();
+        match hosts.get(&key) {
+            Some(existing) if *existing != token => false,
+            _ => {
+                hosts.insert(key, token);
+                true
+            }
+        }
+    }
+
+    /// Remove every hostname bound to `token` — called when its last agent drops
+    /// or it is revoked, so no stale host->token route lingers (#23 BP4a).
+    fn clear_hosts_for(&self, token: &RoutingToken) {
+        self.hosts.lock_safe().retain(|_, v| v != token);
     }
 
     /// Resolve a public hostname (from the TLS SNI) to its routing token.
@@ -238,6 +254,8 @@ impl<H: Clone> EdgeState<H> {
                 drop(agents);
                 self.candidates.lock_safe().remove(token);
                 self.direct.lock_safe().remove(token);
+                // The tunnel is gone — drop its hostname routes too (#23 BP4a).
+                self.clear_hosts_for(token);
             }
         }
     }
@@ -249,6 +267,7 @@ impl<H: Clone> EdgeState<H> {
         self.candidates.lock_safe().remove(token);
         self.direct.lock_safe().remove(token);
         self.tcp_agents.lock_safe().remove(token);
+        self.clear_hosts_for(token);
     }
 
     /// Revoke `token` (#27 RB3): tear down its live registrations and any hostname
@@ -257,8 +276,7 @@ impl<H: Clone> EdgeState<H> {
     /// revoked set, the Agent's reconnect loop would simply register again.
     pub fn revoke_token(&self, token: &RoutingToken) {
         self.revoked.lock_safe().insert(token.clone());
-        self.remove(token);
-        self.hosts.lock_safe().retain(|_, v| v != token);
+        self.remove(token); // also clears the token's hostname routes (#23 BP4a)
     }
 
     /// Whether `token` has been revoked (#27 RB3).
@@ -323,6 +341,32 @@ mod tests {
         state.register(token(1), 42u32);
         assert_eq!(state.route(&token(1)), Some(42));
         assert!(state.is_known(&token(1)));
+    }
+
+    #[test]
+    fn host_binding_is_takeover_safe_and_cleared_on_agent_drop() {
+        // #23 BP4a: first bind wins; a conflicting bind can't steal the route;
+        // the binding is cleared when the tunnel's last agent drops.
+        let state = EdgeState::new();
+        let (t1, t2) = (token(1), token(2));
+        let id = state.register(t1.clone(), 5u32);
+
+        // First bind wins; rebinding the SAME token (reconnect) is idempotent-OK.
+        assert!(state.register_host("app.example", t1.clone()));
+        assert!(state.register_host("app.example", t1.clone()), "same-token rebind ok");
+        assert_eq!(state.route_host("app.example"), Some(t1.clone()));
+
+        // A conflicting bind to a DIFFERENT token is refused; route untouched.
+        assert!(!state.register_host("app.example", t2.clone()), "takeover refused");
+        assert_eq!(state.route_host("app.example"), Some(t1.clone()), "original route intact");
+
+        // When the tunnel's last agent drops, the stale host route is cleared.
+        state.remove_registration(&t1, id);
+        assert_eq!(state.route_host("app.example"), None, "host route cleared on drop");
+
+        // ...so the hostname is now free for a different tunnel to claim.
+        assert!(state.register_host("app.example", t2.clone()));
+        assert_eq!(state.route_host("app.example"), Some(t2));
     }
 
     #[test]

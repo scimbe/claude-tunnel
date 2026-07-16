@@ -294,8 +294,13 @@ pub async fn serve_connection(
             let mut host = vec![0u8; hlen];
             recv.read_exact(&mut host).await?;
             let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
-            state.register_host(host, RoutingToken(token));
-            send.write_all(b"OK").await?;
+            // Takeover-safe (#23 BP4a): refuse if the hostname is already bound to
+            // a different tunnel, so a later bind can't silently steal the route.
+            if state.register_host(host, RoutingToken(token)) {
+                send.write_all(b"OK").await?;
+            } else {
+                send.write_all(b"NO").await?;
+            }
             send.finish()?;
             Ok(None)
         }
