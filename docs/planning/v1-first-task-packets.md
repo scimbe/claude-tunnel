@@ -1366,3 +1366,24 @@ Ciphertext (Cert am Origin). Gewählt: **Edge erweitern** (kein separates Gatewa
   Everything-on-443-Topologie dokumentieren. Reale Zone via Cloudflare (DNS-01-API; #30 bunsenbrenner.org).
 - **Kunden-Subdomain-Hälfte**: #23 BP4b (Hostname-Ownership-Autorisierung) + BP4c (Agent DNS-01) + BP5 (Browser-e2e) —
   hier nicht dupliziert.
+
+## #31 Universal :443 reachability — Tunnel Control+Data-Plane hinter einer :443-Front-Door (priority:high)
+
+Feld-Evidenz (HAW Hamburg 141.22.x): Egress erlaubt **nur :80/:443**; `:8090`/`:4433`/UDP timeout (host-unabhängig,
+gegen `portquiz.net` verifiziert). Konsolidiert #2/#3/#9 (Non-Standard-Ports blockiert). **Reuse** von #23 (SNI-Peek,
+ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir angelegte #32** (GW1–GW4 ↦ FD1–FD5);
+#32 als in-progress/„consolidated into #31" markiert, damit die Loop nicht doppelt baut. Demux ist **ALPN-primär**.
+
+- **FD1** ✅ ClientHello-**ALPN-Peek** (`sni::peek_alpn`, teilt den Extension-Walk mit `peek_sni`) + reiner
+  **Front-Door-Klassifizierer** `classify_front_door(alpn, sni, portal_host) -> {EdgeRelay | ControlPlane |
+  BrowserTunnel(host) | Reject}` (`ct-edge`-ALPN → Datenebene; Portal-SNI/Web-ALPN-ohne-SNI → Control-Plane; sonstige
+  SNI → Browser-Passthrough; sonst reject). Frozen-Tests `peek_alpn_parses_the_protocol_list_alongside_sni`,
+  `classify_front_door_routes_by_alpn_then_sni`. Gate grün (ct-edge 63).
+- **FD2** ⏳ `:443`-Front-Door-Listener (`CT_FRONT_DOOR`, default off): ClientHello buffern → `classify_front_door` →
+  dispatch: EdgeRelay → TLS-TCP-Relay (ADR-0004-Fallback), ControlPlane → Reverse-Proxy zu `:8090`,
+  BrowserTunnel → `serve_sni_passthrough`, Reject → close. Direkte `:8090`/`:4433` bleiben.
+- **FD3** ⏳ Client-Fallback-Leiter: `QUIC :4433 → TLS-TCP :4433 → QUIC/UDP :443 → TLS-TCP :443`, pro Netz gecacht.
+- **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
+  reuse #23/ADR-0003; reale Domain via #30.
+- **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
+  `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.
