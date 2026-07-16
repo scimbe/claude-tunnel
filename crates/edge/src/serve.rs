@@ -294,9 +294,18 @@ pub async fn serve_connection(
             let mut host = vec![0u8; hlen];
             recv.read_exact(&mut host).await?;
             let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
+            let token = RoutingToken(token);
+            // Hostname-ownership authorization (#23 BP4b): on a reachable :443,
+            // refuse a bind the control plane hasn't authorized for this token —
+            // an anonymous 'H' bind can't claim someone's name.
+            if !state.host_bind_allowed(host, &token) {
+                send.write_all(b"NO").await?;
+                send.finish()?;
+                return Ok(None);
+            }
             // Takeover-safe (#23 BP4a): refuse if the hostname is already bound to
             // a different tunnel, so a later bind can't silently steal the route.
-            if state.register_host(host, RoutingToken(token)) {
+            if state.register_host(host, token) {
                 send.write_all(b"OK").await?;
             } else {
                 send.write_all(b"NO").await?;
@@ -452,6 +461,12 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     {
         state.set_admin_token(tok);
         eprintln!("ct-edge: tunnel revocation enabled (CT_EDGE_ADMIN_TOKEN set)");
+        // #23 BP4b: require hostname-ownership authorization for 'H' binds. Enable
+        // this before exposing :443 — an anonymous bind then can't claim a name.
+        if std::env::var_os("CT_EDGE_REQUIRE_HOST_AUTH").is_some() {
+            state.require_host_auth();
+            eprintln!("ct-edge: hostname-ownership authorization required (CT_EDGE_REQUIRE_HOST_AUTH)");
+        }
         // #27 RB4: serve the authenticated admin API (POST /admin/revoke/:token)
         // the control plane calls on a customer revoke — only when an admin
         // listener is configured, and bind it to a private interface in prod.

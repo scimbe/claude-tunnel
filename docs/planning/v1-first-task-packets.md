@@ -1199,10 +1199,14 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   Bind gewinnt; Same-Token-Rebind bei Reconnect idempotent); der 'H'-Handler antwortet bei Konflikt mit `NO`.
   Stale-Bindings werden beim Agent-Drop (letzte Registrierung weg) und bei `revoke_token`/`remove` via
   `clear_hosts_for` aufgeräumt. Frozen-Test `host_binding_is_takeover_safe_and_cleared_on_agent_drop`. Gate grün (ct-edge 61).
-- **BP4b** ⏳ **Hostname-Ownership-Autorisierung** (Feld-Review-Punkt #1): Control-Plane autorisiert Hostname↔Token
-  (Quelle: `subject_tunnels.hostname` + `routing_token`); Edge akzeptiert 'H'-Binds nur mit gültigem Claim → ein
-  halb-konfigurierter Edge nimmt keine anonymen Binds an. **MUSS landen, bevor `:443` in einem erreichbaren Deployment
-  aktiviert wird.** (+ Hostname-Validierung: DNS-Charset, Trailing-Dot-Normalisierung — Review-Punkt #3.)
+- **BP4b** **Hostname-Ownership-Autorisierung** (Feld-Review-Punkt #1) — MUSS vor öffentlichem `:443` landen:
+  - **BP4b-a** ✅ Edge-Gate: `EdgeState` bekommt `host_auth` (None=nicht erforderlich/legacy; Some(map)=erforderlich)
+    + `require_host_auth`/`authorize_host`/`host_bind_allowed`; der 'H'-Handler weist einen nicht-autorisierten Bind mit
+    `NO` ab (vor der BP4a-Takeover-Prüfung). `run_edge` aktiviert via `CT_EDGE_REQUIRE_HOST_AUTH`. Frozen-Test
+    `host_bind_authorization_gates_binds_when_required`. Gate grün (ct-edge 64).
+  - **BP4b-b** ⏳ Authentifizierter Push-Kanal: `POST /admin/authorize-host` (Edge, reuse Admin-Token) + Control-Plane
+    autorisiert Hostname↔`routing_token` (Quelle `subject_tunnels.hostname`), wenn ein Kunde einen Hostnamen setzt.
+  - **BP4b-c** ⏳ Hostname-Validierung (DNS-Charset, Trailing-Dot-Normalisierung — Review-Punkt #3).
 - **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job. Reale Domain jetzt verfügbar (#30: bunsenbrenner.org).
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich

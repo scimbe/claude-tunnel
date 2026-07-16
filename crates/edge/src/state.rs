@@ -53,6 +53,11 @@ pub struct EdgeState<H> {
     /// Shared admin secret authenticating the control plane's `'R'` revoke op
     /// (#27 RB3). `None` = revocation disabled (no `CT_EDGE_ADMIN_TOKEN`).
     admin_token: Mutex<Option<[u8; 32]>>,
+    /// Hostname-ownership authorization (#23 BP4b). `None` = not required (legacy
+    /// binds allowed, subject to BP4a takeover-safety). `Some(map)` = required:
+    /// a hostname may only be bound by the token the control plane authorized for
+    /// it — so an anonymous `'H'` bind on a public `:443` can't claim a name.
+    host_auth: Mutex<Option<HashMap<String, RoutingToken>>>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -71,6 +76,7 @@ impl<H: Clone> EdgeState<H> {
             hosts: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashSet::new()),
             admin_token: Mutex::new(None),
+            host_auth: Mutex::new(None),
             registrations: Counter::default(),
             relays: Counter::default(),
             relay_bytes: Counter::default(),
@@ -100,6 +106,36 @@ impl<H: Clone> EdgeState<H> {
     /// or it is revoked, so no stale host->token route lingers (#23 BP4a).
     fn clear_hosts_for(&self, token: &RoutingToken) {
         self.hosts.lock_safe().retain(|_, v| v != token);
+    }
+
+    /// Require hostname-ownership authorization (#23 BP4b): once enabled, an
+    /// `'H'` bind is refused unless the control plane has authorized that
+    /// (hostname, token) pair. Enabled at startup for a reachable `:443`.
+    pub fn require_host_auth(&self) {
+        let mut ha = self.host_auth.lock_safe();
+        if ha.is_none() {
+            *ha = Some(HashMap::new());
+        }
+    }
+
+    /// Authorize `host` to be bound by `token` (#23 BP4b) — the control plane
+    /// pushes this when a customer sets a hostname on a tunnel they own. Also
+    /// enables authorization if it was not already required.
+    pub fn authorize_host(&self, host: &str, token: RoutingToken) {
+        self.host_auth
+            .lock_safe()
+            .get_or_insert_with(HashMap::new)
+            .insert(host.to_ascii_lowercase(), token);
+    }
+
+    /// Whether binding `host` to `token` is permitted (#23 BP4b): always true
+    /// when authorization is not required; otherwise only for the authorized
+    /// (hostname, token) pair.
+    pub fn host_bind_allowed(&self, host: &str, token: &RoutingToken) -> bool {
+        match self.host_auth.lock_safe().as_ref() {
+            None => true,
+            Some(map) => map.get(&host.to_ascii_lowercase()) == Some(token),
+        }
     }
 
     /// Resolve a public hostname (from the TLS SNI) to its routing token.
@@ -341,6 +377,23 @@ mod tests {
         state.register(token(1), 42u32);
         assert_eq!(state.route(&token(1)), Some(42));
         assert!(state.is_known(&token(1)));
+    }
+
+    #[test]
+    fn host_bind_authorization_gates_binds_when_required() {
+        // #23 BP4b: with authorization required, only the CP-authorized (host,
+        // token) pair may bind; unauthorized host or wrong token is refused.
+        let state = EdgeState::<u32>::new();
+        // Legacy (not required): any bind allowed.
+        assert!(state.host_bind_allowed("x.test", &token(1)));
+
+        state.require_host_auth();
+        assert!(!state.host_bind_allowed("x.test", &token(1)), "nothing allowed until authorized");
+
+        state.authorize_host("X.Test", token(1)); // case-insensitive
+        assert!(state.host_bind_allowed("x.test", &token(1)), "authorized pair allowed");
+        assert!(!state.host_bind_allowed("x.test", &token(2)), "wrong token refused");
+        assert!(!state.host_bind_allowed("y.test", &token(1)), "unauthorized host refused");
     }
 
     #[test]
