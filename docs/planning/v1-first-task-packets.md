@@ -1212,8 +1212,14 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   bzw. `AUTHORIZE_URL`; Client-Secret NICHT hier gehalten). Router in `persistent_control_plane_router`
   gemerged. Frozen-Tests `from_lookup_derives_authorize_url_from_issuer`, `portal_home_renders_the_sso_cta`,
   `login_redirects_to_the_authorize_endpoint`, `login_without_config_reports_unconfigured`. Gate grün.
-- **PP2** ⏳ `GET /portal/callback` (Code→Token-Tausch, `state`/CSRF via Cookie, HttpOnly/Secure Session-Cookie).
-- **PP3** ⏳ Logout + Session-Härtung; eingeloggter Kunden-Home.
+- **PP2** ✅ `GET /portal/callback` mit **CSRF-`state`-Bindung**: `login` setzt den `state` zusätzlich in ein
+  Single-Use-Cookie `ct_portal_state` (HttpOnly, Secure, SameSite=Lax, `/portal`, 10 min); der Callback lehnt
+  fehlende Params (400) und fehlendes/abweichendes `state`-Cookie (403) ab, räumt bei Erfolg das Single-Use-Cookie
+  ab. Frozen-Tests `login_binds_state_in_an_httponly_cookie_matching_the_redirect`,
+  `callback_rejects_missing_params_and_mismatched_state`, `callback_accepts_matching_state_and_clears_the_cookie`,
+  `callback_reports_unconfigured_without_oidc`. Gate grün (92 Tests, 0 Warnings).
+- **PP3** ⏳ Code→Token-Tausch am Token-Endpoint (Client-Secret aus Env, via `reqwest`, injizierbarer Exchanger für Hermetik),
+  signiertes HttpOnly/Secure Session-Cookie, Logout + eingeloggter Kunden-Home.
 ### #26 Konto-Selbstverwaltung (Guthaben, Profil, Credits)
 - **PP1** ✅ Daten-Fläche der Selbstbedienung: `GET /me/account` liefert jetzt `{account, balance, subject}`
   (statt nur `{account}`) — Account-ID, Credit-Guthaben (`ledger.balance`) und verifiziertes Subject.
