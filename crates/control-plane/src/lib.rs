@@ -8,6 +8,7 @@ pub mod client;
 pub mod credential;
 pub mod enrollment;
 pub mod http;
+pub mod installer;
 pub mod issuance;
 pub mod oidc;
 pub mod payment;

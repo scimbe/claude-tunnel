@@ -1231,5 +1231,14 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   `subject_tunnel_store_is_self_scoped_for_create_list_revoke`. Gate grün (85 Tests, 0 Warnings).
 - **PP2** ⏳ Authed HTTP: `POST /portal/tunnels` (Anlage → einmalige Token/Capability-Anzeige), `GET /portal/tunnels` (Liste), `DELETE /portal/tunnels/:id` (Widerruf) — Subject aus Session/Token.
 - **PP3** ⏳ Live-Status je Tunnel via Edge `/metrics` (`ct_edge_active_tunnels`, #17) + Widerruf nutzt Token-Rotation (#12).
-### #28 Per-OS One-Liner-Installer · #29 Zugriffsrechte/Sharing
-- folgen nach #27 (PP-Kette), jeweils dekomponiert; #28 mit striktem Secret-Handling (frisch geprägte einmalige Join-Token, nie geloggt/geteilt).
+### #28 Per-OS One-Liner-Installer
+- **PP1** ✅ Reiner Renderer `installer::install_one_liner(portal_base, join_token, os)` + `InstallOs{Unix,Windows}`/`parse`.
+  Unix: `curl -fsSL <base>/install.sh | CT_JOIN_TOKEN=<tok> sh`; Windows: `$env:CT_JOIN_TOKEN='<tok>'; irm <base>/install.ps1 | iex`.
+  **Secret-sicher**: Token wird per **Env-Variable** übergeben (nie als argv-Positionsargument), und der Renderer prägt/loggt/speichert
+  KEIN Token — er bettet nur ein übergebenes ein. Frozen-Tests `parse_maps_os_aliases`,
+  `one_liners_embed_the_token_via_env_per_os` (Dummy-Token). Gate grün (87 Tests, 0 Warnings).
+- **PP2** ⏳ Authed `GET /portal/tunnels/:id/install?os=…`: prägt pro Anforderung ein **frisches, einmaliges, kurzlebiges** Join-Token
+  (server-seitig, nie geloggt) und rendert den Einzeiler; Subject aus Session, nur für eigene Tunnel (#27).
+- **PP3** ⏳ Ausgelieferte `install.sh`/`install.ps1` (ct-agent holen, `onboard` mit `CT_JOIN_TOKEN`, CA-Root via `/pki/ca` #11, Serve-Loop).
+### #29 Zugriffsrechte/Sharing
+- folgt nach #28 (PP-Kette), dekomponiert; Grants strikt selbstbezüglich, keine Secrets in Issues/Logs.
