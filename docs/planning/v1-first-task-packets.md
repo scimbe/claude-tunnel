@@ -1346,3 +1346,23 @@ Env bleibt der Revoke „nur DB-Zeile weg" (Legacy-Verhalten) — mit ihnen fäl
   Grants mit (keine Waisen). Frozen-Test `tunnel_grants_are_owner_managed_and_gate_authorization`. Gate grün (88 Tests, 0 Warnings).
 - **PP2** ⏳ Authed HTTP: `POST`/`DELETE`/`GET /portal/tunnels/:id/grants` — nur der Besitzer verwaltet; Subject aus Session.
 - **PP3** ⏳ Capability-Ausgabe respektiert `is_authorized` (nur berechtigte, eingeloggte Subjects erhalten den Zugang eines geteilten Tunnels).
+
+## Unified :443 Gateway — Portal-Auth + Tunnel-Subdomains + ACME auf einem Port (ADR-0019)
+
+Motivation: restriktive Client-Netze lassen nur **ausgehend TCP 443** zu (empirisch bestätigt: `:8090`/`:4433`/`:80`
+blockiert). Deshalb müssen Landing-Page/Portal (SSO-Auth, #25–#29), Kunden-Tunnel-Subdomains (#23) **und** die
+TLS-Zertifizierung alle über **:443** laufen. Entscheidung (ADR-0019): das Edge-`:443` wird ein **SNI-multiplexter
+Gateway** — *terminate+reverse-proxy* für den Portal-Host vs *passthrough* für Kunden-Subdomains vs *reject*.
+Blindheit bleibt: der Gateway terminiert nur die **operator-eigene** Portalfläche; Kunden-Tunnel-Bytes bleiben
+Ciphertext (Cert am Origin). Gewählt: **Edge erweitern** (kein separates Gateway-Deployment).
+
+- **GW1** ⏳ SNI-Demux auf Edge-`:443`: klassifiziere gepeektes SNI als *Portal* (konfigurierter Host) vs *Tunnel*
+  (autorisierte Host-Registry) vs *reject*; route zu Terminate vs Passthrough. Frozen-Test auf dem Klassifizierer.
+- **GW2** ⏳ Terminate + Reverse-Proxy: TLS für den Portal-Host terminieren und HTTP an die Control-Plane (`:8090`)
+  proxien; beide Richtungen streamen.
+- **GW3** ⏳ Edge-seitiges ACME (**TLS-ALPN-01**) für den Portal-Host auf `:443` (On-Disk-Cert-Cache + Renewal;
+  Staging-CA in CI, Prod in gated Job).
+- **GW4** ⏳ DNS + Deployment: `A <zone>`/`A *.<zone>` → Plane, `CT_GATEWAY_PORTAL_HOST` + Proxy-Ziel + ACME-Config,
+  Everything-on-443-Topologie dokumentieren. Reale Zone via Cloudflare (DNS-01-API; #30 bunsenbrenner.org).
+- **Kunden-Subdomain-Hälfte**: #23 BP4b (Hostname-Ownership-Autorisierung) + BP4c (Agent DNS-01) + BP5 (Browser-e2e) —
+  hier nicht dupliziert.
