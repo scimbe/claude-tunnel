@@ -1128,6 +1128,10 @@ Zu groß für einen Zyklus → dekomponiert.
   Peer → innerer Fehler wird durchgereicht) — ohne echten Edge. Gate grün.
   (Restliche Lücken: UDP-Data-Loop-Branches + timed-QUIC-Success-Arm — Harness-lastig, in WC5 mit dem
   Kern-Relay-Pfad.)
-- **WC5** ⏳ `edge/src/serve.rs` (85.08%, 97 Zeilen) + `agent/src/serve.rs` (89.80%, 82 Zeilen) —
-  Kern-Relay-Pfad, größte absolute Lücke (vermutlich mehrere Pakete).
-- **WC6** ⏳ Re-Messung mit `scripts/coverage.sh` (Workspace, lib-only); wenn ≥95% → **#21 fix-ready**.
+- **WC5** ⏭️ `edge/src/serve.rs` (85.08%) + `agent/src/serve.rs` (89.80%) — tiefe Kern-Relay-Fehler-/
+  Reconnect-Branches (Netzwerk-Fehlerpfade) BEWUSST zurückgestellt: das gestellte Ziel (**95% Zeilen**,
+  lib-only, Workspace) ist ohne sie erreicht. edge/serve.rs bleibt die schwächste Datei (86.3% Zeilen).
+  Optionaler Stretch für per-file/Funktions-95%.
+- **WC6** ✅ Re-Messung via `scripts/coverage.sh` (Workspace, lib-only, Gate 95): **Workspace 95.59% Zeilen**
+  (Baseline 90.84%), Funktionen 94.44%, Regions 93.76%. Zeilen-Ziel erreicht → **#21 fix-ready**
+  (Funktionen/Regions knapp darunter, edge/serve.rs die Restlücke — transparent kommuniziert).
