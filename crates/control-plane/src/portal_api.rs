@@ -20,6 +20,13 @@ use crate::portal::{escape, session_subject_for};
 use crate::storage::{GrantError, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
 
+/// Where to reach the edge's admin revoke API (#27 RB4), if configured.
+#[derive(Clone)]
+struct EdgeAdmin {
+    url: Arc<str>,
+    token: Arc<str>,
+}
+
 /// Shared state for the authed portal API.
 #[derive(Clone)]
 struct ApiState {
@@ -29,15 +36,19 @@ struct ApiState {
     enrollment: Arc<SqliteEnrollment>,
     /// Public portal origin (e.g. `https://portal.example`) baked into installers.
     portal_base: Arc<str>,
+    /// Edge admin revoke endpoint (#27 RB4b); `None` disables edge propagation.
+    edge_admin: Option<EdgeAdmin>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
+/// `edge_admin` is `(base_url, admin_token)` for the edge revoke API (#27 RB4b).
 pub fn portal_api_router(
     session_key: &[u8],
     ledger: Arc<SqliteLedger>,
     tunnels: Arc<SqliteTunnelStore>,
     enrollment: Arc<SqliteEnrollment>,
     portal_base: &str,
+    edge_admin: Option<(String, String)>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -45,6 +56,10 @@ pub fn portal_api_router(
         tunnels,
         enrollment,
         portal_base: Arc::from(portal_base),
+        edge_admin: edge_admin.map(|(url, token)| EdgeAdmin {
+            url: Arc::from(url),
+            token: Arc::from(token),
+        }),
     };
     Router::new()
         .route("/portal/account", get(account_page))
@@ -164,7 +179,10 @@ async fn create_tunnel(
 }
 
 /// `POST /portal/tunnels/{id}/delete` (#27): revoke one of the caller's tunnels.
-/// Self-scoped: `revoke` only removes a row owned by this subject.
+/// Self-scoped: `revoke` only removes a row owned by this subject. When the edge
+/// admin API is configured, the revoke is propagated so the live tunnel is torn
+/// down and blocked from re-registering (#27 RB4b) — without this, "revoke" only
+/// hid the tunnel while the agent kept serving.
 async fn delete_tunnel(
     State(st): State<ApiState>,
     headers: HeaderMap,
@@ -173,7 +191,24 @@ async fn delete_tunnel(
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    let _ = st.tunnels.revoke(&subject, &id);
+    // `revoke` returns the removed tunnel's routing token (owner-scoped).
+    if let Ok(Some(routing_token)) = st.tunnels.revoke(&subject, &id) {
+        if let Some(edge) = &st.edge_admin {
+            let endpoint = format!("{}/admin/revoke/{}", edge.url.trim_end_matches('/'), routing_token);
+            // Best-effort: the DB row is already gone; log if the edge call fails
+            // so an operator can see a tunnel that may still be serving.
+            match reqwest::Client::new()
+                .post(&endpoint)
+                .header("x-ct-admin-token", edge.token.as_ref())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => eprintln!("ct-cp: edge revoke for tunnel {id} returned {}", r.status()),
+                Err(e) => eprintln!("ct-cp: edge revoke for tunnel {id} failed: {e}"),
+            }
+        }
+    }
     Redirect::to("/portal/tunnels").into_response()
 }
 
@@ -439,7 +474,7 @@ mod tests {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
-        portal_api_router(KEY, ledger, tunnels, enrollment, "https://portal.example")
+        portal_api_router(KEY, ledger, tunnels, enrollment, "https://portal.example", None)
     }
 
     #[tokio::test]
@@ -579,6 +614,59 @@ mod tests {
             1,
             "self-scoped: bob cannot revoke alice's tunnel"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_tunnel_propagates_the_revoke_to_the_edge() {
+        // #27 RB4b: revoking a tunnel POSTs the edge admin revoke endpoint with
+        // the tunnel's routing token + admin auth, so the live tunnel is torn down.
+        use axum::extract::{Path as AxPath, State as AxState};
+        use axum::http::HeaderMap as AxHeaderMap;
+        use std::sync::Mutex;
+
+        let received: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let mock = Router::new()
+            .route(
+                "/admin/revoke/:token",
+                post(
+                    |AxState(rec): AxState<Arc<Mutex<Option<(String, String)>>>>,
+                     headers: AxHeaderMap,
+                     AxPath(token): AxPath<String>| async move {
+                        let auth = headers
+                            .get("x-ct-admin-token")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        *rec.lock().unwrap() = Some((token, auth));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let created = tunnels.create("alice", "web", None).unwrap();
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            "https://portal.example",
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+        );
+
+        let status = post_form(&app, &format!("/portal/tunnels/{}/delete", created.id), "alice", "").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+
+        let got = received.lock().unwrap().clone().expect("edge revoke was called");
+        assert_eq!(got.0, created.routing_token, "revoked the tunnel's routing token");
+        assert_eq!(got.1, "edge-secret", "carried the admin auth header");
+        assert!(tunnels.list_for_subject("alice").unwrap().is_empty(), "tunnel removed");
     }
 
     #[tokio::test]

@@ -732,6 +732,15 @@ pub fn persistent_control_plane_router(
             tunnels.clone(),
             enrollment.clone(),
             &std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
+            // #27 RB4b: propagate tunnel revokes to the edge when both the admin
+            // URL and shared secret are configured.
+            match (
+                std::env::var("CT_CP_EDGE_ADMIN_URL").ok().filter(|s| !s.is_empty()),
+                std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()),
+            ) {
+                (Some(url), Some(token)) => Some((url, token)),
+                _ => None,
+            },
         ))
         .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
