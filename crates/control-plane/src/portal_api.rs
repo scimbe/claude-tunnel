@@ -172,8 +172,30 @@ async fn create_tunnel(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if let Err(e) = st.tunnels.create(&subject, name, hostname) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    let tunnel = match st.tunnels.create(&subject, name, hostname) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // #23 BP4b-c: if the tunnel declares a Browser-Plane hostname, authorize it at
+    // the edge (host -> routing token) so the agent's 'H' bind is accepted under
+    // CT_EDGE_REQUIRE_HOST_AUTH. Best-effort; logged on failure.
+    if let (Some(host), Some(edge)) = (tunnel.hostname.as_deref(), &st.edge_admin) {
+        let endpoint = format!(
+            "{}/admin/authorize-host/{}/{}",
+            edge.url.trim_end_matches('/'),
+            tunnel.routing_token,
+            host
+        );
+        match reqwest::Client::new()
+            .post(&endpoint)
+            .header("x-ct-admin-token", edge.token.as_ref())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
+            Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
+        }
     }
     Redirect::to("/portal/tunnels").into_response()
 }
@@ -675,6 +697,62 @@ mod tests {
         assert_eq!(got.0, created.routing_token, "revoked the tunnel's routing token");
         assert_eq!(got.1, "edge-secret", "carried the admin auth header");
         assert!(tunnels.list_for_subject("alice").unwrap().is_empty(), "tunnel removed");
+    }
+
+    #[tokio::test]
+    async fn create_tunnel_with_a_hostname_authorizes_it_at_the_edge() {
+        // #23 BP4b-c: a tunnel that declares a hostname authorizes (host -> token)
+        // at the edge so the agent's 'H' bind is accepted under required auth.
+        use axum::extract::{Path as AxPath, State as AxState};
+        use axum::http::HeaderMap as AxHeaderMap;
+        use std::sync::Mutex;
+
+        let received: Arc<Mutex<Option<(String, String, String)>>> = Arc::new(Mutex::new(None));
+        let mock = Router::new()
+            .route(
+                "/admin/authorize-host/:token/:host",
+                post(
+                    |AxState(rec): AxState<Arc<Mutex<Option<(String, String, String)>>>>,
+                     headers: AxHeaderMap,
+                     AxPath((token, host)): AxPath<(String, String)>| async move {
+                        let auth = headers
+                            .get("x-ct-admin-token")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        *rec.lock().unwrap() = Some((token, host, auth));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            "https://portal.example",
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+        );
+
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=help.example").await,
+            StatusCode::SEE_OTHER
+        );
+
+        // The edge received authorize-host with this tunnel's routing token + auth.
+        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
+        let (token, host, auth) = received.lock().unwrap().clone().expect("edge authorize called");
+        assert_eq!(token, tunnel.routing_token, "authorizes the tunnel's routing token");
+        assert_eq!(host, "help.example");
+        assert_eq!(auth, "edge-secret");
     }
 
     #[tokio::test]

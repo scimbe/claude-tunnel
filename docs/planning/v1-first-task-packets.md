@@ -1207,9 +1207,11 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   - **BP4b-b** ✅ Edge-Endpoint `POST /admin/authorize-host/:token/:host` (`crate::admin`, reuse Admin-Token-Auth via
     `admin_authed`) → `state.authorize_host`. Frozen-Test `authorize_host_endpoint_authenticates_then_authorizes`
     (401 ohne Auth, 200 + bind-allowed mit Secret, nur der autorisierte Host). Gate grün (ct-edge 65).
-  - **BP4b-c** ⏳ Control-Plane-Push: beim Setzen/Anlegen eines Tunnel-Hostnamens (`subject_tunnels.hostname`) den
-    Edge-Endpoint mit `routing_token` aufrufen (analog zum Revoke-Push RB4b).
-  - **BP4b-d** ⏳ Hostname-Validierung (DNS-Charset, Trailing-Dot-Normalisierung — Review-Punkt #3).
+  - **BP4b-c** ✅ Control-Plane-Push: `create_tunnel` mit Hostname ruft nach dem Anlegen den Edge-Endpoint
+    `POST /admin/authorize-host/{routing_token}/{host}` (best-effort, `edge_admin`-Config aus RB4b wiederverwendet).
+    Frozen-Test `create_tunnel_with_a_hostname_authorizes_it_at_the_edge` (Mock-Edge empfängt Routing-Token + Host + Auth).
+    ct-control-plane 113. **Autorisierungskette end-to-end**: Portal-Create(Hostname) → Edge-authorize → 'H'-Bind erlaubt.
+  - **BP4b-d** ⏳ Hostname-Validierung (DNS-Charset, Trailing-Dot-Normalisierung — Review-Punkt #3). Danach #23-BP4b **fertig**.
 - **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job. Reale Domain jetzt verfügbar (#30: bunsenbrenner.org).
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
