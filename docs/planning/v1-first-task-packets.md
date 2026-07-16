@@ -1198,3 +1198,21 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job.
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
   vertrautem Cert durch den Tunnel). Erst wenn BP1–BP5 erfüllt → **#23 fix-ready**.
+
+## #25–#29 — Kunden-Selfservice-Portal (Epic)
+
+Kundenportal: SSO-Login, Konto-Selbstverwaltung, Tunnel anlegen/verwalten, Zugriffsrechte, Per-OS-One-Liner.
+Server-gerendertes self-contained HTML in der Control-Plane (wie #4), OIDC/Keycloak. **Keine Secrets in Issues/Logs**;
+Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-no-secrets` vor jedem Push.
+
+### #25 Portal + SSO-Login (OIDC Authorization Code)
+- **PP1** ✅ Portal-Shell (`GET /portal`, self-contained „Sign in with SSO"-CTA) + `GET /portal/login`
+  (302-Redirect zum IdP-Authorize-Endpoint: `response_type=code`, `client_id`, `redirect_uri`,
+  `scope=openid`, zufälliger `state`). `PortalOidc::from_env` (`CT_OIDC_CLIENT_ID/REDIRECT_URI/ISSUER`
+  bzw. `AUTHORIZE_URL`; Client-Secret NICHT hier gehalten). Router in `persistent_control_plane_router`
+  gemerged. Frozen-Tests `from_lookup_derives_authorize_url_from_issuer`, `portal_home_renders_the_sso_cta`,
+  `login_redirects_to_the_authorize_endpoint`, `login_without_config_reports_unconfigured`. Gate grün.
+- **PP2** ⏳ `GET /portal/callback` (Code→Token-Tausch, `state`/CSRF via Cookie, HttpOnly/Secure Session-Cookie).
+- **PP3** ⏳ Logout + Session-Härtung; eingeloggter Kunden-Home.
+### #26 Konto-Selbstverwaltung · #27 Tunnel-Verwaltung · #28 Per-OS One-Liner-Installer · #29 Zugriffsrechte/Sharing
+- folgen nach #25 (PP-Kette), jeweils dekomponiert; #28 mit striktem Secret-Handling (frisch geprägte einmalige Join-Token, nie geloggt/geteilt).

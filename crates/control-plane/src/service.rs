@@ -704,6 +704,7 @@ pub fn persistent_control_plane_router(
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
+        .merge(crate::portal::portal_router(crate::portal::PortalOidc::from_env()))
         .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
