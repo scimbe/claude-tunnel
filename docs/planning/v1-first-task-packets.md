@@ -1214,5 +1214,13 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   `login_redirects_to_the_authorize_endpoint`, `login_without_config_reports_unconfigured`. Gate grün.
 - **PP2** ⏳ `GET /portal/callback` (Code→Token-Tausch, `state`/CSRF via Cookie, HttpOnly/Secure Session-Cookie).
 - **PP3** ⏳ Logout + Session-Härtung; eingeloggter Kunden-Home.
-### #26 Konto-Selbstverwaltung · #27 Tunnel-Verwaltung · #28 Per-OS One-Liner-Installer · #29 Zugriffsrechte/Sharing
-- folgen nach #25 (PP-Kette), jeweils dekomponiert; #28 mit striktem Secret-Handling (frisch geprägte einmalige Join-Token, nie geloggt/geteilt).
+### #26 Konto-Selbstverwaltung (Guthaben, Profil, Credits)
+- **PP1** ✅ Daten-Fläche der Selbstbedienung: `GET /me/account` liefert jetzt `{account, balance, subject}`
+  (statt nur `{account}`) — Account-ID, Credit-Guthaben (`ledger.balance`) und verifiziertes Subject.
+  Strikt selbstbezüglich (Subject aus dem verifizierten Token, nie aus dem Body). Bearer-testbar, unabhängig
+  von der #25-Session. Frozen-Test `me_account_exposes_balance_and_subject_for_the_authenticated_customer`.
+  Gate grün (84 Tests, 0 Warnings).
+- **PP2** ⏳ Portal-Konto-Seite (server-gerendertes HTML) rendert die Session-Account-Daten (braucht #25 PP2-Session).
+- **PP3** ⏳ „Credits kaufen": UI-Anbindung an `/payment/intent` + `/me/issue` (Guthaben-Anzeige aktualisiert nach Webhook-Top-up).
+### #27 Tunnel-Verwaltung · #28 Per-OS One-Liner-Installer · #29 Zugriffsrechte/Sharing
+- folgen nach #25/#26 (PP-Kette), jeweils dekomponiert; #28 mit striktem Secret-Handling (frisch geprägte einmalige Join-Token, nie geloggt/geteilt).

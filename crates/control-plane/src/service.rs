@@ -367,7 +367,7 @@ pub struct AuthedState {
 /// in the request, so only an authenticated (Keycloak) user can act, and always
 /// on their own account.
 ///
-/// * `GET /me/account` → `{account}` for the authenticated subject
+/// * `GET /me/account` → `{account, balance, subject}` for the authenticated subject
 /// * `POST /me/issue` `{price}` → `{token}` (402 on insufficient credit, 429 over
 ///   the per-subject rate limit of `max_issues_per_window` per fixed window)
 pub fn authed_billing_router(
@@ -398,17 +398,34 @@ fn authed_subject(state: &AuthedState, headers: &HeaderMap) -> Result<String, (S
         .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
 }
 
+/// The authenticated customer's own account view (#26): account id, current
+/// credit balance (Guthaben) and the verified subject. Strictly self-scoped —
+/// the subject comes from the verified token, never from the request body — so a
+/// caller can only ever see their own account. Serves the portal account page.
+#[derive(Serialize, Deserialize)]
+struct MeAccountResp {
+    account: String,
+    balance: u64,
+    subject: String,
+}
+
 async fn me_account(
     State(state): State<AuthedState>,
     headers: HeaderMap,
-) -> Result<Json<AccountResp>, (StatusCode, String)> {
+) -> Result<Json<MeAccountResp>, (StatusCode, String)> {
     let sub = authed_subject(&state, &headers)?;
     let account = state
         .ledger
         .account_for_subject(&sub)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(AccountResp {
+    let balance = state
+        .ledger
+        .balance(&account)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(MeAccountResp {
         account: hex_encode(&account.0),
+        balance,
+        subject: sub,
     }))
 }
 
@@ -1193,6 +1210,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "authenticated subject gets an account");
+    }
+
+    #[tokio::test]
+    async fn me_account_exposes_balance_and_subject_for_the_authenticated_customer() {
+        // #26 PP1: the self-service account view carries the credit balance
+        // (Guthaben) and the verified subject, self-scoped to the caller.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = persistent_control_plane_router(":memory:", b"whsec", Some(oidc)).unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({ "sub": "kc-user-42", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        let resp = app
+            .oneshot(
+                Request::get("/me/account")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["subject"], "kc-user-42", "echoes the verified subject");
+        assert_eq!(v["balance"], 0, "a fresh account starts with zero credit");
+        assert!(
+            v["account"].as_str().is_some_and(|a| !a.is_empty()),
+            "carries the account id"
+        );
     }
 
     #[tokio::test]
