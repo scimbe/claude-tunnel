@@ -50,6 +50,7 @@ impl Dns01Provider {
 /// `.env` the operator supplies): `DESEC_TOKEN` (API token), `DESEC_DOMAIN` (the
 /// zone managed at deSEC), optional `DESEC_API_BASE` (default
 /// `https://desec.io/api/v1`). The token is held in memory and never logged.
+#[derive(Clone)]
 pub struct DesecClient {
     token: String,
     domain: String,

@@ -19,6 +19,15 @@ use crate::installer::{install_one_liner, InstallOs};
 use crate::portal::{escape, session_subject_for};
 use crate::storage::{GrantError, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
+use ct_dns::provider::DesecClient;
+
+/// Automatic DNS-record management for tunnel hostnames (#38 DL2): create the A
+/// record on hostname-set, delete it on revoke, pointing at the edge's public IP.
+#[derive(Clone)]
+struct DnsAutopilot {
+    client: DesecClient,
+    edge_ip: Arc<str>,
+}
 
 /// Where to reach the edge's admin revoke API (#27 RB4), if configured.
 #[derive(Clone)]
@@ -38,6 +47,8 @@ struct ApiState {
     portal_base: Arc<str>,
     /// Edge admin revoke endpoint (#27 RB4b); `None` disables edge propagation.
     edge_admin: Option<EdgeAdmin>,
+    /// Automatic DNS for tunnel hostnames (#38 DL2); `None` disables it.
+    dns: Option<DnsAutopilot>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -49,6 +60,7 @@ pub fn portal_api_router(
     enrollment: Arc<SqliteEnrollment>,
     portal_base: &str,
     edge_admin: Option<(String, String)>,
+    dns: Option<(DesecClient, String)>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -59,6 +71,10 @@ pub fn portal_api_router(
         edge_admin: edge_admin.map(|(url, token)| EdgeAdmin {
             url: Arc::from(url),
             token: Arc::from(token),
+        }),
+        dns: dns.map(|(client, edge_ip)| DnsAutopilot {
+            client,
+            edge_ip: Arc::from(edge_ip),
         }),
     };
     Router::new()
@@ -180,25 +196,33 @@ async fn create_tunnel(
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // #23 BP4b-c: if the tunnel declares a Browser-Plane hostname, authorize it at
-    // the edge (host -> routing token) so the agent's 'H' bind is accepted under
-    // CT_EDGE_REQUIRE_HOST_AUTH. Best-effort; logged on failure.
-    if let (Some(host), Some(edge)) = (tunnel.hostname.as_deref(), &st.edge_admin) {
-        let endpoint = format!(
-            "{}/admin/authorize-host/{}/{}",
-            edge.url.trim_end_matches('/'),
-            tunnel.routing_token,
-            host
-        );
-        match reqwest::Client::new()
-            .post(&endpoint)
-            .header("x-ct-admin-token", edge.token.as_ref())
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
-            Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
+    if let Some(host) = tunnel.hostname.as_deref() {
+        // #23 BP4b-c: authorize the hostname at the edge (host -> routing token)
+        // so the agent's 'H' bind is accepted under CT_EDGE_REQUIRE_HOST_AUTH.
+        if let Some(edge) = &st.edge_admin {
+            let endpoint = format!(
+                "{}/admin/authorize-host/{}/{}",
+                edge.url.trim_end_matches('/'),
+                tunnel.routing_token,
+                host
+            );
+            match reqwest::Client::new()
+                .post(&endpoint)
+                .header("x-ct-admin-token", edge.token.as_ref())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
+                Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
+            }
+        }
+        // #38 DL2: auto-create the A record (host -> edge IP) so the hostname is
+        // publicly resolvable without a manual DNS step. Both best-effort; logged.
+        if let Some(dns) = &st.dns {
+            if let Err(e) = dns.client.set_a(host, &dns.edge_ip).await {
+                eprintln!("ct-cp: DNS A-record create for {host} failed: {e}");
+            }
         }
     }
     Redirect::to("/portal/tunnels").into_response()
@@ -217,8 +241,16 @@ async fn delete_tunnel(
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
+    // #38 DL2: grab the hostname before revoke so we can clear its DNS afterward.
+    let hostname = st.tunnels.tunnel_hostname(&subject, &id).ok().flatten();
     // `revoke` returns the removed tunnel's routing token (owner-scoped).
     if let Ok(Some(routing_token)) = st.tunnels.revoke(&subject, &id) {
+        // Auto-delete the A record so a revoked tunnel leaves no orphaned DNS.
+        if let (Some(dns), Some(host)) = (&st.dns, hostname.as_deref()) {
+            if let Err(e) = dns.client.clear_a(host).await {
+                eprintln!("ct-cp: DNS A-record delete for {host} failed: {e}");
+            }
+        }
         if let Some(edge) = &st.edge_admin {
             let endpoint = format!("{}/admin/revoke/{}", edge.url.trim_end_matches('/'), routing_token);
             // Best-effort: the DB row is already gone; log if the edge call fails
@@ -508,7 +540,7 @@ mod tests {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
-        portal_api_router(KEY, ledger, tunnels, enrollment, "https://portal.example", None)
+        portal_api_router(KEY, ledger, tunnels, enrollment, "https://portal.example", None, None)
     }
 
     #[tokio::test]
@@ -692,6 +724,7 @@ mod tests {
             enrollment,
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
+            None,
         );
 
         let status = post_form(&app, &format!("/portal/tunnels/{}/delete", created.id), "alice", "").await;
@@ -744,6 +777,7 @@ mod tests {
             enrollment,
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
+            None,
         );
 
         assert_eq!(
@@ -757,6 +791,71 @@ mod tests {
         assert_eq!(token, tunnel.routing_token, "authorizes the tunnel's routing token");
         assert_eq!(host, "help.example");
         assert_eq!(auth, "edge-secret");
+    }
+
+    #[tokio::test]
+    async fn tunnel_hostname_creates_and_deletes_its_dns_a_record() {
+        // #38 DL2: set a hostname -> A record created at the edge IP; revoke ->
+        // A record cleared, so no orphaned DNS.
+        use axum::extract::State as AxState;
+        use axum::routing::patch;
+        use std::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mock = Router::new()
+            .route(
+                "/domains/:domain/rrsets/",
+                patch(|AxState(b): AxState<Arc<Mutex<Vec<String>>>>, body: String| async move {
+                    b.lock().unwrap().push(body);
+                    StatusCode::OK
+                }),
+            )
+            .with_state(bodies.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let desec = ct_dns::provider::DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            "https://portal.example",
+            None,
+            Some((desec, "45.133.9.145".to_string())),
+        );
+
+        // Create with a hostname -> A record for "help" pointing at the edge IP.
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=help.bunsenbrenner.org").await,
+            StatusCode::SEE_OTHER
+        );
+        let id = tunnels.list_for_subject("alice").unwrap()[0].id.clone();
+        assert!(
+            bodies.lock().unwrap().iter().any(|x| x.contains("\"subname\":\"help\"")
+                && x.contains("\"type\":\"A\"")
+                && x.contains("45.133.9.145")),
+            "A record created on hostname-set"
+        );
+
+        // Revoke -> A record cleared (empty records list).
+        post_form(&app, &format!("/portal/tunnels/{id}/delete"), "alice", "").await;
+        assert!(
+            bodies.lock().unwrap().iter().any(|x| x.contains("\"subname\":\"help\"")
+                && x.contains("\"records\":[]")),
+            "A record cleared on revoke"
+        );
     }
 
     #[tokio::test]

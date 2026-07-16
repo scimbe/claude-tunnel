@@ -673,6 +673,20 @@ impl SqliteTunnelStore {
         Ok(Self::owner_of(&self.conn.lock_safe(), tunnel_id)?.as_deref() == Some(subject))
     }
 
+    /// The Browser-Plane hostname of a tunnel the caller owns, if any (#38 DL2):
+    /// used to clear the tunnel's DNS record on revoke. Owner-scoped.
+    pub fn tunnel_hostname(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
     /// The routing token of a tunnel the caller owns, or `None` if the id is
     /// unknown or owned by someone else (#27 RB2). Owner-scoped so a non-owner
     /// cannot read another customer's routing token.

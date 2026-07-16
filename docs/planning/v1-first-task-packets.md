@@ -1436,6 +1436,10 @@ Anlegen) + RB4b (best-effort HTTP-Push-Muster). Reuse der deSEC-Provider-Abstrak
 - **DL1** ✅ `DesecClient` um **A-Record-CRUD** erweitert: `set_a(host, ip)`/`clear_a(host)` (generalisiertes
   `patch_rrset` mit `rtype`), + `guard_under_zone` (ein Host muss unter `DESEC_DOMAIN` liegen, sonst Fehler). Frozen-Test
   `desec_set_and_clear_a_records_and_guard_the_zone` (Mock-deSEC: A-RRset mit IP, empty-records-Clear, Zone-Guard). Gate grün (ct-dns 15).
-- **DL2** ⏳ Control-Plane-Verdrahtung: `create_tunnel` mit Hostname → `set_a(host, CT_CP_DNS_EDGE_IP)`; `delete_tunnel`
-  → `clear_a(host)` (best-effort, logged, analog zum Revoke-/Authorize-Push). Config `DESEC_TOKEN`/`DESEC_DOMAIN` + `CT_CP_DNS_EDGE_IP`.
+- **DL2** ✅ Control-Plane-Verdrahtung (`portal_api`): `create_tunnel` mit Hostname → `set_a(host, CT_CP_DNS_EDGE_IP)`;
+  `delete_tunnel` → `clear_a(host)` (Hostname vor `revoke` gefetcht via `SqliteTunnelStore::tunnel_hostname`); beide
+  best-effort + logged, DNS unabhängig vom Edge-Push. `DnsAutopilot` in `ApiState` (aus `DESEC_TOKEN`/`DESEC_DOMAIN` +
+  `CT_CP_DNS_EDGE_IP`); `DesecClient` jetzt `Clone`. Frozen-Test `tunnel_hostname_creates_and_deletes_its_dns_a_record`
+  (Mock-deSEC: A-Record bei Create, empty-records-Clear bei Revoke). Voller Workspace-Gate grün (control-plane 115).
+  **Hostname-DNS jetzt vollautomatisch** — kein manueller deSEC-A-Record-Schritt mehr.
 - **DL3** ⏳ Design-Frage (nicht blockierend): Provider-Trait für Nicht-deSEC-Selfhoster (aktuell deSEC-only genügt).

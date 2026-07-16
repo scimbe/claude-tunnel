@@ -741,6 +741,15 @@ pub fn persistent_control_plane_router(
                 (Some(url), Some(token)) => Some((url, token)),
                 _ => None,
             },
+            // #38 DL2: automatic tunnel-hostname DNS via deSEC, pointing A records
+            // at the edge's public IP. Enabled when the deSEC config + edge IP are set.
+            match (
+                ct_dns::provider::DesecClient::from_env(),
+                std::env::var("CT_CP_DNS_EDGE_IP").ok().filter(|s| !s.is_empty()),
+            ) {
+                (Some(client), Some(ip)) => Some((client, ip)),
+                _ => None,
+            },
         ))
         .merge(pki);
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
