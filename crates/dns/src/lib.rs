@@ -10,6 +10,7 @@
 //! the UDP `:53` server and the HTTP API are later sub-packets.
 
 pub mod api;
+pub mod client;
 pub mod message;
 pub mod provider;
 pub mod server;

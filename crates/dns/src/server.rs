@@ -43,6 +43,11 @@ pub async fn udp_loop(store: Arc<AcmeDnsStore>, sock: tokio::net::UdpSocket) -> 
 /// length-prefixed with a 2-byte big-endian length.
 pub async fn serve_tcp(store: Arc<AcmeDnsStore>, listen: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    tcp_loop(store, listener).await
+}
+
+/// The TCP accept/answer loop over an already-bound listener (also the test seam).
+pub async fn tcp_loop(store: Arc<AcmeDnsStore>, listener: tokio::net::TcpListener) -> std::io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
         let store = store.clone();

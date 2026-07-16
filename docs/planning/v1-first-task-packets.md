@@ -1404,5 +1404,10 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     `subname_of`-Helper. Frozen-Tests `subname_is_derived_relative_to_the_zone`, `desec_from_lookup_needs_token_and_domain`,
     `desec_set_and_clear_hit_the_bulk_rrset_endpoint_with_auth` (Mock-deSEC). Doku `docs/dns01-desec.md` (Signup +
     NS-Delegation + Token) + `config/desec.env.example`. Gate grün (ct-dns 12).
+  - **AD6** ✅ **deSEC-Self-Test** (Testen vorantreiben, unabhängig von globaler Propagation): Codec um
+    `message::build_query`/`parse_txt_answers` (+ `skip_name`) erweitert; `client::query_txt` (TCP-DNS an einen NS,
+    Test gegen die eigene `tcp_loop`); `ct-dns selftest`-Subcommand — publiziert ein Unique-TXT via deSEC, fragt
+    `ns1.desec.io` direkt ab (bis ~30s), verifiziert, räumt auf → `SELFTEST OK`. Frozen-Tests
+    `build_query_and_parse_txt_answers_round_trip`, `query_txt_reads_txt_records_over_tcp`. Gate grün (ct-dns 14).
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
   `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.

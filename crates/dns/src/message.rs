@@ -105,6 +105,72 @@ pub fn build_response(query: &Query, txts: &[String]) -> Vec<u8> {
     out
 }
 
+/// Build a DNS query datagram for `name` / `qtype` (RD set, one question).
+pub fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&id.to_be_bytes());
+    b.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD
+    b.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar counts
+    encode_name(&mut b, name);
+    b.extend_from_slice(&qtype.to_be_bytes());
+    b.extend_from_slice(&CLASS_IN.to_be_bytes());
+    b
+}
+
+/// Extract the TXT record value(s) from a DNS response, one `String` per TXT
+/// answer (multi-part character-strings within one record are concatenated).
+/// Fully bounds-checked; returns empty on anything malformed or without TXT.
+pub fn parse_txt_answers(buf: &[u8]) -> Vec<String> {
+    fn parse(buf: &[u8]) -> Option<Vec<String>> {
+        if buf.len() < 12 {
+            return None;
+        }
+        let qd = u16::from_be_bytes([buf[4], buf[5]]);
+        let an = u16::from_be_bytes([buf[6], buf[7]]);
+        let mut p = 12usize;
+        for _ in 0..qd {
+            p = skip_name(buf, p)?;
+            p += 4; // qtype + qclass
+        }
+        let mut out = Vec::new();
+        for _ in 0..an {
+            p = skip_name(buf, p)?;
+            let rtype = u16::from_be_bytes([*buf.get(p)?, *buf.get(p + 1)?]);
+            let rdlen = u16::from_be_bytes([*buf.get(p + 8)?, *buf.get(p + 9)?]) as usize;
+            let rdata = buf.get(p + 10..p + 10 + rdlen)?;
+            if rtype == TYPE_TXT {
+                let mut i = 0usize;
+                let mut s = String::new();
+                while i < rdata.len() {
+                    let l = *rdata.get(i)? as usize;
+                    s.push_str(std::str::from_utf8(rdata.get(i + 1..i + 1 + l)?).ok()?);
+                    i += 1 + l;
+                }
+                out.push(s);
+            }
+            p += 10 + rdlen;
+        }
+        Some(out)
+    }
+    parse(buf).unwrap_or_default()
+}
+
+/// Advance past a DNS name at `p` (labels, or a compression pointer which ends
+/// the name in 2 bytes). Returns the offset just after the name.
+fn skip_name(buf: &[u8], mut p: usize) -> Option<usize> {
+    loop {
+        let len = *buf.get(p)? as usize;
+        if len == 0 {
+            return Some(p + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return Some(p + 2); // pointer terminates the name
+        }
+        p += 1 + len;
+    }
+}
+
 /// Encode a dotted name as length-prefixed labels ending in a zero byte.
 fn encode_name(out: &mut Vec<u8>, name: &str) {
     if !name.is_empty() {
@@ -172,6 +238,23 @@ mod tests {
             resp.windows(2).any(|w| w == [0xC0, 0x0C]),
             "answer name compresses to the question"
         );
+    }
+
+    #[test]
+    fn build_query_and_parse_txt_answers_round_trip() {
+        // A query built by build_query parses back; a response's TXT answers are
+        // recovered by parse_txt_answers (incl. multiple records).
+        let raw = build_query(0x55, "_acme-challenge.host.test", TYPE_TXT);
+        let q = parse_query(&raw).unwrap();
+        assert_eq!(q.name, "_acme-challenge.host.test");
+        assert_eq!(q.qtype, TYPE_TXT);
+
+        let resp = build_response(&q, &["tok-a".to_string(), "tok-b".to_string()]);
+        assert_eq!(parse_txt_answers(&resp), vec!["tok-a".to_string(), "tok-b".to_string()]);
+
+        // A response with no answers -> empty; malformed -> empty (no panic).
+        assert!(parse_txt_answers(&build_response(&q, &[])).is_empty());
+        assert!(parse_txt_answers(b"\x00").is_empty());
     }
 
     #[test]
