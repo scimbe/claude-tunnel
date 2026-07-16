@@ -20,7 +20,8 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use crate::config::{AgentConfig, OriginProto};
 use crate::transport::{
-    dial_quic, dial_quic_or_blocked_error, register_tunnel, register_tunnel_stream, tcp_tls_connect,
+    bind_hostname, dial_quic, dial_quic_or_blocked_error, register_tunnel, register_tunnel_stream,
+    tcp_tls_connect,
 };
 use ct_common::metrics::{Metered, TunnelMetrics};
 use ct_common::noise::{frame, noise_pump, origin_handshake, origin_handshake_any};
@@ -357,6 +358,15 @@ pub async fn run_agent(
             }
         }
         backoff.reset();
+        // Browser Plane (#23 BP3b): bind the public hostname to this token so an
+        // SNI-routed browser reaches this tunnel. Re-bound on every reconnect.
+        if config.browser_forward {
+            if let Some(host) = &config.hostname {
+                if let Err(e) = bind_hostname(&conn, &token, host).await {
+                    eprintln!("ct-agent: hostname binding for '{host}' failed ({e})");
+                }
+            }
+        }
         eprintln!("ct-agent: registered with edge {} (serving)", config.edge);
         serve_quic_connection(
             &conn,
@@ -1096,6 +1106,7 @@ mod tests {
             direct_advertise_ip: None,
             metrics_listen: None,
             browser_forward: false,
+            hostname: None,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;

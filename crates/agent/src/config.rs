@@ -46,6 +46,10 @@ pub struct AgentConfig {
     /// Noise session — the browser's TLS terminates at the Origin. Set with
     /// `CT_AGENT_MODE=browser`. Default `false` (Mesh Plane / Noise).
     pub browser_forward: bool,
+    /// Browser Plane (#23): the public hostname this Agent binds to its routing
+    /// token at the Edge (`CT_AGENT_HOSTNAME`), so an SNI-routed browser reaches
+    /// this tunnel. `None` = no hostname bound.
+    pub hostname: Option<String>,
 }
 
 impl AgentConfig {
@@ -63,6 +67,7 @@ impl AgentConfig {
             direct_advertise_ip: None,
             metrics_listen: None,
             browser_forward: false,
+            hostname: None,
         })
     }
 
@@ -105,6 +110,9 @@ impl AgentConfig {
         // Browser Plane (#23): CT_AGENT_MODE=browser -> raw TLS passthrough.
         cfg.browser_forward =
             get("CT_AGENT_MODE").map(|m| m.trim().eq_ignore_ascii_case("browser")) == Some(true);
+        cfg.hostname = get("CT_AGENT_HOSTNAME")
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
         Ok(cfg)
     }
 }

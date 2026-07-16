@@ -1187,8 +1187,13 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
   Browser-Verbindung geht an `serve_sni_passthrough`. Neue Edge-Protokoll-Rolle `'H'`
   (`'H' | token(32) | host_len(2) | host`) in `serve_connection` bindet Hostname→Token
   (`state.register_host`, case-insensitive). Frozen-Test `agent_binds_a_hostname_via_the_h_role`. Gate grün.
-  (Autorisierung — Control-Plane prüft, dass der Agent den Hostnamen besitzt — ist Härtung/Folgepaket;
-  Agent-seitiges Senden von `'H'` via `CT_AGENT_HOSTNAME` kommt in BP3b/BP4.)
+  (Autorisierung — Control-Plane prüft, dass der Agent den Hostnamen besitzt — ist Härtung/Folgepaket.)
+- **BP3b** ✅ **Agent deklariert den Hostnamen**: `AgentConfig.hostname` aus `CT_AGENT_HOSTNAME`;
+  `transport::bind_hostname` (öffnet Stream, sendet `'H' | token | len | host`, liest OK);
+  `run_agent` bindet nach der Registrierung im Browser-Modus (bei jedem Reconnect neu). Frozen-Tests
+  `bind_hostname_sends_h_and_surfaces_the_ack` (OK/Reject/leerer-Host-Guard). Damit läuft die Kette
+  Agent→Edge (Token+Host) → Edge-`:443`-Listener → SNI→Token→Agent→Origin end-to-end (BP1–BP3b).
+  Gate grün.
 - **BP4** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job.
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich

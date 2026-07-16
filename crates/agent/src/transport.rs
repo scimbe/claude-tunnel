@@ -221,6 +221,32 @@ pub async fn register_tunnel(conn: &Connection, token: &RoutingToken) -> Result<
     }
 }
 
+/// Bind a public hostname to this Agent's routing token at the Edge (#23 BP3b):
+/// open a control stream and send `role='H' | token(32) | host_len(2 BE) | host`,
+/// then await the Edge's `OK`. Enables SNI-routed browser access to this tunnel.
+pub async fn bind_hostname(
+    conn: &Connection,
+    token: &RoutingToken,
+    host: &str,
+) -> Result<(), BoxError> {
+    let hb = host.as_bytes();
+    if hb.is_empty() || hb.len() > 253 {
+        return Err("hostname length out of range (1..=253)".into());
+    }
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(b"H").await?;
+    send.write_all(&token.0).await?;
+    send.write_all(&(hb.len() as u16).to_be_bytes()).await?;
+    send.write_all(hb).await?;
+    send.finish()?;
+    let ack = recv.read_to_end(8).await?;
+    if ack == b"OK" {
+        Ok(())
+    } else {
+        Err("edge rejected hostname binding".into())
+    }
+}
+
 /// Register this Agent's tunnel for `token` over a generic byte stream — the
 /// TLS-over-TCP fallback (issue #3 / P1.2c-2): write `role='A' | token(32)` and
 /// await the Edge's `OK`. Unlike the QUIC path (which opens a fresh bi-stream
@@ -704,5 +730,29 @@ mod tests {
             conn.close(0u32.into(), b"done");
             let _ = edge.await;
         }
+    }
+
+    // #23 BP3b: bind_hostname writes 'H' | token | len | host and surfaces the ack.
+    #[tokio::test]
+    async fn bind_hostname_sends_h_and_surfaces_the_ack() {
+        let token = RoutingToken([7u8; 32]);
+
+        let (addr, cert, edge) = mock_edge_replying(b"OK").await;
+        let conn = dial_quic(addr, cert).await.expect("dial");
+        bind_hostname(&conn, &token, "shop.example.test").await.expect("bind ok");
+        // An empty hostname is rejected locally, before any network use.
+        assert!(bind_hostname(&conn, &token, "").await.is_err(), "empty hostname rejected");
+        conn.close(0u32.into(), b"done");
+        let _ = edge.await;
+
+        let (addr2, cert2, edge2) = mock_edge_replying(b"NO").await;
+        let conn2 = dial_quic(addr2, cert2).await.expect("dial");
+        let err = bind_hostname(&conn2, &token, "x.test")
+            .await
+            .err()
+            .expect("non-OK ack must error");
+        assert!(err.to_string().contains("rejected hostname"), "{err}");
+        conn2.close(0u32.into(), b"done");
+        let _ = edge2.await;
     }
 }
