@@ -1392,7 +1392,11 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
   - **AD2** ✅ Autoritativer UDP+TCP-`:53`-Responder (`server`): `respond(store, query)` (pure: parse→lookup→build),
     `serve_udp`/`serve_tcp` (+ `udp_loop`-Test-Seam; TCP mit 2-Byte-Längenpräfix); Malformed wird verworfen, nie Panik.
     Frozen-Tests `respond_serves_a_stored_txt_and_drops_malformed`, `udp_server_round_trips_a_query`. Gate grün (ct-dns 7).
-  - **AD3** ⏳ Localhost-HTTP-API (publish/clear TXT) + Bindung an `127.0.0.1`; Integration mit dem ACME-Client (FD4).
+  - **AD3** ✅ Localhost-HTTP-API (`api`, axum): `PUT /txt/:name` (Body=TXT-Wert)/`DELETE /txt/:name`, optionaler
+    `x-ct-dns-token`; + `ct-dns`-Binary (`main.rs`) das `:53` (udp+tcp) + die Loopback-API zusammen fährt
+    (`CT_DNS_LISTEN`/`CT_DNS_API_LISTEN`/`CT_DNS_API_TOKEN`; Warnung wenn API nicht loopback). Frozen-Tests
+    `api_publishes_and_clears_a_txt_record`, `api_enforces_the_token_when_configured`. Voller Workspace-Gate grün (ct-dns 9).
+    **ct-dns damit als DNS-01-Responder end-to-end lauffähig** (öffentliches `:53`, private Mutations-API).
   - **AD4** ⏳ Strato-Delegation dokumentieren (`CNAME _acme-challenge`→`auth.<zone>` + NS/Glue = „IP zu Strato hinzufügen").
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
   `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.

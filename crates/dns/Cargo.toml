@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# AD1 codec + store are dependency-free; AD2 adds the UDP+TCP :53 responder.
-tokio = { version = "1", features = ["net", "rt", "io-util"] }
+# AD1 codec + store are dependency-free; AD2 adds the :53 responder; AD3 adds the
+# localhost HTTP API (axum) and the ct-dns binary (src/main.rs).
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util"] }
+axum = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
