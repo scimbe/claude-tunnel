@@ -1398,5 +1398,11 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     `api_publishes_and_clears_a_txt_record`, `api_enforces_the_token_when_configured`. Voller Workspace-Gate grün (ct-dns 9).
     **ct-dns damit als DNS-01-Responder end-to-end lauffähig** (öffentliches `:53`, private Mutations-API).
   - **AD4** ⏳ Strato-Delegation dokumentieren (`CNAME _acme-challenge`→`auth.<zone>` + NS/Glue = „IP zu Strato hinzufügen").
+  - **AD5** ✅ **DNS-01-Provider-Abstraktion** (`provider`): `Dns01Provider::{SelfHosted(store) | Desec(DesecClient)}`
+    (`set_txt`/`clear_txt`) — self-hosted bleibt erhalten, **deSEC (desec.io)** als Alternative (Bulk-PATCH-RRset,
+    `Authorization: Token`, TXT gequotet; `DESEC_TOKEN`/`DESEC_DOMAIN`/`DESEC_API_BASE` aus `.env`, Token nie geloggt).
+    `subname_of`-Helper. Frozen-Tests `subname_is_derived_relative_to_the_zone`, `desec_from_lookup_needs_token_and_domain`,
+    `desec_set_and_clear_hit_the_bulk_rrset_endpoint_with_auth` (Mock-deSEC). Doku `docs/dns01-desec.md` (Signup +
+    NS-Delegation + Token) + `config/desec.env.example`. Gate grün (ct-dns 12).
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
   `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.

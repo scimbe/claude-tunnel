@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod message;
+pub mod provider;
 pub mod server;
 pub mod store;
 
