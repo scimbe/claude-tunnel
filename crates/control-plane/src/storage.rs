@@ -493,6 +493,115 @@ impl SqliteLedger {
     }
 }
 
+/// One tunnel owned by a customer, as shown in the portal listing (#27). Holds
+/// **no secret**: the routing token and capability are minted and shown once at
+/// creation (a later sub-packet) and never persisted here, so listing a tunnel
+/// can never leak credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectTunnel {
+    /// Opaque per-tunnel id (not a secret) used to address it for revoke.
+    pub id: String,
+    /// Customer-chosen display name.
+    pub name: String,
+    /// Optional Browser-Plane hostname (#23) this tunnel serves.
+    pub hostname: Option<String>,
+    /// Unix seconds at creation.
+    pub created_at: i64,
+}
+
+/// SQLite-backed per-subject tunnel store (#27): a customer creates, lists and
+/// revokes their **own** tunnels. Every operation is scoped by `subject` (from
+/// the verified token), so one customer can never see or revoke another's tunnel.
+pub struct SqliteTunnelStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteTunnelStore {
+    /// Open (creating if needed) a durable tunnel store at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory store (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS subject_tunnels (
+                 id         TEXT PRIMARY KEY,
+                 subject    TEXT NOT NULL,
+                 name       TEXT NOT NULL,
+                 hostname   TEXT,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_subject_tunnels_subject
+                 ON subject_tunnels (subject);",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Create a tunnel owned by `subject`; returns its metadata (no secret). The
+    /// id is a fresh random hex string. `created_at` is the current Unix time.
+    pub fn create(
+        &self,
+        subject: &str,
+        name: &str,
+        hostname: Option<&str>,
+    ) -> rusqlite::Result<SubjectTunnel> {
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.lock_safe().execute(
+            "INSERT INTO subject_tunnels (id, subject, name, hostname, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, subject, name, hostname, created_at],
+        )?;
+        Ok(SubjectTunnel {
+            id,
+            name: name.to_string(),
+            hostname: hostname.map(str::to_string),
+            created_at,
+        })
+    }
+
+    /// List `subject`'s own tunnels, newest first.
+    pub fn list_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<SubjectTunnel>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hostname, created_at FROM subject_tunnels
+             WHERE subject = ?1 ORDER BY created_at DESC, id",
+        )?;
+        let rows = stmt.query_map(params![subject], |r| {
+            Ok(SubjectTunnel {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                hostname: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Revoke a tunnel by id, but only if it belongs to `subject`. Returns
+    /// `true` if a row was removed — `false` when the id is unknown or owned by
+    /// someone else (no cross-subject deletion).
+    pub fn revoke(&self, subject: &str, id: &str) -> rusqlite::Result<bool> {
+        let affected = self.conn.lock_safe().execute(
+            "DELETE FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+            params![id, subject],
+        )?;
+        Ok(affected > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +619,36 @@ mod tests {
             .join(format!("ct_enroll_{name}.db"))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn subject_tunnel_store_is_self_scoped_for_create_list_revoke() {
+        // #27 PP1: a customer creates, lists and revokes only their OWN tunnels.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+
+        let a1 = store.create("alice", "web", Some("app.example")).unwrap();
+        let _a2 = store.create("alice", "ssh", None).unwrap();
+        let b1 = store.create("bob", "db", None).unwrap();
+
+        // Listing is scoped to the subject — alice sees her two, bob sees his one.
+        let alice = store.list_for_subject("alice").unwrap();
+        assert_eq!(alice.len(), 2, "alice sees only her own tunnels");
+        assert!(alice.iter().any(|t| t.name == "web" && t.hostname.as_deref() == Some("app.example")));
+        assert_eq!(store.list_for_subject("bob").unwrap().len(), 1);
+
+        // Cross-subject revoke is refused: bob cannot delete alice's tunnel.
+        assert!(!store.revoke("bob", &a1.id).unwrap(), "no cross-subject revoke");
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 2, "alice's tunnel survives");
+
+        // Owner revoke removes exactly that tunnel.
+        assert!(store.revoke("alice", &a1.id).unwrap());
+        let alice = store.list_for_subject("alice").unwrap();
+        assert_eq!(alice.len(), 1);
+        assert!(alice.iter().all(|t| t.id != a1.id));
+
+        // Revoking an unknown id is a no-op false; bob's tunnel is untouched.
+        assert!(!store.revoke("alice", "deadbeef").unwrap());
+        assert_eq!(store.list_for_subject("bob").unwrap(), vec![b1]);
     }
 
     #[test]

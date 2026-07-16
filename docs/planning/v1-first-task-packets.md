@@ -1222,5 +1222,14 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   Gate grün (84 Tests, 0 Warnings).
 - **PP2** ⏳ Portal-Konto-Seite (server-gerendertes HTML) rendert die Session-Account-Daten (braucht #25 PP2-Session).
 - **PP3** ⏳ „Credits kaufen": UI-Anbindung an `/payment/intent` + `/me/issue` (Guthaben-Anzeige aktualisiert nach Webhook-Top-up).
-### #27 Tunnel-Verwaltung · #28 Per-OS One-Liner-Installer · #29 Zugriffsrechte/Sharing
-- folgen nach #25/#26 (PP-Kette), jeweils dekomponiert; #28 mit striktem Secret-Handling (frisch geprägte einmalige Join-Token, nie geloggt/geteilt).
+### #27 Tunnel-Verwaltung (anlegen, auflisten, widerrufen)
+- **PP1** ✅ Per-Subject-Tunnel-Store (`storage::SqliteTunnelStore`): `create`/`list_for_subject`/`revoke`,
+  jede Operation nach `subject` gescopt — ein Kunde sieht/widerruft nur seine EIGENEN Tunnel (kein
+  Cross-Subject-Delete). **Secret-frei by design**: gespeichert werden nur `id`, `name`, optionaler
+  `hostname` (#23), `created_at` — Routing-Token/Capability werden erst bei der Anlage (PP2) einmalig
+  geprägt/angezeigt und NIE persistiert. Frozen-Test
+  `subject_tunnel_store_is_self_scoped_for_create_list_revoke`. Gate grün (85 Tests, 0 Warnings).
+- **PP2** ⏳ Authed HTTP: `POST /portal/tunnels` (Anlage → einmalige Token/Capability-Anzeige), `GET /portal/tunnels` (Liste), `DELETE /portal/tunnels/:id` (Widerruf) — Subject aus Session/Token.
+- **PP3** ⏳ Live-Status je Tunnel via Edge `/metrics` (`ct_edge_active_tunnels`, #17) + Widerruf nutzt Token-Rotation (#12).
+### #28 Per-OS One-Liner-Installer · #29 Zugriffsrechte/Sharing
+- folgen nach #27 (PP-Kette), jeweils dekomponiert; #28 mit striktem Secret-Handling (frisch geprägte einmalige Join-Token, nie geloggt/geteilt).
