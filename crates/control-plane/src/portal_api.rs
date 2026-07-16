@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::accounts::AccountId;
 use crate::installer::{install_one_liner, InstallOs};
 use crate::portal::{escape, session_subject_for};
-use crate::storage::{SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
+use crate::storage::{GrantError, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
 
 /// Shared state for the authed portal API.
@@ -52,6 +52,8 @@ pub fn portal_api_router(
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/install", get(install_page))
+        .route("/portal/tunnels/:id/grants", get(grants_page).post(add_grant))
+        .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
         .with_state(state)
 }
 
@@ -231,6 +233,101 @@ async fn install_page(
     Html(page("install", &body)).into_response()
 }
 
+/// A subject to grant tunnel access to.
+#[derive(Deserialize)]
+struct GrantForm {
+    grantee: String,
+}
+
+/// Map a grant-management result: `NotOwner` (or unknown tunnel) -> 404 so a
+/// non-owner cannot even probe a tunnel's sharing; DB errors -> 500.
+fn grant_err(e: GrantError) -> Response {
+    match e {
+        GrantError::NotOwner => (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
+        GrantError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `GET /portal/tunnels/:id/grants` (#29): list the subjects a tunnel is shared
+/// with + an add form. Owner-only.
+async fn grants_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.list_grants(&subject, &id) {
+        Ok(grantees) => Html(grants_html(&id, &grantees)).into_response(),
+        Err(e) => grant_err(e),
+    }
+}
+
+/// `POST /portal/tunnels/:id/grants` (#29): grant a subject access. Owner-only.
+async fn add_grant(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<GrantForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let grantee = form.grantee.trim();
+    if grantee.is_empty() {
+        return (StatusCode::BAD_REQUEST, "grantee required").into_response();
+    }
+    match st.tunnels.grant(&subject, &id, grantee) {
+        Ok(()) => Redirect::to(&format!("/portal/tunnels/{id}/grants")).into_response(),
+        Err(e) => grant_err(e),
+    }
+}
+
+/// `POST /portal/tunnels/:id/grants/:grantee/delete` (#29): revoke a grant. Owner-only.
+async fn delete_grant(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path((id, grantee)): Path<(String, String)>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.revoke_grant(&subject, &id, &grantee) {
+        Ok(_) => Redirect::to(&format!("/portal/tunnels/{id}/grants")).into_response(),
+        Err(e) => grant_err(e),
+    }
+}
+
+fn grants_html(id: &str, grantees: &[String]) -> String {
+    let rows = if grantees.is_empty() {
+        "<p class=\"k\">Not shared with anyone yet.</p>".to_string()
+    } else {
+        grantees
+            .iter()
+            .map(|g| {
+                format!(
+                    r#"<div class="row"><span class="v">{g}</span>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/grants/{ge}/delete">
+  <button class="sec" type="submit">Revoke</button></form></div>"#,
+                    g = escape(g),
+                    id = escape(id),
+                    ge = escape(g),
+                )
+            })
+            .collect::<String>()
+    };
+    let body = format!(
+        r#"<h1>Share this tunnel</h1>
+<p class="k">Grant other signed-in subjects access to this tunnel.</p>
+{rows}
+<h2>Add a subject</h2>
+<form method="post" action="/portal/tunnels/{id}/grants">
+ <input type="text" name="grantee" placeholder="subject" required>
+ <button type="submit">Grant</button>
+</form>
+<a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
+        id = escape(id),
+    );
+    page("share tunnel", &body)
+}
+
 fn tunnels_html(tunnels: &[crate::storage::SubjectTunnel]) -> String {
     let rows = if tunnels.is_empty() {
         "<p class=\"k\">No tunnels yet. Create one below.</p>".to_string()
@@ -246,6 +343,7 @@ fn tunnels_html(tunnels: &[crate::storage::SubjectTunnel]) -> String {
                 format!(
                     r#"<div class="row"><span class="v">{name}{host}</span><span>
  <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <a class="btn sec" href="/portal/tunnels/{id}/grants">Share</a>
  <form class="inline" method="post" action="/portal/tunnels/{id}/delete">
   <button class="sec" type="submit">Revoke</button></form>
 </span></div>"#,
@@ -518,6 +616,52 @@ mod tests {
         // os filter renders just one block.
         let (_s, only_win) = get(&app, &format!("/portal/tunnels/{id}/install?os=windows"), Some("alice")).await;
         assert!(only_win.contains("irm ") && !only_win.contains("curl -fsSL"));
+    }
+
+    #[tokio::test]
+    async fn grants_are_owner_managed_via_http() {
+        let app = test_app();
+        post_form(&app, "/portal/tunnels", "alice", "name=web").await;
+        let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
+
+        // Non-owner cannot even view the sharing page.
+        assert_eq!(
+            get(&app, &format!("/portal/tunnels/{id}/grants"), Some("bob")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // Non-owner cannot grant.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{id}/grants"), "bob", "grantee=mallory").await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Owner grants bob, then sees him listed.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{id}/grants"), "alice", "grantee=bob").await,
+            StatusCode::SEE_OTHER
+        );
+        let (status, html) = get(&app, &format!("/portal/tunnels/{id}/grants"), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("bob"), "grantee listed");
+
+        // Owner revokes bob -> no longer listed.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{id}/grants/bob/delete"), "alice", "").await,
+            StatusCode::SEE_OTHER
+        );
+        let (_s, after) = get(&app, &format!("/portal/tunnels/{id}/grants"), Some("alice")).await;
+        assert!(after.contains("Not shared with anyone"), "grant removed");
+    }
+
+    #[tokio::test]
+    async fn add_grant_rejects_empty_subject() {
+        let app = test_app();
+        post_form(&app, "/portal/tunnels", "alice", "name=web").await;
+        let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{id}/grants"), "alice", "grantee=%20").await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

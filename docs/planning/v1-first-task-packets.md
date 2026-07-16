@@ -1276,7 +1276,12 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
 - **PP2** ⏳ Authed `GET /portal/tunnels/:id/install?os=…`: prägt pro Anforderung ein **frisches, einmaliges, kurzlebiges** Join-Token
   (server-seitig, nie geloggt) und rendert den Einzeiler; Subject aus Session, nur für eigene Tunnel (#27).
 - **PP3** ⏳ Ausgelieferte `install.sh`/`install.ps1` (ct-agent holen, `onboard` mit `CT_JOIN_TOKEN`, CA-Root via `/pki/ca` #11, Serve-Loop).
-### #29 Zugriffsrechte/Sharing (Grants pro Tunnel)
+### #29 Zugriffsrechte/Sharing (Grants pro Tunnel) — ✅ **fix-ready** (Verwaltung)
+- **PP2** ✅ Session-gated Grant-HTTP in `portal_api` (owner-only, sonst 404): `GET /portal/tunnels/:id/grants`
+  (Liste + Add-Formular), `POST …/grants` (Grant), `POST …/grants/:grantee/delete` (Entzug). „Share"-Button je Tunnel.
+  Frozen-Tests `grants_are_owner_managed_via_http`, `add_grant_rejects_empty_subject`. Gate grün (108 Tests).
+- **PP3** ⏳ Cross-Crate-Follow-up: `is_authorized`-Gate in die tatsächliche Capability-Ausgabe des Datenpfads
+  einweben (nur berechtigte Subjects erhalten den Zugang eines geteilten Tunnels).
 - **PP1** ✅ Grant-Datenschicht auf `SqliteTunnelStore`: `grant`/`revoke_grant`/`list_grants` (nur der Besitzer, sonst
   `GrantError::NotOwner`) + `is_authorized(subject, tunnel_id)` = Besitzer ODER Grantee. Tunnel-Widerruf löscht die
   Grants mit (keine Waisen). Frozen-Test `tunnel_grants_are_owner_managed_and_gate_authorization`. Gate grün (88 Tests, 0 Warnings).
