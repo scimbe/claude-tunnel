@@ -1245,7 +1245,22 @@ Capabilities/Join-Token nur server-seitig, nur an eingeloggte Besitzer, `check-n
   Gate grün (84 Tests, 0 Warnings).
 - **PP2** ⏳ Portal-Konto-Seite (server-gerendertes HTML) rendert die Session-Account-Daten (braucht #25 PP2-Session).
 - **PP3** ⏳ „Credits kaufen": UI-Anbindung an `/payment/intent` + `/me/issue` (Guthaben-Anzeige aktualisiert nach Webhook-Top-up).
-### #27 Tunnel-Verwaltung (anlegen, auflisten, widerrufen) — ✅ **fix-ready**
+### #27 Tunnel-Verwaltung — ⚠️ **REOPENED (Feld-Bug): „revoke" widerruft nicht wirklich**
+Feld-Verifikation (live): nach `POST /portal/tunnels/:id/delete` verschwindet der Tunnel aus der Portal-Liste,
+aber der Agent bleibt beim Edge registriert und bedient weiter (`ct_edge_active_tunnels` unverändert). Ursache:
+`delete_tunnel` löscht nur die DB-Zeile; es gibt **keine Verknüpfung Portal-Tunnel ↔ Edge-Routing-Token** und
+keinen Kontrollkanal Control-Plane→Edge. Behebung ist Cross-Crate, mehrzyklig — dekomponiert in RB1..RB4:
+- **RB1** ✅ Storage-Linkage: jeder Tunnel prägt bei `create` ein persistiertes `routing_token` (server-seitig, NIE in
+  Listen gerendert — Routing-Identifier, nicht die Noise-Capability); `revoke` gibt das Token des entfernten Tunnels
+  zurück, damit ein späterer Zyklus die Edge-Registrierung invalidieren kann. Frozen-Test
+  `each_tunnel_binds_a_persistent_routing_token_returned_on_revoke`. Gate grün (109 Tests).
+- **RB2** ⏳ Install-Einzeiler übergibt das Tunnel-Routing-Token an den Agenten (Env); Agent registriert unter DIESEM
+  Token beim Edge → deterministische Portal↔Edge-Verknüpfung.
+- **RB3** ⏳ Authentifizierter Control-Plane→Edge „revoke token"-Kanal (Edge droppt Registrierungen + schließt Live-Verbindungen).
+- **RB4** ⏳ `delete_tunnel` ruft den Edge-Revoke für das Tunnel-Token (und/oder Rotation via #12) → Agent wird deregistriert;
+  Live-Repro (`ct_edge_active_tunnels` fällt) grün → **fix-ready**.
+
+#### (vor der Feld-Verifikation gelandet)
 - **PP2** ✅ Session-gated Portal-HTTP in `portal_api`: `GET /portal/tunnels` (Liste eigener Tunnel + Anlage-Formular),
   `POST /portal/tunnels` (anlegen: name + optional hostname), `POST /portal/tunnels/:id/delete` (Widerruf).
   Strikt selbstbezüglich (Subject aus Session; `revoke` nur eigene). „Install"-Button pro Tunnel → #28-Endpoint.

@@ -507,6 +507,11 @@ pub struct SubjectTunnel {
     pub hostname: Option<String>,
     /// Unix seconds at creation.
     pub created_at: i64,
+    /// Hex routing token the tunnel's agent registers under at the edge. Held
+    /// **server-side only** — never rendered in a listing — so a revocation can
+    /// invalidate the live registration (#27 RB1). It is a routing identifier,
+    /// not the Noise capability (which is still never persisted).
+    pub routing_token: String,
 }
 
 /// Why a tunnel-grant operation failed: the caller is not the tunnel's owner, or
@@ -562,11 +567,12 @@ impl SqliteTunnelStore {
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS subject_tunnels (
-                 id         TEXT PRIMARY KEY,
-                 subject    TEXT NOT NULL,
-                 name       TEXT NOT NULL,
-                 hostname   TEXT,
-                 created_at INTEGER NOT NULL
+                 id            TEXT PRIMARY KEY,
+                 subject       TEXT NOT NULL,
+                 name          TEXT NOT NULL,
+                 hostname      TEXT,
+                 created_at    INTEGER NOT NULL,
+                 routing_token TEXT NOT NULL DEFAULT ''
              );
              CREATE INDEX IF NOT EXISTS idx_subject_tunnels_subject
                  ON subject_tunnels (subject);
@@ -581,31 +587,37 @@ impl SqliteTunnelStore {
         })
     }
 
-    /// Create a tunnel owned by `subject`; returns its metadata (no secret). The
-    /// id is a fresh random hex string. `created_at` is the current Unix time.
+    /// Create a tunnel owned by `subject`; returns its metadata. A fresh routing
+    /// token is minted and persisted server-side so a revocation can later find
+    /// and invalidate the tunnel's edge registration (#27 RB1). The `id` is a
+    /// random hex string; `created_at` is the current Unix time.
     pub fn create(
         &self,
         subject: &str,
         name: &str,
         hostname: Option<&str>,
     ) -> rusqlite::Result<SubjectTunnel> {
-        let mut bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut idb = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut idb);
+        let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
+        let mut tokb = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut tokb);
+        let routing_token: String = tokb.iter().map(|b| format!("{b:02x}")).collect();
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         self.conn.lock_safe().execute(
-            "INSERT INTO subject_tunnels (id, subject, name, hostname, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, subject, name, hostname, created_at],
+            "INSERT INTO subject_tunnels (id, subject, name, hostname, created_at, routing_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, subject, name, hostname, created_at, routing_token],
         )?;
         Ok(SubjectTunnel {
             id,
             name: name.to_string(),
             hostname: hostname.map(str::to_string),
             created_at,
+            routing_token,
         })
     }
 
@@ -613,7 +625,7 @@ impl SqliteTunnelStore {
     pub fn list_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<SubjectTunnel>> {
         let conn = self.conn.lock_safe();
         let mut stmt = conn.prepare(
-            "SELECT id, name, hostname, created_at FROM subject_tunnels
+            "SELECT id, name, hostname, created_at, routing_token FROM subject_tunnels
              WHERE subject = ?1 ORDER BY created_at DESC, id",
         )?;
         let rows = stmt.query_map(params![subject], |r| {
@@ -622,27 +634,36 @@ impl SqliteTunnelStore {
                 name: r.get(1)?,
                 hostname: r.get(2)?,
                 created_at: r.get(3)?,
+                routing_token: r.get(4)?,
             })
         })?;
         rows.collect()
     }
 
-    /// Revoke a tunnel by id, but only if it belongs to `subject`. Returns
-    /// `true` if a row was removed — `false` when the id is unknown or owned by
+    /// Revoke a tunnel by id, but only if it belongs to `subject`. Returns the
+    /// removed tunnel's **routing token** (so the caller can invalidate its edge
+    /// registration — #27 RB3/RB4), or `None` when the id is unknown or owned by
     /// someone else (no cross-subject deletion). Also clears the tunnel's access
     /// grants (#29) so none are orphaned.
-    pub fn revoke(&self, subject: &str, id: &str) -> rusqlite::Result<bool> {
+    pub fn revoke(&self, subject: &str, id: &str) -> rusqlite::Result<Option<String>> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
-        let affected = tx.execute(
-            "DELETE FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
-            params![id, subject],
-        )?;
-        if affected > 0 {
+        let token: Option<String> = tx
+            .query_row(
+                "SELECT routing_token FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if token.is_some() {
+            tx.execute(
+                "DELETE FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![id, subject],
+            )?;
             tx.execute("DELETE FROM tunnel_grants WHERE tunnel_id = ?1", params![id])?;
         }
         tx.commit()?;
-        Ok(affected > 0)
+        Ok(token)
     }
 
     /// Whether `subject` is the owner of `tunnel_id` (not merely a grantee).
@@ -768,18 +789,39 @@ mod tests {
         assert_eq!(store.list_for_subject("bob").unwrap().len(), 1);
 
         // Cross-subject revoke is refused: bob cannot delete alice's tunnel.
-        assert!(!store.revoke("bob", &a1.id).unwrap(), "no cross-subject revoke");
+        assert!(store.revoke("bob", &a1.id).unwrap().is_none(), "no cross-subject revoke");
         assert_eq!(store.list_for_subject("alice").unwrap().len(), 2, "alice's tunnel survives");
 
-        // Owner revoke removes exactly that tunnel.
-        assert!(store.revoke("alice", &a1.id).unwrap());
+        // Owner revoke removes exactly that tunnel and returns its routing token.
+        assert_eq!(store.revoke("alice", &a1.id).unwrap(), Some(a1.routing_token.clone()));
         let alice = store.list_for_subject("alice").unwrap();
         assert_eq!(alice.len(), 1);
         assert!(alice.iter().all(|t| t.id != a1.id));
 
         // Revoking an unknown id is a no-op false; bob's tunnel is untouched.
-        assert!(!store.revoke("alice", "deadbeef").unwrap());
+        assert!(store.revoke("alice", "deadbeef").unwrap().is_none());
         assert_eq!(store.list_for_subject("bob").unwrap(), vec![b1]);
+    }
+
+    #[test]
+    fn each_tunnel_binds_a_persistent_routing_token_returned_on_revoke() {
+        // #27 RB1: creation mints a distinct 32-byte (64-hex) routing token that
+        // persists (survives a re-read) and is returned when the tunnel is revoked
+        // — the linkage a later cycle uses to invalidate the edge registration.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let a = store.create("alice", "web", None).unwrap();
+        let b = store.create("alice", "ssh", None).unwrap();
+        assert_eq!(a.routing_token.len(), 64, "32-byte hex routing token");
+        assert_ne!(a.routing_token, b.routing_token, "distinct per tunnel");
+
+        // The token persists (list re-reads it from the row).
+        let listed = store.list_for_subject("alice").unwrap();
+        assert!(listed.iter().any(|t| t.routing_token == a.routing_token));
+
+        // Revoke returns exactly that token so the caller can act on it.
+        assert_eq!(store.revoke("alice", &a.id).unwrap(), Some(a.routing_token));
+        // A second revoke of the same id yields nothing.
+        assert_eq!(store.revoke("alice", &a.id).unwrap(), None);
     }
 
     #[test]
@@ -817,7 +859,7 @@ mod tests {
 
         // Revoking the tunnel clears its grants (no orphans).
         store.grant("alice", &t.id, "bob").unwrap();
-        assert!(store.revoke("alice", &t.id).unwrap());
+        assert!(store.revoke("alice", &t.id).unwrap().is_some());
         assert!(!store.is_authorized("bob", &t.id).unwrap(), "grant gone with the tunnel");
         assert!(!store.is_authorized("alice", &t.id).unwrap(), "owner gone with the tunnel");
     }
