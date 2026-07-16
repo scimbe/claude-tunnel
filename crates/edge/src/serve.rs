@@ -141,6 +141,35 @@ pub async fn route_and_relay(
     Ok(())
 }
 
+/// Browser Plane (#23, sub-packet 1): serve one inbound TLS connection by SNI.
+/// Peek the ClientHello's SNI hostname **without terminating TLS**, map it to a
+/// routing token, open a stream to the serving Agent, replay the buffered
+/// ClientHello, and relay the raw TLS bytes both ways. TLS terminates at the
+/// Origin (which holds the certificate); the Edge sees only the hostname and
+/// ciphertext, so the payload stays provider-blind.
+pub async fn serve_sni_passthrough<S>(
+    mut inbound: S,
+    state: &EdgeState<Connection>,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (hello, sni) = crate::sni::read_client_hello(&mut inbound)
+        .await
+        .ok_or("no SNI in the TLS ClientHello")?;
+    let token = state
+        .route_host(&sni)
+        .ok_or_else(|| format!("no tunnel registered for host '{sni}'"))?;
+    let (mut agent_send, agent_recv) = open_agent_stream(state, &token).await?;
+    // Replay the buffered ClientHello to the Agent first, then relay the rest so
+    // the browser<->origin TLS handshake completes end-to-end through the tunnel.
+    agent_send.write_all(&hello).await?;
+    let mut agent = join(agent_recv, agent_send);
+    let (a, b) = relay(&mut inbound, &mut agent).await?;
+    state.note_relay(a + b);
+    Ok(())
+}
+
 /// Serve one connection by dispatching on its first stream's role byte. `'A'`
 /// registers an Agent tunnel (`token`); `'C'` runs a PoW-gated rendezvous, then
 /// routes and relays the same stream to the Agent. This is the unified
@@ -1006,5 +1035,108 @@ mod tests {
         echo.await.unwrap();
         drop(client_peer);
         let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn sni_passthrough_routes_a_browser_tls_connection_to_the_origin() {
+        // #23 Browser Plane (sub-packet 1): a plain rustls "browser" reaches a
+        // public-hostname HTTPS origin THROUGH the tunnel, routed purely by the
+        // TLS SNI — the edge never terminates TLS (provider-blind), and the
+        // browser validates the origin's cert client-side (TLS terminates at the
+        // origin). No ct-client protocol, no capability: just SNI -> tunnel.
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        // A "public" HTTPS origin with a cert for browser.test (the browser
+        // trusts it, standing in for a publicly-trusted / Let's Encrypt cert).
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["browser.test".to_string()]).unwrap();
+        let origin_cert = certified.cert.der().clone();
+        let origin_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![origin_cert.clone()], origin_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (sock, _) = origin_listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.expect("origin TLS handshake");
+            let mut b = [0u8; 1024];
+            let n = tls.read(&mut b).await.unwrap();
+            assert!(b[..n].starts_with(b"GET "), "origin got an HTTP request over TLS");
+            tls.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        // Edge + a raw-forwarding Agent: the agent pipes the tunnel stream to the
+        // origin verbatim (Browser Plane carries raw TLS, not Noise).
+        let token = RoutingToken([0x42; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.register_host("Browser.Test", token.clone()); // case-insensitive
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let edge_addr = server.local_addr().unwrap();
+        let state_e = state.clone();
+        let edge_srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            let _ = serve_connection(&conn, &state_e, &challenge).await;
+            conn.closed().await;
+        });
+        let agent_ep = build_client_endpoint(cert).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(edge_addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut a_s, mut a_r) = agent_conn.open_bi().await.unwrap();
+        a_s.write_all(b"A").await.unwrap();
+        a_s.write_all(&token.0).await.unwrap();
+        a_s.finish().unwrap();
+        assert_eq!(a_r.read_to_end(8).await.unwrap(), b"OK");
+        let agent_task = tokio::spawn(async move {
+            let (e_send, e_recv) = agent_conn.accept_bi().await.unwrap();
+            let mut edge_side = tokio::io::join(e_recv, e_send);
+            let mut origin_tcp = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            let _ = crate::relay::relay(&mut edge_side, &mut origin_tcp).await;
+        });
+
+        // Browser: rustls over a duplex; the other end feeds serve_sni_passthrough.
+        let (browser_side, edge_inbound) = tokio::io::duplex(64 * 1024);
+        let state_p = state.clone();
+        let pass =
+            tokio::spawn(async move { serve_sni_passthrough(edge_inbound, &state_p).await });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(origin_cert).unwrap();
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let sni = rustls::pki_types::ServerName::try_from("browser.test").unwrap();
+        let mut tls = connector
+            .connect(sni, browser_side)
+            .await
+            .expect("browser validates the cert and completes TLS via SNI routing");
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: browser.test\r\n\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let page = String::from_utf8_lossy(&resp);
+        assert!(
+            page.contains("200 OK") && page.contains("hello"),
+            "HTTPS 200 through the tunnel via SNI passthrough: {page}"
+        );
+
+        pass.abort();
+        agent_task.abort();
+        edge_srv.abort();
+        origin.abort();
     }
 }

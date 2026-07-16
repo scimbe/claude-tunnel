@@ -1162,3 +1162,25 @@ Browser Plane (öffentliches SNI + Let's Encrypt, ADR-0010) ist post-v1 → sepa
   den bewusst zurückgestellten post-v1-Teil, damit #22 schließen kann ohne „fehlt/kaputt" zu implizieren.
   **→ #22 fix-ready** (HW1 Test + HW2 Demo decken die v1-Akzeptanz; TLS-terminiert-am-Origin durch den
   Tunnel, Cert client-seitig validiert, Edge ciphertext-only).
+
+## #23 — Browser Plane (öffentlicher Hostname + SNI-Routing, post-v1 auf Wunsch reaktiviert)
+
+Ziel: Browser tippt `https://<hostname>/`, Let's Encrypt „funktioniert einfach" über SNI; TLS
+terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI) + Chiffretext
+(ADR-0010-Kompromiss: Hostname sichtbar, Nutzlast blind). Zu groß für einen Zyklus → dekomponiert.
+
+- **BP1** ✅ **SNI-Passthrough-Routing am Edge**: `sni::peek_sni` (bounds-checked TLS-ClientHello-Parser)
+  + `sni::read_client_hello` (puffert den ersten Record) + Host→Token-Registry in `EdgeState`
+  (`register_host`/`route_host`, lowercased) + `serve_sni_passthrough` (SNI lesen ohne TLS-Terminierung
+  → Token → Agent-Stream öffnen → gepufferten ClientHello + rohe TLS-Bytes durchreichen). Frozen-Tests:
+  `peek_sni_*`, `read_client_hello_*`, und `sni_passthrough_routes_a_browser_tls_connection_to_the_origin`
+  (rustls-„Browser" erreicht einen public-hostname HTTPS-Origin durch den Tunnel, validiert das Cert
+  client-seitig, HTTP 200 — Edge terminiert nie TLS). Gate grün.
+- **BP2** ⏳ **Agent-Browser-Forward-Modus**: der reale Agent reicht den Tunnel-Stream roh zum Origin
+  durch (kein Noise) — der Produktions-Gegenpart zum Mock-Agent im BP1-Test.
+- **BP3** ⏳ **Öffentlicher :443-Browser-Listener** am Edge (SNI-Peek → `serve_sni_passthrough`) +
+  Hostname-Bindung über die Control-Plane (Hostname→Token registrieren, autorisiert).
+- **BP4** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
+  LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job.
+- **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
+  vertrautem Cert durch den Tunnel). Erst wenn BP1–BP5 erfüllt → **#23 fix-ready**.

@@ -40,6 +40,11 @@ pub struct EdgeState<H> {
     /// sender the Client handler uses to hand its stream to the waiting agent.
     /// Unlike QUIC agents these are single-use (one client per registration).
     tcp_agents: Mutex<HashMap<RoutingToken, oneshot::Sender<BoxedStream>>>,
+    /// Browser Plane (#23): public hostname -> routing token, so an SNI-routed
+    /// TLS connection can be mapped to a tunnel without the Client protocol.
+    /// Hostnames are stored lowercased. The payload stays blind (TLS ciphertext
+    /// is passed through); only the SNI hostname is visible to the Edge.
+    hosts: Mutex<HashMap<String, RoutingToken>>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -55,11 +60,26 @@ impl<H: Clone> EdgeState<H> {
             candidates: Mutex::new(HashMap::new()),
             direct: Mutex::new(HashMap::new()),
             tcp_agents: Mutex::new(HashMap::new()),
+            hosts: Mutex::new(HashMap::new()),
             registrations: Counter::default(),
             relays: Counter::default(),
             relay_bytes: Counter::default(),
             failovers: Counter::default(),
         }
+    }
+
+    /// Map a public hostname to a routing token (Browser Plane, #23). The
+    /// hostname is lowercased so SNI lookups are case-insensitive.
+    pub fn register_host(&self, host: &str, token: RoutingToken) {
+        self.hosts
+            .lock()
+            .unwrap()
+            .insert(host.to_ascii_lowercase(), token);
+    }
+
+    /// Resolve a public hostname (from the TLS SNI) to its routing token.
+    pub fn route_host(&self, host: &str) -> Option<RoutingToken> {
+        self.hosts.lock().unwrap().get(&host.to_ascii_lowercase()).cloned()
     }
 
     /// Note a completed relay of `bytes` total bytes (both directions), and a

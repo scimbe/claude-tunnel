@@ -8,6 +8,7 @@ pub mod pki;
 pub mod relay;
 pub mod rendezvous;
 pub mod serve;
+pub mod sni;
 pub mod state;
 pub mod transport;
 
