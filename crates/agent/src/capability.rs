@@ -63,12 +63,40 @@ pub fn resolve_serving_identity(
     edge: &str,
     extra_keys_dir: Option<&str>,
 ) -> Result<ServingIdentity, BoxError> {
-    let (cap, primary) = resolve_primary_identity(key_path, cap_path, edge)?;
+    resolve_serving_identity_with_token(key_path, cap_path, edge, extra_keys_dir, None)
+}
+
+/// Like [`resolve_serving_identity`], but when `forced_token` is `Some` a newly
+/// minted capability uses that routing token instead of a random one (#27 RB2b).
+/// This lets an agent onboarded via the portal register at the edge under the
+/// tunnel's known routing token, so a revocation can find and drop it. A reused
+/// persisted capability keeps its own token (redundancy/rotation unaffected).
+pub fn resolve_serving_identity_with_token(
+    key_path: Option<&str>,
+    cap_path: &str,
+    edge: &str,
+    extra_keys_dir: Option<&str>,
+    forced_token: Option<RoutingToken>,
+) -> Result<ServingIdentity, BoxError> {
+    let (cap, primary) = resolve_primary_identity(key_path, cap_path, edge, forced_token)?;
     let mut origin_keys = vec![primary];
     if let Some(dir) = extra_keys_dir {
         origin_keys.extend(load_extra_origin_keys(dir)?);
     }
     Ok(ServingIdentity { cap, origin_keys })
+}
+
+/// Parse a 64-hex routing token (e.g. from `CT_AGENT_TOKEN`), if valid.
+pub fn parse_routing_token_hex(s: &str) -> Option<RoutingToken> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut t = [0u8; 32];
+    for (i, byte) in t.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(RoutingToken(t))
 }
 
 /// Resolve the **primary** identity — the capability and its origin private key.
@@ -78,7 +106,13 @@ fn resolve_primary_identity(
     key_path: Option<&str>,
     cap_path: &str,
     edge: &str,
+    forced_token: Option<RoutingToken>,
 ) -> Result<(Capability, [u8; 32]), BoxError> {
+    // Mint a capability for `origin`, honoring a forced routing token if given.
+    let mint = |origin: OriginIdentity| match &forced_token {
+        Some(t) => mint_capability_with_token(t.clone(), origin, edge.to_string()),
+        None => mint_capability(origin, edge.to_string()),
+    };
     if let Some(kp) = key_path {
         // Shared identity: reuse the persisted key + capability if both exist.
         if let (Ok(key), Ok(capb)) = (std::fs::read(kp), std::fs::read(cap_path)) {
@@ -90,14 +124,14 @@ fn resolve_primary_identity(
         }
         // First agent: generate the identity and persist both for peers to share.
         let origin_key = OriginKey::generate();
-        let cap = mint_capability(origin_key.origin_identity(), edge.to_string());
+        let cap = mint(origin_key.origin_identity());
         write_owner_only(kp, &origin_key.private_bytes())?;
         std::fs::write(cap_path, cap.encode())?;
         return Ok((cap, origin_key.private_bytes()));
     }
     // Default: a fresh, unique single-agent identity.
     let origin_key = OriginKey::generate();
-    let cap = mint_capability(origin_key.origin_identity(), edge.to_string());
+    let cap = mint(origin_key.origin_identity());
     std::fs::write(cap_path, cap.encode())?;
     Ok((cap, origin_key.private_bytes()))
 }
@@ -190,6 +224,34 @@ mod tests {
             .join(format!("ct-{}-{}", std::process::id(), name))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn forced_routing_token_is_honored_on_a_fresh_identity() {
+        // #27 RB2b: a portal-supplied routing token is the token the freshly
+        // minted capability registers under.
+        let forced = RoutingToken([0x5a; 32]);
+        let cap = tmp("forced-cap.bin");
+        let _ = std::fs::remove_file(&cap);
+        let id = resolve_serving_identity_with_token(
+            None,
+            &cap,
+            "edge:443",
+            None,
+            Some(forced.clone()),
+        )
+        .unwrap();
+        assert_eq!(id.cap.token, forced, "capability adopts the forced routing token");
+        // Without a forced token, the token is random (not the forced value).
+        let other = resolve_serving_identity_with_token(None, &tmp("rand-cap.bin"), "edge:443", None, None).unwrap();
+        assert_ne!(other.cap.token, forced);
+    }
+
+    #[test]
+    fn parse_routing_token_hex_validates_length_and_hex() {
+        assert_eq!(parse_routing_token_hex(&"5a".repeat(32)), Some(RoutingToken([0x5a; 32])));
+        assert!(parse_routing_token_hex("deadbeef").is_none(), "too short");
+        assert!(parse_routing_token_hex(&"zz".repeat(32)).is_none(), "non-hex");
     }
 
     #[test]

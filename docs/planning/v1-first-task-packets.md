@@ -1258,8 +1258,11 @@ keinen Kontrollkanal Control-Plane→Edge. Behebung ist Cross-Crate, mehrzyklig 
   als `CT_AGENT_TOKEN` (Env, nie argv); `install_page` holt es via neuem owner-gescopten `SqliteTunnelStore::routing_token`
   (dient zugleich als Owner-Gate) und rendert es in den Einzeiler. Frozen-Tests
   `one_liners_embed_both_tokens_via_env_per_os` + erweitertes `install_page_is_owner_only_...` (CT_AGENT_TOKEN). Gate grün (109 Tests).
-- **RB2b** ⏳ Agent-Consume: `CT_AGENT_TOKEN` in `AgentConfig`/`onboard` lesen → `mint_capability_with_token(<token>, …)`
-  statt zufälligem `mint_capability` → Agent registriert unter dem Tunnel-Token beim Edge.
+- **RB2b** ✅ Agent-Consume: `main.rs` liest `CT_AGENT_TOKEN` → `parse_routing_token_hex` →
+  `resolve_serving_identity_with_token(…, Some(token))` → `mint_capability_with_token` statt zufälligem `mint_capability`.
+  Der Agent registriert nun unter dem Tunnel-Routing-Token beim Edge (deterministische Portal↔Edge-Verknüpfung steht).
+  Frozen-Tests `forced_routing_token_is_honored_on_a_fresh_identity`, `parse_routing_token_hex_validates_length_and_hex`.
+  Gate grün (ct-agent 70 Tests).
 - **RB3** ⏳ Authentifizierter Control-Plane→Edge „revoke token"-Kanal (Edge droppt Registrierungen + schließt Live-Verbindungen).
 - **RB4** ⏳ `delete_tunnel` ruft den Edge-Revoke für das Tunnel-Token (und/oder Rotation via #12) → Agent wird deregistriert;
   Live-Repro (`ct_edge_active_tunnels` fällt) grün → **fix-ready**.

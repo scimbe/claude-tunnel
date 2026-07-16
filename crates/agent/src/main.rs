@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use ct_agent::capability::resolve_serving_identity;
+use ct_agent::capability::{parse_routing_token_hex, resolve_serving_identity_with_token};
 use ct_agent::config::AgentConfig;
 use ct_agent::onboard::OnboardEnv;
 use ct_agent::serve::run_agent;
@@ -90,11 +90,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // rotation window (#12).
     let origin_key_path = std::env::var("CT_AGENT_ORIGIN_KEY").ok();
     let origin_key_dir = std::env::var("CT_AGENT_ORIGIN_KEY_DIR").ok();
-    let identity = resolve_serving_identity(
+    // #27 RB2b: if the portal supplied the tunnel's routing token (CT_AGENT_TOKEN,
+    // set by the install one-liner), register at the edge under THAT token so a
+    // revocation can find and drop this tunnel. Otherwise mint a random token.
+    let forced_token = std::env::var("CT_AGENT_TOKEN")
+        .ok()
+        .and_then(|s| parse_routing_token_hex(&s));
+    let identity = resolve_serving_identity_with_token(
         origin_key_path.as_deref(),
         &cap_out,
         &config.edge.to_string(),
         origin_key_dir.as_deref(),
+        forced_token,
     )?;
     eprintln!(
         "ct-agent: edge={} origin={} capability -> {} (serving {} origin identit{}){}",
