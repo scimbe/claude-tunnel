@@ -94,6 +94,40 @@ docker compose \
 If a non-allowed email is used with `CT_PORTAL_ALLOWED_EMAIL_DOMAINS` set, the
 callback returns a clear "not on the access list" page and mints no session (#43).
 
+## Social login / identity brokering (#49)
+
+The `ct-demo` realm ships with **Google, GitHub, and GitLab** identity providers
+declared (see `keycloak/ct-demo-realm.json`). Once you supply real OAuth-app
+credentials for the ones you want, Keycloak's login page grows "Sign in with
+Google / GitHub / GitLab" buttons alongside the local account form — **no
+control-plane change**, and `#43`'s email-domain allow-list still gates access
+using whatever `email` the broker passes through (the providers set `trustEmail`).
+
+For each provider you want active, register an OAuth app on that platform and set
+its **redirect / callback URI** to Keycloak's broker endpoint:
+
+```
+https://<AUTH_PUBLIC_HOST>/realms/ct-demo/broker/<alias>/endpoint
+```
+
+| Provider | `<alias>` | Register the OAuth app at | `.env` keys |
+|----------|-----------|---------------------------|-------------|
+| Google | `google` | Google Cloud Console → APIs & Services → Credentials → OAuth client ID (Web) | `KC_GOOGLE_CLIENT_ID`, `KC_GOOGLE_CLIENT_SECRET` |
+| GitHub | `github` | GitHub → Settings → Developer settings → OAuth Apps → New | `KC_GITHUB_CLIENT_ID`, `KC_GITHUB_CLIENT_SECRET` |
+| GitLab | `gitlab` | GitLab → Preferences → Applications (scopes: `openid`, `email`, `profile`) | `KC_GITLAB_CLIENT_ID`, `KC_GITLAB_CLIENT_SECRET` |
+
+Put the credentials in `docker/deploy/.env`, then redeploy (or restart Keycloak) —
+the realm import substitutes them via `${env.KC_*}`. A provider left with **empty**
+credentials still shows a button that errors on click; disable or delete the ones
+you don't use in the Keycloak admin console (Identity Providers → the provider →
+toggle *Enabled* off), or remove them from the realm JSON.
+
+**A custom OIDC provider** (any fourth IdP) needs no code or realm-file change —
+add it live in the admin console: **Identity Providers → Add provider → OpenID
+Connect v1.0**, paste the provider's discovery URL (`.../.well-known/openid-configuration`),
+set the client ID/secret, and give the provider the same broker redirect URI above
+with your chosen alias.
+
 ## How it verifies (no key export)
 
 `CT_OIDC_ISSUER` → the control-plane derives `<issuer>/protocol/openid-connect/certs`,

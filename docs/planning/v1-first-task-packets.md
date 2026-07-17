@@ -1551,9 +1551,12 @@ Control-Plane-/Portal-Code ändert sich — Keycloak-Feature *Identity Brokering
   alle 3 Broker deklariert, `trustEmail`, Creds aus `${env.*}` (nie gebacken). Gate grün (control-plane 127).
   **Verifikations-Abhängigkeit:** dass Keycloak den IdP-Block *sauber importiert* + die Login-Buttons erscheinen, ist **nicht
   hermetisch prüfbar** (kein Keycloak im Cargo-Gate) — central verifiziert live (wie #42). Darum #49 **in-progress**, nicht fix-ready.
-- **KC4-b** ⏳ **Runbook**: OAuth-App-Registrierung (Google/GitHub/GitLab) + die `.env`-Keys (`KC_*_CLIENT_ID|SECRET`) + Redirect-URI
-  (`https://auth.<zone>/realms/ct-demo/broker/<alias>/endpoint`) + Schritte für einen Custom-OIDC-Provider via Admin-Console
-  (Identity Providers → Add → OpenID Connect v1.0). Dann #49 **fix-ready**; central fährt den externen Klick-Durchlauf mit echten Creds.
+- **KC4-b** ✅ **Runbook** (`keycloak-sso.md`, Abschnitt „Social login / identity brokering"): OAuth-App-Registrierung
+  (Google/GitHub/GitLab, mit Registrierungs-Ort je Provider), Broker-Redirect-URI
+  `https://<AUTH_PUBLIC_HOST>/realms/ct-demo/broker/<alias>/endpoint`, `.env`-Keys-Tabelle (`KC_*_CLIENT_ID|SECRET`), Hinweis zum
+  Deaktivieren/Entfernen leerer Provider, und Custom-OIDC-Provider via Admin-Console (Identity Providers → Add → OpenID Connect v1.0,
+  Discovery-URL). **#49 fix-ready** (Developer-Seite komplett) — central verifiziert live: Realm importiert sauber + Buttons erscheinen
+  (echte Creds in `.env`), #43-Gate greift weiter.
 
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
 
