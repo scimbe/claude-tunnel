@@ -298,6 +298,20 @@ pub fn verify(
     Ok(())
 }
 
+/// Verify a holder's **proof of possession** (#81 gap 1): `signature` must be the
+/// holder's ed25519 signature over the edge-issued `challenge`. This closes "stolen
+/// grant = bearer token" — presenting a valid [`SignedChannelGrant`] is not enough;
+/// the presenter must also prove it holds the private key matching the grant's
+/// `holder` public key by signing a fresh, single-use challenge the edge picks. The
+/// caller pairs this with the grant/membership checks at the admission gate. Returns
+/// `false` on a non-key `holder`, a bad signature, or a challenge mismatch.
+pub fn verify_holder_possession(holder: &[u8; 32], challenge: &[u8], signature: &[u8; 64]) -> bool {
+    match VerifyingKey::from_bytes(holder) {
+        Ok(vk) => vk.verify(challenge, &Signature::from_bytes(signature)).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Lowercase-hex a 32-byte value for the canonical signing bytes.
 fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -422,6 +436,33 @@ mod tests {
         let mut bad_utf8 = signed.encode();
         bad_utf8.extend_from_slice(&[0xff, 0xfe]);
         assert_eq!(ChannelJoinRequest::decode(&bad_utf8), Err(GrantError::Malformed));
+    }
+
+    #[test]
+    fn holder_possession_proof_verifies_only_the_real_holder() {
+        // #81 gap 1: the holder proves possession by signing the edge challenge.
+        let holder_sk = SigningKey::from_bytes(&[0x42u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let challenge = b"edge-nonce-0123456789abcdef";
+
+        // The genuine holder's signature over the challenge verifies.
+        let sig = holder_sk.sign(challenge).to_bytes();
+        assert!(verify_holder_possession(&holder, challenge, &sig));
+
+        // A different key cannot produce a valid proof for this holder.
+        let other = SigningKey::from_bytes(&[0x43u8; 32]);
+        let forged = other.sign(challenge).to_bytes();
+        assert!(!verify_holder_possession(&holder, challenge, &forged), "wrong key rejected");
+
+        // A signature over a DIFFERENT challenge is rejected (no replay of an old
+        // proof against a fresh nonce).
+        let stale = holder_sk.sign(b"a-different-nonce").to_bytes();
+        assert!(!verify_holder_possession(&holder, challenge, &stale), "stale challenge rejected");
+
+        // A tampered signature is rejected.
+        let mut tampered = sig;
+        tampered[0] ^= 0xff;
+        assert!(!verify_holder_possession(&holder, challenge, &tampered), "tampered signature rejected");
     }
 
     #[test]

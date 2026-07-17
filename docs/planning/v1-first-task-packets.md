@@ -1784,9 +1784,14 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
   key rotation/expiry-shortening). Advertised endpoints must pass `safe_endpoint` (parseable SocketAddr,
   reject loopback/unspecified/multicast) before a peer will dial them. 2 new frozen tests (non-member
   refused; loopback endpoint refused) + the 10 existing. Gate green.
-- **SEC81b** ⏳ **Holder proof-of-possession** (gap 1): challenge-response at the gate — the presenter must
-  sign an edge nonce with the holder private key; verify against `grant.holder`. Closes "stolen grant =
-  bearer token". Needs the agent to hold an ed25519 identity key + a handshake round-trip.
+- **SEC81b-a** ✅ **Possession-proof primitive** (`ct-common::channel::verify_holder_possession`): the pure
+  check — `signature` must be the holder's ed25519 signature over the edge-issued `challenge`, verified
+  against the grant's `holder` pubkey. Closes replay of an old proof against a fresh nonce. 1 frozen test
+  (real holder verifies; wrong key / stale challenge / tampered sig rejected). Gate green.
+- **SEC81b-b** ⏳ **Wire the challenge-response into the QUIC gate**: the gate issues a single-use nonce
+  after grant+membership pass, reads the holder's signature, calls `verify_holder_possession`. Needs
+  length-prefixed request framing (or a second stream) + the test client to sign; lands with the agent-side
+  join dial. MUST precede SEC81c (broker-live).
 - **SEC81c** ⏳ **Wire the broker into the live edge** (gap 4): mount `broker_channel_rendezvous` in
   serve.rs + a control-plane channel-registry API, ONLY after SEC81b. Endpoint should additionally be
   constrained to match the agent's advertised direct endpoint where possible.
