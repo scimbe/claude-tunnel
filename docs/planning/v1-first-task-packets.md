@@ -1683,10 +1683,16 @@ Decomposed:
   `BrokerError`. No sockets — testable without a network. 7 frozen tests (pairing, role reversal,
   both-flexible→a-leads, two-initiators/two-acceptors rejected, channel mismatch, same-holder, expired/
   wrong-key). Gate green.
-- **AF2c** ⏳ **Same-user QUIC brokering + transport**: generalise `rendezvous.rs` to relay/broker two
-  agents over QUIC using the AF2b pairing decision; the two run a pairwise Noise session (edge broker, no
-  payload relay); real two-agent integration test on the NAT-punch base. Needs the operator-key source
-  (control-plane channel registry) wired.
+- **AF2c** ✅ **Channel-join request wire type** (`ct-common::channel::ChannelJoinRequest`): the on-wire
+  form an agent presents to the edge — its `SignedChannelGrant` (fixed `WIRE_LEN` prefix) + advertised
+  direct endpoint (host:port tail). encode/decode with non-empty-endpoint + full-grant validation; the AF2b
+  broker parses two of these to pair. 1 frozen test (roundtrip + malformed: no endpoint / truncated /
+  bad-utf8). Design-robust (independent of the key-custody decision). Gate green.
+- **AF2d** ⏳ **Same-user QUIC brokering + transport** (BLOCKED on a design decision): generalise
+  `rendezvous.rs` to relay/broker two agents over QUIC using AF2b + the AF2c request; the two run a pairwise
+  Noise session (edge broker, no payload relay); real two-agent integration test. Needs scimbe's call on
+  channel-operator **key custody** (agent-held vs. portal/control-plane-held) + the channel registry that
+  supplies the edge the operator pubkey (like host-auth). Do NOT build until answered — avoids rework.
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration

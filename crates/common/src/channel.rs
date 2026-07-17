@@ -180,6 +180,10 @@ impl std::fmt::Display for GrantError {
 impl std::error::Error for GrantError {}
 
 impl SignedChannelGrant {
+    /// The exact byte length of [`SignedChannelGrant::encode`]'s output — all
+    /// fields are fixed-size, so a grant occupies a fixed prefix on the wire.
+    pub const WIRE_LEN: usize = 64 + 32 + 32 + 1 + 1 + 1 + 8; // 139
+
     /// Encode to a fixed-layout binary wire form (all fields are fixed size):
     /// `signature(64) | channel(32) | holder(32) | direction(1) | rights(1) | delegable(1) | expires_at(u64 LE)`.
     pub fn encode(&self) -> Vec<u8> {
@@ -234,6 +238,44 @@ impl SignedChannelGrant {
             },
             signature,
         })
+    }
+}
+
+/// What an agent presents to the edge to join/operate a channel: its signed
+/// [`ChannelGrant`] plus the direct endpoint it advertises for the peer to reach it
+/// (host:port — the edge brokers the two advertised endpoints, ADR-0015). The
+/// channel and holder are inside the grant, so they are not repeated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelJoinRequest {
+    pub grant: SignedChannelGrant,
+    pub endpoint: String,
+}
+
+impl ChannelJoinRequest {
+    /// Wire form: the fixed-length grant, then the advertised endpoint as the tail
+    /// (`grant(WIRE_LEN) | endpoint(utf8, rest)`). No length prefix is needed — the
+    /// grant is fixed-size, so the endpoint is unambiguously the remainder.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.grant.encode();
+        out.extend_from_slice(self.endpoint.as_bytes());
+        out
+    }
+
+    /// Decode from [`ChannelJoinRequest::encode`]. Requires a full grant prefix and
+    /// a non-empty, valid-UTF-8 endpoint.
+    pub fn decode(bytes: &[u8]) -> Result<Self, GrantError> {
+        if bytes.len() <= SignedChannelGrant::WIRE_LEN {
+            return Err(GrantError::Malformed);
+        }
+        let (grant_bytes, endpoint_bytes) = bytes.split_at(SignedChannelGrant::WIRE_LEN);
+        let grant = SignedChannelGrant::decode(grant_bytes)?;
+        let endpoint = std::str::from_utf8(endpoint_bytes)
+            .map_err(|_| GrantError::Malformed)?
+            .to_string();
+        if endpoint.is_empty() {
+            return Err(GrantError::Malformed);
+        }
+        Ok(ChannelJoinRequest { grant, endpoint })
     }
 }
 
@@ -353,6 +395,33 @@ mod tests {
         let mut bad_dir = signed.encode();
         bad_dir[128] = 9;
         assert_eq!(SignedChannelGrant::decode(&bad_dir), Err(GrantError::Malformed));
+    }
+
+    #[test]
+    fn join_request_roundtrips_and_rejects_malformed() {
+        let (_pk, signed) = signed_grant(Direction::Initiate, Rights::ReadWrite, false, 5_000);
+        // Grant occupies exactly the advertised fixed prefix.
+        assert_eq!(signed.encode().len(), SignedChannelGrant::WIRE_LEN);
+
+        let req = ChannelJoinRequest {
+            grant: signed.clone(),
+            endpoint: "203.0.113.7:5001".to_string(),
+        };
+        let bytes = req.encode();
+        assert_eq!(ChannelJoinRequest::decode(&bytes), Ok(req));
+
+        // A grant with no trailing endpoint is malformed (endpoint required).
+        assert_eq!(
+            ChannelJoinRequest::decode(&signed.encode()),
+            Err(GrantError::Malformed),
+            "a join request must advertise an endpoint"
+        );
+        // Truncated below a full grant is malformed.
+        assert_eq!(ChannelJoinRequest::decode(&[0u8; 10]), Err(GrantError::Malformed));
+        // Invalid UTF-8 in the endpoint tail is malformed.
+        let mut bad_utf8 = signed.encode();
+        bad_utf8.extend_from_slice(&[0xff, 0xfe]);
+        assert_eq!(ChannelJoinRequest::decode(&bad_utf8), Err(GrantError::Malformed));
     }
 
     #[test]
