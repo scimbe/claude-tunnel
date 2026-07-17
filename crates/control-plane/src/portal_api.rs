@@ -476,7 +476,18 @@ fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
   edge automatically; otherwise point it there yourself.</span>
  </label>
  <button type="submit">Create</button>
-</form>"#,
+</form>
+<h2>Next steps</h2>
+<ol class="steps">
+ <li>Create a tunnel above &mdash; name it, and add a hostname if you want a public
+ HTTPS site.</li>
+ <li>Click <strong>Install</strong> on its row to get a one-line install command.</li>
+ <li>Run that command <strong>on the machine you want to expose</strong> (the
+ <em>origin</em> &mdash; e.g. your server or laptop running the service), not on
+ the device you are browsing from.</li>
+ <li>Done &mdash; requests reach your origin through the relay, end-to-end
+ encrypted; the operator never sees your payload.</li>
+</ol>"#,
     );
     page("your tunnels", &body)
 }
@@ -511,6 +522,8 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  label input{{display:block;margin-top:.3rem;width:100%;max-width:360px}}
  .help{{color:#8b949e;font-size:.82rem;display:block}} label .help{{margin-top:.35rem}}
  p.help{{margin:.2rem 0 1rem}} .opt{{color:#8b949e;font-weight:400}}
+ ol.steps{{color:#8b949e;font-size:.86rem;margin:.2rem 0;padding-left:1.2rem}}
+ ol.steps li{{margin:.35rem 0}} ol.steps strong{{color:#e6edf3}}
 </style></head><body>
 <div class="card">
 <nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/logout">Sign out</a></nav>
@@ -723,6 +736,25 @@ mod tests {
         assert!(
             !html.contains("http://") && !html.contains("https://cdn"),
             "no external assets"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_shows_getting_started_steps() {
+        // #69 T69.2: after creating a tunnel a first-time customer lands back on the
+        // list with no idea what to do next. A "Next steps" walkthrough must be
+        // present, and it must make the critical create->install->run-on-the-origin
+        // distinction (run the one-liner on the machine you want to expose, not the
+        // browsing device) explicit. Frozen so the walkthrough can't silently vanish.
+        let app = test_app();
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Next steps"), "a next-steps walkthrough is shown");
+        assert!(html.contains("<ol class=\"steps\">"), "rendered as ordered steps");
+        assert!(html.contains("Install"), "step references the Install action");
+        assert!(
+            html.contains("machine you want to expose"),
+            "explains the one-liner runs on the origin, not the browsing device"
         );
     }
 

@@ -1645,8 +1645,10 @@ are control-plane HTML producers with oneshot render tests). Decomposed:
   "Browser Plane"), and that DNS is pointed at the edge automatically when the operator has deSEC
   configured (#38 DL2). Frozen test asserts the rendered form carries the field labels + the
   Browser-Plane/DNS explanation. Gate: cargo build+test, 0 warnings.
-- **T69.2** ⏳ **Post-create "next steps" panel** (friction point 3): after creating, the tunnel list
-  shows a short create → install → run → done walkthrough panel for a first-time user.
+- **T69.2** ✅ **Post-create "next steps" panel** (friction point 3): the tunnel list carries a numbered
+  create → install → run-on-the-origin → done walkthrough, making the critical "run the one-liner on the
+  machine you want to expose, not your browsing device" distinction explicit. Frozen test asserts the
+  steps panel + that guidance. Gate: cargo build+test, 0 warnings.
 - **T69.3** ⏳ **Install-page context + lost-token signposting** (friction points 4+5): frame the
   install one-liner with a sentence — run it on the machine you want to expose (the origin), not your
   laptop — and signpost revoke-and-recreate for a lost single-use token. **fix-ready only when all five
