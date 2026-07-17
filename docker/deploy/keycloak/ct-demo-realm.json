@@ -12,6 +12,7 @@
     {
       "clientId": "ct-portal",
       "name": "claude-tunnel customer portal",
+      "secret": "${env.KC_PORTAL_CLIENT_SECRET}",
       "protocol": "openid-connect",
       "enabled": true,
       "publicClient": false,

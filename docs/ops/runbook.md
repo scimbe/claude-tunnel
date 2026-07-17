@@ -275,6 +275,7 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 |---------|--------------|--------|
 | `/readyz` returns 503 | DB unreachable / volume detached | check the `cpdata` volume mount; restart once storage is back |
 | All webhooks `401` | wrong/blank `CT_PAYMENT_WEBHOOK_SECRET` | set it to match the provider; restart |
+| Portal SSO login `502 sign-in failed` right after a successful Keycloak login | `KC_PORTAL_CLIENT_SECRET` unset, or `.env` change not picked up (#65) | set `KC_PORTAL_CLIENT_SECRET` in `.env`; check `docker compose logs control-plane` for `OIDC code exchange failed`; recreate with `docker compose ... up -d control-plane keycloak` — **not** `docker restart` (it reuses baked-in env and won't re-read `.env`) |
 | Clients can't connect after cert change | should not happen (CA-root trust) | confirm clients hold the CA root, not a pinned leaf |
 | One account floods issuance | working as designed | per-account rate limit returns `429`; adjust the cap if legitimate |
 | Suspected committed secret | credential in a commit | run `./scripts/check-no-secrets.sh`; rotate the exposed secret |

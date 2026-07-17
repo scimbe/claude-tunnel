@@ -35,8 +35,12 @@
 #   AUTH_CERT_DIR         host dir with the BYO cert for auth.<zone> — fullchain.pem +
 #                         privkey.pem (obtained like the Portal's, deSEC DNS-01).
 #   PORTAL_PUBLIC_URL     the portal base URL the browser uses (https://<zone>).
-#   CT_OIDC_CLIENT_SECRET the `ct-portal` client secret Keycloak minted on import
-#                         (Clients -> ct-portal -> Credentials); kept only in .env.
+#   KC_PORTAL_CLIENT_SECRET  the `ct-portal` confidential-client secret (#65). Pick
+#                         any random hex ONCE and keep it in .env. Keycloak imports
+#                         this exact value on every realm (re)import and the
+#                         control-plane uses the same var for the code→token
+#                         exchange, so they never drift — no more copying a
+#                         Keycloak-minted secret by hand after each recreate.
 
 name: ct-selfhost
 
@@ -67,6 +71,13 @@ services:
       # See docs/deploy/keycloak-sso.md. An empty pair leaves that button present
       # but non-functional; remove/disable unwanted providers in the admin console.
       KC_GOOGLE_CLIENT_ID: "${KC_GOOGLE_CLIENT_ID:-}"
+      # #65: pin the ct-portal confidential-client secret so Keycloak adopts THIS
+      # fixed value on every --import-realm instead of minting a fresh random one.
+      # Keycloak's realm is ephemeral (start-dev, no volume) and reimports on every
+      # recreate; without a pinned secret the control-plane's CT_OIDC_CLIENT_SECRET
+      # drifts out of sync and every login 502s. The realm JSON substitutes this via
+      # ${env.KC_PORTAL_CLIENT_SECRET}; the control-plane below reads the SAME var.
+      KC_PORTAL_CLIENT_SECRET: "${KC_PORTAL_CLIENT_SECRET:?set KC_PORTAL_CLIENT_SECRET=<random hex; stable across Keycloak reimports>}"
       KC_GOOGLE_CLIENT_SECRET: "${KC_GOOGLE_CLIENT_SECRET:-}"
       KC_GITHUB_CLIENT_ID: "${KC_GITHUB_CLIENT_ID:-}"
       KC_GITHUB_CLIENT_SECRET: "${KC_GITHUB_CLIENT_SECRET:-}"
@@ -106,15 +117,18 @@ services:
         condition: service_healthy
 
   # Merge the OIDC env onto the base control-plane service (#42 KC3). CT_OIDC_ISSUER
-  # alone enables OIDC — the control-plane fetches the realm JWKS at startup (KC2-c);
-  # the client secret comes from .env (inherited env_file from the base service),
-  # never from the realm export. Wait for Keycloak so the boot-time JWKS fetch lands.
+  # alone enables OIDC — the control-plane fetches the realm JWKS at startup (KC2-c).
+  # Wait for Keycloak so the boot-time JWKS fetch lands.
   control-plane:
     environment:
       CT_OIDC_ISSUER: "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL=https://<AUTH_PUBLIC_HOST>}/realms/ct-demo"
       CT_OIDC_CLIENT_ID: "ct-portal"
       CT_OIDC_REDIRECT_URI: "${PORTAL_PUBLIC_URL:?set PORTAL_PUBLIC_URL=https://<zone>}/portal/callback"
-      # CT_OIDC_CLIENT_SECRET is read from .env (do NOT put it here).
+      # #65: the code→token exchange secret is DERIVED from the same single .env var
+      # that pins Keycloak's client secret above — so the two can never drift apart
+      # across a Keycloak reimport (which was the 502 root cause). Not a committed
+      # secret: it's an env indirection, and the real value lives only in .env.
+      CT_OIDC_CLIENT_SECRET: "${KC_PORTAL_CLIENT_SECRET:?set KC_PORTAL_CLIENT_SECRET=<random hex; same value Keycloak imports>}"
       # The email-domain access-list (#43) is optional; set it in .env to restrict
       # who may register: CT_PORTAL_ALLOWED_EMAIL_DOMAINS=becke.biz
     depends_on:

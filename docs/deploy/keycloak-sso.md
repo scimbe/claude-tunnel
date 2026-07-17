@@ -10,8 +10,10 @@ stack runs unchanged without it.
 - `docker/deploy/compose.sso.yml` — the Keycloak service (`quay.io/keycloak/keycloak:25`,
   `start-dev --import-realm`) plus the `CT_OIDC_*` env merged onto the control-plane.
 - `docker/deploy/keycloak/ct-demo-realm.json` — a declarative realm `ct-demo` with a
-  confidential RS256 client `ct-portal` and self-registration enabled. **No secret is
-  baked in** — Keycloak mints the client secret on import.
+  confidential RS256 client `ct-portal` and self-registration enabled. Its secret is
+  **pinned to `${env.KC_PORTAL_CLIENT_SECRET}`** (#65) — no literal is baked in, but
+  Keycloak adopts that exact value on every (re)import, so it stays stable across the
+  ephemeral realm's recreates and never drifts from the control-plane.
 
 The control-plane verifies tokens by fetching the realm's RS256 signing key from
 its JWKS at startup (`CT_OIDC_ISSUER` alone is enough; no PEM export needed).
@@ -52,8 +54,10 @@ KEYCLOAK_PUBLIC_URL=https://auth.bunsenbrenner.org
 AUTH_CERT_DIR=/etc/ct/certs/auth
 # Portal base URL the browser uses.
 PORTAL_PUBLIC_URL=https://bunsenbrenner.org
-# The ct-portal client secret Keycloak minted on import (see step 3). Keep it ONLY here.
-CT_OIDC_CLIENT_SECRET=<paste-from-keycloak>
+# The ct-portal client secret (#65). Pick any random hex ONCE (e.g. `openssl rand
+# -hex 32`); Keycloak imports this exact value and the control-plane uses the same
+# var for the code->token exchange, so they never drift across a Keycloak recreate.
+KC_PORTAL_CLIENT_SECRET=<random-hex-you-choose>
 # Optional (#43): restrict who may self-register, by email domain.
 CT_PORTAL_ALLOWED_EMAIL_DOMAINS=becke.biz
 # Keycloak admin console creds (change for anything reachable).
@@ -80,9 +84,13 @@ docker compose \
 2. If the control-plane started before Keycloak was ready and logged OIDC as
    disabled, restart it: `docker compose ... restart control-plane` — it re-fetches
    the JWKS. (A boot-time retry is a possible follow-up.)
-3. **Grab the client secret**: Keycloak admin console (`KEYCLOAK_PUBLIC_URL`) →
-   realm `ct-demo` → Clients → `ct-portal` → Credentials → copy the secret into
-   `CT_OIDC_CLIENT_SECRET` in `.env`, then `restart control-plane`.
+3. **Client secret (#65)**: you no longer copy a Keycloak-minted secret. Set
+   `KC_PORTAL_CLIENT_SECRET=<random hex>` in `.env` **once** — Keycloak imports that
+   value for `ct-portal` on every realm (re)import and the control-plane reads the
+   same var, so the two stay in sync automatically. After a Keycloak recreate you do
+   **not** need to re-sync anything; just make sure any `.env` change is picked up by
+   recreating the affected service (`docker compose ... up -d`), not `docker restart`
+   (which reuses the container's original baked-in env and does not re-read `.env`).
 
 ## Click-through
 

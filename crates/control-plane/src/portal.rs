@@ -328,8 +328,11 @@ async fn portal_callback(
             set_cookie(&mut resp, &cleared_state_cookie());
             resp
         }
-        Err(_) => {
-            // Don't surface IdP/exchange error detail to the browser.
+        Err(e) => {
+            // Don't surface IdP/exchange error detail to the browser, but DO log it
+            // server-side (#65): a bare 502 with nothing in the logs gave an operator
+            // no lead on client-secret drift. The message never reaches the browser.
+            eprintln!("ct-cp: OIDC code exchange failed: {e}");
             let mut resp = (StatusCode::BAD_GATEWAY, "sign-in failed").into_response();
             set_cookie(&mut resp, &cleared_state_cookie());
             resp
@@ -685,6 +688,17 @@ mod tests {
         assert_eq!(client["publicClient"], false, "confidential client (secret-backed)");
         assert_eq!(client["standardFlowEnabled"], true, "Authorization Code flow");
 
+        // #65: the confidential client's secret must be PINNED to an env placeholder
+        // (${env.KC_PORTAL_CLIENT_SECRET}), not absent. Without this Keycloak mints a
+        // fresh random secret on every ephemeral realm reimport, drifting out of sync
+        // with the control-plane's CT_OIDC_CLIENT_SECRET → every login 502s. It must
+        // still never be a baked-in literal (kept in .env).
+        let secret = client["secret"].as_str().unwrap_or("");
+        assert!(
+            secret.contains("${env.KC_PORTAL_CLIENT_SECRET"),
+            "ct-portal secret must be env-pinned for a stable reimport, got {secret:?}"
+        );
+
         // #42 regression: `defaultClientScopes` may only name real Keycloak client
         // scopes. `openid` is the request-time scope param (the portal sends
         // scope=openid), NOT a client scope — listing it fails the realm import.
@@ -755,11 +769,20 @@ mod tests {
         );
         assert!(compose.contains("/portal/callback"), "redirect uri hits the /portal/callback route");
         assert!(compose.contains("/realms/ct-demo"), "issuer points at the ct-demo realm");
-        // The secret must come from .env — never be assigned a value in the compose.
-        let sets_secret = compose
-            .lines()
-            .any(|l| l.trim().starts_with("CT_OIDC_CLIENT_SECRET:"));
-        assert!(!sets_secret, "client secret must live in .env, not the committed compose");
+        // #65: the client secret is single-sourced from ONE .env var
+        // (KC_PORTAL_CLIENT_SECRET) that both drives Keycloak's realm import AND the
+        // control-plane's code→token exchange — so they can never drift across a
+        // Keycloak reimport. Neither side may carry a baked-in literal value.
+        for var in ["KC_PORTAL_CLIENT_SECRET", "CT_OIDC_CLIENT_SECRET"] {
+            let line = compose
+                .lines()
+                .find(|l| l.trim().starts_with(&format!("{var}:")))
+                .unwrap_or_else(|| panic!("{var} must be wired in the compose"));
+            assert!(
+                line.contains("${KC_PORTAL_CLIENT_SECRET"),
+                "{var} must reference the single .env var, not a literal secret: {line}"
+            );
+        }
 
         // #42 regression (bug 2): Keycloak 25 serves /health on the management
         // interface :9000, not the main :8080 — probing 8080 404s and the
