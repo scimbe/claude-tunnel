@@ -1703,10 +1703,17 @@ Decomposed:
   accepts one `ChannelJoinRequest` over QUIC, looks up the channel's operator pubkey (injected, wired to
   AF2d-registry), verifies the grant, replies OK/NO, returns the request + advertised endpoint. 2 QUIC
   integration tests (admit valid; refuse unknown-channel + expired). Gate green.
-- **AF2d-transport-b** ⏳ **Pair two admitted joins**: hold two `resolve_channel_join` results for the same
-  channel, pair via AF2b `authorize_channel_pair`, swap the advertised endpoints back to each agent; the two
-  run a pairwise Noise session (edge broker, no payload relay), relay fallback; real TWO-agent integration
-  test. This is the packet that makes two agents actually talk directly.
+- **AF2d-transport-b** ✅ **Two-agent broker** (`broker_channel_rendezvous`): accepts two channel-joins for
+  the same channel, pairs them via AF2b, and replies to each with the PEER's advertised endpoint (`OK
+  <endpoint>`) so the two can connect directly (edge = rendezvous broker, never payload). Refactored the
+  read step into `accept_and_read_join`. Real TWO-agent QUIC integration test (two clients pair + each
+  learns the other's endpoint + roles follow directions). Gate green (channel_broker 10).
+- **AF3** ⏳ **Cross-user invitation**: operator issues an invitation → another user's agent redeems it into
+  a scoped member grant (agent-signed); trust-fail (deny/expiry/revoke) rules + tests.
+- **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**: agent joins/operates a channel
+  (dials the peer endpoint from the broker), runs a pairwise Noise session over the direct path, edge relay
+  fallback when the direct dial fails; real end-to-end two-agent data-exchange + fallback integration test.
+  **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration

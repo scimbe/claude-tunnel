@@ -98,19 +98,16 @@ pub fn authorize_channel_pair(
     }
 }
 
-/// Accept one channel-join over QUIC (AF2d-transport): read the presented
-/// [`ChannelJoinRequest`], look up the channel's operator public key via
-/// `operator_for` (wired to the control-plane channel registry), verify the grant
-/// at `now`, reply `OK`/`NO`, and return the request on success. This is the edge
-/// admission gate for a *single* participant; pairing two admitted participants
-/// (via [`authorize_channel_pair`]) and swapping their advertised endpoints is the
-/// next step. Rejects a malformed request, an unknown channel, and a bad/expired
-/// grant — always replying `NO` before erroring so the peer learns it was refused.
-pub async fn resolve_channel_join<F>(
+/// Accept one QUIC connection and read + verify a presented [`ChannelJoinRequest`],
+/// but do NOT ack yet — the caller owns the reply, because a single admission acks
+/// `OK` immediately while the two-party broker must defer until it knows the
+/// pairing. A malformed request, an unknown channel, or a bad/expired grant is
+/// rejected here with a `NO` before erroring.
+async fn accept_and_read_join<F>(
     endpoint: &Endpoint,
     now: UnixSeconds,
-    operator_for: F,
-) -> Result<ChannelJoinRequest, BoxError>
+    operator_for: &F,
+) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest), BoxError>
 where
     F: Fn(&ChannelId) -> Option<[u8; 32]>,
 {
@@ -138,17 +135,75 @@ where
             return Err("unknown channel".into());
         }
     };
-    match verify(&operator, &req.grant, now) {
-        Ok(()) => {
-            send.write_all(b"OK").await?;
-            send.finish()?;
-            conn.closed().await; // hold the connection so the peer reads the ack
-            Ok(req)
+    if let Err(e) = verify(&operator, &req.grant, now) {
+        let _ = send.write_all(b"NO").await;
+        let _ = send.finish();
+        return Err(format!("channel grant rejected: {e}").into());
+    }
+    Ok((conn, send, req))
+}
+
+/// Accept one channel-join over QUIC (AF2d-transport-a): read the presented
+/// [`ChannelJoinRequest`], verify its grant against the channel's operator public
+/// key (via `operator_for`, wired to the control-plane channel registry), reply
+/// `OK`/`NO`, and return the request on success. This is the edge admission gate
+/// for a *single* participant; [`broker_channel_rendezvous`] pairs two of them.
+pub async fn resolve_channel_join<F>(
+    endpoint: &Endpoint,
+    now: UnixSeconds,
+    operator_for: F,
+) -> Result<ChannelJoinRequest, BoxError>
+where
+    F: Fn(&ChannelId) -> Option<[u8; 32]>,
+{
+    let (conn, mut send, req) = accept_and_read_join(endpoint, now, &operator_for).await?;
+    send.write_all(b"OK").await?;
+    send.finish()?;
+    conn.closed().await; // hold the connection so the peer reads the ack
+    Ok(req)
+}
+
+/// Broker a direct channel between two agents (AF2d-transport-b): accept two
+/// channel-joins for the same channel, pair them via [`authorize_channel_pair`],
+/// and reply to each side with the *peer's* advertised endpoint (`OK <endpoint>`)
+/// so the two can connect directly — the edge is only the rendezvous broker and
+/// never sees their payload. An unpairable pair (channel mismatch / incompatible
+/// directions / same holder) gets `NO` on both sides. Returns the decided pairing.
+pub async fn broker_channel_rendezvous<F>(
+    endpoint: &Endpoint,
+    now: UnixSeconds,
+    operator_for: F,
+) -> Result<ChannelPairing, BoxError>
+where
+    F: Fn(&ChannelId) -> Option<[u8; 32]>,
+{
+    let (conn_a, mut send_a, req_a) = accept_and_read_join(endpoint, now, &operator_for).await?;
+    let (conn_b, mut send_b, req_b) = accept_and_read_join(endpoint, now, &operator_for).await?;
+
+    // Both grants are already verified against their own channel's operator; the
+    // pairing uses channel A's operator and rejects a cross-channel pair.
+    let operator = operator_for(&req_a.grant.grant.channel).ok_or("unknown channel")?;
+    match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
+        Ok(pairing) => {
+            // Each agent learns the OTHER's advertised endpoint to dial directly.
+            send_a
+                .write_all(format!("OK {}", req_b.endpoint).as_bytes())
+                .await?;
+            send_b
+                .write_all(format!("OK {}", req_a.endpoint).as_bytes())
+                .await?;
+            send_a.finish()?;
+            send_b.finish()?;
+            conn_a.closed().await;
+            conn_b.closed().await;
+            Ok(pairing)
         }
         Err(e) => {
-            let _ = send.write_all(b"NO").await;
-            let _ = send.finish();
-            Err(format!("channel grant rejected: {e}").into())
+            let _ = send_a.write_all(b"NO").await;
+            let _ = send_b.write_all(b"NO").await;
+            let _ = send_a.finish();
+            let _ = send_b.finish();
+            Err(format!("channel pair refused: {e}").into())
         }
     }
 }
@@ -277,7 +332,7 @@ mod tests {
         let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
         send.write_all(req_bytes).await.expect("write request");
         send.finish().expect("finish");
-        recv.read_to_end(8).await.unwrap_or_default()
+        recv.read_to_end(128).await.unwrap_or_default()
     }
 
     fn join_request(channel: [u8; 32], holder: u8, endpoint: &str) -> ChannelJoinRequest {
@@ -344,5 +399,56 @@ mod tests {
         let ack2 = present_join(&conn2, &expired.encode()).await;
         assert_ne!(ack2, b"OK", "an expired grant must be refused");
         let _ = server2_task.await;
+    }
+
+    #[tokio::test]
+    async fn broker_pairs_two_agents_and_swaps_endpoints() {
+        // The end-to-end AF2d milestone: two agents present valid joins for the
+        // SAME channel (one Initiate, one Accept); the edge pairs them and hands
+        // each the OTHER's advertised endpoint so they can connect directly.
+        let pk = operator_pubkey();
+        let channel = [0xD1u8; 32];
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            broker_channel_rendezvous(&server, 500, move |c| (c.0 == channel).then_some(pk))
+                .await
+                .map(|p| (p.initiator_holder[0], p.acceptor_holder[0]))
+                .map_err(|e| e.to_string())
+        });
+
+        let req_a = ChannelJoinRequest {
+            grant: grant(channel, 0xa1, Direction::Initiate, 1_000),
+            endpoint: "10.0.0.1:7001".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: grant(channel, 0xb2, Direction::Accept, 1_000),
+            endpoint: "10.0.0.2:7002".to_string(),
+        };
+        let cert_b = cert.clone();
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_a.encode()).await;
+            conn.close(0u32.into(), b"done");
+            String::from_utf8(ack).unwrap_or_default()
+        });
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_b.encode()).await;
+            conn.close(0u32.into(), b"done");
+            String::from_utf8(ack).unwrap_or_default()
+        });
+
+        let ack_a = a.await.expect("a");
+        let ack_b = b.await.expect("b");
+        let paired = server_task.await.expect("join").expect("paired");
+
+        // Each agent learned the PEER's endpoint (independent of edge accept order).
+        assert!(ack_a.contains("10.0.0.2:7002"), "agent A learns B's endpoint, got {ack_a:?}");
+        assert!(ack_b.contains("10.0.0.1:7001"), "agent B learns A's endpoint, got {ack_b:?}");
+        // The initiator is the Initiate-holder (0xa1), the acceptor the Accept-holder (0xb2).
+        assert_eq!(paired, (0xa1, 0xb2), "roles follow the grants' directions");
     }
 }
