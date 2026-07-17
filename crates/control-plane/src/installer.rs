@@ -59,9 +59,81 @@ pub fn install_one_liner(
     }
 }
 
+/// Render the POSIX `/install.sh` script the Unix one-liner pipes into `sh`
+/// (#75 IS3a). It detects OS+arch, downloads the matching prebuilt `ct-agent`
+/// binary from `release_base` (the GitHub-Releases-style asset base, e.g.
+/// `https://github.com/scimbe/claude-tunnel/releases/latest/download`), and execs
+/// `ct-agent onboard` — which reads `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN` from the
+/// environment the one-liner set, so no secret is ever a script argument. This is
+/// the served script CONTENT; wiring the `/install.sh` route is IS3b and the
+/// prebuilt release binaries it downloads are IS2.
+///
+/// `release_base` is trusted config (never user input) and has any trailing slash
+/// trimmed. The script is `set -eu`, fails loudly on an unsupported OS/arch, and
+/// installs into a fresh temp dir.
+pub fn render_install_sh(release_base: &str) -> String {
+    let base = release_base.trim_end_matches('/');
+    format!(
+        r#"#!/bin/sh
+# claude-tunnel agent installer (#75). Piped from the portal one-liner:
+#   curl -fsSL <portal>/install.sh | CT_JOIN_TOKEN=... CT_AGENT_TOKEN=... sh
+# Run this on the machine you want to expose (the origin), not your laptop.
+set -eu
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in
+  x86_64|amd64) arch=x86_64 ;;
+  aarch64|arm64) arch=aarch64 ;;
+  *) echo "ct-agent install: unsupported architecture '$arch'" >&2; exit 1 ;;
+esac
+case "$os" in
+  linux|darwin) ;;
+  *) echo "ct-agent install: unsupported OS '$os' (use the manual path)" >&2; exit 1 ;;
+esac
+
+: "${{CT_JOIN_TOKEN:?set CT_JOIN_TOKEN (from the portal install page)}}"
+: "${{CT_AGENT_TOKEN:?set CT_AGENT_TOKEN (from the portal install page)}}"
+
+asset="ct-agent-${{os}}-${{arch}}"
+url="{base}/${{asset}}"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "ct-agent install: downloading $url" >&2
+curl -fsSL "$url" -o "$tmp/ct-agent"
+chmod +x "$tmp/ct-agent"
+# Tokens are inherited from the environment (never on the command line).
+exec "$tmp/ct-agent" onboard
+"#,
+        base = base,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_sh_detects_os_arch_downloads_and_onboards() {
+        let sh = render_install_sh("https://github.com/scimbe/claude-tunnel/releases/latest/download/");
+        // POSIX + fail-fast.
+        assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang");
+        assert!(sh.contains("set -eu"), "fail-fast");
+        // OS + arch detection with a normalised asset name.
+        assert!(sh.contains("uname -s") && sh.contains("uname -m"), "detects OS + arch");
+        assert!(sh.contains("aarch64") && sh.contains("x86_64"), "normalises arch aliases");
+        assert!(sh.contains(r#"asset="ct-agent-${os}-${arch}""#), "per-OS/arch asset name");
+        // Downloads from the release base (trailing slash trimmed — no `//`).
+        assert!(
+            sh.contains(r#"url="https://github.com/scimbe/claude-tunnel/releases/latest/download/${asset}""#),
+            "downloads the matching binary from the release base"
+        );
+        // Requires the tokens from the env (not as args) and execs onboard.
+        assert!(sh.contains("CT_JOIN_TOKEN:?") && sh.contains("CT_AGENT_TOKEN:?"), "requires the env tokens");
+        assert!(sh.contains(r#"exec "$tmp/ct-agent" onboard"#), "execs the agent onboarding");
+        // No secret is ever a positional argument.
+        assert!(!sh.contains("onboard $CT_JOIN_TOKEN") && !sh.contains("onboard \""), "tokens stay in the env");
+    }
 
     #[test]
     fn parse_maps_os_aliases() {

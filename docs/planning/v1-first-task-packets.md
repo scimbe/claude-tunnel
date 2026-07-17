@@ -1734,9 +1734,13 @@ prebuilt image dead-ends at the final step. Substantial feature (like #72) → d
   Gate: cargo build+test, 0 warnings. Stops misleading real customers immediately.
 - **IS2** ⏳ **Binary distribution**: GitHub Releases (or equivalent) with prebuilt `ct-agent` binaries
   for Linux x86_64/arm64, macOS, Windows — without this `install.sh` has nothing to download.
-- **IS3** ⏳ **`/install.sh` route**: served POSIX script (rustup/Homebrew pattern) that detects OS/arch,
-  downloads the matching release binary, and runs `ct-agent onboard` with `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN`
-  from the env.
+- **IS3a** ✅ **`/install.sh` script renderer** (`installer::render_install_sh`): pure function producing the
+  POSIX installer — detects OS (uname) + arch (x86_64/aarch64 normalised), downloads `ct-agent-<os>-<arch>`
+  from the release base, `set -eu` + temp-dir + `exec ct-agent onboard` (tokens from env, never argv).
+  1 frozen test (shebang, detection, asset name, download URL, env-token requirement, onboard exec, no
+  secret in argv). Gate green.
+- **IS3b** ⏳ **`/install.sh` + `/install.ps1` routes**: axum handlers serving the rendered scripts (release
+  base from config), replacing the honest-stopgap 404. Wire once IS2 release binaries exist.
 - **IS4** ⏳ **`/install.ps1` route**: same for PowerShell/Windows.
 - **IS5** ⏳ **Real integration test**: execute the served script in a CLEAN container (no prebuilt
   image), not just the page's text generation. **fix-ready only when a fresh customer can run the
