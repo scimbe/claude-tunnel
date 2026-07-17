@@ -253,6 +253,48 @@ pub fn csv_row(delay: &str, loss: &str, rate: &str, s: &Summary) -> String {
     )
 }
 
+/// Bulk-transfer throughput over a sustained transfer (#76 OV1). Latency (RTT) is
+/// the wrong lens for overlay-under-load behaviour; the topology study needs
+/// bytes/second. This is the pure measurement primitive the bulk-transfer run mode
+/// (OV2) emits — kept unit-testable and network-free, alongside [`Summary`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Throughput {
+    /// Total application bytes transferred.
+    pub bytes: u64,
+    /// Wall-clock seconds the transfer took.
+    pub secs: f64,
+    /// Throughput in megabits per second (bytes·8 / secs / 1e6).
+    pub mbps: f64,
+    /// Throughput in mebibytes per second (bytes / secs / 2^20).
+    pub mib_s: f64,
+}
+
+/// Compute [`Throughput`] for `bytes` transferred in `secs`. Returns `None` for a
+/// non-positive duration (no meaningful rate).
+pub fn throughput(bytes: u64, secs: f64) -> Option<Throughput> {
+    if secs <= 0.0 {
+        return None;
+    }
+    Some(Throughput {
+        bytes,
+        secs,
+        mbps: (bytes as f64) * 8.0 / secs / 1_000_000.0,
+        mib_s: (bytes as f64) / secs / (1024.0 * 1024.0),
+    })
+}
+
+/// CSV columns for a bulk-transfer sample under a netem condition (#76 OV1).
+pub const THROUGHPUT_CSV_HEADER: &str = "delay,loss,rate,bytes,secs,mbps,mib_s";
+
+/// Format a CSV row for a netem condition and its [`Throughput`], columns per
+/// [`THROUGHPUT_CSV_HEADER`].
+pub fn throughput_csv_row(delay: &str, loss: &str, rate: &str, t: &Throughput) -> String {
+    format!(
+        "{},{},{},{},{:.3},{:.3},{:.3}",
+        delay, loss, rate, t.bytes, t.secs, t.mbps, t.mib_s
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +335,30 @@ mod tests {
     #[test]
     fn empty_is_none() {
         assert!(summarize(&[]).is_none());
+    }
+
+    #[test]
+    fn throughput_computes_mbps_and_mibps() {
+        // 10 MB in 2 s = 40 Mbit/s; ~4.768 MiB/s.
+        let t = throughput(10_000_000, 2.0).expect("positive duration");
+        assert_eq!(t.bytes, 10_000_000);
+        assert!((t.mbps - 40.0).abs() < 1e-6, "40 Mbit/s, got {}", t.mbps);
+        assert!((t.mib_s - 4.76837).abs() < 1e-3, "~4.768 MiB/s, got {}", t.mib_s);
+        // Non-positive duration has no meaningful rate.
+        assert!(throughput(1, 0.0).is_none());
+        assert!(throughput(1, -1.0).is_none());
+    }
+
+    #[test]
+    fn throughput_csv_row_formats() {
+        let t = throughput(5_000_000, 1.0).unwrap();
+        let row = throughput_csv_row("30ms", "1%", "10mbit", &t);
+        assert_eq!(row, "30ms,1%,10mbit,5000000,1.000,40.000,4.768");
+        assert_eq!(
+            THROUGHPUT_CSV_HEADER.split(',').count(),
+            row.split(',').count(),
+            "header and row column counts match"
+        );
     }
 
     #[test]

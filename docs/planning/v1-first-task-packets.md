@@ -1741,3 +1741,27 @@ prebuilt image dead-ends at the final step. Substantial feature (like #72) → d
 - **IS5** ⏳ **Real integration test**: execute the served script in a CLEAN container (no prebuilt
   image), not just the page's text generation. **fix-ready only when a fresh customer can run the
   one-liner end-to-end.**
+
+## #76 Multi-agent tunnel overlay + topology study (epic) [+ Part B MA thesis, idle-time only]
+
+Research epic (priority:high, Part A): stand up ≤8-agent overlay on the Agent Fabric (#72), bulk-transfer
+workload, compare routing approaches (baseline / smart-routing / smart-shortcuts / random-mesh) × topology
+× link condition on Mininet/Containernet, report throughput/tail-latency/stretch/failover. Part B (LOW,
+idle-only): a HAW MA thesis (DoE, SIGCOMM-grade, ≥10p longer than the BA, security/metadata-obfuscation as
+a factor), linked everywhere the BA is. Decomposed:
+
+- **OV1** ✅ **Throughput measurement primitive** (`ct-client::bench`): `Throughput` {bytes, secs, mbps,
+  mib_s} + `throughput(bytes, secs)` + `throughput_csv_row`/`THROUGHPUT_CSV_HEADER` — the pure,
+  network-free bytes/sec metric the bulk-transfer mode emits (RTT is the wrong lens for overlay-under-load).
+  3 frozen tests (mbps/MiB-s math, non-positive-duration None, CSV format + header/row column match). Gate green.
+- **OV2** ⏳ **Bulk-transfer run mode**: client sends N bytes sustained over the tunnel (`CT_CLIENT_BULK_BYTES`),
+  measures wall-clock, emits a `Throughput` row — the load workload (vs today's RTT-only bench).
+- **OV3** ⏳ **Switchable routing-approach factor** (the cleanly-isolated factor for the DoE): an enum +
+  config (`CT_OVERLAY_ROUTING` = baseline|smart-route|shortcut|random-mesh) threaded so a run pins exactly one.
+- **OV4** ⏳ **N-agent (≤8) scale-out harness**: compose/script (like `redundancy-smoke.sh`, but N-agent +
+  bulk transfer) bringing up an overlay on the Agent Fabric channels (#72).
+- **OV5** ⏳ **Mininet/Containernet topology sweep**: emulator harness sweeping {routing × topology × netem
+  link condition (#57)}, emitting comparable numbers (throughput, p95/p99 #52, stretch, failover #8, overhead #51).
+- **OV6** ⏳ **Results write-up**: which routing/topology wins under which link regime + raw data.
+- **Part B (OV7+, idle-only)** ⏳ HAW MA thesis on the above (DoE, security/metadata factor, ≥10p > BA),
+  linked everywhere the BA thesis is. **#72/#76 fix-ready per their own acceptance; this stays in-progress.**
