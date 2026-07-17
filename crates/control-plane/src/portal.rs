@@ -508,10 +508,12 @@ fn home_html(subject: &str) -> String {
  h1{{font-size:1.3rem;margin:.2rem 0 1rem}} .sub{{color:#8b949e;font-size:.9rem;word-break:break-all}}
  a.btn{{display:inline-block;margin-top:1.4rem;background:#21262d;color:#e6edf3;text-decoration:none;
        padding:.55rem 1.1rem;border-radius:8px;border:1px solid #30363d}} a.btn:hover{{background:#30363d}}
+ a.pri{{background:#238636;border-color:#238636;color:#fff;margin-right:.6rem}} a.pri:hover{{background:#2ea043}}
 </style></head><body>
 <div class="card">
  <h1>Signed in</h1>
  <div class="sub">Subject: {subject}</div>
+ <a class="btn pri" href="/portal/tunnels">Manage tunnels &rarr;</a>
  <a class="btn" href="/portal/logout">Sign out</a>
 </div>
 </body></html>"#,
@@ -1239,6 +1241,12 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("kc-user-7"), "shows the signed-in subject");
         assert!(html.contains("/portal/logout"), "offers sign-out");
+        // #67: home must offer a discoverable path into tunnel management — else a
+        // signed-in customer can't reach the product without knowing the URL.
+        assert!(
+            html.contains(r#"href="/portal/tunnels""#),
+            "links to tunnel management (#67)"
+        );
     }
 
     #[tokio::test]
