@@ -330,7 +330,7 @@ pub async fn run_agent(
     // connection drops, then back off and retry, so a transient edge/network
     // failure doesn't kill the tunnel. A *first*-dial failure means UDP is blocked
     // → the TLS-TCP fallback (issue #3).
-    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, RECONNECT_MAX_ATTEMPTS);
+    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, reconnect_max_attempts());
     let mut first = true;
     loop {
         let conn = match dial_quic_or_blocked_error(config.edge, edge_cert.clone(), Duration::from_secs(5))
@@ -401,6 +401,26 @@ const RECONNECT_BASE: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
+/// How many reconnect attempts before the agent gives up and exits. Configurable
+/// via `CT_AGENT_RECONNECT_MAX_ATTEMPTS`; `0` means retry forever (#36): a
+/// long-lived public demo must rejoin a redeployed edge automatically rather than
+/// exit — the process holds a single-use join token, so exiting can't cleanly
+/// re-onboard, and a bare `restart:` would just crash-loop redeeming a spent token.
+/// Retrying forever keeps the onboarded credential and simply waits out the edge.
+fn reconnect_max_attempts() -> u32 {
+    parse_reconnect_max_attempts(std::env::var("CT_AGENT_RECONNECT_MAX_ATTEMPTS").ok())
+}
+
+/// Pure core of [`reconnect_max_attempts`]: `Some("0")` → unbounded (`u32::MAX`),
+/// a valid count → itself, anything else (unset/garbage) → the default.
+fn parse_reconnect_max_attempts(raw: Option<String>) -> u32 {
+    match raw.and_then(|s| s.trim().parse::<u32>().ok()) {
+        Some(0) => u32::MAX,
+        Some(n) => n,
+        None => RECONNECT_MAX_ATTEMPTS,
+    }
+}
+
 /// Serve Client tunnels over a live QUIC `conn` until it drops, then return so
 /// the caller can reconnect. Each accepted bi-stream is one Client's Noise tunnel.
 async fn serve_quic_connection(
@@ -448,7 +468,7 @@ async fn run_agent_tcp_fallback(
     let metrics = Arc::new(TunnelMetrics::new());
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
     // single tunnel ends or the connection drops, with backoff on failure.
-    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, RECONNECT_MAX_ATTEMPTS);
+    let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, reconnect_max_attempts());
     loop {
         match tcp_connect_register_serve(config, &edge_cert, &token, &origin_keys, &metrics).await {
             // A tunnel completed cleanly — re-register for the next client.
@@ -506,6 +526,16 @@ mod tests {
     use super::*;
     use crate::transport::dial_quic;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn parse_reconnect_max_attempts_maps_zero_to_unbounded() {
+        // #36: unset/garbage keeps the default; an explicit 0 means retry forever
+        // (so the public-demo agent rejoins a redeployed edge instead of exiting).
+        assert_eq!(parse_reconnect_max_attempts(None), RECONNECT_MAX_ATTEMPTS);
+        assert_eq!(parse_reconnect_max_attempts(Some("not-a-number".into())), RECONNECT_MAX_ATTEMPTS);
+        assert_eq!(parse_reconnect_max_attempts(Some("0".into())), u32::MAX, "0 -> retry forever");
+        assert_eq!(parse_reconnect_max_attempts(Some(" 7 ".into())), 7);
+    }
 
     /// issue #3 acceptance: with UDP blocked, the agent registers over the TLS-TCP
     /// fallback and a Client completes a full Noise round-trip through the edge to

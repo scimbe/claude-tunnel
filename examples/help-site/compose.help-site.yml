@@ -22,6 +22,9 @@ services:
       - help_caddy_data:/data
     expose:
       - "443"   # reachable only via the tunnel/agent, not published to the host
+    # #36: keep the origin up across host reboots / #15 stack redeploys, so the
+    # "route intact but Caddy origin stuck/down" failure mode recovers on its own.
+    restart: unless-stopped
 
   help-agent:
     # The workspace ct-agent image, in Browser-Plane mode.
@@ -44,9 +47,17 @@ services:
       - CT_AGENT_JOIN_TOKEN=${HELP_JOIN_TOKEN:?single-use join token}
       - CT_AGENT_ID=help-demo
       - CT_AGENT_EDGE_CERT_URL=${HELP_AGENT_EDGE_CERT_URL:-}
+      # #36: retry forever so a redeployed/bounced edge (the #15 stack churn) is
+      # rejoined automatically instead of the agent giving up after 10 tries and
+      # exiting — which, holding a single-use join token, can't cleanly re-onboard.
+      - CT_AGENT_RECONNECT_MAX_ATTEMPTS=0
     command: ["onboard"]
     depends_on:
       - help-origin
+    # #36: backstop for an actual crash/OOM. Safe now that the agent retries the
+    # edge forever (it won't exit on edge downtime), so this won't crash-loop
+    # redeeming an already-spent join token.
+    restart: unless-stopped
 
 volumes:
   help_caddy_data:
