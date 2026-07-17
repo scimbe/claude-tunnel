@@ -97,6 +97,21 @@ pub fn jwks_uri_for(issuer: &str) -> String {
     format!("{}/protocol/openid-connect/certs", issuer.trim_end_matches('/'))
 }
 
+/// Build an RS256 verifier by fetching the realm's JWKS at startup (#42 KC2-c).
+/// `fetch` resolves the JWKS document for a URL — the live path uses reqwest, and
+/// tests inject a canned document, so this stays hermetic. Returns `None` when the
+/// fetch yields nothing or the document carries no RS256 signing key, which the
+/// caller treats as "SSO key unavailable" (endpoints stay disabled, no panic).
+pub async fn verifier_from_jwks<F, Fut>(issuer: &str, fetch: F) -> Option<OidcVerifier>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<serde_json::Value>>,
+{
+    let jwks = fetch(jwks_uri_for(issuer)).await?;
+    let (n, e) = jwks_signing_key(&jwks)?;
+    OidcVerifier::from_rsa_components(&n, &e, issuer).ok()
+}
+
 /// Select the RS256 **signing** key from a parsed JWKS document and return its
 /// base64url `(n, e)` components for [`OidcVerifier::from_rsa_components`] (#42
 /// KC2). Picks the first key with `kty=RSA` that is usable for signature
@@ -266,12 +281,10 @@ ZQIDAQAB
         assert!(err.is_err(), "garbage modulus is rejected");
     }
 
-    #[test]
-    fn from_rsa_components_verifies_a_token_signed_by_the_matching_key() {
-        // #42 KC2-b: the end-to-end JWKS -> verifier chain. Generate a throwaway
-        // RSA key AT RUNTIME (never committed — secret-guard forbids a private key
-        // in the tree), publish its (n, e) the way a JWK would, sign an RS256 token
-        // with the private half, and verify it through from_rsa_components.
+    /// Generate a throwaway RSA key AT RUNTIME (never committed — secret-guard
+    /// forbids a private key in the tree), returning its base64url JWK components
+    /// `(n, e)` and an RS256 token for `sub` signed by the private half.
+    fn rsa_jwk_and_token(sub: &str) -> (String, String, String) {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
         use rsa::traits::PublicKeyParts;
@@ -283,26 +296,60 @@ ZQIDAQAB
         let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
         let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
         let pem = private.to_pkcs8_pem(LineEnding::LF).expect("pkcs8 pem");
-
-        let claims = serde_json::json!({ "sub": "user-99", "iss": ISSUER, "exp": now() + 3600 });
+        let claims = serde_json::json!({ "sub": sub, "iss": ISSUER, "exp": now() + 3600 });
         let token = encode(
             &Header::new(Algorithm::RS256),
             &claims,
             &EncodingKey::from_rsa_pem(pem.as_bytes()).expect("signing key"),
         )
         .expect("sign RS256");
+        (n, e, token)
+    }
 
-        // The realm advertises (n, e) at its JWKS; the verifier is built from them.
+    #[test]
+    fn from_rsa_components_verifies_a_token_signed_by_the_matching_key() {
+        // #42 KC2-b: the end-to-end JWKS -> verifier chain from raw components.
+        let (n, e, token) = rsa_jwk_and_token("user-99");
         let v = OidcVerifier::from_rsa_components(&n, &e, ISSUER).expect("verifier from components");
         assert_eq!(v.subject(&token).unwrap(), "user-99", "token verifies via JWKS components");
 
         // A DIFFERENT key's components must reject the token — proving it checks the
         // signature, not merely that the components parse.
-        let other_priv = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let other = RsaPublicKey::from(&other_priv);
-        let on = URL_SAFE_NO_PAD.encode(other.n().to_bytes_be());
-        let oe = URL_SAFE_NO_PAD.encode(other.e().to_bytes_be());
+        let (on, oe, _) = rsa_jwk_and_token("someone-else");
         let v2 = OidcVerifier::from_rsa_components(&on, &oe, ISSUER).unwrap();
         assert!(v2.subject(&token).is_err(), "a non-matching key rejects the token");
+    }
+
+    #[tokio::test]
+    async fn verifier_from_jwks_fetches_selects_and_verifies() {
+        // #42 KC2-c: the startup path — fetch the JWKS (injected here), select the
+        // RS256 signing key, build the verifier, and verify a real token end-to-end.
+        let (n, e, token) = rsa_jwk_and_token("user-77");
+        let jwks = serde_json::json!({
+            "keys": [
+                { "kty": "EC", "use": "sig", "crv": "P-256", "x": "a", "y": "b" },
+                { "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k1", "n": n, "e": e }
+            ]
+        });
+
+        let v = verifier_from_jwks(ISSUER, |url| {
+            assert!(url.ends_with("/protocol/openid-connect/certs"), "fetches the certs endpoint");
+            async move { Some(jwks) }
+        })
+        .await
+        .expect("verifier built from the fetched JWKS");
+        assert_eq!(v.subject(&token).unwrap(), "user-77", "fetched key verifies the token");
+
+        // A failed fetch -> None (endpoints stay disabled, no panic).
+        assert!(
+            verifier_from_jwks(ISSUER, |_url| async { None }).await.is_none(),
+            "no JWKS -> no verifier"
+        );
+        // A JWKS with no RSA signing key -> None.
+        let ec_only = serde_json::json!({ "keys": [ { "kty": "EC", "use": "sig" } ] });
+        assert!(
+            verifier_from_jwks(ISSUER, |_url| async move { Some(ec_only) }).await.is_none(),
+            "no RS256 key -> no verifier"
+        );
     }
 }

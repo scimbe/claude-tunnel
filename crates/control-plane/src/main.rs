@@ -16,8 +16,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ct_control_plane::oidc::OidcVerifier;
+use ct_control_plane::oidc::{verifier_from_jwks, OidcVerifier};
 use ct_control_plane::service::persistent_control_plane_router;
+
+/// Fetch a realm JWKS document over HTTP(S) for the startup verifier (#42 KC2-c).
+/// Best-effort: any transport/status/parse failure yields `None`, so a missing or
+/// not-yet-ready IdP leaves the /me/* endpoints disabled rather than aborting boot.
+async fn fetch_jwks(url: String) -> Option<serde_json::Value> {
+    let resp = reqwest::Client::new().get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        eprintln!("ct-control-plane: JWKS fetch {url} -> HTTP {}", resp.status());
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -41,23 +53,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Mount the authenticated /me/* endpoints only when OIDC is fully configured:
-    // the realm issuer plus a PEM file with the realm's RSA public key.
-    let oidc = match (
-        std::env::var("CT_OIDC_ISSUER"),
-        std::env::var("CT_OIDC_PUBKEY_PATH"),
-    ) {
-        (Ok(issuer), Ok(path)) if !issuer.is_empty() && !path.is_empty() => {
-            let pem = std::fs::read(&path)?;
-            let verifier = OidcVerifier::from_rsa_pem(&pem, &issuer)
-                .map_err(|e| format!("invalid OIDC realm key at {path}: {e}"))?;
-            eprintln!("ct-control-plane: OIDC enabled (issuer={issuer})");
-            Some(Arc::new(verifier))
-        }
+    // Mount the authenticated /me/* endpoints when OIDC is configured. Preferred
+    // (#42 KC2-c): CT_OIDC_ISSUER alone — the realm's RS256 signing key is fetched
+    // from its JWKS (<issuer>/protocol/openid-connect/certs) at startup, no manual
+    // key export. CT_OIDC_PUBKEY_PATH remains an explicit offline override (the
+    // realm's RSA public key in PEM), taking precedence when set.
+    let oidc = match std::env::var("CT_OIDC_ISSUER") {
+        Ok(issuer) if !issuer.is_empty() => match std::env::var("CT_OIDC_PUBKEY_PATH") {
+            Ok(path) if !path.is_empty() => {
+                let pem = std::fs::read(&path)?;
+                let verifier = OidcVerifier::from_rsa_pem(&pem, &issuer)
+                    .map_err(|e| format!("invalid OIDC realm key at {path}: {e}"))?;
+                eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=PEM {path})");
+                Some(Arc::new(verifier))
+            }
+            _ => match verifier_from_jwks(&issuer, fetch_jwks).await {
+                Some(v) => {
+                    eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=JWKS)");
+                    Some(Arc::new(v))
+                }
+                None => {
+                    eprintln!(
+                        "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key — /me/* disabled"
+                    );
+                    None
+                }
+            },
+        },
         _ => {
-            eprintln!(
-                "ct-control-plane: CT_OIDC_ISSUER/CT_OIDC_PUBKEY_PATH unset — /me/* endpoints disabled"
-            );
+            eprintln!("ct-control-plane: CT_OIDC_ISSUER unset — /me/* endpoints disabled");
             None
         }
     };

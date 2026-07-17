@@ -1516,8 +1516,11 @@ importierter Demo-Realm, passend zu dem, was `PortalOidc::from_env`/`OidcVerifie
     generiert zur Laufzeit einen 2048-bit-RSA-Schlüssel (Dev-Deps `rsa`+`base64`, **kein** Private-Key im Baum, Secret-Guard-konform),
     publiziert `(n,e)` base64url wie ein JWK, signiert ein RS256-Token mit dem Private-Half und verifiziert es über `from_rsa_components`
     (`subject()`==`user-99`); ein Fremdschlüssel weist das Token ab (prüft die Signatur, nicht nur das Parsen). Gate grün (control-plane 125).
-  - **KC2-c** ⏳ **Startup-Fetch**: beim Start das Realm-JWKS (`jwks_uri_for(CT_OIDC_ISSUER)`) via reqwest holen, Signaturschlüssel wählen,
-    Verifier bauen — `CT_OIDC_PUBKEY_PATH` als Fallback behalten. Best-effort + geloggt.
+  - **KC2-c** ✅ **Startup-Fetch**: `oidc::verifier_from_jwks(issuer, fetch)` (injizierter Fetcher → hermetisch) holt das Realm-JWKS,
+    wählt den Signaturschlüssel und baut den Verifier. `main.rs`-Startup umgestellt: `CT_OIDC_ISSUER` allein genügt jetzt (JWKS-Fetch via
+    reqwest, `fetch_jwks`, best-effort + geloggt, `None` → /me/* bleibt aus); `CT_OIDC_PUBKEY_PATH` bleibt expliziter Offline-Override
+    (Vorrang). `reqwest` um `rustls-tls` erweitert (HTTPS-Issuer). Frozen-Test `verifier_from_jwks_fetches_selects_and_verifies` (Fetch →
+    Auswahl → echtes Token verifiziert; Fetch-Fehler/kein RS256-Key → `None`). Gate grün (control-plane 126). **KC2 damit komplett.**
 - **KC3** ⏳ **Control-Plane-Verdrahtung + Doku**: `CT_OIDC_*`-Env (Issuer/Client-ID/Redirect/Token-URL/PubkeyPath) im Overlay auf
   den control-plane-Service mergen, `.env.example`-Ergänzungen (Client-Secret aus `.env`, nie im Realm-Export), Operator-Runbook für
   den vollen Klick-Durchlauf (Sign in → Selbst-Registrierung → `/portal/home` → Konto/Tunnel → Logout). Erst wenn KC1–KC3 erfüllt →
