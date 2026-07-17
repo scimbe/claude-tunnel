@@ -66,6 +66,16 @@ impl OidcVerifier {
         Ok(Self::build(key, Algorithm::RS256, issuer))
     }
 
+    /// Build a verifier straight from a JWK's RSA components — the base64url
+    /// modulus `n` and exponent `e` a Keycloak realm advertises at its JWKS
+    /// endpoint (#42 KC2). Lets the control plane fetch the signing key from the
+    /// realm rather than requiring a hand-exported PEM file, and skips the
+    /// PEM roundtrip. Pair with [`jwks_signing_key`] to pull `(n, e)` from a JWKS.
+    pub fn from_rsa_components(n: &str, e: &str, issuer: &str) -> Result<Self, OidcError> {
+        let key = DecodingKey::from_rsa_components(n, e).map_err(OidcError::from)?;
+        Ok(Self::build(key, Algorithm::RS256, issuer))
+    }
+
     /// Build a verifier for HS256 tokens from a shared secret and expected
     /// issuer. For local/dev and tests; production uses [`Self::from_rsa_pem`].
     pub fn from_hs_secret(secret: &[u8], issuer: &str) -> Self {
@@ -78,6 +88,36 @@ impl OidcVerifier {
         let data = decode::<Claims>(token, &self.key, &self.validation)?;
         Ok(data.claims.sub)
     }
+}
+
+/// The JWKS (signing-key) endpoint of a Keycloak realm whose issuer is `issuer`
+/// (#42 KC2): `<issuer>/protocol/openid-connect/certs`. A trailing slash on the
+/// issuer is tolerated so it composes with `CT_OIDC_ISSUER` either way.
+pub fn jwks_uri_for(issuer: &str) -> String {
+    format!("{}/protocol/openid-connect/certs", issuer.trim_end_matches('/'))
+}
+
+/// Select the RS256 **signing** key from a parsed JWKS document and return its
+/// base64url `(n, e)` components for [`OidcVerifier::from_rsa_components`] (#42
+/// KC2). Picks the first key with `kty=RSA` that is usable for signature
+/// verification — `use` is `sig` or absent, `alg` is `RS256` or absent — so EC
+/// keys and encryption keys in the same document are skipped. Returns `None` when
+/// the document exposes no such key (nothing is trusted by default).
+pub fn jwks_signing_key(jwks: &serde_json::Value) -> Option<(String, String)> {
+    jwks.get("keys")?.as_array()?.iter().find_map(|k| {
+        if k.get("kty").and_then(|v| v.as_str()) != Some("RSA") {
+            return None;
+        }
+        if matches!(k.get("use").and_then(|v| v.as_str()), Some(u) if u != "sig") {
+            return None;
+        }
+        if matches!(k.get("alg").and_then(|v| v.as_str()), Some(a) if a != "RS256") {
+            return None;
+        }
+        let n = k.get("n")?.as_str()?.to_string();
+        let e = k.get("e")?.as_str()?.to_string();
+        Some((n, e))
+    })
 }
 
 #[cfg(test)]
@@ -172,5 +212,58 @@ ZQIDAQAB
             format!("{err}").starts_with("oidc verification failed:"),
             "Display renders the reason"
         );
+    }
+
+    #[test]
+    fn jwks_uri_is_derived_from_the_issuer() {
+        // #42 KC2: with or without a trailing slash on the issuer.
+        assert_eq!(
+            jwks_uri_for("https://kc.example/realms/ct-demo"),
+            "https://kc.example/realms/ct-demo/protocol/openid-connect/certs"
+        );
+        assert_eq!(
+            jwks_uri_for("https://kc.example/realms/ct-demo/"),
+            "https://kc.example/realms/ct-demo/protocol/openid-connect/certs"
+        );
+    }
+
+    #[test]
+    fn jwks_signing_key_selects_the_rs256_sig_key_among_decoys() {
+        // #42 KC2: a realm JWKS carries several keys — an EC key, an RSA
+        // *encryption* key, and the RSA *signing* key. Only the last is the token
+        // verification key; the selector must skip the others.
+        let jwks = serde_json::json!({
+            "keys": [
+                { "kty": "EC", "use": "sig", "crv": "P-256", "x": "aa", "y": "bb" },
+                { "kty": "RSA", "use": "enc", "alg": "RSA-OAEP", "n": "ENC-N", "e": "AQAB" },
+                { "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k1", "n": "SIG-N", "e": "AQAB" }
+            ]
+        });
+        assert_eq!(
+            jwks_signing_key(&jwks),
+            Some(("SIG-N".to_string(), "AQAB".to_string())),
+            "picks the RSA RS256 sig key, not the EC or the RSA enc key"
+        );
+
+        // A key with `use`/`alg` absent still qualifies (Keycloak omits them on
+        // some realms) as long as it is RSA.
+        let bare = serde_json::json!({ "keys": [ { "kty": "RSA", "n": "BARE-N", "e": "AQAB" } ] });
+        assert_eq!(jwks_signing_key(&bare), Some(("BARE-N".into(), "AQAB".into())));
+
+        // No RSA signing key -> nothing trusted.
+        let none = serde_json::json!({
+            "keys": [ { "kty": "EC", "use": "sig", "crv": "P-256", "x": "a", "y": "b" } ]
+        });
+        assert_eq!(jwks_signing_key(&none), None);
+        assert_eq!(jwks_signing_key(&serde_json::json!({})), None, "no keys array -> None");
+    }
+
+    #[test]
+    fn from_rsa_components_rejects_malformed_components() {
+        // The positive round-trip (verify a token) lands in KC2-b with a real key
+        // vector; here, invalid base64url components must surface as an error, not
+        // a panic — the startup path treats that as "SSO key unavailable".
+        let err = OidcVerifier::from_rsa_components("!!not-base64!!", "AQAB", ISSUER);
+        assert!(err.is_err(), "garbage modulus is rejected");
     }
 }

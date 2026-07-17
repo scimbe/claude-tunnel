@@ -1505,9 +1505,17 @@ importierter Demo-Realm, passend zu dem, was `PortalOidc::from_env`/`OidcVerifie
   + `/portal/callback`-Redirects, `registrationAllowed` statt mitgeliefertem Credential — **kein Secret im Repo**). Frozen-Test
   `demo_realm_matches_the_portal_oidc_contract` (`include_str!` des Realm-Exports zur Compile-Zeit → gegen `PortalOidc::from_lookup`
   gegroundet: client_id/redirect/Realm-Name ergeben exakt Keycloaks Authorize/Token-Endpoints). Gate grün (control-plane 117).
-- **KC2** ⏳ **Realm-Signaturschlüssel → PEM**: den RS256-Public-Key der Realm nach `CT_OIDC_PUBKEY_PATH` exportieren (Init-Schritt:
-  JWKS von Keycloak holen → PEM auf ein geteiltes Volume, das die Control-Plane liest); Test auf der JWKS→PEM-Konvertierung, die
-  `OidcVerifier::from_rsa_pem` füttert.
+- **KC2** ⏳ **Realm-Signaturschlüssel in den Verifier**: statt eines hand-exportierten PEM den RS256-Public-Key direkt aus dem
+  Realm-JWKS beziehen. **Dekomponiert:**
+  - **KC2-a** ✅ **JWKS-Dokument-Handling** (`ct-control-plane::oidc`): `jwks_uri_for(issuer)` (→ `<issuer>/protocol/openid-connect/certs`,
+    Trailing-Slash-tolerant) + `jwks_signing_key(&Value) -> Option<(n,e)>` (wählt den RSA-**Signatur**-Schlüssel: `kty=RSA`,
+    `use=sig`-oder-fehlt, `alg=RS256`-oder-fehlt; überspringt EC-/Enc-Keys; `None` wenn keiner) + `OidcVerifier::from_rsa_components(n,e,issuer)`
+    (jsonwebtoken `DecodingKey::from_rsa_components`, spart den PEM-Umweg). Frozen-Tests `jwks_uri_is_derived_from_the_issuer`,
+    `jwks_signing_key_selects_the_rs256_sig_key_among_decoys`, `from_rsa_components_rejects_malformed_components`. Gate grün (control-plane 124).
+  - **KC2-b** ⏳ **Positiver Krypto-Round-Trip**: mit echtem RSA-JWK-Vektor ein RS256-Token signieren → via `from_rsa_components` verifizieren
+    (`subject()` == erwartetes `sub`), damit die JWKS→Verifier-Kette end-to-end bewiesen ist.
+  - **KC2-c** ⏳ **Startup-Fetch**: beim Start das Realm-JWKS (`jwks_uri_for(CT_OIDC_ISSUER)`) via reqwest holen, Signaturschlüssel wählen,
+    Verifier bauen — `CT_OIDC_PUBKEY_PATH` als Fallback behalten. Best-effort + geloggt.
 - **KC3** ⏳ **Control-Plane-Verdrahtung + Doku**: `CT_OIDC_*`-Env (Issuer/Client-ID/Redirect/Token-URL/PubkeyPath) im Overlay auf
   den control-plane-Service mergen, `.env.example`-Ergänzungen (Client-Secret aus `.env`, nie im Realm-Export), Operator-Runbook für
   den vollen Klick-Durchlauf (Sign in → Selbst-Registrierung → `/portal/home` → Konto/Tunnel → Logout). Erst wenn KC1–KC3 erfüllt →
