@@ -16,8 +16,20 @@ help.bunsenbrenner.org {
 	encode gzip
 	tls {
 		# DNS-01 via deSEC (token from the environment; see docs/dns01-desec.md).
-		dns desec {env.DESEC_TOKEN}
+		# Block form with {$DESEC_TOKEN}: the Caddyfile adapter substitutes the env
+		# var at adapt time (guaranteed), rather than relying on the desec module to
+		# run a runtime replacer on an inline {env.X} placeholder.
+		dns desec {
+			token {$DESEC_TOKEN}
+		}
 		resolvers ns1.desec.io ns2.desec.org
+		# deSEC enforces a zone minimum_ttl of 3600s and rejects the plugin's default
+		# TTL 0 outright (HTTP 400), so the challenge TXT is never created. Pin it.
+		dns_ttl 3600s
+		# Give LE's multi-vantage-point validation time to read the TXT before Caddy's
+		# own propagation check passes and deletes it (else LE hits NXDOMAIN).
+		propagation_delay 30s
+		propagation_timeout 2m
 	}
 	header {
 		Strict-Transport-Security "max-age=31536000"
