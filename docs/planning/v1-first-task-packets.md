@@ -1649,7 +1649,8 @@ are control-plane HTML producers with oneshot render tests). Decomposed:
   create → install → run-on-the-origin → done walkthrough, making the critical "run the one-liner on the
   machine you want to expose, not your browsing device" distinction explicit. Frozen test asserts the
   steps panel + that guidance. Gate: cargo build+test, 0 warnings.
-- **T69.3** ⏳ **Install-page context + lost-token signposting** (friction points 4+5): frame the
-  install one-liner with a sentence — run it on the machine you want to expose (the origin), not your
-  laptop — and signpost revoke-and-recreate for a lost single-use token. **fix-ready only when all five
-  friction points are addressed.**
+- **T69.3** ✅ **Install-page context + lost-token signposting** (friction points 4+5): the install page
+  now frames WHERE to run the one-liner (on the origin — the machine you want to expose, not the browsing
+  device — what it does, no inbound port) and signposts lost-token recovery (reopen the page → a fresh
+  single-use token per visit, which the code already mints). Frozen test asserts both. **All five friction
+  points addressed → #69 fix-ready.**

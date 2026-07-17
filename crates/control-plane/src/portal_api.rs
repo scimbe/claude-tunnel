@@ -320,8 +320,16 @@ async fn install_page(
         .collect::<String>();
     let body = format!(
         r#"<h1>Install an agent</h1>
+<p class="help">Run this <strong>on the machine you want to expose</strong> &mdash;
+the <em>origin</em>: the server or device running the service you are tunnelling,
+not the device you are reading this on. It downloads and starts the tunnel agent,
+which connects out to the relay and serves your origin through it (no inbound
+firewall port needed).</p>
 <p class="k"><strong>Single-use token — copy the command now; it is shown only once.</strong></p>
 {blocks}
+<p class="help">Closed the tab or lost the command? Just reopen this Install page
+&mdash; each visit mints a fresh single-use token, so you always get a new working
+command.</p>
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
     );
     Html(page("install", &body)).into_response()
@@ -977,6 +985,17 @@ mod tests {
         assert!(html.contains("CT_AGENT_TOKEN="), "tunnel routing token carried via env (#27 RB2)");
         assert!(html.contains("irm https://portal.example/install.ps1 | iex"));
         assert!(html.contains("single-use") || html.contains("Single-use"), "warns token is single-use");
+        // #69 T69.3: the page must frame WHERE to run the command (on the origin,
+        // not the browsing device) and signpost recovery for a lost single-use
+        // token (reopen the page for a fresh one).
+        assert!(
+            html.contains("machine you want to expose"),
+            "explains the command runs on the origin, not the browsing device"
+        );
+        assert!(
+            html.contains("reopen this Install page"),
+            "signposts lost-token recovery (a fresh token per visit)"
+        );
 
         // os filter renders just one block.
         let (_s, only_win) = get(&app, &format!("/portal/tunnels/{id}/install?os=windows"), Some("alice")).await;
