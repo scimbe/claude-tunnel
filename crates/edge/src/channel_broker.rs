@@ -98,18 +98,38 @@ pub fn authorize_channel_pair(
     }
 }
 
+/// Endpoint policy (#81 gap 3): the peer will *dial* this advertised address, so it
+/// must be a real socket address and not an SSRF target. Reject anything that isn't
+/// a parseable `SocketAddr`, and reject loopback / unspecified / multicast (dial-to-
+/// self and nonsense targets). Private (LAN) and global unicast are allowed —
+/// legitimate agent-to-agent P2P. Returns the parsed address when acceptable.
+fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
+    let addr: std::net::SocketAddr = ep.parse().ok()?;
+    let ip = addr.ip();
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return None;
+    }
+    Some(addr)
+}
+
 /// Accept one QUIC connection and read + verify a presented [`ChannelJoinRequest`],
 /// but do NOT ack yet — the caller owns the reply, because a single admission acks
-/// `OK` immediately while the two-party broker must defer until it knows the
-/// pairing. A malformed request, an unknown channel, or a bad/expired grant is
-/// rejected here with a `NO` before erroring.
+/// `OK` immediately while the two-party broker must defer until it knows the pairing.
+///
+/// `authorize(channel, holder)` returns the channel's operator public key **iff the
+/// holder is a current member** of the channel — a single lookup that folds the
+/// #81 gap-2 membership/revocation check into the operator-key source (removing a
+/// member from the registry now denies admission at the gate, no key rotation or
+/// expiry-shortening needed). Rejects (with a `NO`) a malformed request, an
+/// #81 gap-3 unsafe advertised endpoint, an unknown-channel/non-member holder, and
+/// a bad/expired grant. Returns the request and the resolved operator key.
 async fn accept_and_read_join<F>(
     endpoint: &Endpoint,
     now: UnixSeconds,
-    operator_for: &F,
-) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest), BoxError>
+    authorize: &F,
+) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
 where
-    F: Fn(&ChannelId) -> Option<[u8; 32]>,
+    F: Fn(&ChannelId, &[u8; 32]) -> Option<[u8; 32]>,
 {
     let incoming = endpoint
         .accept()
@@ -127,12 +147,20 @@ where
             return Err("malformed channel join request".into());
         }
     };
-    let operator = match operator_for(&req.grant.grant.channel) {
+    // #81 gap 3: the advertised endpoint must be a safe, dialable socket address.
+    if safe_endpoint(&req.endpoint).is_none() {
+        let _ = send.write_all(b"NO").await;
+        let _ = send.finish();
+        return Err("unsafe advertised endpoint".into());
+    }
+    // #81 gap 2: the holder must be a current member; `authorize` yields the
+    // operator key only then, so a revoked member is refused here.
+    let operator = match authorize(&req.grant.grant.channel, &req.grant.grant.holder) {
         Some(op) => op,
         None => {
             let _ = send.write_all(b"NO").await;
             let _ = send.finish();
-            return Err("unknown channel".into());
+            return Err("unknown channel or holder not a member".into());
         }
     };
     if let Err(e) = verify(&operator, &req.grant, now) {
@@ -140,23 +168,23 @@ where
         let _ = send.finish();
         return Err(format!("channel grant rejected: {e}").into());
     }
-    Ok((conn, send, req))
+    Ok((conn, send, req, operator))
 }
 
 /// Accept one channel-join over QUIC (AF2d-transport-a): read the presented
-/// [`ChannelJoinRequest`], verify its grant against the channel's operator public
-/// key (via `operator_for`, wired to the control-plane channel registry), reply
-/// `OK`/`NO`, and return the request on success. This is the edge admission gate
-/// for a *single* participant; [`broker_channel_rendezvous`] pairs two of them.
+/// [`ChannelJoinRequest`], authorize the holder + verify its grant (via `authorize`,
+/// wired to the control-plane channel registry — see [`accept_and_read_join`]),
+/// reply `OK`/`NO`, and return the request on success. This is the edge admission
+/// gate for a *single* participant; [`broker_channel_rendezvous`] pairs two.
 pub async fn resolve_channel_join<F>(
     endpoint: &Endpoint,
     now: UnixSeconds,
-    operator_for: F,
+    authorize: F,
 ) -> Result<ChannelJoinRequest, BoxError>
 where
-    F: Fn(&ChannelId) -> Option<[u8; 32]>,
+    F: Fn(&ChannelId, &[u8; 32]) -> Option<[u8; 32]>,
 {
-    let (conn, mut send, req) = accept_and_read_join(endpoint, now, &operator_for).await?;
+    let (conn, mut send, req, _op) = accept_and_read_join(endpoint, now, &authorize).await?;
     send.write_all(b"OK").await?;
     send.finish()?;
     conn.closed().await; // hold the connection so the peer reads the ack
@@ -172,17 +200,18 @@ where
 pub async fn broker_channel_rendezvous<F>(
     endpoint: &Endpoint,
     now: UnixSeconds,
-    operator_for: F,
+    authorize: F,
 ) -> Result<ChannelPairing, BoxError>
 where
-    F: Fn(&ChannelId) -> Option<[u8; 32]>,
+    F: Fn(&ChannelId, &[u8; 32]) -> Option<[u8; 32]>,
 {
-    let (conn_a, mut send_a, req_a) = accept_and_read_join(endpoint, now, &operator_for).await?;
-    let (conn_b, mut send_b, req_b) = accept_and_read_join(endpoint, now, &operator_for).await?;
+    let (conn_a, mut send_a, req_a, operator) =
+        accept_and_read_join(endpoint, now, &authorize).await?;
+    let (conn_b, mut send_b, req_b, _op_b) =
+        accept_and_read_join(endpoint, now, &authorize).await?;
 
-    // Both grants are already verified against their own channel's operator; the
-    // pairing uses channel A's operator and rejects a cross-channel pair.
-    let operator = operator_for(&req_a.grant.grant.channel).ok_or("unknown channel")?;
+    // Both holders are authorized members with verified grants; pair using channel
+    // A's operator key (authorize_channel_pair rejects a cross-channel pair).
     match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
         Ok(pairing) => {
             // Each agent learns the OTHER's advertised endpoint to dial directly.
@@ -351,7 +380,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
                 .await
                 .map(|r| r.endpoint)
                 .map_err(|e| e.to_string())
@@ -375,7 +404,7 @@ mod tests {
         let addr = server.local_addr().expect("addr");
         let server_task =
             tokio::spawn(
-                async move { resolve_channel_join(&server, 500, |_c| None).await.map(|_| ()) },
+                async move { resolve_channel_join(&server, 500, |_c, _h| None).await.map(|_| ()) },
             );
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
@@ -390,7 +419,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let server2_task = tokio::spawn(async move {
-            resolve_channel_join(&server2, 2_000, move |c| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server2, 2_000, move |c, _h| (c.0 == channel).then_some(pk))
                 .await
                 .map(|_| ())
         });
@@ -411,7 +440,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            broker_channel_rendezvous(&server, 500, move |c| (c.0 == channel).then_some(pk))
+            broker_channel_rendezvous(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
                 .await
                 .map(|p| (p.initiator_holder[0], p.acceptor_holder[0]))
                 .map_err(|e| e.to_string())
@@ -450,5 +479,51 @@ mod tests {
         assert!(ack_b.contains("10.0.0.1:7001"), "agent B learns A's endpoint, got {ack_b:?}");
         // The initiator is the Initiate-holder (0xa1), the acceptor the Accept-holder (0xb2).
         assert_eq!(paired, (0xa1, 0xb2), "roles follow the grants' directions");
+    }
+
+    #[tokio::test]
+    async fn edge_refuses_a_non_member_holder() {
+        // #81 gap 2: a holder that is NOT a current member is refused even with a
+        // valid, signed, unexpired grant — this is what makes revocation work
+        // (removing a member from the registry denies admission at the gate).
+        let pk = operator_pubkey();
+        let channel = [0xE1u8; 32];
+        let member = [0x0au8; 32];
+        let req = join_request(channel, 0x0b, "203.0.113.9:6100"); // holder 0x0b, not a member
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            resolve_channel_join(&server, 500, move |c, h| {
+                (c.0 == channel && h == &member).then_some(pk)
+            })
+            .await
+            .map(|_| ())
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode()).await;
+        assert_ne!(ack, b"OK", "a non-member holder must be refused");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn edge_refuses_an_unsafe_endpoint() {
+        // #81 gap 3: a loopback advertised endpoint (a dial-to-self SSRF target) is
+        // refused before pairing, even for an authorized member with a valid grant.
+        let pk = operator_pubkey();
+        let channel = [0xE2u8; 32];
+        let req = join_request(channel, 0x0c, "127.0.0.1:22"); // loopback -> unsafe
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
+                .await
+                .map(|_| ())
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode()).await;
+        assert_ne!(ack, b"OK", "a loopback advertised endpoint must be refused");
+        let _ = server_task.await;
     }
 }

@@ -1765,3 +1765,21 @@ a factor), linked everywhere the BA is. Decomposed:
 - **OV6** ⏳ **Results write-up**: which routing/topology wins under which link regime + raw data.
 - **Part B (OV7+, idle-only)** ⏳ HAW MA thesis on the above (DoE, security/metadata factor, ≥10p > BA),
   linked everywhere the BA thesis is. **#72/#76 fix-ready per their own acceptance; this stays in-progress.**
+
+## #81 Agent Fabric security hardening (security-review of #72)
+
+GLM-5.2 review found 4 trust gaps in the AF2d admission gate. Ordering per the review: close the trust
+gaps BEFORE wiring the broker into the live edge binary. Decomposed:
+
+- **SEC81a** ✅ **Membership/revocation check + endpoint SSRF guard** (gaps 2+3, `ct-edge::channel_broker`):
+  the gate's `authorize(channel, holder)` now returns the operator key ONLY iff the holder is a current
+  member (folds `is_member` in → removing a member denies admission at the gate, real revocation without
+  key rotation/expiry-shortening). Advertised endpoints must pass `safe_endpoint` (parseable SocketAddr,
+  reject loopback/unspecified/multicast) before a peer will dial them. 2 new frozen tests (non-member
+  refused; loopback endpoint refused) + the 10 existing. Gate green.
+- **SEC81b** ⏳ **Holder proof-of-possession** (gap 1): challenge-response at the gate — the presenter must
+  sign an edge nonce with the holder private key; verify against `grant.holder`. Closes "stolen grant =
+  bearer token". Needs the agent to hold an ed25519 identity key + a handshake round-trip.
+- **SEC81c** ⏳ **Wire the broker into the live edge** (gap 4): mount `broker_channel_rendezvous` in
+  serve.rs + a control-plane channel-registry API, ONLY after SEC81b. Endpoint should additionally be
+  constrained to match the agent's advertised direct endpoint where possible.
