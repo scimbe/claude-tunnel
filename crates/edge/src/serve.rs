@@ -245,6 +245,62 @@ where
     Ok(())
 }
 
+/// Serve one plaintext HTTP/1.x request on `:80` with a `308 Permanent Redirect`
+/// to the HTTPS URL for the same Host + path — so a browser typing
+/// `http://<host>/…` is bounced to `https://<host>/…` on the unified `:443`
+/// gateway. Generic over the byte stream so it drives a real socket live and an
+/// in-memory duplex in tests. Reads only the request head (bounded), never a body.
+pub async fn serve_http_redirect<S>(mut inbound: S) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Read up to the header terminator (bounded — a redirect never needs a body).
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = inbound.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16384 {
+            break;
+        }
+    }
+    let req = String::from_utf8_lossy(&buf);
+    let mut lines = req.split("\r\n");
+    // Request line: METHOD SP request-target SP HTTP/x.
+    let target = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .filter(|t| t.starts_with('/'))
+        .unwrap_or("/");
+    // Host header (case-insensitive), with any :port stripped (default to 443).
+    let host = lines.find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case("host") {
+            let h = v.trim();
+            // Strip a trailing :port on a plain host (skip bracketed IPv6).
+            let h = if h.starts_with('[') { h } else { h.split(':').next().unwrap_or(h) };
+            (!h.is_empty()).then(|| h.to_string())
+        } else {
+            None
+        }
+    });
+    let resp = match host {
+        Some(h) => format!(
+            "HTTP/1.1 308 Permanent Redirect\r\nLocation: https://{h}{target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        // No Host header -> can't build an absolute HTTPS URL.
+        None => {
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        }
+    };
+    inbound.write_all(resp.as_bytes()).await?;
+    inbound.flush().await?;
+    Ok(())
+}
+
 /// #31 FD2 — the unified `:443` front door. Restrictive client networks often
 /// allow only outbound TCP 443 (HAW field evidence: `:8090`/`:4433`/UDP all time
 /// out), so the Portal, the customer Browser-Plane subdomains, and the tunnel
@@ -794,6 +850,28 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 Err(e) => eprintln!("ct-edge: cannot bind CT_FRONT_DOOR {listen}: {e}"),
             },
             Err(e) => eprintln!("ct-edge: invalid CT_FRONT_DOOR '{addr}': {e}"),
+        }
+    }
+
+    // Optional :80 -> :443 redirect: bounce a browser that types http://<host>/
+    // to https on the unified gateway. Off unless CT_EDGE_HTTP_REDIRECT is set
+    // (e.g. 0.0.0.0:80). Pairs with the front door / FD4-a Portal termination.
+    if let Ok(addr) = std::env::var("CT_EDGE_HTTP_REDIRECT") {
+        match addr.parse::<SocketAddr>() {
+            Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
+                Ok(rl) => {
+                    tokio::spawn(async move {
+                        while let Ok((tcp, _)) = rl.accept().await {
+                            tokio::spawn(async move {
+                                let _ = serve_http_redirect(tcp).await;
+                            });
+                        }
+                    });
+                    eprintln!("ct-edge: HTTP->HTTPS redirect on {listen} (CT_EDGE_HTTP_REDIRECT)");
+                }
+                Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_HTTP_REDIRECT {listen}: {e}"),
+            },
+            Err(e) => eprintln!("ct-edge: invalid CT_EDGE_HTTP_REDIRECT '{addr}': {e}"),
         }
     }
 
@@ -1728,6 +1806,40 @@ mod tests {
         // serve_front_door returns (the upstream already closed after the echo).
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
+    async fn http_redirect_bounces_to_https_preserving_host_and_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A browser hitting http://<host>/path gets a 308 to the https URL.
+        let (mut browser, edge) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move { serve_http_redirect(edge).await });
+        browser
+            .write_all(b"GET /help?x=1 HTTP/1.1\r\nHost: bunsenbrenner.org\r\nUser-Agent: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        browser.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 308"), "permanent redirect: {text:?}");
+        assert!(
+            text.contains("Location: https://bunsenbrenner.org/help?x=1"),
+            "redirects to https preserving host+path: {text:?}"
+        );
+        srv.await.unwrap().unwrap();
+
+        // A :port on the Host is stripped (default 443).
+        let (mut b2, e2) = tokio::io::duplex(4096);
+        let s2 = tokio::spawn(async move { serve_http_redirect(e2).await });
+        b2.write_all(b"GET / HTTP/1.1\r\nHost: example.test:80\r\n\r\n").await.unwrap();
+        let mut r2 = Vec::new();
+        b2.read_to_end(&mut r2).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&r2).contains("Location: https://example.test/"),
+            "host port stripped"
+        );
+        s2.await.unwrap().unwrap();
     }
 
     #[tokio::test]
