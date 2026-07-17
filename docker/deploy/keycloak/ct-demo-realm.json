@@ -12,7 +12,7 @@
     {
       "clientId": "ct-portal",
       "name": "claude-tunnel customer portal",
-      "secret": "${env.KC_PORTAL_CLIENT_SECRET}",
+      "secret": "${KC_PORTAL_CLIENT_SECRET}",
       "protocol": "openid-connect",
       "enabled": true,
       "publicClient": false,
@@ -43,8 +43,8 @@
       "storeToken": false,
       "linkOnly": false,
       "config": {
-        "clientId": "${env.KC_GOOGLE_CLIENT_ID:}",
-        "clientSecret": "${env.KC_GOOGLE_CLIENT_SECRET:}",
+        "clientId": "${KC_GOOGLE_CLIENT_ID:}",
+        "clientSecret": "${KC_GOOGLE_CLIENT_SECRET:}",
         "syncMode": "IMPORT"
       }
     },
@@ -56,8 +56,8 @@
       "storeToken": false,
       "linkOnly": false,
       "config": {
-        "clientId": "${env.KC_GITHUB_CLIENT_ID:}",
-        "clientSecret": "${env.KC_GITHUB_CLIENT_SECRET:}",
+        "clientId": "${KC_GITHUB_CLIENT_ID:}",
+        "clientSecret": "${KC_GITHUB_CLIENT_SECRET:}",
         "syncMode": "IMPORT"
       }
     },
@@ -69,8 +69,8 @@
       "storeToken": false,
       "linkOnly": false,
       "config": {
-        "clientId": "${env.KC_GITLAB_CLIENT_ID:}",
-        "clientSecret": "${env.KC_GITLAB_CLIENT_SECRET:}",
+        "clientId": "${KC_GITLAB_CLIENT_ID:}",
+        "clientSecret": "${KC_GITLAB_CLIENT_SECRET:}",
         "syncMode": "IMPORT"
       }
     }

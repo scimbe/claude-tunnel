@@ -11,7 +11,7 @@ stack runs unchanged without it.
   `start-dev --import-realm`) plus the `CT_OIDC_*` env merged onto the control-plane.
 - `docker/deploy/keycloak/ct-demo-realm.json` — a declarative realm `ct-demo` with a
   confidential RS256 client `ct-portal` and self-registration enabled. Its secret is
-  **pinned to `${env.KC_PORTAL_CLIENT_SECRET}`** (#65) — no literal is baked in, but
+  **pinned to `${KC_PORTAL_CLIENT_SECRET}`** (#65) — no literal is baked in, but
   Keycloak adopts that exact value on every (re)import, so it stays stable across the
   ephemeral realm's recreates and never drifts from the control-plane.
 

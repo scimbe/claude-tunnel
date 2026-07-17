@@ -690,15 +690,25 @@ mod tests {
         assert_eq!(client["publicClient"], false, "confidential client (secret-backed)");
         assert_eq!(client["standardFlowEnabled"], true, "Authorization Code flow");
 
-        // #65: the confidential client's secret must be PINNED to an env placeholder
-        // (${env.KC_PORTAL_CLIENT_SECRET}), not absent. Without this Keycloak mints a
-        // fresh random secret on every ephemeral realm reimport, drifting out of sync
-        // with the control-plane's CT_OIDC_CLIENT_SECRET → every login 502s. It must
-        // still never be a baked-in literal (kept in .env).
+        // #65: the confidential client's secret must be PINNED to the env placeholder
+        // so Keycloak adopts the same value on every ephemeral realm reimport (else it
+        // mints a fresh random secret and the control-plane's CT_OIDC_CLIENT_SECRET
+        // drifts → every login 401/502s). CRITICAL: the realm-import resolver looks the
+        // placeholder up via System.getenv(<inner>), so it MUST be `${KC_PORTAL_CLIENT_SECRET}`
+        // — the `${env.KC_...}` form is NEVER substituted (verified live against KC 25.0:
+        // it stays a literal and 401s the token exchange). Assert the exact resolvable form.
         let secret = client["secret"].as_str().unwrap_or("");
+        assert_eq!(
+            secret, "${KC_PORTAL_CLIENT_SECRET}",
+            "ct-portal secret must be the resolvable ${{KC_PORTAL_CLIENT_SECRET}} placeholder (NOT ${{env....}}, which realm import leaves literal), got {secret:?}"
+        );
+
+        // #65 regression guard: the `${env.X}` form silently fails realm-import
+        // substitution (System.getenv(\"env.X\") is null) and leaves a literal that
+        // breaks the login. It must never reappear ANYWHERE in the realm export.
         assert!(
-            secret.contains("${env.KC_PORTAL_CLIENT_SECRET"),
-            "ct-portal secret must be env-pinned for a stable reimport, got {secret:?}"
+            !raw.contains("${env."),
+            "realm export must not use the ${{env.VAR}} form — realm import does not substitute it (#65)"
         );
 
         // #42 regression: `defaultClientScopes` may only name real Keycloak client
@@ -711,8 +721,10 @@ mod tests {
             );
         }
 
-        // #49: identity-brokering providers (google/github/gitlab) are declared,
-        // with credentials sourced from ${env.KC_*} — never baked into the export.
+        // #49: identity-brokering providers (google/github/gitlab) are declared, with
+        // credentials sourced from ${KC_*:} placeholders (resolvable form, empty
+        // default so an unconfigured broker imports blank instead of a literal) —
+        // never baked into the export. #65: same env-prefix fix as the portal secret.
         let idps = realm["identityProviders"].as_array().expect("identityProviders present");
         for want in ["google", "github", "gitlab"] {
             let idp = idps
@@ -723,8 +735,8 @@ mod tests {
             assert_eq!(idp["trustEmail"], true, "{want} trustEmail (so #43's email gate works)");
             let cid = idp["config"]["clientId"].as_str().unwrap_or("");
             let sec = idp["config"]["clientSecret"].as_str().unwrap_or("");
-            assert!(cid.contains("${env."), "{want} clientId from env, not baked: {cid}");
-            assert!(sec.contains("${env."), "{want} clientSecret from env, not baked: {sec}");
+            assert!(cid.starts_with("${KC_") && cid.ends_with(":}"), "{want} clientId from a resolvable ${{KC_*:}} placeholder, not baked/env-prefixed: {cid}");
+            assert!(sec.starts_with("${KC_") && sec.ends_with(":}"), "{want} clientSecret from a resolvable ${{KC_*:}} placeholder, not baked/env-prefixed: {sec}");
         }
 
         let redirect = client["redirectUris"]
