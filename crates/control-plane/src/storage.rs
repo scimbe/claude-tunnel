@@ -24,6 +24,30 @@ use crate::registry::TunnelInfo;
 use ct_common::{AgentId, RoutingToken, TenantId};
 use ct_common::sync::MutexExt;
 
+/// Additive schema migration for in-place self-host upgrades (#44). SQLite's
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a column
+/// introduced in a later commit is silently absent from a DB file created by an
+/// older binary — the next write then fails with `no column named …` and 500s.
+/// This ensures `table` has `column`, adding it via `ALTER TABLE … ADD COLUMN`
+/// (which SQLite allows for a NOT NULL column only with a DEFAULT) when missing.
+/// Idempotent: a no-op once the column exists, so it is safe on every startup.
+///
+/// `table`/`column`/`decl` are compile-time constants (never user input), so the
+/// `format!` interpolation carries no injection surface.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let present = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        cols.iter().any(|c| c == column)
+    };
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
 /// Why a persisted redemption failed: an enrollment rule or the database.
 #[derive(Debug)]
 pub enum RedeemError {
@@ -313,6 +337,9 @@ impl SqliteLedger {
                  account BLOB NOT NULL
              );",
         )?;
+        // #44: `payments.confirmed` was added after the table's first release;
+        // ensure it exists on a pre-existing DB so a top-up write doesn't 500.
+        ensure_column(&conn, "payments", "confirmed", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -581,6 +608,16 @@ impl SqliteTunnelStore {
                  grantee   TEXT NOT NULL,
                  PRIMARY KEY (tunnel_id, grantee)
              );",
+        )?;
+        // #44: subject_tunnels gained `hostname` (#23) and `routing_token` (#27)
+        // after its first release; add them to any pre-existing DB so schema-adding
+        // upgrades don't 500 on a persistent self-host volume.
+        ensure_column(&conn, "subject_tunnels", "hostname", "TEXT")?;
+        ensure_column(
+            &conn,
+            "subject_tunnels",
+            "routing_token",
+            "TEXT NOT NULL DEFAULT ''",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -892,6 +929,46 @@ mod tests {
         // Revoking an unknown id is a no-op false; bob's tunnel is untouched.
         assert!(store.revoke("alice", "deadbeef").unwrap().is_none());
         assert_eq!(store.list_for_subject("bob").unwrap(), vec![b1]);
+    }
+
+    #[test]
+    fn reopening_an_older_db_migrates_missing_columns_instead_of_500ing() {
+        // #44: a self-host DB created by an OLDER binary has subject_tunnels
+        // WITHOUT the later-added `hostname` (#23) / `routing_token` (#27) columns.
+        // CREATE TABLE IF NOT EXISTS won't touch it, so pre-fix the first create()
+        // hit "no column named routing_token" and 500'd. Reproduce that exact
+        // starting state, then prove open() migrates it and create()/list() work.
+        let path = temp_db_path();
+
+        // Old-schema DB: subject_tunnels as it existed before #23/#27.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE subject_tunnels (
+                     id         TEXT PRIMARY KEY,
+                     subject    TEXT NOT NULL,
+                     name       TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+
+        // Reopen with the current binary — from_connection runs the migration.
+        let store = SqliteTunnelStore::open(&path).unwrap();
+        let created = store
+            .create("alice", "web", Some("app.example"))
+            .expect("create must not 500 on a migrated older DB");
+        assert_eq!(created.routing_token.len(), 64, "routing_token column present + minted");
+        let listed = store.list_for_subject("alice").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hostname.as_deref(), Some("app.example"), "hostname column present");
+
+        // Idempotent: a second open over the now-migrated DB is a clean no-op.
+        let store2 = SqliteTunnelStore::open(&path).unwrap();
+        assert_eq!(store2.list_for_subject("alice").unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
