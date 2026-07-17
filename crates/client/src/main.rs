@@ -5,7 +5,7 @@
 //! runs the latency bench and prints a labeled `RESULT` CSV row for the sweep.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ct_client::bench::{csv_row, run_bench, run_bench_stream, run_bench_udp, summarize};
 use ct_client::config::ClientConfig;
@@ -14,7 +14,7 @@ use ct_client::ladder::{
 };
 use ct_client::transport::{
     client_forward, client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed,
-    dial_edge, dial_rung, udp_selftest, load_cert, EdgeConn,
+    dial_edge, dial_rung, load_cert, udp_selftest, EdgeConn,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
@@ -40,10 +40,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wait for the Edge cert. Cross-host, fetch the published root once with
     // `curl http://<cp>:8090/pki/ca -o edge-cert.der` (#11) and point
     // CT_CLIENT_EDGE_CERT at it; the lean client stays HTTP-client-free.
+    let edge_cert_wait_secs = std::env::var("CT_CLIENT_EDGE_CERT_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    let edge_cert_deadline = Instant::now() + Duration::from_secs(edge_cert_wait_secs);
     let edge_cert = loop {
         match load_cert(&config.edge_cert_file) {
             Ok(cert) => break cert,
             Err(_) => {
+                if Instant::now() >= edge_cert_deadline {
+                    return Err(format!(
+                        "ct-client: edge cert not available within {edge_cert_wait_secs}s at {}",
+                        config.edge_cert_file
+                    )
+                    .into());
+                }
                 eprintln!("ct-client: waiting for edge cert ...");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -51,6 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // Wait for the Agent's Capability.
+    let cap_wait_secs = std::env::var("CT_CLIENT_CAPABILITY_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    let cap_deadline = Instant::now() + Duration::from_secs(cap_wait_secs);
     let cap = loop {
         match std::fs::read(&config.capability_file)
             .ok()
@@ -58,6 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         {
             Some(cap) => break cap,
             None => {
+                if Instant::now() >= cap_deadline {
+                    return Err(format!(
+                        "ct-client: capability not available within {cap_wait_secs}s at {}",
+                        config.capability_file
+                    )
+                    .into());
+                }
                 eprintln!("ct-client: waiting for capability ...");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -74,8 +98,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the echo (the Agent must run with CT_AGENT_ORIGIN_PROTO=udp).
     if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("udp") {
         let conn = dial_edge(edge_addr, edge_cert).await?;
-        let echo =
-            udp_selftest(&conn, &cap.token, &cap, &client_kp.private, payload.as_bytes()).await?;
+        let echo = udp_selftest(
+            &conn,
+            &cap.token,
+            &cap,
+            &client_kp.private,
+            payload.as_bytes(),
+        )
+        .await?;
         println!(
             "ct-client: udp sent {:?}, received {:?}",
             payload,
@@ -236,14 +266,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (response, via) = match picked {
         (rung, EdgeConn::Quic(conn)) => {
             let r = client_tunnel_noise_timed(
-                &conn, &cap.token, &cap, &client_kp.private, payload.as_bytes(), tunnel_timeout,
+                &conn,
+                &cap.token,
+                &cap,
+                &client_kp.private,
+                payload.as_bytes(),
+                tunnel_timeout,
             )
             .await?;
             (r, via_label(rung))
         }
         (rung, EdgeConn::Tcp(tls)) => {
             let r = client_tunnel_noise_tcp_timed(
-                tls, &cap.token, &cap, &client_kp.private, payload.as_bytes(), tunnel_timeout,
+                tls,
+                &cap.token,
+                &cap,
+                &client_kp.private,
+                payload.as_bytes(),
+                tunnel_timeout,
             )
             .await?;
             (r, via_label(rung))

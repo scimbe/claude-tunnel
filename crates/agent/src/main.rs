@@ -4,6 +4,7 @@
 //! shared volume for the Client), registers its tunnel, and serves the Origin.
 
 use std::time::Duration;
+use tokio::time::Instant;
 
 use ct_agent::capability::{parse_routing_token_hex, resolve_serving_identity_with_token};
 use ct_agent::config::AgentConfig;
@@ -44,7 +45,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let env = OnboardEnv::from_env()?;
         let edge = env.config.edge;
         let cp_url = env.cp_url.clone();
-        let onboarded = env.onboard().await?;
+        let onboard_timeout_secs = std::env::var("CT_AGENT_ONBOARD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        let onboarded =
+            tokio::time::timeout(Duration::from_secs(onboard_timeout_secs), env.onboard())
+                .await
+                .map_err(|_| {
+                    format!("ct-agent: onboarding timed out after {onboard_timeout_secs}s")
+                })??;
         eprintln!(
             "ct-agent: onboarded agent={} tenant={} via {} (edge={})",
             onboarded.agent_id.0, onboarded.tenant.0, cp_url, edge
@@ -66,14 +76,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .fetch_edge_cert()
             .await
             .map_err(|e| format!("ct-agent: fetch edge cert from {url}: {e:?}"))?;
-        eprintln!("ct-agent: fetched edge cert from {url} ({} bytes)", der.len());
+        eprintln!(
+            "ct-agent: fetched edge cert from {url} ({} bytes)",
+            der.len()
+        );
         rustls::pki_types::CertificateDer::from(der)
     } else {
+        let cert_wait_secs = std::env::var("CT_AGENT_EDGE_CERT_WAIT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+        let cert_deadline = Instant::now() + Duration::from_secs(cert_wait_secs);
+        let mut next_log_at = Instant::now();
         loop {
             match load_cert(&cert_path) {
                 Ok(cert) => break cert,
                 Err(_) => {
-                    eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
+                    if Instant::now() >= cert_deadline {
+                        return Err(format!(
+                            "ct-agent: edge cert not available within {cert_wait_secs}s at {cert_path}"
+                        )
+                        .into());
+                    }
+                    if Instant::now() >= next_log_at {
+                        eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
+                        next_log_at = Instant::now() + Duration::from_secs(5);
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -109,7 +137,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.origin,
         cap_out,
         identity.origin_keys.len(),
-        if identity.origin_keys.len() == 1 { "y" } else { "ies" },
+        if identity.origin_keys.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         match &origin_key_path {
             Some(p) => format!(", shared origin key {p}"),
             None => String::new(),
