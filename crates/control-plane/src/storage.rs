@@ -21,6 +21,7 @@ use crate::accounts::{AccountId, LedgerError};
 use crate::enrollment::{AgentPublicKey, EnrollError, JoinToken};
 use crate::payment::{PaymentError, PaymentId};
 use crate::registry::TunnelInfo;
+use ct_common::channel::ChannelId;
 use ct_common::{AgentId, RoutingToken, TenantId};
 use ct_common::sync::MutexExt;
 
@@ -882,6 +883,168 @@ impl SqliteTunnelStore {
     }
 }
 
+/// Agent Fabric channel registry (ADR-0020, #72 AF2d). Under **agent-held** key
+/// custody the operator agent holds its channel signing key and signs grants; the
+/// control plane stores only the operator **public** key + membership, and hands
+/// the edge the operator pubkey for a channel (the same role host-auth plays for
+/// hostnames). Never stores a channel signing key. Owner-scoped: only the subject
+/// that registered a channel may re-key it or manage its members.
+pub struct SqliteChannelStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteChannelStore {
+    /// Open (creating if needed) a durable channel store at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory channel store (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channels (
+                 channel   BLOB PRIMARY KEY,
+                 operator  BLOB NOT NULL,
+                 owner     TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS channel_members (
+                 channel BLOB NOT NULL,
+                 holder  BLOB NOT NULL,
+                 PRIMARY KEY (channel, holder)
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Register `channel` operated by `owner`, storing its operator **public** key.
+    /// Idempotent for the same owner (re-key allowed); returns `false` without any
+    /// change when the channel already exists under a *different* owner.
+    pub fn register_channel(
+        &self,
+        channel: &ChannelId,
+        operator_pubkey: &[u8; 32],
+        owner: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT owner FROM channels WHERE channel = ?1",
+                params![&channel.0[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if matches!(existing, Some(ref o) if o != owner) {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO channels (channel, operator, owner) VALUES (?1, ?2, ?3)",
+            params![&channel.0[..], &operator_pubkey[..], owner],
+        )?;
+        Ok(true)
+    }
+
+    /// The operator public key for `channel`, if registered (the edge's lookup).
+    pub fn operator_pubkey(&self, channel: &ChannelId) -> rusqlite::Result<Option<[u8; 32]>> {
+        let raw: Option<Vec<u8>> = self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT operator FROM channels WHERE channel = ?1",
+                params![&channel.0[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
+    }
+
+    /// The subject that owns `channel`, if registered.
+    pub fn channel_owner(&self, channel: &ChannelId) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT owner FROM channels WHERE channel = ?1",
+                params![&channel.0[..]],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Add `holder` as a member of `channel`. Owner-scoped: succeeds (`true`) only
+    /// when `owner` owns the channel; idempotent. Returns `false` if not the owner
+    /// (or the channel is unknown).
+    pub fn add_member(
+        &self,
+        channel: &ChannelId,
+        owner: &str,
+        holder: &[u8; 32],
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_members (channel, holder) VALUES (?1, ?2)",
+            params![&channel.0[..], &holder[..]],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether `holder` is a member of `channel`.
+    pub fn is_member(&self, channel: &ChannelId, holder: &[u8; 32]) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM channel_members WHERE channel = ?1 AND holder = ?2",
+                params![&channel.0[..], &holder[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Remove `holder` from `channel`. Owner-scoped, idempotent; `false` if not the
+    /// owner (or unknown channel).
+    pub fn remove_member(
+        &self,
+        channel: &ChannelId,
+        owner: &str,
+        holder: &[u8; 32],
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM channel_members WHERE channel = ?1 AND holder = ?2",
+            params![&channel.0[..], &holder[..]],
+        )?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1286,6 +1449,58 @@ mod tests {
             "subject maps to the same account after reopen"
         );
         assert_eq!(reopened.balance(&acct).unwrap(), 7);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- #72 AF2d: agent-held channel registry ---
+
+    #[test]
+    fn channel_register_lookup_and_owner_scoped_membership() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        let op = [0x22u8; 32];
+        let member = [0x33u8; 32];
+
+        // Alice registers a channel with its operator PUBLIC key; the edge lookup
+        // resolves it, and the owner is recorded.
+        assert!(s.register_channel(&ch, &op, "alice").unwrap());
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op));
+        assert_eq!(s.channel_owner(&ch).unwrap(), Some("alice".to_string()));
+        assert_eq!(s.operator_pubkey(&ChannelId([0x99; 32])).unwrap(), None);
+
+        // Non-owner cannot re-key the channel or manage its members.
+        assert!(!s.register_channel(&ch, &[0xAAu8; 32], "mallory").unwrap());
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op), "operator key unchanged");
+        assert!(!s.add_member(&ch, "mallory", &member).unwrap());
+        assert!(!s.is_member(&ch, &member).unwrap());
+
+        // Owner adds a member (idempotent), then removes it (idempotent).
+        assert!(s.add_member(&ch, "alice", &member).unwrap());
+        assert!(s.add_member(&ch, "alice", &member).unwrap(), "add is idempotent");
+        assert!(s.is_member(&ch, &member).unwrap());
+        assert!(s.remove_member(&ch, "alice", &member).unwrap());
+        assert!(s.remove_member(&ch, "alice", &member).unwrap(), "remove is idempotent");
+        assert!(!s.is_member(&ch, &member).unwrap());
+
+        // Owner may re-key their own channel (agent rotates its operator key).
+        assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+    }
+
+    #[test]
+    fn channel_registry_survives_reopen() {
+        let path = temp_db_path();
+        let ch = ChannelId([0x55; 32]);
+        let op = [0x66u8; 32];
+        let member = [0x77u8; 32];
+        {
+            let s = SqliteChannelStore::open(&path).unwrap();
+            assert!(s.register_channel(&ch, &op, "alice").unwrap());
+            assert!(s.add_member(&ch, "alice", &member).unwrap());
+        }
+        let reopened = SqliteChannelStore::open(&path).unwrap();
+        assert_eq!(reopened.operator_pubkey(&ch).unwrap(), Some(op), "operator key persists");
+        assert!(reopened.is_member(&ch, &member).unwrap(), "membership persists");
         let _ = std::fs::remove_file(&path);
     }
 }

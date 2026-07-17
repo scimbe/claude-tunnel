@@ -1693,7 +1693,15 @@ Decomposed:
   channel registry stores only the operator PUBLIC key + membership and hands the edge that pubkey (like
   host-auth supplies authorized hostnames). Then: generalise `rendezvous.rs` to broker two agents over QUIC
   using AF2b + the AF2c request; the two run a pairwise Noise session (edge broker, no payload relay); real
-  two-agent integration test. Split if large: AF2d-registry (control-plane store) then AF2d-transport.
+  two-agent integration test. Split: AF2d-registry then AF2d-transport.
+- **AF2d-registry** ✅ **Control-plane channel store** (`SqliteChannelStore` in storage.rs): agent-held
+  custody — stores the operator PUBLIC key + membership (never a signing key), owner-scoped. Methods:
+  register_channel (re-key own, reject others), operator_pubkey (the edge lookup, like host-auth),
+  channel_owner, add_member/is_member/remove_member (owner-scoped, idempotent). 2 frozen tests
+  (register+lookup+owner-scoped membership; survives reopen). Gate green.
+- **AF2d-transport** ⏳ generalise `rendezvous.rs` to broker two agents over QUIC using the AF2b pairing +
+  AF2c request + the operator pubkey from AF2d-registry; pairwise Noise (edge broker, no payload relay);
+  real two-agent integration test.
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration
