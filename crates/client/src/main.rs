@@ -234,12 +234,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Single-tunnel mode (#31 FD3-c): walk the transport fallback ladder
-    // (QUIC:4433 → TLS-TCP:4433 → QUIC:443 → TLS-TCP:443), landing on the first
-    // reachable rung and remembering it per network — so a :443-only restrictive
-    // network reaches the FD2 front door without re-paying a timeout on every
-    // blocked rung. CT_CLIENT_FORCE_TCP keeps only the TLS-TCP rungs.
+    // (QUIC:<edge_port> → TLS-TCP:<edge_port> → QUIC:443 → TLS-TCP:443), landing on
+    // the first reachable rung and remembering it per network — so a :443-only
+    // restrictive network reaches the FD2 front door without re-paying a timeout on
+    // every blocked rung. CT_CLIENT_FORCE_TCP keeps only the TLS-TCP rungs.
+    // #74: the primary rungs use the port from the capability's edge_addr, so an
+    // edge on a non-4433 port (e.g. the self-host stack on :4434) is reachable.
     let force_tcp = std::env::var("CT_CLIENT_FORCE_TCP").is_ok();
-    let ladder = filtered_ladder(force_tcp);
+    let edge_port = edge_addr.port();
+    let ladder = filtered_ladder(force_tcp, edge_port);
     let netsig = network_signature();
     let per_rung = Duration::from_secs(2);
     let edge_ip = edge_addr.ip();
@@ -250,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         async move { dial_rung(rung, edge_ip, cert, per_rung).await }
     })
     .await
-    .ok_or("ct-client: no edge rung reachable (tried the :4433/:443 ladder)")?;
+    .ok_or_else(|| format!("ct-client: no edge rung reachable (tried the :{edge_port}/:443 ladder)"))?;
     // Overall deadline for the tunnel operation once the edge connection is up,
     // so the client never hangs when the edge accepts the connection but cannot
     // relay (issue #2 — e.g. no agent registered for the token). Configurable via

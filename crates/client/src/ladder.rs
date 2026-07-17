@@ -17,17 +17,25 @@ pub enum Rung {
     TlsTcp(u16),
 }
 
-/// The default ladder: `QUIC:4433 → TLS-TCP:4433 → QUIC:443 → TLS-TCP:443`.
-/// Ordered most-direct/fastest first (QUIC on the dedicated port), most
-/// restrictive-network-friendly last (TLS-TCP on :443, the one port such networks
-/// reliably allow). The `:443` rungs reach the unified front door (FD2).
-pub fn default_ladder() -> Vec<Rung> {
-    vec![
-        Rung::Quic(4433),
-        Rung::TlsTcp(4433),
-        Rung::Quic(443),
-        Rung::TlsTcp(443),
-    ]
+/// The unified front-door port (FD2) — a fixed, restrictive-network-friendly
+/// fallback that every deployment exposes, independent of the edge's own port.
+pub const FRONT_DOOR_PORT: u16 = 443;
+
+/// The default ladder for an edge on `edge_port`:
+/// `QUIC:<edge_port> → TLS-TCP:<edge_port> → QUIC:443 → TLS-TCP:443`.
+/// Ordered most-direct/fastest first (QUIC on the edge's own port, taken from the
+/// capability's `edge_addr` — #74), most restrictive-network-friendly last
+/// (TLS-TCP on :443, the one port such networks reliably allow). The `:443` rungs
+/// reach the unified front door (FD2). When the edge already runs on :443 the
+/// front-door rungs coincide and are not duplicated.
+pub fn default_ladder(edge_port: u16) -> Vec<Rung> {
+    let mut rungs = vec![Rung::Quic(edge_port), Rung::TlsTcp(edge_port)];
+    for r in [Rung::Quic(FRONT_DOOR_PORT), Rung::TlsTcp(FRONT_DOOR_PORT)] {
+        if !rungs.contains(&r) {
+            rungs.push(r);
+        }
+    }
+    rungs
 }
 
 /// Remembers the last rung that worked, keyed by an opaque network signature, so a
@@ -100,8 +108,8 @@ where
 /// The ladder to attempt, honoring `CT_CLIENT_FORCE_TCP` (#31 FD3-c): when TCP is
 /// forced (the UDP-blocked smoke, or a known QUIC-hostile network) keep only the
 /// TLS-TCP rungs, so the client doesn't burn a timeout on every QUIC rung first.
-pub fn filtered_ladder(force_tcp: bool) -> Vec<Rung> {
-    let full = default_ladder();
+pub fn filtered_ladder(force_tcp: bool, edge_port: u16) -> Vec<Rung> {
+    let full = default_ladder(edge_port);
     if force_tcp {
         full.into_iter()
             .filter(|r| matches!(r, Rung::TlsTcp(_)))
@@ -161,11 +169,40 @@ mod tests {
 
     #[test]
     fn filtered_ladder_keeps_only_tcp_when_forced() {
-        assert_eq!(filtered_ladder(false), default_ladder());
+        assert_eq!(filtered_ladder(false, 4433), default_ladder(4433));
         assert_eq!(
-            filtered_ladder(true),
+            filtered_ladder(true, 4433),
             vec![Rung::TlsTcp(4433), Rung::TlsTcp(443)],
             "force-TCP drops the QUIC rungs"
+        );
+        // #74: the forced-TCP ladder also honors a non-4433 edge port.
+        assert_eq!(
+            filtered_ladder(true, 4434),
+            vec![Rung::TlsTcp(4434), Rung::TlsTcp(443)],
+            "force-TCP keeps the capability's edge port, then the :443 front door"
+        );
+    }
+
+    #[test]
+    fn default_ladder_honors_the_capability_edge_port() {
+        // #74 regression: an edge on a non-4433 port (e.g. the #15 self-host stack
+        // on :4434) must be the PRIMARY rungs — the ladder previously hardcoded
+        // :4433 and dropped the real port, making such edges unreachable by clients.
+        assert_eq!(
+            default_ladder(4434),
+            vec![
+                Rung::Quic(4434),
+                Rung::TlsTcp(4434),
+                Rung::Quic(443),
+                Rung::TlsTcp(443),
+            ],
+            "the edge's own port leads; :443 front door follows as the fallback"
+        );
+        // An edge already on :443 must not duplicate the front-door rungs.
+        assert_eq!(
+            default_ladder(443),
+            vec![Rung::Quic(443), Rung::TlsTcp(443)],
+            "edge on :443 coincides with the front door — no duplicate rungs"
         );
     }
 
@@ -188,7 +225,7 @@ mod tests {
     #[test]
     fn default_ladder_is_direct_first_restrictive_last() {
         assert_eq!(
-            default_ladder(),
+            default_ladder(4433),
             vec![
                 Rung::Quic(4433),
                 Rung::TlsTcp(4433),
@@ -200,7 +237,7 @@ mod tests {
 
     #[test]
     fn attempt_order_puts_the_cached_rung_first_without_duplicating() {
-        let ladder = default_ladder();
+        let ladder = default_ladder(4433);
         let mut cache = LadderCache::new();
 
         // Empty cache -> the ladder unchanged.
@@ -228,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_via_ladder_picks_first_reachable_and_caches_it() {
-        let ladder = default_ladder();
+        let ladder = default_ladder(4433);
         let mut cache = LadderCache::new();
         let tried: Arc<Mutex<Vec<Rung>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -274,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_via_ladder_returns_none_when_every_rung_fails() {
-        let ladder = default_ladder();
+        let ladder = default_ladder(4433);
         let mut cache = LadderCache::new();
         let got: Option<(Rung, &str)> =
             connect_via_ladder(&mut cache, "dead", &ladder, |_rung| async { None }).await;
