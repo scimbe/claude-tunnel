@@ -1439,9 +1439,14 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     auf dem Rung-Port; `None` bei Timeout/Fehler, damit `connect_via_ladder` weiterläuft). Frozen-Test
     `dial_rung_walks_the_ladder_to_the_live_quic_rung_and_caches_it`: echter In-Process-Edge auf Ephemeral-QUIC-Port, tote
     TLS-TCP-Rung zuerst → Leiter überspringt sie, landet live auf QUIC, cached den Rung. Gate grün (ct-client 35).
-  - **FD3-c** ⏳ **`main.rs`-Verdrahtung**: Single-Tunnel-Pfad auf `connect_via_ladder(&dial_rung)` umstellen (EdgeConn-Variante →
-    `client_tunnel_noise_timed` bzw. `..._tcp_timed`), Netz-Signatur ableiten (Default-Gateway/lokales Subnetz), Cache über
-    Läufe persistieren. `CT_CLIENT_FORCE_TCP` weiter respektieren (Rung-Filter).
+  - **FD3-c** ✅ **`main.rs`-Verdrahtung**: Single-Tunnel-Pfad läuft jetzt über `connect_via_ladder(&dial_rung)` — EdgeConn-Variante
+    → `client_tunnel_noise_timed` bzw. `..._tcp_timed`, `via`-Label bleibt grob (`quic`/`tcp`, damit die Smoke-Greps `via=…` über
+    die neuen `:443`-Sprossen weiter matchen). `filtered_ladder(force_tcp)` respektiert `CT_CLIENT_FORCE_TCP` (nur TLS-TCP-Sprossen);
+    `network_signature()` = `CT_CLIENT_NET_SIG`-Override, sonst Egress-IPv4-/24, sonst `default` (reine `network_signature_from`
+    getestet). Frozen-Tests `filtered_ladder_keeps_only_tcp_when_forced`, `network_signature_prefers_override_then_reduces_egress_ip`.
+    Gate grün (ct-client 37). **FD3 damit funktional komplett** (Leiter-Modell + Live-Dialer + Live-Pfad); Cache-Persistenz über
+    getrennte Prozess-Läufe ist optionale Erweiterung (Single-Shot-Client walkt die Leiter jeden Lauf ohnehin korrekt), nicht Teil
+    der #31-Akzeptanz.
 - **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
   reuse #23/ADR-0003; reale Domain via #30. **DNS-01 via selbst-gehostetem `ct-dns`** (acme-dns-Pattern, Strato hat keine API):
   - **AD1** ✅ Neue Crate `ct-dns`: hand-rolled DNS-Wire-Codec (`message::parse_query`/`build_response`, TXT, bounds-checked,

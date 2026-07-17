@@ -9,12 +9,24 @@ use std::time::Duration;
 
 use ct_client::bench::{csv_row, run_bench, run_bench_stream, run_bench_udp, summarize};
 use ct_client::config::ClientConfig;
+use ct_client::ladder::{
+    connect_via_ladder, filtered_ladder, network_signature, LadderCache, Rung,
+};
 use ct_client::transport::{
     client_forward, client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed,
-    dial_edge, tcp_tls_connect, udp_selftest, load_cert,
+    dial_edge, dial_rung, udp_selftest, load_cert, EdgeConn,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
+
+/// The transport family label for a landed rung — kept coarse ("quic"/"tcp") so
+/// existing smoke greps (`via=quic` / `via=tcp`) still match across the :443 rungs.
+fn via_label(rung: Rung) -> &'static str {
+    match rung {
+        Rung::Quic(_) => "quic",
+        Rung::TlsTcp(_) => "tcp",
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -191,19 +203,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Single-tunnel mode: QUIC primary, TLS-TCP fallback when UDP is blocked.
-    // CT_CLIENT_FORCE_TCP forces the fallback (used by the UDP-blocked smoke).
+    // Single-tunnel mode (#31 FD3-c): walk the transport fallback ladder
+    // (QUIC:4433 → TLS-TCP:4433 → QUIC:443 → TLS-TCP:443), landing on the first
+    // reachable rung and remembering it per network — so a :443-only restrictive
+    // network reaches the FD2 front door without re-paying a timeout on every
+    // blocked rung. CT_CLIENT_FORCE_TCP keeps only the TLS-TCP rungs.
     let force_tcp = std::env::var("CT_CLIENT_FORCE_TCP").is_ok();
-    let quic_conn = if force_tcp {
-        None
-    } else {
-        match tokio::time::timeout(Duration::from_secs(2), dial_edge(edge_addr, edge_cert.clone()))
-            .await
-        {
-            Ok(Ok(conn)) => Some(conn),
-            _ => None,
-        }
-    };
+    let ladder = filtered_ladder(force_tcp);
+    let netsig = network_signature();
+    let per_rung = Duration::from_secs(2);
+    let edge_ip = edge_addr.ip();
+    let mut cache = LadderCache::new();
+    let cert_for_dial = edge_cert.clone();
+    let picked = connect_via_ladder(&mut cache, &netsig, &ladder, |rung| {
+        let cert = cert_for_dial.clone();
+        async move { dial_rung(rung, edge_ip, cert, per_rung).await }
+    })
+    .await
+    .ok_or("ct-client: no edge rung reachable (tried the :4433/:443 ladder)")?;
     // Overall deadline for the tunnel operation once the edge connection is up,
     // so the client never hangs when the edge accepts the connection but cannot
     // relay (issue #2 — e.g. no agent registered for the token). Configurable via
@@ -214,21 +231,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10),
     );
-    let (response, via) = match quic_conn {
-        Some(conn) => {
+    // Report the transport family ("quic"/"tcp") as before, so existing smoke
+    // greps (via=quic / via=tcp) keep working across the new :443 rungs.
+    let (response, via) = match picked {
+        (rung, EdgeConn::Quic(conn)) => {
             let r = client_tunnel_noise_timed(
                 &conn, &cap.token, &cap, &client_kp.private, payload.as_bytes(), tunnel_timeout,
             )
             .await?;
-            (r, "quic")
+            (r, via_label(rung))
         }
-        None => {
-            let tls = tcp_tls_connect(edge_addr, edge_cert).await?;
+        (rung, EdgeConn::Tcp(tls)) => {
             let r = client_tunnel_noise_tcp_timed(
                 tls, &cap.token, &cap, &client_kp.private, payload.as_bytes(), tunnel_timeout,
             )
             .await?;
-            (r, "tcp")
+            (r, via_label(rung))
         }
     };
     println!(

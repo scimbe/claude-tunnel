@@ -97,10 +97,93 @@ where
     None
 }
 
+/// The ladder to attempt, honoring `CT_CLIENT_FORCE_TCP` (#31 FD3-c): when TCP is
+/// forced (the UDP-blocked smoke, or a known QUIC-hostile network) keep only the
+/// TLS-TCP rungs, so the client doesn't burn a timeout on every QUIC rung first.
+pub fn filtered_ladder(force_tcp: bool) -> Vec<Rung> {
+    let full = default_ladder();
+    if force_tcp {
+        full.into_iter()
+            .filter(|r| matches!(r, Rung::TlsTcp(_)))
+            .collect()
+    } else {
+        full
+    }
+}
+
+/// The cache key for the current network (#31 FD3-c). Prefers an explicit
+/// `CT_CLIENT_NET_SIG` (operators/tests pin it); else a best-effort key from the
+/// default egress interface's IPv4 /24 (stable per LAN, distinct across networks);
+/// else `"default"`. It only needs to be stable-per-network and distinct-across —
+/// it is a local cache key and never leaves the host.
+pub fn network_signature() -> String {
+    network_signature_from(
+        std::env::var("CT_CLIENT_NET_SIG").ok(),
+        local_egress_ip(),
+    )
+}
+
+/// Pure core of [`network_signature`] (testable): explicit override wins, else the
+/// egress IP is reduced to a stable per-network key.
+fn network_signature_from(override_env: Option<String>, egress: Option<std::net::IpAddr>) -> String {
+    if let Some(s) = override_env
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return s;
+    }
+    match egress {
+        Some(std::net::IpAddr::V4(ip)) => {
+            let o = ip.octets();
+            format!("v4:{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        Some(std::net::IpAddr::V6(ip)) => format!("v6:{ip}"),
+        None => "default".to_string(),
+    }
+}
+
+/// Best-effort local egress IP: "connect" a UDP socket to an unrouted public
+/// address (no packet is sent — it only makes the OS pick the default-route source
+/// interface) and read the socket's local address. `None` when there is no route.
+fn local_egress_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): never a real host, so nothing is
+    // contacted; connect() only fixes the source interface via the routing table.
+    sock.connect(("192.0.2.1", 9)).ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn filtered_ladder_keeps_only_tcp_when_forced() {
+        assert_eq!(filtered_ladder(false), default_ladder());
+        assert_eq!(
+            filtered_ladder(true),
+            vec![Rung::TlsTcp(4433), Rung::TlsTcp(443)],
+            "force-TCP drops the QUIC rungs"
+        );
+    }
+
+    #[test]
+    fn network_signature_prefers_override_then_reduces_egress_ip() {
+        let v4 = Some(IpAddr::V4(Ipv4Addr::new(141, 22, 33, 44)));
+        // Explicit override wins verbatim.
+        assert_eq!(network_signature_from(Some("pinned-net".into()), v4), "pinned-net");
+        // A blank override is ignored -> fall through to the egress key.
+        assert_eq!(network_signature_from(Some("  ".into()), v4), "v4:141.22.33.0/24");
+        // IPv4 is reduced to its /24; IPv6 kept whole; no route -> "default".
+        assert_eq!(network_signature_from(None, v4), "v4:141.22.33.0/24");
+        assert_eq!(
+            network_signature_from(None, Some(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+            "v6:::1"
+        );
+        assert_eq!(network_signature_from(None, None), "default");
+    }
 
     #[test]
     fn default_ladder_is_direct_first_restrictive_last() {
