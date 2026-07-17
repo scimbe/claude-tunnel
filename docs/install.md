@@ -32,6 +32,14 @@ docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.e
 The control plane persists to a named volume and restarts on failure; the edge
 comes up once the control plane is healthy.
 
+> **Build caching (needs BuildKit/buildx).** The image (`docker/Dockerfile`) uses
+> BuildKit cache mounts for the cargo registry and `target/`, so an incremental
+> rebuild after a small change takes ~20 s instead of recompiling the whole
+> dependency tree (5–20 min). This needs BuildKit — modern `docker` enables it by
+> default; otherwise export `DOCKER_BUILDKIT=1` or install the `docker-buildx`
+> plugin. The **legacy builder silently ignores** `--mount=type=cache` (you'll see
+> a "legacy builder is deprecated" warning and rebuilds stay cold).
+
 ### Hosted (Kubernetes)
 
 ```bash
