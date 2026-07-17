@@ -1609,3 +1609,25 @@ importierter Demo-Realm, passend zu dem, was `PortalOidc::from_env`/`OidcVerifie
   `docs/deploy/keycloak-sso.md` (Split-Horizon-Caveat zu `KEYCLOAK_PUBLIC_URL`, `.env`-Keys, Bring-up, Klick-Durchlauf). Frozen-Test
   `sso_compose_wires_the_control_plane_to_the_demo_realm` (`include_str!` des Compose → client-id/redirect/realm konsistent mit Realm+Code,
   kein Secret im Compose). Gate grün (control-plane 127). **KC1–KC3 erfüllt → #42 fix-ready.**
+
+## #50 Literaturverzeichnis ausbauen (4 → 20–40 Quellen); Related Work belegen; OHTTP + iCloud Private Relay abgrenzen
+
+Gutachten-Befund (schwerster Punkt): `references.bib` hat nur 4 Einträge; Kap. 3 nennt WireGuard, Cloudflare
+Tunnel, ngrok, Tailscale Funnel, Tor, obfs4, Shadowsocks, MASQUE — keines zitiert. Ziel: ≥20 belastbare Quellen,
+jedes diskutierte System zitiert, 3.5 gegen OHTTP + iCloud Private Relay abgegrenzt. Thesis-Issue → gated durch
+`scripts/thesis-build.sh` (latexmk, 0 undefined). Feature-groß → in drei Teilpakete dekomponiert:
+
+- **T50.1** ✅ **Bibliografie-Grundstock + bestehende Systeme zitiert**: 10 verifizierte Primärquellen aus der
+  Issue-Tabelle in `references.bib` ergänzt (WireGuard/Donenfeld NDSS'17, Tor/Dingledine USENIX'04, Sybil/Douceur
+  IPTPS'02, MASQUE RFC 9298 + RFC 9484, obfs4, Shadowsocks + Produkt-Refs Cloudflare Tunnel/ngrok/Tailscale Funnel)
+  und in `chapters/relatedwork.tex` an **jedem bereits im Text genannten System** `\cite{}` verdrahtet (§3.1
+  WireGuard, §3.2 Reverse-Tunnel-Produkte, §3.3 Tor+obfs4+Shadowsocks+Sybil, §3.4 MASQUE). Gate: Thesis baut grün
+  (`latexmk` exit 0), `grep -ci undefined thesis.log == 0`; gedruckte Bibliografie 4 → 14. Frozen = der Build-Gate.
+- **T50.2** ⏳ **3.5 Abgrenzung + Zensur-Quellen**: OHTTP (RFC 9458), Apple iCloud Private Relay (Zwei-Hop,
+  Ingress/Egress-Trennung), TLS 1.3 (RFC 8446), Domain Fronting (Fifield PoPETs'15), Telex/Decoy-Routing
+  (Wustrow USENIX'11) als konzeptionelle Vorläufer aufnehmen; §3.5 explizit dagegen abgrenzen (Alleinstellung der
+  Vier-Bausteine-Kombination). Zensurresistenz mit Mess-/Umgehungsforschung belegen (OONI, Snowflake/meek).
+- **T50.3** ⏳ **Noise peer-reviewed + Zielzahl**: Noise über die Webseite hinaus mit peer-reviewter Analyse
+  untermauern (Kobeissi et al.; Dowling & Paterson, WireGuard/Noise), Privacy Pass (Davidson PoPETs'18) für
+  tokenbasierten anonymen Zugang; auf ≥20 gedruckte Quellen auffüllen + finaler Zitations-Audit. **fix-ready erst
+  wenn Akzeptanz (≥20, jedes System zitiert, 3.5 abgegrenzt) vollständig erfüllt.**

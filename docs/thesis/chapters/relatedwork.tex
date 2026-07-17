@@ -16,7 +16,7 @@ oder die Verbindung kappen?}
 \label{sec:rw-vpn}
 
 Klassische VPNs stellen einen verschlüsselten Tunnel zwischen zwei Endpunkten
-her. Bei WireGuard etwa terminiert die Verschlüsselung an den beiden Peers
+her. Bei WireGuard~\cite{donenfeld2017wireguard} etwa terminiert die Verschlüsselung an den beiden Peers
 selbst: Der Tunnel verbindet einen Client mit einem Server, der zugleich
 Gegenstelle und Vertrauensanker ist. Für den hier verfolgten Anwendungsfall ---
 ein kundeneigenes Origin hinter einer restriktiven Netzgrenze ohne öffentliche
@@ -34,7 +34,8 @@ verschiebt die Terminierung jedoch vom Vermittler an das kundeneigene Ziel.
 \section{Reverse-Tunnel-Dienste}
 \label{sec:rw-reverse}
 
-Reverse-Tunnel-Dienste wie Cloudflare Tunnel, ngrok oder Tailscale Funnel lösen
+Reverse-Tunnel-Dienste wie Cloudflare Tunnel~\cite{cloudflaretunnel},
+ngrok~\cite{ngrok} oder Tailscale Funnel~\cite{tailscalefunnel} lösen
 dieselbe Erreichbarkeitsaufgabe: Ein Agent im privaten Netz baut eine
 ausgehende Verbindung zu einer Anbieter-Infrastruktur auf, über die eingehender
 Verkehr an das interne Ziel zurückgereicht wird. Damit entfällt die
@@ -58,11 +59,11 @@ Vertrauensbürde des klartextsichtigen Anbieters erreicht.
 \section{Anonymität und Zensurumgehung}
 \label{sec:rw-anon}
 
-Tor und allgemeiner das Onion-Routing verfolgen ein anderes Bedrohungsmodell:
+Tor~\cite{dingledine2004tor} und allgemeiner das Onion-Routing verfolgen ein anderes Bedrohungsmodell:
 Ziel ist die \emph{Anonymität} der kommunizierenden Parteien, erreicht durch
 mehrstufige, geschichtete Verschlüsselung über mehrere unabhängige Relays, sodass
 kein einzelner Knoten Sender und Empfänger zugleich kennt. \emph{Pluggable
-transports} wie obfs4 oder Shadowsocks ergänzen dies um Verschleierung des
+transports} wie obfs4~\cite{obfs4} oder Shadowsocks~\cite{shadowsocks} ergänzen dies um Verschleierung des
 Verkehrsmusters, um Deep-Packet-Inspection und Protokollfilter zu unterlaufen.
 Diese Systeme schützen also primär die \emph{Identität} und die
 \emph{Beobachtbarkeit} der Kommunikation gegenüber Netzbeobachtern.
@@ -77,7 +78,7 @@ Spuren ein Vermittler zwangsläufig sieht) und der \emph{Denial-of-Service}-
 Resistenz eines offenen, KYC-freien Zugangs. Wo Tor auf Netzwerk- und
 Reputationsmechanismen setzt, verwendet \texttt{claude-tunnel} ein
 Proof-of-Work-Rendezvous~\cite{back2002hashcash} mit tokenweiser Ratenbegrenzung
-als primären Sybil- und Flutungs-Schutz.
+als primären Sybil-~\cite{douceur2002sybil} und Flutungs-Schutz.
 
 \section{QUIC-Relays und MASQUE}
 \label{sec:rw-quic}
@@ -85,7 +86,7 @@ als primären Sybil- und Flutungs-Schutz.
 Auf der Transportebene ist \texttt{claude-tunnel} den QUIC-basierten
 Relay-Ansätzen verwandt. QUIC~\cite{rfc9000} bündelt Verbindungsaufbau,
 Verschlüsselung und Multiplexing über UDP und eignet sich damit für den
-schnellen Aufbau vieler kurzlebiger Tunnel. Das MASQUE-Framework baut auf QUIC
+schnellen Aufbau vieler kurzlebiger Tunnel. Das MASQUE-Framework~\cite{rfc9298,rfc9484} baut auf QUIC
 und HTTP/3 auf, um Proxy- und Tunneldienste über eine QUIC-Verbindung zu
 transportieren --- konzeptionell ein Relay, das UDP- oder IP-Verkehr für einen
 Client weiterreicht. Die Datenebene dieser Arbeit teilt diese Transportbasis:

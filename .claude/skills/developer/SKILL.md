@@ -55,6 +55,15 @@ Run `gh issue list --state open --limit 100 --json number,author,labels,title`.
   `fix-ready` — **lowest number first**.
 - **(B)** if none: open issues labelled `feature`, scimbe-authored, not
   `fix-ready`, not `in-progress` — lowest number first.
+- **(C)** if none: open issues labelled `thesis`, scimbe-authored, not
+  `fix-ready`, not `in-progress` — lowest number first. Thesis issues are
+  in-scope for the loop (scimbe's directive, cycle 137+). They edit the BA thesis
+  under `docs/thesis` and are gated by the **thesis build**, not the cargo gate
+  (see below). A thesis issue is almost always feature-sized → **decompose** and
+  land one sub-packet per cycle exactly like a feature; add `fix-ready` only when
+  its acceptance criteria are fully met. Measurement-hungry thesis issues
+  (baseline/throughput/failover/loss) need real testbed runs — the first
+  sub-packet is the measurement itself; **never invent numbers**.
 - If an explicit `[issue-number]` argument was given, process that one (still
   enforce scimbe authorship).
 - If nothing qualifies, **do nothing** — report the idle sweep and stop. Do not
@@ -92,6 +101,25 @@ docker run --rm -v "$PWD":/work -w /work -u $(id -u):$(id -g) \
 
 `-D warnings` is the 0-warnings gate (clippy is not in `rust:1-slim`). Every fix
 lands with a **frozen regression test** that exercises the real failure path.
+
+### Thesis gate (for `thesis`-labelled issues)
+
+Thesis issues touch `docs/thesis/*.tex` + `references.bib`, not Rust. Their gate is
+a clean LaTeX build in the Docker TeX Live image:
+
+```bash
+bash scripts/thesis-build.sh          # builds ct-thesis image, runs latexmk (pdflatex→biber→…)
+# green = exit 0 AND no undefined citations/refs:
+grep -ci 'undefined' docs/thesis/thesis.log   # must be 0
+```
+
+The **frozen check** analogous to a regression test is: the thesis compiles with
+`-halt-on-error` **and** `grep -ci undefined docs/thesis/thesis.log == 0` (every
+`\cite{}`/`\ref{}` resolves). Only source is committed (`.tex`, `.bib`, and the
+`thesis.pdf` deliverable); the `.aux/.bbl/.bcf/.log/...` build artefacts are
+git-ignored (`docs/thesis/.gitignore`). Ground every factual claim/number in the
+code, a committed measurement CSV under `docs/thesis/data`, or a real citation —
+**never invent** figures or references.
 
 ### Commit + push (as scimbe)
 
