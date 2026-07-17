@@ -12,6 +12,8 @@ use ct_agent::onboard::OnboardEnv;
 use ct_agent::serve::run_agent;
 use ct_agent::transport::load_cert;
 
+const EDGE_CERT_WAIT_LOG_THROTTLE_SECS: u64 = 5;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `rotate` subcommand (#12 K4): rotate the origin key while KEEPING the
@@ -86,21 +88,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(60);
+        let cert_log_interval_secs = std::env::var("CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(EDGE_CERT_WAIT_LOG_THROTTLE_SECS);
         let cert_deadline = Instant::now() + Duration::from_secs(cert_wait_secs);
         let mut next_log_at = Instant::now();
         loop {
+            let now = Instant::now();
             match load_cert(&cert_path) {
                 Ok(cert) => break cert,
                 Err(_) => {
-                    if Instant::now() >= cert_deadline {
+                    if now >= cert_deadline {
                         return Err(format!(
                             "ct-agent: edge cert not available within {cert_wait_secs}s at {cert_path}"
                         )
                         .into());
                     }
-                    if Instant::now() >= next_log_at {
+                    if now >= next_log_at {
                         eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
-                        next_log_at = Instant::now() + Duration::from_secs(5);
+                        next_log_at = now + Duration::from_secs(cert_log_interval_secs);
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }

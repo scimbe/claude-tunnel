@@ -28,21 +28,25 @@ ORIGIN_PORT="${ORIGIN_PORT:-8080}"
 AGENT_ID="${AGENT_ID:-smoke-agent}"
 PAYLOAD="${PAYLOAD:-hello-smoke}"
 BIN="${BIN:-./target/debug}"
-WORK="$(mktemp -d)"
+WORK="$(umask 077 && mktemp -d)"
 chmod 700 "$WORK"
 CAP="$WORK/capability.bin"
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
-terminate_tree() {
+terminate_process() {
   local pid="$1"
   [ -n "${pid:-}" ] || return 0
   kill "$pid" 2>/dev/null || true
   sleep 0.5
   kill -9 "$pid" 2>/dev/null || true
 }
+process_alive() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null
+}
 cleanup() {
-  terminate_tree "${AGENT_PID:-}"
-  terminate_tree "${ORIGIN_PID:-}"
+  terminate_process "${AGENT_PID:-}"
+  terminate_process "${ORIGIN_PID:-}"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -72,9 +76,10 @@ socat "TCP-LISTEN:${ORIGIN_PORT},reuseaddr,fork" EXEC:cat >/dev/null 2>&1 &
 ORIGIN_PID=$!
 for _ in $(seq 1 20); do
   nc -z 127.0.0.1 "$ORIGIN_PORT" >/dev/null 2>&1 && break
-  kill -0 "$ORIGIN_PID" 2>/dev/null || fail "local echo origin exited early"
+  process_alive "$ORIGIN_PID" || fail "local echo origin exited early"
   sleep 0.25
 done
+# Total readiness budget: 20 * 0.25s = 5s.
 nc -z 127.0.0.1 "$ORIGIN_PORT" >/dev/null 2>&1 \
   || fail "local echo origin did not become ready on 127.0.0.1:${ORIGIN_PORT}"
 
@@ -88,7 +93,7 @@ AGENT_PID=$!
 # Wait for the agent to write its capability (enroll + register).
 for _ in $(seq 1 60); do
   [ -s "$CAP" ] && break
-  kill -0 "$AGENT_PID" 2>/dev/null || fail "agent exited early (see $WORK/agent.log): $(tail -n20 "$WORK/agent.log" 2>/dev/null)"
+  process_alive "$AGENT_PID" || fail "agent exited early (see $WORK/agent.log): $(tail -n20 "$WORK/agent.log" 2>/dev/null)"
   sleep 0.5
 done
 [ -s "$CAP" ] || fail "agent did not register within 30s (see $WORK/agent.log): $(tail -n20 "$WORK/agent.log" 2>/dev/null)"
