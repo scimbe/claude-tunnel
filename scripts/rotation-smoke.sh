@@ -5,7 +5,7 @@
 #
 #   CENTRAL=<host> EDGE_CERT=/path/to/edge-cert.der ./scripts/rotation-smoke.sh
 #
-# Prereqs: built binaries (BIN=./target/debug), socat, curl. Runs against an
+# Prereqs: built binaries (BIN=./target/debug), socat, curl, jq. Runs against an
 # already-running central control plane (:8090) + edge (:4433).
 set -euo pipefail
 
@@ -16,7 +16,8 @@ EDGE="${EDGE:-${CENTRAL}:4433}"
 TENANT="${TENANT:-t1}"
 ORIGIN_PORT="${ORIGIN_PORT:-8085}"
 BIN="${BIN:-./target/debug}"
-W="$(mktemp -d)"
+W="$(umask 077 && mktemp -d)"
+chmod 700 "$W"
 KEY="$W/origin.key"          # primary origin key (rotated in place)
 DIR="$W/retired"            # retired-key dir (old identities served in the window)
 CAP="$W/capability.bin"      # published capability (re-minted on rotate)
@@ -35,10 +36,12 @@ trap cleanup EXIT
 [ -x "$BIN/ct-agent" ] && [ -x "$BIN/ct-client" ] || fail "binaries not built (BIN=$BIN)"
 command -v socat >/dev/null || fail "socat required"
 command -v curl  >/dev/null || fail "curl required"
+command -v jq >/dev/null || fail "jq required (apt-get install jq)"
 
 mint_token() {
-  curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-    -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p'
+  curl --connect-timeout 5 --max-time 10 -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+    -d "{\"tenant\":\"$TENANT\"}" \
+    | jq -r '.token // empty' 2>/dev/null
 }
 start_agent() {  # $1 = extra env note; serves with the current KEY/DIR/CAP
   CT_AGENT_CP_URL="$CP_URL" CT_AGENT_JOIN_TOKEN="$(mint_token)" CT_AGENT_ID="rot-$1" \

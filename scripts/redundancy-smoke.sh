@@ -7,7 +7,7 @@
 #
 #   CENTRAL=<host> EDGE_CERT=/path/to/edge-cert.der ./scripts/redundancy-smoke.sh
 #
-# Prereqs: built binaries (BIN=./target/debug), socat, curl. Runs against an
+# Prereqs: built binaries (BIN=./target/debug), socat, curl, jq. Runs against an
 # already-running central control plane (:8090) + edge (:4433).
 set -euo pipefail
 
@@ -18,7 +18,8 @@ EDGE="${EDGE:-${CENTRAL}:4433}"
 TENANT="${TENANT:-t1}"
 ORIGIN_PORT="${ORIGIN_PORT:-8083}"
 BIN="${BIN:-./target/debug}"
-W="$(mktemp -d)"
+W="$(umask 077 && mktemp -d)"
+chmod 700 "$W"
 KEY="$W/origin.key"      # shared origin key (agent 1 creates, agent 2 loads)
 CAP="$W/capability.bin"  # shared capability (same routing token)
 SECRET="redundancy-$(date +%s)"
@@ -34,10 +35,12 @@ trap cleanup EXIT
 [ -x "$BIN/ct-agent" ] && [ -x "$BIN/ct-client" ] || fail "binaries not built (BIN=$BIN)"
 command -v socat >/dev/null || fail "socat required"
 command -v curl  >/dev/null || fail "curl required"
+command -v jq >/dev/null || fail "jq required (apt-get install jq)"
 
 mint_token() {
-  curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-    -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p'
+  curl --connect-timeout 5 --max-time 10 -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+    -d "{\"tenant\":\"$TENANT\"}" \
+    | jq -r '.token // empty' 2>/dev/null
 }
 run_client() {  # → prints ct-client output; returns its exit code
   CT_CLIENT_CAPABILITY="$CAP" CT_CLIENT_EDGE_CERT="$EDGE_CERT" CT_CLIENT_PAYLOAD="$SECRET" \

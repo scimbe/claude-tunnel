@@ -28,13 +28,25 @@ ORIGIN_PORT="${ORIGIN_PORT:-8080}"
 AGENT_ID="${AGENT_ID:-smoke-agent}"
 PAYLOAD="${PAYLOAD:-hello-smoke}"
 BIN="${BIN:-./target/debug}"
-WORK="$(mktemp -d)"
+WORK="$(umask 077 && mktemp -d)"
+chmod 700 "$WORK"
 CAP="$WORK/capability.bin"
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
+terminate_process() {
+  local pid="$1"
+  [ -n "${pid:-}" ] || return 0
+  kill "$pid" 2>/dev/null || true
+  sleep 0.5
+  kill -9 "$pid" 2>/dev/null || true
+}
+process_alive() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null
+}
 cleanup() {
-  [ -n "${AGENT_PID:-}" ] && kill "$AGENT_PID" 2>/dev/null || true
-  [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
+  terminate_process "${AGENT_PID:-}"
+  terminate_process "${ORIGIN_PID:-}"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -45,31 +57,51 @@ trap cleanup EXIT
   || fail "binaries not built (expected $BIN/ct-agent and $BIN/ct-client) — build the workspace first"
 command -v socat >/dev/null || fail "socat is required for the echo origin (apt-get install socat)"
 command -v curl >/dev/null || fail "curl is required"
+command -v jq >/dev/null || fail "jq is required for robust token parsing (apt-get install jq)"
+command -v nc >/dev/null || fail "nc is required for origin readiness checks (apt-get install netcat-openbsd)"
 
 # 1. Join token — use CT_JOIN_TOKEN or mint one from the control plane.
 TOKEN="${CT_JOIN_TOKEN:-}"
 if [ -z "$TOKEN" ]; then
-  TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-             -d "{\"tenant\":\"$TENANT\"}" \
-           | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')" || true
+  TOKEN="$(
+    curl --connect-timeout 5 --max-time 10 -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+      -d "{\"tenant\":\"$TENANT\"}" \
+      | jq -r '.token // empty' 2>/dev/null
+  )" || true
   [ -n "$TOKEN" ] || fail "could not mint a join token at $CP_URL/enroll/issue"
 fi
 
 # 2. Local echo origin (TCP), so the tunnelled payload comes back unchanged.
 socat "TCP-LISTEN:${ORIGIN_PORT},reuseaddr,fork" EXEC:cat >/dev/null 2>&1 &
 ORIGIN_PID=$!
-sleep 1
+for _ in $(seq 1 20); do
+  nc -z 127.0.0.1 "$ORIGIN_PORT" >/dev/null 2>&1 && break
+  process_alive "$ORIGIN_PID" || fail "local echo origin exited early"
+  sleep 0.25
+done
+# Total readiness budget: 20 * 0.25s = 5s.
+nc -z 127.0.0.1 "$ORIGIN_PORT" >/dev/null 2>&1 \
+  || fail "local echo origin did not become ready on 127.0.0.1:${ORIGIN_PORT}"
 
 # 3. Onboard + run the agent (it registers and serves; writes the capability).
+# The agent's onboard/cert-wait bounds are opt-in (default: wait forever, so a
+# production agent holding a spent single-use token never gives up). The smoke
+# path wants fail-fast, so set them explicitly here.
 CT_AGENT_CP_URL="$CP_URL" CT_AGENT_JOIN_TOKEN="$TOKEN" CT_AGENT_ID="$AGENT_ID" \
 CT_AGENT_EDGE="$EDGE" CT_AGENT_ORIGIN="127.0.0.1:${ORIGIN_PORT}" \
 CT_AGENT_EDGE_CERT="$EDGE_CERT" CT_AGENT_CAPABILITY_OUT="$CAP" \
+CT_AGENT_ONBOARD_TIMEOUT_SECS="${CT_AGENT_ONBOARD_TIMEOUT_SECS:-30}" \
+CT_AGENT_EDGE_CERT_WAIT_SECS="${CT_AGENT_EDGE_CERT_WAIT_SECS:-60}" \
   "$BIN/ct-agent" onboard >"$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 
 # Wait for the agent to write its capability (enroll + register).
-for _ in $(seq 1 30); do [ -s "$CAP" ] && break; sleep 0.5; done
-[ -s "$CAP" ] || fail "agent did not register within 15s (see $WORK/agent.log): $(tail -n2 "$WORK/agent.log" 2>/dev/null)"
+for _ in $(seq 1 60); do
+  [ -s "$CAP" ] && break
+  process_alive "$AGENT_PID" || fail "agent exited early (see $WORK/agent.log): $(tail -n20 "$WORK/agent.log" 2>/dev/null)"
+  sleep 0.5
+done
+[ -s "$CAP" ] || fail "agent did not register within 30s (see $WORK/agent.log): $(tail -n20 "$WORK/agent.log" 2>/dev/null)"
 
 # 4. Run the client through the tunnel and read the round-trip result.
 OUT="$(CT_CLIENT_CAPABILITY="$CAP" CT_CLIENT_EDGE_CERT="$EDGE_CERT" CT_CLIENT_PAYLOAD="$PAYLOAD" \
@@ -81,4 +113,4 @@ if printf '%s' "$OUT" | grep -q "round-trip OK"; then
   exit 0
 fi
 printf '%s\n' "$OUT" >&2
-fail "no tunnel round-trip (agent log: $WORK/agent.log)"
+fail "no tunnel round-trip (agent log tail): $(tail -n20 "$WORK/agent.log" 2>/dev/null)"

@@ -4,12 +4,15 @@
 //! shared volume for the Client), registers its tunnel, and serves the Origin.
 
 use std::time::Duration;
+use tokio::time::Instant;
 
 use ct_agent::capability::{parse_routing_token_hex, resolve_serving_identity_with_token};
 use ct_agent::config::AgentConfig;
 use ct_agent::onboard::OnboardEnv;
 use ct_agent::serve::run_agent;
 use ct_agent::transport::load_cert;
+
+const EDGE_CERT_WAIT_LOG_THROTTLE_SECS: u64 = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -44,7 +47,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let env = OnboardEnv::from_env()?;
         let edge = env.config.edge;
         let cp_url = env.cp_url.clone();
-        let onboarded = env.onboard().await?;
+        // Onboarding redeems a SINGLE-USE join token. A timeout here that fires
+        // after the token is already spent server-side would, on restart, re-onboard
+        // with a dead token and never recover (#36). So the timeout is OPT-IN: unset
+        // ⇒ wait indefinitely (prior behaviour, resilient); set only where a bounded
+        // fail-fast is wanted (CI / the e2e smoke script).
+        let onboarded = match std::env::var("CT_AGENT_ONBOARD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(secs) => tokio::time::timeout(Duration::from_secs(secs), env.onboard())
+                .await
+                .map_err(|_| format!("ct-agent: onboarding timed out after {secs}s"))??,
+            None => env.onboard().await?,
+        };
         eprintln!(
             "ct-agent: onboarded agent={} tenant={} via {} (edge={})",
             onboarded.agent_id.0, onboarded.tenant.0, cp_url, edge
@@ -66,14 +82,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .fetch_edge_cert()
             .await
             .map_err(|e| format!("ct-agent: fetch edge cert from {url}: {e:?}"))?;
-        eprintln!("ct-agent: fetched edge cert from {url} ({} bytes)", der.len());
+        eprintln!(
+            "ct-agent: fetched edge cert from {url} ({} bytes)",
+            der.len()
+        );
         rustls::pki_types::CertificateDer::from(der)
     } else {
+        // This wait runs AFTER onboarding has spent the single-use token, so the
+        // bound is OPT-IN too: unset ⇒ wait indefinitely for the edge to publish its
+        // cert on the shared volume (prior behaviour — an agent that can't re-onboard
+        // must not give up), set only for fail-fast (CI / smoke). Log throttling is
+        // always on so a long wait doesn't spam the log twice a second.
+        let cert_deadline = std::env::var("CT_AGENT_EDGE_CERT_WAIT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| (Instant::now() + Duration::from_secs(secs), secs));
+        let cert_log_interval_secs = std::env::var("CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(EDGE_CERT_WAIT_LOG_THROTTLE_SECS);
+        let mut next_log_at = Instant::now();
         loop {
+            let now = Instant::now();
             match load_cert(&cert_path) {
                 Ok(cert) => break cert,
                 Err(_) => {
-                    eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
+                    if let Some((deadline, secs)) = cert_deadline {
+                        if now >= deadline {
+                            return Err(format!(
+                                "ct-agent: edge cert not available within {secs}s at {cert_path}"
+                            )
+                            .into());
+                        }
+                    }
+                    if now >= next_log_at {
+                        eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
+                        next_log_at = now + Duration::from_secs(cert_log_interval_secs);
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -109,7 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.origin,
         cap_out,
         identity.origin_keys.len(),
-        if identity.origin_keys.len() == 1 { "y" } else { "ies" },
+        if identity.origin_keys.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         match &origin_key_path {
             Some(p) => format!(", shared origin key {p}"),
             None => String::new(),

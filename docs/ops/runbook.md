@@ -81,6 +81,11 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_EDGE_HTTP_REDIRECT` | edge | optional `:80` listener (e.g. `0.0.0.0:80`) that 308-redirects to `:443` (unset ⇒ off) |
 | `CT_CP_EDGE_CERT_PATH` | control plane | path it reads the edge CA root from to publish at `/pki/ca` (default `/shared/edge-cert.der`, issue #11) |
 | `CT_AGENT_EDGE_CERT_URL` | agent | fetch the edge CA root from this control-plane URL instead of a local file (issue #11) |
+| `CT_AGENT_ONBOARD_TIMEOUT_SECS` | agent | bound the one-shot onboarding flow (#73); **unset ⇒ wait indefinitely** — a spent single-use join token can't re-onboard, so production stays patient. Set for fail-fast (CI/smoke) |
+| `CT_AGENT_EDGE_CERT_WAIT_SECS` | agent | bound the shared-volume edge-cert wait (#73); **unset ⇒ wait indefinitely** (same resilience reason). Set for fail-fast |
+| `CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS` | agent | throttle the "waiting for edge cert" log line (default 5s, #73) — cosmetic; does not affect the wait |
+| `CT_CLIENT_EDGE_CERT_WAIT_SECS` | client | bound the edge-cert wait (default 30s, #73); the client is a bench/test tool, so it fails fast rather than hanging |
+| `CT_CLIENT_CAPABILITY_WAIT_SECS` | client | bound the capability wait (default 60s, #73); fail-fast with a precise error instead of an indefinite poll |
 
 Secrets come from `.env` (self-host, gitignored) or Kubernetes Secrets (hosted) —
 never commit them. Verify with `./scripts/check-no-secrets.sh`.
