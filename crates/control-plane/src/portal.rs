@@ -843,6 +843,16 @@ mod tests {
         // else plain http://<zone>/ is connection-refused. Same gap class as #60.
         assert!(fd.contains("CT_EDGE_HTTP_REDIRECT"), "the :80->:443 redirect listener is enabled");
         assert!(fd.contains(r#""80:80""#), "the :80 port is published for the redirect");
+        // #68: the customer install one-liner's public base URL must be wired from
+        // the front door's Portal host — else it defaults to https://localhost.
+        let base_line = fd
+            .lines()
+            .find(|l| l.trim().starts_with("CT_PORTAL_BASE_URL:"))
+            .expect("CT_PORTAL_BASE_URL wired in the overlay (#68)");
+        assert!(
+            base_line.contains("${PORTAL_PUBLIC_HOST"),
+            "install base URL derives from PORTAL_PUBLIC_HOST, not a localhost default: {base_line}"
+        );
     }
 
     #[tokio::test]

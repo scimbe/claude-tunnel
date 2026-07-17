@@ -66,6 +66,7 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL; **alone** enables OIDC — the realm JWKS is fetched at startup to mount `/me/*` (#42) |
 | `CT_OIDC_PUBKEY_PATH` | control plane | PEM of the realm's RSA public key; an **offline override** of the JWKS fetch (takes precedence when set) |
 | `CT_PAYMENT_WEBHOOK_SECRET` | control plane | provider webhook signing secret (unset ⇒ payment disabled) |
+| `CT_PORTAL_BASE_URL` | control plane | public base URL embedded in the customer install one-liner (`/portal/tunnels/{id}/install`), e.g. `https://<zone>`; **unset ⇒ silently defaults to `https://localhost`** (warned at startup, #68). The front-door overlay wires it from `PORTAL_PUBLIC_HOST` |
 | `CT_EDGE_LISTEN` | edge | bind address (default `0.0.0.0:4433`) |
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
 | `CT_EDGE_CERT_OUT` | edge | path the edge writes its CA root to |

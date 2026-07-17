@@ -61,3 +61,7 @@ services:
     environment:
       CT_CP_EDGE_ADMIN_URL: "http://edge:9601"
       CT_CP_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:?set CT_EDGE_ADMIN_TOKEN=<64-hex, same on edge>}"
+      # #68: the customer-facing install one-liner embeds this public base URL.
+      # Reuse the front door's Portal host (no separate .env key) — without it the
+      # one-liner defaults to https://localhost and is useless for a real customer.
+      CT_PORTAL_BASE_URL: "https://${PORTAL_PUBLIC_HOST:?set PORTAL_PUBLIC_HOST=<zone>}"

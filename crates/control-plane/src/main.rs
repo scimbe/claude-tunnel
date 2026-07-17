@@ -86,6 +86,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    // #68: the customer-facing install one-liner (/portal/tunnels/{id}/install)
+    // embeds this base URL. If it's unset it silently falls back to
+    // https://localhost — useless for a real customer — so warn loudly at startup.
+    if std::env::var("CT_PORTAL_BASE_URL").map(|s| s.is_empty()).unwrap_or(true) {
+        eprintln!(
+            "ct-control-plane: CT_PORTAL_BASE_URL unset — customer install one-liners will point at https://localhost; set it to your public portal URL (e.g. https://<zone>)"
+        );
+    }
+
     let app = persistent_control_plane_router(&db, &webhook_secret, oidc)?;
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
