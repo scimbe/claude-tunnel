@@ -4,6 +4,7 @@
 pub mod acme;
 pub mod capability;
 pub mod config;
+pub mod ladder;
 pub mod identity;
 pub mod observe;
 pub mod onboard;

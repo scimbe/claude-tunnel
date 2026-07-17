@@ -1491,6 +1491,24 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
 - **FD5** ⏳ e2e-Smoke über den `:443`-TLS-TCP-Sprosse (`SMOKE OK via=tcp`) aus einem :80/:443-only-Netz +
   `docs/security/tls-everywhere.md`/Runbook. Blindheit (Noise_IK e2e) im Threat-Model bestätigen. Dann #31 **fix-ready**.
 
+## #46 Agent-Firewall-Fallback — Register/Revoke über `:443`, wenn der Primärport blockiert ist
+
+Ziel: ein Agent, dessen ausgehendes `:4433` (QUIC+TLS-TCP) von einer Firewall geblockt ist, erreicht den Edge trotzdem —
+über die unified `:443`-Front-Door (#31 FD2, die `ALPN=ct-edge` → `serve_tcp_connection` routet, wo `'A'`/`'B'`-Register **und**
+`'R'`-Revoke laufen). Fehlt agent-seitig: eine Fallback-Leiter (analog Client-FD3) + `ALPN=ct-edge` auf der `:443`-TLS-TCP-Verbindung.
+
+- **FB-a** ✅ **Reine Edge-Rung-Leiter** (`ct-agent::ladder`): `EdgeRung::{Quic(SocketAddr)|TlsTcp(SocketAddr)}` +
+  `edge_ladder(edge, fallback_443)` → `[Quic(edge), TlsTcp(edge)]`, plus `TlsTcp(edge_ip:443)` als letzte Sprosse wenn
+  `fallback_443` und der konfigurierte Port ≠ 443 (nie dupliziert). Frozen-Tests
+  `ladder_without_fallback_is_quic_then_tls_tcp_on_the_configured_port`, `ladder_with_fallback_appends_the_443_front_door`,
+  `ladder_does_not_double_the_443_rung_when_already_configured_on_443`. Gate grün (ct-agent 80).
+- **FB-b** ⏳ **Live-Dialer + ALPN**: Agent-Onboard/Reconnect-Pfad walkt `edge_ladder` (real QUIC-Dial bzw. `tcp_tls_connect`
+  pro Rung, Timeout je Sprosse); die TLS-TCP-Rungs präsentieren **`ALPN=ct-edge`**, damit die Front-Door sie als `EdgeRelay`
+  klassifiziert. Config `CT_AGENT_FALLBACK_443` (default off). Gegen In-Process-Edge mit FD2-Front-Door getestet.
+- **FB-c** ⏳ **Revoke über die gewählte Verbindung** verifizieren (`'R'` über die `:443`-Sprosse), damit an-/abmelden beide über
+  die Front-Door laufen. Dann #46 **fix-ready**.
+- **:80 (Plaintext)** ⏳ separat/niedrigprior — braucht HTTP-`CONNECT`/WebSocket-Upgrade; nur falls ein `:80`-only-Netz auftaucht.
+
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
 
 Ziel: kein manuelles A-Record-Anlegen mehr — beim Setzen eines Tunnel-Hostnamens automatisch den A-Record (Host → Edge-IP)
