@@ -1502,11 +1502,14 @@ Ziel: ein Agent, dessen ausgehendes `:4433` (QUIC+TLS-TCP) von einer Firewall ge
   `fallback_443` und der konfigurierte Port ≠ 443 (nie dupliziert). Frozen-Tests
   `ladder_without_fallback_is_quic_then_tls_tcp_on_the_configured_port`, `ladder_with_fallback_appends_the_443_front_door`,
   `ladder_does_not_double_the_443_rung_when_already_configured_on_443`. Gate grün (ct-agent 80).
-- **FB-b** ⏳ **Live-Dialer + ALPN**: Agent-Onboard/Reconnect-Pfad walkt `edge_ladder` (real QUIC-Dial bzw. `tcp_tls_connect`
-  pro Rung, Timeout je Sprosse); die TLS-TCP-Rungs präsentieren **`ALPN=ct-edge`**, damit die Front-Door sie als `EdgeRelay`
-  klassifiziert. Config `CT_AGENT_FALLBACK_443` (default off). Gegen In-Process-Edge mit FD2-Front-Door getestet.
-- **FB-c** ⏳ **Revoke über die gewählte Verbindung** verifizieren (`'R'` über die `:443`-Sprosse), damit an-/abmelden beide über
-  die Front-Door laufen. Dann #46 **fix-ready**.
+- **FB-b** ✅ **`ALPN=ct-edge` + Register über die Front-Door bewiesen**: `transport::tcp_tls_connect` setzt jetzt
+  `alpn_protocols=["ct-edge"]` im ClientHello (harmlos am direkten `:4433`-TLS-Listener, der kein ALPN anbietet → Server ignoriert
+  das Angebot). Frozen-Test `agent_registers_through_the_443_front_door_via_alpn`: echter In-Process-Edge, der die **Front-Door**
+  (`serve_front_door`) fährt → ALPN-Peek `ct-edge` → `EdgeRelay` → `serve_tcp_connection` → Agent registriert `'A'` und wird geparkt.
+  Der bestehende Direkt-Listener-Test bleibt grün (ALPN-Angebot schadet dort nicht). Gate grün (ct-agent 81).
+- **FB-c** ⏳ **Live-Ladder-Walk + Revoke**: `edge_ladder` in den Agent-Onboard/Reconnect-Pfad verdrahten (real QUIC-Dial bzw.
+  `tcp_tls_connect` pro Rung mit Timeout, Config `CT_AGENT_FALLBACK_443` default off), + `'R'`-Revoke über die `:443`-Sprosse
+  verifizieren (an-/abmelden beide über die Front-Door). Dann #46 **fix-ready**.
 - **:80 (Plaintext)** ⏳ separat/niedrigprior — braucht HTTP-`CONNECT`/WebSocket-Upgrade; nur falls ein `:80`-only-Netz auftaucht.
 
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen

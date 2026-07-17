@@ -316,9 +316,15 @@ pub async fn tcp_tls_connect(
     install_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(edge_cert)?;
-    let cfg = rustls::ClientConfig::builder()
+    let mut cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // #46 FB-b: advertise ALPN `ct-edge` in the ClientHello so the unified :443
+    // front door (#31 FD2) classifies this as the data-plane relay (EdgeRelay) and
+    // routes it to serve_tcp_connection — the path that handles register ('A'/'B')
+    // and revoke ('R'). Harmless on the direct :4433 TLS listener (it advertises no
+    // ALPN, so the server ignores the client's offer).
+    cfg.alpn_protocols = vec![b"ct-edge".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
     let tcp = TcpStream::connect(addr).await?;
     let server_name = rustls::pki_types::ServerName::try_from("localhost")?;
@@ -458,6 +464,63 @@ mod tests {
         assert!(
             state.has_tcp_agent(&token),
             "agent registered over TLS-TCP and is parked at the edge"
+        );
+        edge.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_registers_through_the_443_front_door_via_alpn() {
+        // #46 FB-b: the agent's TLS-TCP connect advertises ALPN=ct-edge, so the
+        // unified :443 front door (#31 FD2) classifies it as EdgeRelay and routes
+        // it to serve_tcp_connection — the firewall-fallback register path. Same as
+        // the direct-listener test above, but the edge runs the FRONT DOOR.
+        use ct_common::pow::Challenge;
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use ct_edge::serve::serve_front_door;
+        use ct_edge::state::EdgeState;
+        use quinn::Connection;
+
+        let ca = Ca::new("test-ca").expect("ca");
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .expect("dual edge");
+        let fd_addr = tcp_listener.local_addr().unwrap();
+        let token = RoutingToken([0x46; 32]);
+        let state = std::sync::Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge {
+            nonce: [0u8; 16],
+            difficulty: 0,
+        };
+
+        // Edge FRONT DOOR: classify by ALPN/SNI and dispatch (no portal wired).
+        let state_e = state.clone();
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let _ = serve_front_door(tcp, &state_e, &acceptor, None, None, None, &challenge).await;
+        });
+
+        // Agent: TLS-TCP connect (ALPN=ct-edge set in tcp_tls_connect) + register.
+        let mut stream = tcp_tls_connect(fd_addr, ca_root)
+            .await
+            .expect("agent TLS-TCP connect via the front door");
+        register_tunnel_stream(&mut stream, &token)
+            .await
+            .expect("register through the :443 front door");
+
+        for _ in 0..100 {
+            if state.has_tcp_agent(&token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.has_tcp_agent(&token),
+            "agent registered through the front door (ALPN=ct-edge -> EdgeRelay)"
         );
         edge.abort();
     }
