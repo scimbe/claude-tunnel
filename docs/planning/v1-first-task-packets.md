@@ -1403,9 +1403,15 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
   BrowserTunnel(host) | Reject}` (`ct-edge`-ALPN → Datenebene; Portal-SNI/Web-ALPN-ohne-SNI → Control-Plane; sonstige
   SNI → Browser-Passthrough; sonst reject). Frozen-Tests `peek_alpn_parses_the_protocol_list_alongside_sni`,
   `classify_front_door_routes_by_alpn_then_sni`. Gate grün (ct-edge 63).
-- **FD2** ⏳ `:443`-Front-Door-Listener (`CT_FRONT_DOOR`, default off): ClientHello buffern → `classify_front_door` →
-  dispatch: EdgeRelay → TLS-TCP-Relay (ADR-0004-Fallback), ControlPlane → Reverse-Proxy zu `:8090`,
-  BrowserTunnel → `serve_sni_passthrough`, Reject → close. Direkte `:8090`/`:4433` bleiben.
+- **FD2** ✅ `:443`-Front-Door-Listener (`CT_FRONT_DOOR`, default off): `serve_front_door` puffert den ClientHello,
+  klassifiziert via `classify_front_door` (ALPN-dann-SNI) und dispatcht OHNE den Handshake zu konsumieren — ein
+  `Prepend` spielt die gepufferten Bytes am gewählten Backend zurück: EdgeRelay (ALPN `ct-edge`) → TLS mit Edge-Leaf
+  terminieren → `serve_tcp_connection` (ADR-0004-Fallback); ControlPlane (Portal-SNI / Web-ALPN ohne SNI) → Roh-Proxy
+  des ganzen TLS-Stroms zum Portal (payload-blind); BrowserTunnel(host) → `serve_sni_passthrough` (TLS am Origin);
+  Reject → close. `CT_EDGE_PORTAL_HOST`/`CT_CP_PROXY_ADDR`. `sni::read_client_hello` auf SNI-optionales
+  `read_client_hello_bytes` refaktoriert (der `ct-edge`-Zweig trägt kein SNI). Direkte `:8090`/`:4433` bleiben.
+  Frozen-Test `front_door_proxies_the_portal_sni_to_the_control_plane` (echtes TCP, Echo-Upstream, ClientHello
+  intakt zurückgespielt+proxied). Gate grün (ct-edge 69).
 - **FD3** ⏳ Client-Fallback-Leiter: `QUIC :4433 → TLS-TCP :4433 → QUIC/UDP :443 → TLS-TCP :443`, pro Netz gecacht.
 - **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
   reuse #23/ADR-0003; reale Domain via #30. **DNS-01 via selbst-gehostetem `ct-dns`** (acme-dns-Pattern, Strato hat keine API):
