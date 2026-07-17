@@ -33,19 +33,32 @@ const SESSION_COOKIE: &str = "ct_portal_session";
 /// Session lifetime (8 hours).
 const SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 
-/// Exchanges an authorization `code` for the authenticated subject (an OIDC
-/// `sub`). Injectable so the callback flow is hermetically testable without a
+/// The identity extracted from a verified id_token at the OIDC callback: the
+/// durable account key (`sub`) plus the optional `email` claim used only to make
+/// the access-list decision (#43) — never stored or logged beyond that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExchangedIdentity {
+    pub subject: String,
+    pub email: Option<String>,
+}
+
+/// Exchanges an authorization `code` for the authenticated identity (OIDC `sub`
+/// + `email`). Injectable so the callback flow is hermetically testable without a
 /// live IdP; the production default calls the token endpoint over TLS.
 type Exchanger =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<ExchangedIdentity, String>> + Send>> + Send + Sync>;
 
-/// Router state: the OIDC login config, the session-cookie signing key, and the
-/// code→subject exchanger.
+/// Router state: the OIDC login config, the session-cookie signing key, the
+/// code→identity exchanger, and the optional email-domain access-list (#43).
 #[derive(Clone)]
 struct PortalState {
     oidc: Option<PortalOidc>,
     session_key: Arc<[u8]>,
     exchange: Exchanger,
+    /// `None` = the acceptance gate is OFF (allow every authenticated subject);
+    /// `Some(domains)` = admit only subjects whose id_token email is under one of
+    /// these lowercase domains.
+    allowed_domains: Option<Arc<[String]>>,
 }
 
 /// OIDC login configuration for the Authorization Code flow (#25). Built from
@@ -113,18 +126,55 @@ impl PortalOidc {
 }
 
 /// Build the customer portal router (#25 PP1): `GET /portal` (shell) and
-/// `GET /portal/login` (SSO Authorization Code redirect).
+/// `GET /portal/login` (SSO Authorization Code redirect). The email-domain
+/// access-list (#43) is read from `CT_PORTAL_ALLOWED_EMAIL_DOMAINS` here.
 pub fn portal_router(oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
     let exchange = default_exchanger(oidc.clone());
-    portal_router_with(oidc, session_key, exchange)
+    let allowed_domains = parse_allowed_domains(std::env::var("CT_PORTAL_ALLOWED_EMAIL_DOMAINS").ok());
+    portal_router_with(oidc, session_key, exchange, allowed_domains)
 }
 
-/// Router builder with an injectable exchanger (for tests).
-fn portal_router_with(oidc: Option<PortalOidc>, session_key: &[u8], exchange: Exchanger) -> Router {
+/// Parse `CT_PORTAL_ALLOWED_EMAIL_DOMAINS` (comma-separated) into a lowercase
+/// domain allow-list. `None` = the acceptance gate is OFF (unset/empty → admit
+/// every authenticated subject), matching the project's opt-in-restriction
+/// pattern (`CT_EDGE_REQUIRE_HOST_AUTH`): the policy stays disabled until an
+/// operator names the domains, so zero-config self-host is unaffected. `Some`
+/// enables the gate for exactly those domains (a leading `@` is tolerated).
+fn parse_allowed_domains(raw: Option<String>) -> Option<Arc<[String]>> {
+    let list: Vec<String> = raw?
+        .split(',')
+        .map(|s| s.trim().trim_start_matches('@').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then(|| Arc::from(list))
+}
+
+/// Is `email` admitted by the domain allow-list? The domain is the case-insensitive
+/// part after the last `@`. A missing/malformed email is rejected — the list is
+/// only consulted when the gate is enabled, so "no email" means "not on the list".
+fn email_domain_allowed(email: Option<&str>, allowed: &[String]) -> bool {
+    match email
+        .and_then(|e| e.rsplit_once('@'))
+        .map(|(_, d)| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+    {
+        Some(domain) => allowed.iter().any(|a| a == &domain),
+        None => false,
+    }
+}
+
+/// Router builder with an injectable exchanger + access-list (for tests).
+fn portal_router_with(
+    oidc: Option<PortalOidc>,
+    session_key: &[u8],
+    exchange: Exchanger,
+    allowed_domains: Option<Arc<[String]>>,
+) -> Router {
     let state = PortalState {
         oidc,
         session_key: Arc::from(session_key.to_vec()),
         exchange,
+        allowed_domains,
     };
     Router::new()
         .route("/portal", get(portal_home))
@@ -169,15 +219,16 @@ fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
                 .get("id_token")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "token response has no id_token".to_string())?;
-            subject_from_id_token(id_token)
+            identity_from_id_token(id_token)
         })
     })
 }
 
-/// Extract the `sub` claim from an id_token JWT. Signature validation is disabled
-/// deliberately: the token came straight from the IdP token endpoint over TLS
-/// (see [`default_exchanger`]). Kept standalone so it is unit-tested directly.
-fn subject_from_id_token(jwt: &str) -> Result<String, String> {
+/// Extract the `sub` (required) and `email` (optional, #43 access-list gate) from
+/// an id_token JWT. Signature validation is disabled deliberately: the token came
+/// straight from the IdP token endpoint over TLS (see [`default_exchanger`]). Kept
+/// standalone so it is unit-tested directly.
+fn identity_from_id_token(jwt: &str) -> Result<ExchangedIdentity, String> {
     let mut v = jsonwebtoken::Validation::default();
     v.insecure_disable_signature_validation();
     v.validate_exp = false;
@@ -185,11 +236,18 @@ fn subject_from_id_token(jwt: &str) -> Result<String, String> {
     v.required_spec_claims.clear();
     let key = jsonwebtoken::DecodingKey::from_secret(b"");
     let data = jsonwebtoken::decode::<serde_json::Value>(jwt, &key, &v).map_err(|e| e.to_string())?;
-    data.claims
+    let subject = data
+        .claims
         .get("sub")
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "id_token has no sub".to_string())
+        .ok_or_else(|| "id_token has no sub".to_string())?;
+    let email = data
+        .claims
+        .get("email")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    Ok(ExchangedIdentity { subject, email })
 }
 
 async fn portal_home() -> Html<&'static str> {
@@ -246,7 +304,20 @@ async fn portal_callback(
     // cookie and land the customer on their home. The single-use state cookie is
     // retired either way.
     match (st.exchange)(code.to_string()).await {
-        Ok(subject) => {
+        Ok(identity) => {
+            // #43 acceptance gate: when an email-domain access-list is configured,
+            // only subjects whose id_token email is under an allowed domain may
+            // mint a session. A clear 403 page (not a generic error) makes an
+            // access-policy rejection obviously distinct from a broken login, and
+            // no session cookie is set. The gate is skipped entirely when OFF.
+            if let Some(allowed) = &st.allowed_domains {
+                if !email_domain_allowed(identity.email.as_deref(), allowed) {
+                    let mut resp = (StatusCode::FORBIDDEN, Html(ACCESS_DENIED_HTML)).into_response();
+                    set_cookie(&mut resp, &cleared_state_cookie());
+                    return resp;
+                }
+            }
+            let subject = identity.subject;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -289,6 +360,29 @@ fn sso_unconfigured() -> Response {
     )
         .into_response()
 }
+
+/// Shown (with `403`) when a successfully-authenticated subject is not on the
+/// email-domain access-list (#43): a clear acceptance-policy rejection, distinct
+/// from a broken login, with no session minted. Self-contained/CSP-safe.
+const ACCESS_DENIED_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-tunnel — access not permitted</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
+      display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;max-width:480px}
+ h1{font-size:1.3rem;margin:.2rem 0 1rem} p{color:#8b949e;font-size:.95rem;line-height:1.5}
+ a.btn{display:inline-block;margin-top:1.4rem;background:#21262d;color:#e6edf3;text-decoration:none;
+       padding:.55rem 1.1rem;border-radius:8px;border:1px solid #30363d} a.btn:hover{background:#30363d}
+</style></head><body>
+<div class="card">
+ <h1>You're not on the access list</h1>
+ <p>Your sign-in succeeded, but your email domain isn't permitted on this
+    deployment yet. If you think you should have access, contact the operator.</p>
+ <a class="btn" href="/portal">Back</a>
+</div>
+</body></html>"#;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -506,9 +600,28 @@ mod tests {
 
     const TEST_KEY: &[u8] = b"portal-test-session-key";
 
-    /// An injected exchanger returning a fixed subject.
+    /// An injected exchanger returning a fixed subject and no email.
     fn stub_exchanger(subject: &'static str) -> Exchanger {
-        Arc::new(move |_code| Box::pin(async move { Ok(subject.to_string()) }))
+        Arc::new(move |_code| {
+            Box::pin(async move {
+                Ok(ExchangedIdentity {
+                    subject: subject.to_string(),
+                    email: None,
+                })
+            })
+        })
+    }
+
+    /// An injected exchanger returning a fixed subject + email (#43 gate tests).
+    fn stub_exchanger_email(subject: &'static str, email: &'static str) -> Exchanger {
+        Arc::new(move |_code| {
+            Box::pin(async move {
+                Ok(ExchangedIdentity {
+                    subject: subject.to_string(),
+                    email: Some(email.to_string()),
+                })
+            })
+        })
     }
 
     /// An injected exchanger that always fails (simulates an IdP/token error).
@@ -711,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn callback_exchanges_the_code_and_mints_a_session() {
         // #25 PP4: valid state -> exchange -> session cookie -> redirect to home.
-        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger("kc-user-9"));
+        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger("kc-user-9"), None);
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
@@ -753,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_reports_bad_gateway_when_exchange_fails() {
-        let app = portal_router_with(Some(cfg()), TEST_KEY, failing_exchanger());
+        let app = portal_router_with(Some(cfg()), TEST_KEY, failing_exchanger(), None);
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
@@ -776,17 +889,137 @@ mod tests {
     }
 
     #[test]
-    fn subject_from_id_token_reads_the_sub_claim() {
+    fn identity_from_id_token_reads_sub_and_email() {
         use jsonwebtoken::{encode, EncodingKey, Header};
         let jwt = encode(
             &Header::default(),
-            &serde_json::json!({ "sub": "kc-user-42", "aud": "ct-portal" }),
+            &serde_json::json!({ "sub": "kc-user-42", "email": "a@becke.biz", "aud": "ct-portal" }),
             &EncodingKey::from_secret(b"whatever"),
         )
         .unwrap();
         // Signature is not verified (token comes over the TLS back-channel).
-        assert_eq!(subject_from_id_token(&jwt).unwrap(), "kc-user-42");
-        assert!(subject_from_id_token("garbage").is_err());
+        let id = identity_from_id_token(&jwt).unwrap();
+        assert_eq!(id.subject, "kc-user-42");
+        assert_eq!(id.email.as_deref(), Some("a@becke.biz"));
+        assert!(identity_from_id_token("garbage").is_err());
+
+        // #43: sub is required, email is optional (absent claim -> None).
+        let no_email = encode(
+            &Header::default(),
+            &serde_json::json!({ "sub": "kc-user-7" }),
+            &EncodingKey::from_secret(b"x"),
+        )
+        .unwrap();
+        assert_eq!(identity_from_id_token(&no_email).unwrap().email, None);
+    }
+
+    #[test]
+    fn allowed_domains_parses_and_matches_case_insensitively() {
+        // #43: unset/empty -> gate OFF (None). A leading '@' and whitespace are
+        // tolerated; matching is on the case-folded domain after the last '@'.
+        assert!(parse_allowed_domains(None).is_none(), "unset -> gate off");
+        assert!(parse_allowed_domains(Some("  , ".into())).is_none(), "empty entries -> off");
+
+        let allow = parse_allowed_domains(Some(" becke.biz , @Example.org ".into())).unwrap();
+        assert_eq!(&*allow, &["becke.biz".to_string(), "example.org".to_string()]);
+
+        assert!(email_domain_allowed(Some("Alice@Becke.BIZ"), &allow), "case-insensitive host");
+        assert!(email_domain_allowed(Some("x@example.org"), &allow));
+        assert!(!email_domain_allowed(Some("mallory@evil.test"), &allow), "other domain rejected");
+        assert!(!email_domain_allowed(None, &allow), "no email -> rejected when gate on");
+        assert!(!email_domain_allowed(Some("no-at-sign"), &allow), "malformed -> rejected");
+    }
+
+    #[tokio::test]
+    async fn callback_gate_admits_allowed_domain_and_mints_a_session() {
+        // #43: an allowed-domain subject reaches /portal/home WITH a session cookie.
+        let allow = parse_allowed_domains(Some("becke.biz".into()));
+        let app = portal_router_with(
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger_email("kc-user-9", "dev@becke.biz"),
+            allow,
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "/portal/home");
+        assert!(
+            resp.headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("ct_portal_session=")
+                    && !c.to_str().unwrap().contains("ct_portal_session=;")),
+            "an allowed subject gets a real session cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_gate_rejects_disallowed_domain_without_a_session() {
+        // #43: a non-allowed-domain subject is 403'd with the access-list page and
+        // NO session cookie — an obvious acceptance-policy rejection.
+        let allow = parse_allowed_domains(Some("becke.biz".into()));
+        let app = portal_router_with(
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger_email("kc-user-x", "mallory@evil.test"),
+            allow,
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let sets: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !sets.iter().any(|c| c.starts_with("ct_portal_session=")
+                && !c.contains("ct_portal_session=;")),
+            "no session cookie is minted for a rejected subject"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("not on the access list"),
+            "a clear access-policy message, not a generic error"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_gate_off_admits_any_domain() {
+        // #43: with the gate OFF (None), any authenticated subject is admitted —
+        // zero-config self-host is unchanged even with an email present.
+        let app = portal_router_with(
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger_email("kc-user-z", "anyone@wherever.test"),
+            None,
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "gate off -> admitted");
     }
 
     #[tokio::test]
