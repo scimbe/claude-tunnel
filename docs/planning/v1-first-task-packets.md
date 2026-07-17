@@ -1631,3 +1631,23 @@ jedes diskutierte System zitiert, 3.5 gegen OHTTP + iCloud Private Relay abgegre
   untermauern (Kobeissi et al.; Dowling & Paterson, WireGuard/Noise), Privacy Pass (Davidson PoPETs'18) für
   tokenbasierten anonymen Zugang; auf ≥20 gedruckte Quellen auffüllen + finaler Zitations-Audit. **fix-ready erst
   wenn Akzeptanz (≥20, jedes System zitiert, 3.5 abgegrenzt) vollständig erfüllt.**
+
+## #69 Tunnel-creation UX — first-time-customer friendliness (decomposable)
+
+User feedback after using the portal as a first-time customer: creation is unintuitive — unexplained
+fields, no DNS guidance, no "what's next", no context on the install one-liner, sharp single-use-token
+UX. Reporter explicitly asked for decomposable-feature treatment. Gated by the cargo hermetic gate (these
+are control-plane HTML producers with oneshot render tests). Decomposed:
+
+- **T69.1** ✅ **Inline help on the create form** (friction points 1+2): the two bare inputs
+  (`name`, `hostname`) get real labels + muted help text — what each field is, that an empty hostname
+  means a standard end-to-end tunnel vs. a set hostname makes it a browser-openable HTTPS site (the
+  "Browser Plane"), and that DNS is pointed at the edge automatically when the operator has deSEC
+  configured (#38 DL2). Frozen test asserts the rendered form carries the field labels + the
+  Browser-Plane/DNS explanation. Gate: cargo build+test, 0 warnings.
+- **T69.2** ⏳ **Post-create "next steps" panel** (friction point 3): after creating, the tunnel list
+  shows a short create → install → run → done walkthrough panel for a first-time user.
+- **T69.3** ⏳ **Install-page context + lost-token signposting** (friction points 4+5): frame the
+  install one-liner with a sentence — run it on the machine you want to expose (the origin), not your
+  laptop — and signpost revoke-and-recreate for a lost single-use token. **fix-ready only when all five
+  friction points are addressed.**

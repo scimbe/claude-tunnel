@@ -460,9 +460,21 @@ fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
         r#"<h1>Your tunnels</h1>
 {rows}
 <h2>Create a tunnel</h2>
+<p class="help">A tunnel exposes a service running on your own machine (the
+<em>origin</em>) through the relay &mdash; no inbound firewall port to open.</p>
 <form method="post" action="/portal/tunnels">
- <input type="text" name="name" placeholder="name" required>
- <input type="text" name="hostname" placeholder="hostname (optional, browser plane)">
+ <label>Name
+  <input type="text" name="name" placeholder="e.g. my-api" required>
+  <span class="help">A label to recognise this tunnel. Any short name.</span>
+ </label>
+ <label>Public hostname <span class="opt">&mdash; optional (Browser Plane)</span>
+  <input type="text" name="hostname" placeholder="e.g. app.example.com">
+  <span class="help">Leave empty for a standard end-to-end tunnel (reached by your
+  own client with a routing token). Set a hostname to serve the origin as a normal
+  HTTPS website a browser can open directly &mdash; this is the <em>Browser Plane</em>.
+  When the operator has DNS configured, the hostname's DNS record is pointed at the
+  edge automatically; otherwise point it there yourself.</span>
+ </label>
  <button type="submit">Create</button>
 </form>"#,
     );
@@ -495,6 +507,10 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  input,select{{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:.5rem;font:inherit}}
  code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.15rem .4rem}}
  form.inline{{display:inline}}
+ label{{display:block;margin:.85rem 0;font-size:.9rem}}
+ label input{{display:block;margin-top:.3rem;width:100%;max-width:360px}}
+ .help{{color:#8b949e;font-size:.82rem;display:block}} label .help{{margin-top:.35rem}}
+ p.help{{margin:.2rem 0 1rem}} .opt{{color:#8b949e;font-weight:400}}
 </style></head><body>
 <div class="card">
 <nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/logout">Sign out</a></nav>
@@ -679,6 +695,34 @@ mod tests {
             count(&get(&app, "/portal/tunnels", Some("alice")).await.1),
             1,
             "self-scoped: bob cannot revoke alice's tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnels_create_form_carries_inline_help() {
+        // #69 T69.1: a first-time customer must be able to understand the create
+        // form without reading the architecture docs — the two fields get real
+        // labels + help text, and the hostname field explains the Browser-Plane
+        // choice and the automatic-DNS behaviour. Frozen so the form can't regress
+        // back to two bare unlabelled inputs.
+        let app = test_app();
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("<label>Name"), "the name field is labelled");
+        assert!(html.contains("Public hostname"), "the hostname field is labelled");
+        assert!(html.contains("Browser Plane"), "explains the Browser-Plane choice");
+        assert!(
+            html.contains("standard end-to-end tunnel"),
+            "explains the empty-hostname (standard tunnel) case"
+        );
+        assert!(
+            html.to_lowercase().contains("dns"),
+            "gives DNS guidance for a hostname tunnel"
+        );
+        // Still self-contained / CSP-safe: no external asset URLs.
+        assert!(
+            !html.contains("http://") && !html.contains("https://cdn"),
+            "no external assets"
         );
     }
 
@@ -954,9 +998,15 @@ mod tests {
             StatusCode::SEE_OTHER
         );
 
-        // bob sees the shared tunnel, marked, without owner actions.
+        // bob sees the shared tunnel, marked, without owner actions. Key on the
+        // tunnel's unique id (its install row), not the name — a common word like
+        // "web" also appears in the create-form help text (#69 T69.1).
         let (_s, bob_list) = get(&app, "/portal/tunnels", Some("bob")).await;
-        assert!(bob_list.contains("web") && bob_list.contains("shared with you"));
+        assert!(
+            bob_list.contains(&format!("/portal/tunnels/{id}/install"))
+                && bob_list.contains("shared with you"),
+            "grantee sees the shared tunnel row"
+        );
         assert!(!bob_list.contains(&format!("/portal/tunnels/{id}/delete")), "no revoke for a grantee");
         // ...and can install an agent for it (authorized, not just owner).
         assert_eq!(
@@ -964,8 +1014,15 @@ mod tests {
             StatusCode::OK
         );
 
-        // carol (no grant) sees nothing and cannot install.
-        assert!(!get(&app, "/portal/tunnels", Some("carol")).await.1.contains("web"));
+        // carol (no grant) sees nothing and cannot install. Key on the tunnel's
+        // unique install row, not the name "web" (now a substring of the form help).
+        assert!(
+            !get(&app, "/portal/tunnels", Some("carol"))
+                .await
+                .1
+                .contains(&format!("/portal/tunnels/{id}/install")),
+            "non-grantee sees no row for the tunnel"
+        );
         assert_eq!(
             get(&app, &format!("/portal/tunnels/{id}/install"), Some("carol")).await.0,
             StatusCode::NOT_FOUND
