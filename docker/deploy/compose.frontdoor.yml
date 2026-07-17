@@ -1,0 +1,58 @@
+# Optional :443 front-door overlay (#60). The base self-host stack
+# (compose.selfhost.yml) runs the mesh-plane relay on :4433 only — it deliberately
+# publishes NO :443. This overlay wires the edge's unified :443 front door (#31
+# FD1-FD4a): one published :443 that SNI/ALPN-demuxes to the tunnel data-plane
+# relay, the Portal landing page (terminated with a BYO cert, reverse-proxied to
+# the control plane), and Browser-Plane subdomains (SNI passthrough, e.g.
+# help.<zone>). It also enables host-ownership authorization so only
+# control-plane-authorized hostnames may bind. Add compose.sso.yml on top for the
+# Keycloak Auth route (#48).
+#
+# OFF BY DEFAULT: opt in by naming it explicitly.
+#
+#   docker compose \
+#     -f docker/deploy/compose.selfhost.yml \
+#     -f docker/deploy/compose.frontdoor.yml \
+#     [-f docker/deploy/compose.sso.yml] \
+#     --env-file docker/deploy/.env up --build -d
+#
+# .env keys this overlay reads (see docs/ops/runbook.md):
+#   PORTAL_PUBLIC_HOST   the Portal/landing hostname (e.g. bunsenbrenner.org), its
+#                        DNS pointed at this edge. Served + terminated at :443.
+#   PORTAL_CERT_DIR      host dir with the Portal BYO cert: fullchain.pem + privkey.pem
+#                        (LE via deSEC DNS-01, like help.'s origin cert). Never committed.
+#   CT_EDGE_ADMIN_TOKEN  64-hex shared secret enabling host-auth + revoke admin ops;
+#                        the control plane uses the same value to authorize hostnames.
+
+name: ct-selfhost
+
+services:
+  edge:
+    # Without env_file the front-door vars below can't be overridden from .env.
+    env_file:
+      - .env
+    environment:
+      # Unified :443 front door: ALPN=ct-edge -> relay; Portal SNI -> terminate+proxy
+      # to the control plane; other SNI -> Browser-Plane passthrough.
+      CT_FRONT_DOOR: "0.0.0.0:443"
+      CT_EDGE_PORTAL_HOST: "${PORTAL_PUBLIC_HOST:?set PORTAL_PUBLIC_HOST=<zone>}"
+      CT_CP_PROXY_ADDR: "control-plane:8090"
+      CT_EDGE_PORTAL_CERT: "/certs/portal/fullchain.pem"
+      CT_EDGE_PORTAL_KEY: "/certs/portal/privkey.pem"
+      # Host-ownership authorization (#23 BP4b): only control-plane-authorized
+      # hostnames may bind — required for the help.<zone> Browser-Plane demo and the
+      # revoke push. The control plane authorizes via the admin API below.
+      CT_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:?set CT_EDGE_ADMIN_TOKEN=<64-hex, same on control-plane>}"
+      CT_EDGE_REQUIRE_HOST_AUTH: "1"
+      CT_EDGE_ADMIN_LISTEN: "0.0.0.0:9601"
+    volumes:
+      - "${PORTAL_CERT_DIR:?set PORTAL_CERT_DIR=<dir with portal fullchain.pem+privkey.pem>}:/certs/portal:ro"
+    ports:
+      - "443:443"
+
+  control-plane:
+    # Let the control plane authorize hostnames + push revocations to the edge's
+    # admin API (#23 BP4b-c, #27 RB4b) — same token as the edge.
+    environment:
+      CT_CP_EDGE_ADMIN_URL: "http://edge:9601"
+      CT_CP_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:?set CT_EDGE_ADMIN_TOKEN=<64-hex, same on edge>}"

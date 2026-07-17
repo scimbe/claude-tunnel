@@ -799,6 +799,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frontdoor_overlay_wires_the_443_front_door() {
+        // #60 regression: the :443 front door (Portal landing page / SSO / browser
+        // tunnels) must be REPRODUCIBLE from a checked-in compose overlay — not a
+        // local uncommitted patch. compose.frontdoor.yml must enable CT_FRONT_DOOR,
+        // route the Portal, mount its cert, and publish :443.
+        let fd = include_str!("../../../docker/deploy/compose.frontdoor.yml");
+        assert!(fd.contains("CT_FRONT_DOOR"), "front-door listener enabled");
+        assert!(fd.contains("CT_EDGE_PORTAL_HOST"), "Portal host routed");
+        assert!(fd.contains("CT_CP_PROXY_ADDR"), "Portal upstream (control plane) set");
+        assert!(fd.contains("CT_EDGE_PORTAL_CERT"), "Portal TLS cert wired (FD4-a)");
+        assert!(fd.contains("/certs/portal"), "Portal cert dir mounted");
+        assert!(fd.contains(r#""443:443""#), "the :443 port is published");
+        // env_file on the edge, so the above are overridable from .env (the gap #60 hit).
+        assert!(fd.contains("env_file"), "edge reads .env for the front-door vars");
+    }
+
     #[tokio::test]
     async fn portal_home_renders_the_sso_cta() {
         let app = portal_router(None, TEST_KEY);

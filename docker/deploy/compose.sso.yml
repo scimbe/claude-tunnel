@@ -22,9 +22,10 @@
 # real, externally-reachable URL, so the token `iss` and the browser login work
 # from a remote browser (not just from the host running the containers).
 #
-# Prereq: the edge must have the front door enabled (CT_FRONT_DOOR=0.0.0.0:443 +
-# the Portal routing CT_EDGE_PORTAL_HOST/CT_CP_PROXY_ADDR/CT_EDGE_PORTAL_CERT|KEY,
-# as for the FD4-a landing page). This overlay adds the Auth (Keycloak) route to it.
+# Prereq: the edge's :443 front door must be enabled — add compose.frontdoor.yml
+# (#60), which wires CT_FRONT_DOOR + the Portal routing/cert. This overlay only
+# adds the Auth (Keycloak) route on top:
+#   -f compose.selfhost.yml -f compose.frontdoor.yml -f compose.sso.yml
 #
 # .env keys this overlay reads (see docs/deploy/keycloak-sso.md and .env.example):
 #   AUTH_PUBLIC_HOST      the Keycloak hostname served via the front door (auth.<zone>).
