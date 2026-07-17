@@ -1670,8 +1670,15 @@ Decomposed:
   (vs. flat bearer); cross-user via explicit invitation (distinct from sharing); transport reuses ADR-0015
   rendezvous (edge broker, pairwise agent↔agent Noise, relay only as payload-blind fallback); a channel is
   a hub of pairwise 2-party sessions (sidesteps group-crypto). Gate: design artifact — workspace unchanged/green.
-- **AF2** ⏳ **Same-user minimal prototype**: two agents of one user establish a direct channel via the
-  existing rendezvous (edge as broker, no payload relay); real two-agent integration test on the NAT-punch base.
+- **AF2a** ✅ **Trust primitives in ct-common** (`crates/common/src/channel.rs`): `ChannelId` (opaque
+  address, like RoutingToken) + `ChannelGrant`/`SignedChannelGrant` — a scoped/directional/expiring,
+  ed25519-operator-signed grant (mirrors `credential.rs`), with `Direction`{initiate,accept,both} +
+  `Rights`{r,w,rw} + `delegable`, fixed-layout wire encode/decode, and stateless `verify(operator_pk, now)`.
+  Deliberately NOT a flat bearer token: tampering scope/holder breaks the signature. 7 frozen tests
+  (roundtrip all variants, expiry, wrong-key, 4-way tamper, malformed/bad-enum, predicates). Gate green.
+- **AF2b** ⏳ **Same-user rendezvous prototype**: two agents of one user establish a direct channel via the
+  existing rendezvous (edge as broker, no payload relay), authorized by an AF2a grant; real two-agent
+  integration test on the NAT-punch base.
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration
