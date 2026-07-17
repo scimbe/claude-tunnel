@@ -3,13 +3,15 @@
 #
 # Measures workspace line/function/region coverage inside the hermetic
 # rust:1-slim container via cargo-llvm-cov, installing it into a persistent cargo
-# cache on first run (subsequent runs reuse it). By default it measures ALL
-# workspace files. For library-only measurement (excluding CLI entrypoints that
-# are covered by shell smokes), use COVERAGE_SCOPE=lib.
+# cache on first run (subsequent runs reuse it). By default it measures LIBRARY
+# code only: the thin main.rs / bin/* CLI entrypoints read 0% under `cargo test`
+# — they are exercised by the shell smokes (e2e-smoke.sh, redundancy-smoke.sh,
+# rotation-smoke.sh), not unit tests — so they are excluded from the denominator,
+# matching the coverage scope decided for #20.
 #
-#   ./scripts/coverage.sh                        # full summary + 95% line gate
+#   ./scripts/coverage.sh                        # lib-only summary + 95% line gate
 #   COVERAGE_MIN=90 ./scripts/coverage.sh        # custom line threshold
-#   COVERAGE_SCOPE=lib ./scripts/coverage.sh     # exclude bin/* and main.rs
+#   COVERAGE_SCOPE=all ./scripts/coverage.sh     # include the entrypoints
 #   COVERAGE_PKG=ct-agent ./scripts/coverage.sh  # a single crate
 #
 # Exit code: 0 if line coverage >= COVERAGE_MIN, non-zero otherwise (wire into CI
@@ -19,7 +21,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="${CT_CARGO_CACHE:-$HOME/.cache/ct-cargo}"
 MIN="${COVERAGE_MIN:-95}"
-SCOPE="${COVERAGE_SCOPE:-all}"
+SCOPE="${COVERAGE_SCOPE:-lib}"
 PKG="${COVERAGE_PKG:-}"
 mkdir -p "$CACHE"
 
