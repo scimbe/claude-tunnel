@@ -161,6 +161,17 @@ pub fn classify_front_door(
 /// verbatim to the Origin so the TLS handshake completes end-to-end. Returns
 /// `None` if the stream does not start with a ClientHello carrying SNI.
 pub async fn read_client_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Option<(Vec<u8>, String)> {
+    let buf = read_client_hello_bytes(stream).await?;
+    let sni = peek_sni(&buf)?;
+    Some((buf, sni))
+}
+
+/// Read the raw ClientHello TLS record into a buffer without requiring an SNI
+/// extension (#31 FD2): the `:443` front door classifies by ALPN *then* SNI, and
+/// the `ct-edge` data-plane leg carries no SNI at all. Returns the buffered
+/// handshake bytes so the caller can [`peek_alpn`]/[`peek_sni`] and then replay
+/// them to the chosen backend. Bounds-checked and panic-free like the parsers.
+pub async fn read_client_hello_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; 5];
     stream.read_exact(&mut buf).await.ok()?;
     if buf[0] != 0x16 {
@@ -173,8 +184,56 @@ pub async fn read_client_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Option<(
     }
     buf.resize(5 + rec_len, 0);
     stream.read_exact(&mut buf[5..]).await.ok()?;
-    let sni = peek_sni(&buf)?;
-    Some((buf, sni))
+    Some(buf)
+}
+
+/// Build a minimal but well-formed TLS ClientHello record carrying the given SNI
+/// and ALPN list — a test fixture shared across the edge's SNI/front-door tests
+/// (`#31` FD1/FD2). Test-only; kept at module scope so `serve`'s front-door tests
+/// can synthesize a handshake without a real TLS client.
+#[cfg(test)]
+pub(crate) fn synth_client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
+    let mut exts = Vec::new();
+    if let Some(host) = sni {
+        let h = host.as_bytes();
+        let mut entry = vec![0x00];
+        entry.extend_from_slice(&(h.len() as u16).to_be_bytes());
+        entry.extend_from_slice(h);
+        let mut snl = (entry.len() as u16).to_be_bytes().to_vec();
+        snl.extend_from_slice(&entry);
+        exts.extend_from_slice(&[0x00, 0x00]);
+        exts.extend_from_slice(&(snl.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&snl);
+    }
+    if !alpn.is_empty() {
+        let mut list = Vec::new();
+        for p in alpn {
+            list.push(p.len() as u8);
+            list.extend_from_slice(p.as_bytes());
+        }
+        let mut data = (list.len() as u16).to_be_bytes().to_vec();
+        data.extend_from_slice(&list);
+        exts.extend_from_slice(&[0x00, 0x10]);
+        exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&data);
+    }
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0x00);
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(0x01);
+    body.push(0x00);
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+    let mut hs = vec![0x01];
+    let bl = body.len();
+    hs.extend_from_slice(&[(bl >> 16) as u8, (bl >> 8) as u8, bl as u8]);
+    hs.extend_from_slice(&body);
+    let mut rec = vec![0x16, 0x03, 0x01];
+    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
 }
 
 #[cfg(test)]
@@ -219,49 +278,7 @@ mod tests {
     }
 
     /// Build a ClientHello with an optional SNI and an optional ALPN list.
-    fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
-        let mut exts = Vec::new();
-        if let Some(host) = sni {
-            let h = host.as_bytes();
-            let mut entry = vec![0x00];
-            entry.extend_from_slice(&(h.len() as u16).to_be_bytes());
-            entry.extend_from_slice(h);
-            let mut snl = (entry.len() as u16).to_be_bytes().to_vec();
-            snl.extend_from_slice(&entry);
-            exts.extend_from_slice(&[0x00, 0x00]);
-            exts.extend_from_slice(&(snl.len() as u16).to_be_bytes());
-            exts.extend_from_slice(&snl);
-        }
-        if !alpn.is_empty() {
-            let mut list = Vec::new();
-            for p in alpn {
-                list.push(p.len() as u8);
-                list.extend_from_slice(p.as_bytes());
-            }
-            let mut data = (list.len() as u16).to_be_bytes().to_vec();
-            data.extend_from_slice(&list);
-            exts.extend_from_slice(&[0x00, 0x10]);
-            exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            exts.extend_from_slice(&data);
-        }
-        let mut body = vec![0x03, 0x03];
-        body.extend_from_slice(&[0u8; 32]);
-        body.push(0x00);
-        body.extend_from_slice(&2u16.to_be_bytes());
-        body.extend_from_slice(&[0x13, 0x01]);
-        body.push(0x01);
-        body.push(0x00);
-        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-        body.extend_from_slice(&exts);
-        let mut hs = vec![0x01];
-        let bl = body.len();
-        hs.extend_from_slice(&[(bl >> 16) as u8, (bl >> 8) as u8, bl as u8]);
-        hs.extend_from_slice(&body);
-        let mut rec = vec![0x16, 0x03, 0x01];
-        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
-        rec.extend_from_slice(&hs);
-        rec
-    }
+    use super::synth_client_hello as client_hello;
 
     #[test]
     fn peek_sni_extracts_and_lowercases_the_hostname() {

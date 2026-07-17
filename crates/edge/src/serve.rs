@@ -245,6 +245,69 @@ where
     Ok(())
 }
 
+/// #31 FD2 — the unified `:443` front door. Restrictive client networks often
+/// allow only outbound TCP 443 (HAW field evidence: `:8090`/`:4433`/UDP all time
+/// out), so the Portal, the customer Browser-Plane subdomains, and the tunnel
+/// data-plane fallback must all share one port. Buffer the ClientHello, classify
+/// by ALPN-then-SNI ([`classify_front_door`]), then dispatch **without consuming
+/// the handshake** — a [`Prepend`] replays the buffered bytes to the chosen
+/// backend so no TLS record is lost:
+///
+/// - `EdgeRelay` (ALPN `ct-edge`): terminate TLS with the edge leaf and run the
+///   TLS-TCP relay protocol ([`serve_tcp_connection`]) — the ADR-0004 fallback.
+/// - `ControlPlane` (Portal SNI, or a web ALPN with no SNI): raw-proxy the whole
+///   TLS stream to the Portal, which terminates it — the edge stays payload-blind.
+/// - `BrowserTunnel(host)`: SNI-passthrough to the bound tunnel (TLS at Origin).
+/// - `Reject`: close.
+///
+/// Direct `:8090`/`:4433` listeners keep working; the front door is additive and
+/// off unless `CT_FRONT_DOOR` is set.
+pub async fn serve_front_door(
+    mut inbound: tokio::net::TcpStream,
+    state: &EdgeState<Connection>,
+    acceptor: &tokio_rustls::TlsAcceptor,
+    portal_host: Option<&str>,
+    portal_addr: Option<SocketAddr>,
+    challenge: &Challenge,
+) -> Result<(), BoxError> {
+    let hello = crate::sni::read_client_hello_bytes(&mut inbound)
+        .await
+        .ok_or("front door: not a TLS ClientHello")?;
+    let alpn = crate::sni::peek_alpn(&hello);
+    let sni = crate::sni::peek_sni(&hello);
+    match crate::sni::classify_front_door(&alpn, sni.as_deref(), portal_host) {
+        crate::sni::FrontDoorRoute::EdgeRelay => {
+            let joined = Prepend {
+                pre: hello,
+                pos: 0,
+                inner: inbound,
+            };
+            let tls = acceptor.accept(joined).await?;
+            serve_tcp_connection(tls, state, challenge).await
+        }
+        crate::sni::FrontDoorRoute::ControlPlane => {
+            let addr = portal_addr.ok_or("front door: control-plane proxy address not configured")?;
+            let mut upstream = tokio::net::TcpStream::connect(addr).await?;
+            let mut joined = Prepend {
+                pre: hello,
+                pos: 0,
+                inner: inbound,
+            };
+            tokio::io::copy_bidirectional(&mut joined, &mut upstream).await?;
+            Ok(())
+        }
+        crate::sni::FrontDoorRoute::BrowserTunnel(_host) => {
+            let joined = Prepend {
+                pre: hello,
+                pos: 0,
+                inner: inbound,
+            };
+            serve_sni_passthrough(joined, state).await
+        }
+        crate::sni::FrontDoorRoute::Reject => Ok(()),
+    }
+}
+
 /// Serve one connection by dispatching on its first stream's role byte. `'A'`
 /// registers an Agent tunnel (`token`); `'C'` runs a PoW-gated rendezvous, then
 /// routes and relays the same stream to the Agent. This is the unified
@@ -644,6 +707,50 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_BROWSER_LISTEN {listen}: {e}"),
             },
             Err(e) => eprintln!("ct-edge: invalid CT_EDGE_BROWSER_LISTEN '{addr}': {e}"),
+        }
+    }
+
+    // #31 FD2: the unified :443 front door — one TCP listener that classifies
+    // each ClientHello (ALPN then SNI) and dispatches to the data-plane relay,
+    // the Portal, or a Browser-Plane tunnel (serve_front_door). Off unless
+    // CT_FRONT_DOOR is set; additive, so direct :8090/:4433 keep working. This is
+    // the single port agents/clients/browsers on :443-only networks reach.
+    if let Ok(addr) = std::env::var("CT_FRONT_DOOR") {
+        match addr.parse::<SocketAddr>() {
+            Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
+                Ok(fl) => {
+                    let fstate = state.clone();
+                    let facceptor = acceptor.clone();
+                    let portal_host = std::env::var("CT_EDGE_PORTAL_HOST").ok();
+                    let portal_addr = std::env::var("CT_CP_PROXY_ADDR")
+                        .ok()
+                        .and_then(|s| s.parse::<SocketAddr>().ok());
+                    tokio::spawn(async move {
+                        while let Ok((tcp, _)) = fl.accept().await {
+                            let state = fstate.clone();
+                            let acceptor = facceptor.clone();
+                            let portal_host = portal_host.clone();
+                            tokio::spawn(async move {
+                                let mut nonce = [0u8; 16];
+                                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                                let challenge = Challenge { nonce, difficulty };
+                                let _ = serve_front_door(
+                                    tcp,
+                                    &state,
+                                    &acceptor,
+                                    portal_host.as_deref(),
+                                    portal_addr,
+                                    &challenge,
+                                )
+                                .await;
+                            });
+                        }
+                    });
+                    eprintln!("ct-edge: unified :443 front door on {listen} (CT_FRONT_DOOR)");
+                }
+                Err(e) => eprintln!("ct-edge: cannot bind CT_FRONT_DOOR {listen}: {e}"),
+            },
+            Err(e) => eprintln!("ct-edge: invalid CT_FRONT_DOOR '{addr}': {e}"),
         }
     }
 
@@ -1498,5 +1605,84 @@ mod tests {
         );
         conn.close(0u32.into(), b"done");
         edge.abort();
+    }
+
+    #[tokio::test]
+    async fn front_door_proxies_the_portal_sni_to_the_control_plane() {
+        // #31 FD2: a browser reaching the unified :443 with the Portal's SNI is
+        // classified ControlPlane and raw-proxied to the Portal verbatim — the
+        // buffered ClientHello is replayed first (no handshake byte lost) and the
+        // edge never terminates TLS on this leg. Proven with a plain echo upstream
+        // standing in for the Portal: whatever the client sends comes back intact.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        // Upstream "Portal": echo back exactly the bytes it receives.
+        let hello = crate::sni::synth_client_hello(Some("portal.test"), &[]);
+        let extra = b"PING-after-hello";
+        let total = hello.len() + extra.len();
+        let portal = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let portal_addr = portal.local_addr().unwrap();
+        let n_echo = total;
+        let portal_task = tokio::spawn(async move {
+            let (mut sock, _) = portal.accept().await.unwrap();
+            let mut buf = vec![0u8; n_echo];
+            sock.read_exact(&mut buf).await.unwrap();
+            sock.write_all(&buf).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        // A TLS acceptor is required by the signature (used only on the EdgeRelay
+        // arm); build a throwaway one so the ControlPlane arm can run.
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    certified.key_pair.serialize_der(),
+                )),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        // Front door: one connection through serve_front_door with portal routing.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_front_door(
+                tcp,
+                &state,
+                &acceptor,
+                Some("portal.test"),
+                Some(portal_addr),
+                &challenge,
+            )
+            .await
+        });
+
+        // Client: send the ClientHello (SNI=portal.test) + extra, read it echoed.
+        let mut client = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        client.write_all(&hello).await.unwrap();
+        client.write_all(extra).await.unwrap();
+        client.flush().await.unwrap();
+        let mut got = vec![0u8; total];
+        client.read_exact(&mut got).await.unwrap();
+
+        let mut expected = hello.clone();
+        expected.extend_from_slice(extra);
+        assert_eq!(got, expected, "portal SNI is raw-proxied, ClientHello replayed");
+
+        portal_task.await.unwrap();
+        // Close the client so the proxy's client->upstream half sees EOF and
+        // serve_front_door returns (the upstream already closed after the echo).
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }
 }
