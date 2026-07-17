@@ -17,7 +17,7 @@ docker run --rm -v "$PWD":/work -w /work rust:1-slim \
   sh -c 'cargo build --workspace && cargo test --workspace'
 ```
 
-That builds all five crates and runs the full test suite in a throwaway
+That builds all six crates and runs the full test suite in a throwaway
 container.
 
 ## 3. Run it

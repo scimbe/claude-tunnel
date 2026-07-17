@@ -20,7 +20,8 @@ can route your traffic but never read it.
 
 ## Architecture
 
-A Rust Cargo workspace of five crates, each depending only on `ct-common`:
+A Rust Cargo workspace of six crates. Five form the tunnel and depend only on
+`ct-common`; `ct-dns` is a standalone DNS-01 responder for the front door's certs:
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -29,13 +30,14 @@ A Rust Cargo workspace of five crates, each depending only on `ct-common`:
 | `ct-agent` | customer-run; custodian of the origin key; serve path |
 | `ct-control-plane` | enrollment, tunnel registry/rendezvous, billing |
 | `ct-client` | tunnel setup, operating modes, bench harness |
+| `ct-dns` | authoritative DNS-01 responder for ACME (front door certs) |
 
 ## Documentation
 
 Four entry points, depending on what you need:
 
 **1. The source base** — how the code is organized
-[**→ Codebase overview**](docs/architecture.md): the five crates, the data path,
+[**→ Codebase overview**](docs/architecture.md): the six crates, the data path,
 the control path, and where each piece lives.
 
 **2. Using it** — easy install notes and scripts
@@ -45,7 +47,7 @@ Kubernetes deploy, one-command agent onboarding, and the helper scripts. Plus th
 [operations runbook](docs/ops/runbook.md).
 
 **3. Deep detail** — the reasoning and specification
-The 19 [Architecture Decision Records](docs/adr/), the [specification](docs/SPEC.md),
+The 20 [Architecture Decision Records](docs/adr/), the [specification](docs/SPEC.md),
 and the security set: [whitepaper](docs/security/whitepaper.md) ·
 [threat model](docs/security/threat-model.md) ·
 [TLS everywhere](docs/security/tls-everywhere.md) ·

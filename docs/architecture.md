@@ -6,8 +6,8 @@ full specification see [`SPEC.md`](SPEC.md).
 
 ## Workspace
 
-A Rust Cargo workspace of five crates. The dependency graph is acyclic — every
-crate depends only on `ct-common`.
+A Rust Cargo workspace of six crates. The dependency graph is acyclic — the five
+tunnel crates each depend only on `ct-common`; `ct-dns` is standalone.
 
 ```
 ct-client ─┐
@@ -23,6 +23,7 @@ ct-control-plane ─┘
 | `ct-agent` | customer-run node, origin-key custodian | `onboard`, `identity`, `serve`, `origin`, `capability`, `transport` |
 | `ct-control-plane` | coordination & billing | `service` (HTTP), `storage` (SQLite), `oidc`, `payment_provider`, `enrollment`, `registry`, `billing` |
 | `ct-client` | tunnel setup & benchmarking | `rendezvous`, `noise`, `transport`, `bench` |
+| `ct-dns` | authoritative DNS-01 responder (ACME, front door #31) | `server` (`:53`), `store`, `api`, `provider` (deSEC) |
 
 ## Data path (payload)
 
@@ -72,6 +73,6 @@ and the thesis chapter *Produktivierung*. In the code it spans persistence
 
 ## Where to read next
 
-- Decisions in depth: [`docs/adr/`](adr/) (18 ADRs).
+- Decisions in depth: [`docs/adr/`](adr/) (20 ADRs).
 - The specification: [`SPEC.md`](SPEC.md).
 - The development process the code was built by: [`DEVELOPMENT-PROCESS.md`](DEVELOPMENT-PROCESS.md).
