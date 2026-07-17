@@ -50,6 +50,10 @@ pub struct AgentConfig {
     /// token at the Edge (`CT_AGENT_HOSTNAME`), so an SNI-routed browser reaches
     /// this tunnel. `None` = no hostname bound.
     pub hostname: Option<String>,
+    /// Firewall-fallback (#46): when true, if the configured edge port is blocked
+    /// the Agent also tries the edge's unified `:443` front door (TLS-TCP with
+    /// `ALPN=ct-edge`). `CT_AGENT_FALLBACK_443`; default `false`.
+    pub fallback_443: bool,
 }
 
 /// Resolve a `host:port` (or `IP:port`) to a [`SocketAddr`] (#45). A literal
@@ -77,6 +81,7 @@ impl AgentConfig {
             metrics_listen: None,
             browser_forward: false,
             hostname: None,
+            fallback_443: false,
         })
     }
 
@@ -122,6 +127,13 @@ impl AgentConfig {
         cfg.hostname = get("CT_AGENT_HOSTNAME")
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty());
+        // Firewall-fallback (#46): CT_AGENT_FALLBACK_443 truthy -> also try :443.
+        cfg.fallback_443 = get("CT_AGENT_FALLBACK_443")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+            })
+            == Some(true);
         Ok(cfg)
     }
 }
@@ -154,6 +166,27 @@ mod tests {
 
         // Missing port / unresolvable garbage -> a clear error (not a panic).
         assert!(resolve_addr("CT_AGENT_ORIGIN", "no-port-here").is_err());
+    }
+
+    #[test]
+    fn fallback_443_reads_the_env_flag() {
+        // #46: off by default; truthy values enable it; 0/false/empty keep it off.
+        let base = |v: Option<&str>| {
+            AgentConfig::from_env_with(|k| match k {
+                "CT_AGENT_EDGE" => Some("127.0.0.1:4433".into()),
+                "CT_AGENT_ORIGIN" => Some("127.0.0.1:8080".into()),
+                "CT_AGENT_FALLBACK_443" => v.map(str::to_string),
+                _ => None,
+            })
+            .unwrap()
+            .fallback_443
+        };
+        assert!(!base(None), "default off");
+        assert!(!base(Some("0")), "0 -> off");
+        assert!(!base(Some("false")), "false -> off");
+        assert!(!base(Some("")), "empty -> off");
+        assert!(base(Some("1")), "1 -> on");
+        assert!(base(Some("true")), "true -> on");
     }
 
     #[test]

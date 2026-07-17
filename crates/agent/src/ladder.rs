@@ -30,12 +30,33 @@ pub fn edge_ladder(edge: SocketAddr, fallback_443: bool) -> Vec<EdgeRung> {
     rungs
 }
 
+/// The TLS-TCP addresses to try, in order, for the TCP-fallback path (#46 FB-c):
+/// the configured edge port first, then the `:443` front door when `fallback_443`
+/// is on. Derived from [`edge_ladder`] by keeping the TLS-TCP rungs — QUIC is
+/// dialed separately on the primary path.
+pub fn tcp_rungs(edge: SocketAddr, fallback_443: bool) -> Vec<SocketAddr> {
+    edge_ladder(edge, fallback_443)
+        .into_iter()
+        .filter_map(|r| match r {
+            EdgeRung::TlsTcp(a) => Some(a),
+            EdgeRung::Quic(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, 2], port))
+    }
+
+    #[test]
+    fn tcp_rungs_are_the_tls_tcp_addresses_in_order() {
+        assert_eq!(tcp_rungs(addr(4433), false), vec![addr(4433)]);
+        assert_eq!(tcp_rungs(addr(4433), true), vec![addr(4433), addr(443)]);
+        assert_eq!(tcp_rungs(addr(443), true), vec![addr(443)], "no duplicate :443");
     }
 
     #[test]

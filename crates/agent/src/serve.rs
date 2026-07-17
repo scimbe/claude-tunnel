@@ -469,34 +469,56 @@ async fn run_agent_tcp_fallback(
     // Reconnect loop (issue #5 / P1.2b): re-register and serve again after each
     // single tunnel ends or the connection drops, with backoff on failure.
     let mut backoff = Backoff::new(RECONNECT_BASE, RECONNECT_MAX, reconnect_max_attempts());
+    // #46 FB-c: the TCP-fallback rungs to try in order — the configured edge port,
+    // then the unified :443 front door when CT_AGENT_FALLBACK_443 is set. The first
+    // rung that connects+registers serves the client; if all fail, back off.
+    let rungs = crate::ladder::tcp_rungs(config.edge, config.fallback_443);
     loop {
-        match tcp_connect_register_serve(config, &edge_cert, &token, &origin_keys, &metrics).await {
-            // A tunnel completed cleanly — re-register for the next client.
-            Ok(()) => backoff.reset(),
-            Err(e) => {
-                eprintln!("ct-agent: TLS-TCP fallback: {e}; will reconnect");
-                match backoff.next_delay() {
-                    Some(d) => tokio::time::sleep(d).await,
-                    None => {
-                        return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into())
-                    }
+        let mut served = false;
+        let mut last_err: Option<BoxError> = None;
+        for addr in &rungs {
+            match tcp_connect_register_serve(config, *addr, &edge_cert, &token, &origin_keys, &metrics)
+                .await
+            {
+                // A tunnel completed cleanly — re-register (re-walk from the primary).
+                Ok(()) => {
+                    backoff.reset();
+                    served = true;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("ct-agent: TLS-TCP rung {addr} failed: {e}; trying next rung");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !served {
+            let e = last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no TCP rung configured".to_string());
+            eprintln!("ct-agent: all TLS-TCP rungs failed ({e}); will reconnect");
+            match backoff.next_delay() {
+                Some(d) => tokio::time::sleep(d).await,
+                None => {
+                    return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into())
                 }
             }
         }
     }
 }
 
-/// Connect over TLS-TCP, register the tunnel over the stream, and serve one
-/// Client's Noise tunnel over it — the single-shot body of the TCP-fallback
-/// reconnect loop (issue #5 / P1.2b).
+/// Connect over TLS-TCP to `target`, register the tunnel over the stream, and
+/// serve one Client's Noise tunnel over it — the single-shot body of the
+/// TCP-fallback reconnect loop (issue #5 / P1.2b), one rung of the #46 ladder.
 async fn tcp_connect_register_serve(
     config: &AgentConfig,
+    target: SocketAddr,
     edge_cert: &CertificateDer<'static>,
     token: &RoutingToken,
     origin_keys: &[[u8; 32]],
     metrics: &Arc<TunnelMetrics>,
 ) -> Result<(), BoxError> {
-    let mut stream = tcp_tls_connect(config.edge, edge_cert.clone()).await?;
+    let mut stream = tcp_tls_connect(target, edge_cert.clone()).await?;
     // Browser Plane over the TCP fallback (#41 FB3): register+bind the public
     // hostname in one 'B' frame, then raw-forward the relayed browser stream to
     // the Origin verbatim — the browser's TLS terminates AT the Origin, so this
@@ -1163,6 +1185,7 @@ mod tests {
             metrics_listen: None,
             browser_forward: false,
             hostname: None,
+            fallback_443: false,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;

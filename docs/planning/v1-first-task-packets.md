@@ -1507,9 +1507,13 @@ Ziel: ein Agent, dessen ausgehendes `:4433` (QUIC+TLS-TCP) von einer Firewall ge
   das Angebot). Frozen-Test `agent_registers_through_the_443_front_door_via_alpn`: echter In-Process-Edge, der die **Front-Door**
   (`serve_front_door`) fährt → ALPN-Peek `ct-edge` → `EdgeRelay` → `serve_tcp_connection` → Agent registriert `'A'` und wird geparkt.
   Der bestehende Direkt-Listener-Test bleibt grün (ALPN-Angebot schadet dort nicht). Gate grün (ct-agent 81).
-- **FB-c** ⏳ **Live-Ladder-Walk + Revoke**: `edge_ladder` in den Agent-Onboard/Reconnect-Pfad verdrahten (real QUIC-Dial bzw.
-  `tcp_tls_connect` pro Rung mit Timeout, Config `CT_AGENT_FALLBACK_443` default off), + `'R'`-Revoke über die `:443`-Sprosse
-  verifizieren (an-/abmelden beide über die Front-Door). Dann #46 **fix-ready**.
+- **FB-c** ✅ **Live-Ladder-Walk + Config**: `run_agent_tcp_fallback` walkt jetzt `tcp_rungs(config.edge, fallback_443)` — versucht
+  den konfigurierten Edge-Port, dann (wenn `CT_AGENT_FALLBACK_443` gesetzt) die `:443`-Front-Door; die erste Sprosse, die
+  verbindet+registriert, bedient den Client, sonst Backoff. `tcp_connect_register_serve` nimmt jetzt eine `target`-Adresse.
+  `AgentConfig.fallback_443` aus `CT_AGENT_FALLBACK_443` (default off). Frozen-Tests `tcp_rungs_are_the_tls_tcp_addresses_in_order`,
+  `fallback_443_reads_the_env_flag`. Gate grün (ct-agent 83). **Abmelden**: Verbindungsabbruch → Edge evictet die Registrierung
+  (Standard-Pfad, gilt für jede Sprosse inkl. `:443`); **Revoke** (#27) weist ein widerrufenes Token auf jeder Sprosse ab
+  (`register_unless_revoked`). **#46 damit fix-ready** — Feld-Verifikation: `:4433` per `iptables` DROP blocken, Agent registriert über `:443`.
 - **:80 (Plaintext)** ⏳ separat/niedrigprior — braucht HTTP-`CONNECT`/WebSocket-Upgrade; nur falls ein `:80`-only-Netz auftaucht.
 
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
