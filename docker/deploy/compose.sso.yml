@@ -15,12 +15,25 @@
 # The control-plane fetches the realm's RS256 signing key from its JWKS at startup
 # (KC2-c), so no key export is needed. Full runbook: docs/deploy/keycloak-sso.md.
 #
+# #48: Keycloak is reached through the edge's unified :443 front door on its own
+# hostname (AUTH_PUBLIC_HOST, e.g. auth.<zone>) — NO separate published port. The
+# front door terminates TLS for auth.<zone> with a BYO cert and reverse-proxies to
+# keycloak:8080 internally. This makes KEYCLOAK_PUBLIC_URL = https://auth.<zone> a
+# real, externally-reachable URL, so the token `iss` and the browser login work
+# from a remote browser (not just from the host running the containers).
+#
+# Prereq: the edge must have the front door enabled (CT_FRONT_DOOR=0.0.0.0:443 +
+# the Portal routing CT_EDGE_PORTAL_HOST/CT_CP_PROXY_ADDR/CT_EDGE_PORTAL_CERT|KEY,
+# as for the FD4-a landing page). This overlay adds the Auth (Keycloak) route to it.
+#
 # .env keys this overlay reads (see docs/deploy/keycloak-sso.md and .env.example):
-#   KEYCLOAK_PUBLIC_URL   the Keycloak base URL reachable from BOTH the browser and
-#                         the control-plane container (a LAN IP or public hostname,
-#                         NOT localhost — the container can't reach the host's
-#                         localhost). The realm issuer is <KEYCLOAK_PUBLIC_URL>/realms/ct-demo.
-#   PORTAL_PUBLIC_URL     the portal base URL the browser uses (default http://localhost:8090).
+#   AUTH_PUBLIC_HOST      the Keycloak hostname served via the front door (auth.<zone>).
+#   KEYCLOAK_PUBLIC_URL    https://<AUTH_PUBLIC_HOST> — the realm issuer base
+#                         (<KEYCLOAK_PUBLIC_URL>/realms/ct-demo); reachable from both
+#                         the browser and the control-plane (both go via the front door).
+#   AUTH_CERT_DIR         host dir with the BYO cert for auth.<zone> — fullchain.pem +
+#                         privkey.pem (obtained like the Portal's, deSEC DNS-01).
+#   PORTAL_PUBLIC_URL     the portal base URL the browser uses (https://<zone>).
 #   CT_OIDC_CLIENT_SECRET the `ct-portal` client secret Keycloak minted on import
 #                         (Clients -> ct-portal -> Credentials); kept only in .env.
 
@@ -41,14 +54,18 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
-      # Pin the realm issuer to a stable, everyone-reachable base URL so the token's
-      # `iss` matches what the control-plane validates. Must resolve the same from
-      # the browser and the control-plane container (see KEYCLOAK_PUBLIC_URL above).
-      KC_HOSTNAME: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8091}"
+      # Pin the realm issuer to the public front-door URL (https://auth.<zone>) so
+      # the token's `iss` matches what the control-plane validates and what the
+      # browser reached. The edge is an L4 (TCP) reverse proxy — it does not set
+      # X-Forwarded-* — so KC_HOSTNAME pinned to the https URL is what makes
+      # Keycloak emit https URLs; no KC_PROXY_HEADERS needed.
+      KC_HOSTNAME: "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL=https://<AUTH_PUBLIC_HOST>}"
     volumes:
       - ./keycloak/ct-demo-realm.json:/opt/keycloak/data/import/ct-demo-realm.json:ro
-    ports:
-      - "${KEYCLOAK_PORT:-8091}:8080"
+    # #48: NO published port — Keycloak is reached only through the edge :443 front
+    # door (auth.<zone>) and internally as keycloak:8080. Nothing to open on the host.
+    expose:
+      - "8080"
     restart: unless-stopped
     healthcheck:
       # Keycloak 25 serves /health on the MANAGEMENT interface (:9000), not the
@@ -59,15 +76,32 @@ services:
       retries: 10
       start_period: 30s
 
+  # #48: add the Auth (Keycloak) route to the edge's :443 front door — terminate
+  # TLS for auth.<zone> with a BYO cert and reverse-proxy to keycloak:8080. Assumes
+  # the front door + Portal routing are already enabled on the edge (see the header).
+  edge:
+    environment:
+      CT_EDGE_AUTH_HOST: "${AUTH_PUBLIC_HOST:?set AUTH_PUBLIC_HOST=auth.<zone>}"
+      CT_EDGE_AUTH_ADDR: "keycloak:8080"
+      CT_EDGE_AUTH_CERT: "/certs/auth/fullchain.pem"
+      CT_EDGE_AUTH_KEY: "/certs/auth/privkey.pem"
+    volumes:
+      # BYO cert for auth.<zone> (fullchain.pem + privkey.pem), obtained like the
+      # Portal's via deSEC DNS-01. Never committed — supplied from the host.
+      - "${AUTH_CERT_DIR:?set AUTH_CERT_DIR=<host dir with auth fullchain.pem+privkey.pem>}:/certs/auth:ro"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
   # Merge the OIDC env onto the base control-plane service (#42 KC3). CT_OIDC_ISSUER
   # alone enables OIDC — the control-plane fetches the realm JWKS at startup (KC2-c);
   # the client secret comes from .env (inherited env_file from the base service),
   # never from the realm export. Wait for Keycloak so the boot-time JWKS fetch lands.
   control-plane:
     environment:
-      CT_OIDC_ISSUER: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8091}/realms/ct-demo"
+      CT_OIDC_ISSUER: "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL=https://<AUTH_PUBLIC_HOST>}/realms/ct-demo"
       CT_OIDC_CLIENT_ID: "ct-portal"
-      CT_OIDC_REDIRECT_URI: "${PORTAL_PUBLIC_URL:-http://localhost:8090}/portal/callback"
+      CT_OIDC_REDIRECT_URI: "${PORTAL_PUBLIC_URL:?set PORTAL_PUBLIC_URL=https://<zone>}/portal/callback"
       # CT_OIDC_CLIENT_SECRET is read from .env (do NOT put it here).
       # The email-domain access-list (#43) is optional; set it in .env to restrict
       # who may register: CT_PORTAL_ALLOWED_EMAIL_DOMAINS=becke.biz

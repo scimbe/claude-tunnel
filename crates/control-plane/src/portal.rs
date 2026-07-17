@@ -770,6 +770,17 @@ mod tests {
             !sets_bootstrap_admin,
             "KC_BOOTSTRAP_ADMIN_* is ignored on KC 25 — no admin gets created"
         );
+
+        // #48: Keycloak is reached through the edge :443 front door (auth route),
+        // NOT a published host port — so the SSO URLs are externally reachable.
+        assert!(
+            compose.contains("CT_EDGE_AUTH_HOST"),
+            "the Auth (Keycloak) route is wired onto the edge front door"
+        );
+        assert!(
+            !compose.contains("KEYCLOAK_PORT"),
+            "Keycloak must not publish a host port — it's reached via the front door only"
+        );
     }
 
     #[tokio::test]

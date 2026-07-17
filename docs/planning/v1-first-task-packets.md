@@ -1531,10 +1531,13 @@ derselben `:443`-Front-Door wie das Portal (FD4-a), erreichbar per eigenem Hostn
   `classify_front_door_routes_by_alpn_then_sni` (2 Terminate-Hosts), `front_door_routes_a_second_terminate_host_to_its_own_upstream`
   (echter Browser-Handshake SNI=auth.test → AUTH-Cert terminiert → AUTH-Upstream, nicht Portal); FD2/FD4-a/#46-Tests grün mit
   Map-Signatur. Gate grün (ct-edge 73). **Edge-Seite damit komplett** — jeder zusätzliche Terminate-Host braucht nur ein Env-Paar.
-- **AP-b** ⏳ **Deploy-Verdrahtung**: `compose.sso.yml` — Keycloak über die Front-Door routen (`CT_EDGE_AUTH_HOST=auth.<zone>`,
-  `CT_EDGE_AUTH_ADDR=keycloak:8080`, BYO-Cert für `auth.<zone>` via deSEC DNS-01), **`KEYCLOAK_PORT`-Publish entfernen**,
-  `KEYCLOAK_PUBLIC_URL=https://auth.<zone>`. Runbook `keycloak-sso.md` aktualisieren. Dann #48 **fix-ready**; central fährt den
-  externen Browser-Klick-Durchlauf.
+- **AP-b** ✅ **Deploy-Verdrahtung**: `compose.sso.yml` — `edge`-Override mit `CT_EDGE_AUTH_HOST=${AUTH_PUBLIC_HOST}`,
+  `CT_EDGE_AUTH_ADDR=keycloak:8080`, `CT_EDGE_AUTH_CERT|KEY=/certs/auth/*` (BYO-Cert-Mount via `AUTH_CERT_DIR`);
+  Keycloak-`ports:`-Publish entfernt (nur noch `expose: 8080`, erreichbar über die Front-Door); `KC_HOSTNAME`/`CT_OIDC_ISSUER`
+  = `KEYCLOAK_PUBLIC_URL` (jetzt `:?`-required, `https://auth.<zone>`), `CT_OIDC_REDIRECT_URI`/`PORTAL_PUBLIC_URL` ebenfalls required.
+  Runbook `keycloak-sso.md` auf die Front-Door-Route umgeschrieben (neue `.env`-Keys `AUTH_PUBLIC_HOST`/`AUTH_CERT_DIR`), Runbook-Env-Tabelle
+  um `CT_EDGE_AUTH_*` ergänzt. Frozen-Test `sso_compose_wires_the_control_plane_to_the_demo_realm` erweitert (`CT_EDGE_AUTH_HOST` verdrahtet,
+  **kein** `KEYCLOAK_PORT`-Publish). Gate grün (control-plane 127). **#48 fix-ready** — central fährt den externen Browser-Klick-Durchlauf.
 
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
 
