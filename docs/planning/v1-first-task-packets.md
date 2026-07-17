@@ -1425,6 +1425,17 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
   Frozen-Test `front_door_proxies_the_portal_sni_to_the_control_plane` (echtes TCP, Echo-Upstream, ClientHello
   intakt zurückgespielt+proxied). Gate grün (ct-edge 69).
 - **FD3** ⏳ Client-Fallback-Leiter: `QUIC :4433 → TLS-TCP :4433 → QUIC/UDP :443 → TLS-TCP :443`, pro Netz gecacht.
+  **Dekomponiert:**
+  - **FD3-a** ✅ **Reine Leiter-Logik + Cache** (`ct-client::ladder`): `Rung::{Quic(u16)|TlsTcp(u16)}`, `default_ladder()`
+    (die 4 Sprossen, direkt-zuerst/restriktiv-zuletzt), `LadderCache` (network-Signatur → letzte funktionierende Sprosse),
+    `attempt_order` (gecachte Sprosse zuerst, ohne Duplikat; stale/leer → Default-Leiter) und `connect_via_ladder` mit
+    **injiziertem** async `dial` (Live-Sockets in FD3-b, Stub im Test) — nimmt die erste erreichbare Sprosse und cached sie.
+    Frozen-Tests: `default_ladder_is_direct_first_restrictive_last`, `attempt_order_puts_the_cached_rung_first_without_duplicating`,
+    `connect_via_ladder_picks_first_reachable_and_caches_it` (nur TLS-TCP:443 erreichbar → alle Sprossen der Reihe nach, dann
+    gecached → beim Reconnect zuerst probiert, keine blockierte Sprosse erneut), `connect_via_ladder_returns_none_when_every_rung_fails`.
+    Gate grün (ct-client 34).
+  - **FD3-b** ⏳ **Live-Verdrahtung**: `main.rs` Single-Tunnel-Pfad auf `connect_via_ladder` umstellen (real `dial_edge`/`tcp_tls_connect`
+    pro Rung, Timeout je Sprosse), Netz-Signatur ableiten (Default-Gateway/lokales Subnetz), Cache über Läufe persistieren.
 - **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
   reuse #23/ADR-0003; reale Domain via #30. **DNS-01 via selbst-gehostetem `ct-dns`** (acme-dns-Pattern, Strato hat keine API):
   - **AD1** ✅ Neue Crate `ct-dns`: hand-rolled DNS-Wire-Codec (`message::parse_query`/`build_response`, TXT, bounds-checked,
