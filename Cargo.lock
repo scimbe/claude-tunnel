@@ -283,6 +283,7 @@ name = "ct-agent"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64",
  "ct-client",
  "ct-common",
  "ct-control-plane",
@@ -293,6 +294,8 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "rustls",
+ "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "tower",

@@ -1236,8 +1236,14 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
     liefert stattdessen ein eigenes Leaf. Frozen-Tests `generate_csr_binds_the_normalized_hostname_and_a_usable_key`
     (Key-Roundtrip + normalisierter Host verbatim in der DER, Mixed-Case wegnormalisiert), `generate_csr_rejects_an_invalid_hostname`.
     Gate grün (ct-agent 73). *(CSR-Parsing in rcgen 0.13 braucht das `x509-parser`-Feature — bewusst nicht aktiviert; Test prüft die DER-Bytes.)*
-  - **BP4c-b** ⏳ **ACME-Directory/Account-Client** (RFC 8555): new-account (EAB optional), new-order für den Hostnamen,
-    DNS-01-Challenge lesen. Abhängigkeit `instant-acme` oder handgerollt; LE-Staging-Directory für Hermetik.
+  - **BP4c-b** ✅ **ACME-Protokoll-Parsing + DNS-01-Ableitung** (RFC 8555, `ct-agent::acme`, rein/hermetisch): `parse_directory`
+    (newNonce/newAccount/newOrder), `parse_order` (status/authorizations/finalize/certificate), `select_dns01` (wählt die
+    `dns-01`-Challenge, überspringt http-01), `dns01_record_name` (`_acme-challenge.<domain>`), `dns01_txt_value`
+    (`base64url(SHA256(keyAuthorization))`). Deps `serde_json`/`sha2`/`base64`. Frozen-Tests
+    `parses_acme_directory_order_and_selects_dns01`, `dns01_record_name_and_txt_value_follow_rfc8555` (unabhängiger Vektor:
+    `base64url(SHA256("")) == 47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU`). Gate grün (ct-agent 75). *(Das JWS-signierte
+    Account/Order-**Netz-I/O** selbst — Nonce, `jwk`/`kid`, POST — ist BP4c-c und wird gegen ein lokales Pebble getestet, nicht im
+    hermetischen Cargo-Gate.)*
   - **BP4c-c** ⏳ **DNS-01-Erfüllung + Finalize**: TXT-Challenge via `ct-dns`-Provider (AD5 `set_txt`/`clear_txt`) publizieren,
     pollen, mit der BP4c-a-CSR finalisieren, Leaf holen + speichern/erneuern.
   - **BP4c-d** ⏳ **BYO-Cert-Fallback**: Operator-Cert+Key aus Env/Pfad laden (überspringt ACME), Renewal-Hook.
