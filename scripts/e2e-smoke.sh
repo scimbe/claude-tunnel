@@ -84,9 +84,14 @@ nc -z 127.0.0.1 "$ORIGIN_PORT" >/dev/null 2>&1 \
   || fail "local echo origin did not become ready on 127.0.0.1:${ORIGIN_PORT}"
 
 # 3. Onboard + run the agent (it registers and serves; writes the capability).
+# The agent's onboard/cert-wait bounds are opt-in (default: wait forever, so a
+# production agent holding a spent single-use token never gives up). The smoke
+# path wants fail-fast, so set them explicitly here.
 CT_AGENT_CP_URL="$CP_URL" CT_AGENT_JOIN_TOKEN="$TOKEN" CT_AGENT_ID="$AGENT_ID" \
 CT_AGENT_EDGE="$EDGE" CT_AGENT_ORIGIN="127.0.0.1:${ORIGIN_PORT}" \
 CT_AGENT_EDGE_CERT="$EDGE_CERT" CT_AGENT_CAPABILITY_OUT="$CAP" \
+CT_AGENT_ONBOARD_TIMEOUT_SECS="${CT_AGENT_ONBOARD_TIMEOUT_SECS:-30}" \
+CT_AGENT_EDGE_CERT_WAIT_SECS="${CT_AGENT_EDGE_CERT_WAIT_SECS:-60}" \
   "$BIN/ct-agent" onboard >"$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 

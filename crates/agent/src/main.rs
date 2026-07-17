@@ -47,16 +47,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let env = OnboardEnv::from_env()?;
         let edge = env.config.edge;
         let cp_url = env.cp_url.clone();
-        let onboard_timeout_secs = std::env::var("CT_AGENT_ONBOARD_TIMEOUT_SECS")
+        // Onboarding redeems a SINGLE-USE join token. A timeout here that fires
+        // after the token is already spent server-side would, on restart, re-onboard
+        // with a dead token and never recover (#36). So the timeout is OPT-IN: unset
+        // ⇒ wait indefinitely (prior behaviour, resilient); set only where a bounded
+        // fail-fast is wanted (CI / the e2e smoke script).
+        let onboarded = match std::env::var("CT_AGENT_ONBOARD_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30);
-        let onboarded =
-            tokio::time::timeout(Duration::from_secs(onboard_timeout_secs), env.onboard())
+        {
+            Some(secs) => tokio::time::timeout(Duration::from_secs(secs), env.onboard())
                 .await
-                .map_err(|_| {
-                    format!("ct-agent: onboarding timed out after {onboard_timeout_secs}s")
-                })??;
+                .map_err(|_| format!("ct-agent: onboarding timed out after {secs}s"))??,
+            None => env.onboard().await?,
+        };
         eprintln!(
             "ct-agent: onboarded agent={} tenant={} via {} (edge={})",
             onboarded.agent_id.0, onboarded.tenant.0, cp_url, edge
@@ -84,26 +88,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         rustls::pki_types::CertificateDer::from(der)
     } else {
-        let cert_wait_secs = std::env::var("CT_AGENT_EDGE_CERT_WAIT_SECS")
+        // This wait runs AFTER onboarding has spent the single-use token, so the
+        // bound is OPT-IN too: unset ⇒ wait indefinitely for the edge to publish its
+        // cert on the shared volume (prior behaviour — an agent that can't re-onboard
+        // must not give up), set only for fail-fast (CI / smoke). Log throttling is
+        // always on so a long wait doesn't spam the log twice a second.
+        let cert_deadline = std::env::var("CT_AGENT_EDGE_CERT_WAIT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(60);
+            .map(|secs| (Instant::now() + Duration::from_secs(secs), secs));
         let cert_log_interval_secs = std::env::var("CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(EDGE_CERT_WAIT_LOG_THROTTLE_SECS);
-        let cert_deadline = Instant::now() + Duration::from_secs(cert_wait_secs);
         let mut next_log_at = Instant::now();
         loop {
             let now = Instant::now();
             match load_cert(&cert_path) {
                 Ok(cert) => break cert,
                 Err(_) => {
-                    if now >= cert_deadline {
-                        return Err(format!(
-                            "ct-agent: edge cert not available within {cert_wait_secs}s at {cert_path}"
-                        )
-                        .into());
+                    if let Some((deadline, secs)) = cert_deadline {
+                        if now >= deadline {
+                            return Err(format!(
+                                "ct-agent: edge cert not available within {secs}s at {cert_path}"
+                            )
+                            .into());
+                        }
                     }
                     if now >= next_log_at {
                         eprintln!("ct-agent: waiting for edge cert at {cert_path} ...");
