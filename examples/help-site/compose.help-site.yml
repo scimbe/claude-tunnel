@@ -40,8 +40,11 @@ services:
       # agent registers under this routing token so the bind is authorized. Empty
       # -> the agent mints its own token (BP4a-only path).
       - CT_AGENT_TOKEN=${HELP_AGENT_TOKEN:-}
-      - CT_AGENT_ORIGIN=help-origin:443              # forward raw TLS here
+      - CT_AGENT_ORIGIN=help-origin:443              # forward raw TLS here (hostname resolved, #45)
       - CT_AGENT_ORIGIN_PROTO=tcp
+      # #45: this service has no /shared volume (unlike the main plane), so point
+      # the capability file at a writable path — nothing here reads it back.
+      - CT_AGENT_CAPABILITY_OUT=/tmp/capability.bin
       - CT_AGENT_EDGE=${HELP_AGENT_EDGE:?edge host:port, e.g. edge:4433}
       - CT_AGENT_CP_URL=${HELP_AGENT_CP_URL:?control-plane URL for onboarding}
       - CT_AGENT_JOIN_TOKEN=${HELP_JOIN_TOKEN:?single-use join token}
@@ -51,7 +54,10 @@ services:
       # rejoined automatically instead of the agent giving up after 10 tries and
       # exiting — which, holding a single-use join token, can't cleanly re-onboard.
       - CT_AGENT_RECONNECT_MAX_ATTEMPTS=0
-    command: ["onboard"]
+    # #45: docker/Dockerfile has no ENTRYPOINT, so `command` is the full argv — it
+    # must name the binary (ct-agent), then the subcommand. `["onboard"]` alone
+    # tries to exec a binary literally named "onboard", which doesn't exist.
+    command: ["ct-agent", "onboard"]
     depends_on:
       - help-origin
     # #36: backstop for an actual crash/OOM. Safe now that the agent retries the
@@ -61,3 +67,13 @@ services:
 
 volumes:
   help_caddy_data:
+
+# #45: join the running self-host plane's network so help-agent/help-origin can
+# reach `edge` and `control-plane` (and the HELP_AGENT_EDGE/HELP_AGENT_CP_URL
+# hostnames resolve). Without this the compose creates its own isolated network
+# and the agent can't reach the plane at all. The base stack (compose.selfhost.yml,
+# `name: ct-selfhost`) creates the `ct-selfhost_default` network; bring it up first.
+networks:
+  default:
+    name: ct-selfhost_default
+    external: true

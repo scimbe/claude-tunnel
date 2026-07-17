@@ -52,14 +52,23 @@ pub struct AgentConfig {
     pub hostname: Option<String>,
 }
 
+/// Resolve a `host:port` (or `IP:port`) to a [`SocketAddr`] (#45). A literal
+/// IP:port parses directly (no DNS); a hostname:port is resolved via the system
+/// resolver — so Compose service names like `help-origin:443` / `edge:4433` work
+/// on a shared Docker network instead of requiring churning literal IPs. Returns
+/// the first resolved address.
+fn resolve_addr(var: &str, s: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    s.to_socket_addrs()
+        .map_err(|e| format!("invalid {var} '{s}': {e}"))?
+        .next()
+        .ok_or_else(|| format!("{var} '{s}' resolved to no address"))
+}
+
 impl AgentConfig {
     pub fn parse(edge: &str, origin: &str) -> Result<AgentConfig, String> {
-        let edge = edge
-            .parse::<SocketAddr>()
-            .map_err(|e| format!("invalid CT_AGENT_EDGE '{edge}': {e}"))?;
-        let origin = origin
-            .parse::<SocketAddr>()
-            .map_err(|e| format!("invalid CT_AGENT_ORIGIN '{origin}': {e}"))?;
+        let edge = resolve_addr("CT_AGENT_EDGE", edge)?;
+        let origin = resolve_addr("CT_AGENT_ORIGIN", origin)?;
         Ok(AgentConfig {
             edge,
             origin,
@@ -128,6 +137,23 @@ mod tests {
         assert_eq!(c.origin, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(c.origin_proto, OriginProto::Tcp, "defaults to TCP");
         assert_eq!(c.direct_advertise_ip, None, "P2P disabled by default");
+    }
+
+    #[test]
+    fn resolves_hostname_and_literal_addresses() {
+        // #45: a Compose service name (hostname:port) must resolve, not just a
+        // literal IP:port — so help-origin:443 / edge:4433 work on a Docker network.
+        // `localhost` is in the container's /etc/hosts, so it stands in for a
+        // resolvable service name in the hermetic gate.
+        let a = resolve_addr("X", "localhost:8443").expect("hostname resolves");
+        assert_eq!(a.port(), 8443);
+        assert!(a.ip().is_loopback(), "localhost -> loopback");
+
+        // A literal IP:port parses directly (no DNS).
+        assert_eq!(resolve_addr("X", "10.0.0.5:4433").unwrap(), "10.0.0.5:4433".parse().unwrap());
+
+        // Missing port / unresolvable garbage -> a clear error (not a panic).
+        assert!(resolve_addr("CT_AGENT_ORIGIN", "no-port-here").is_err());
     }
 
     #[test]
