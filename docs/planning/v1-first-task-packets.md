@@ -1699,9 +1699,14 @@ Decomposed:
   register_channel (re-key own, reject others), operator_pubkey (the edge lookup, like host-auth),
   channel_owner, add_member/is_member/remove_member (owner-scoped, idempotent). 2 frozen tests
   (register+lookup+owner-scoped membership; survives reopen). Gate green.
-- **AF2d-transport** ⏳ generalise `rendezvous.rs` to broker two agents over QUIC using the AF2b pairing +
-  AF2c request + the operator pubkey from AF2d-registry; pairwise Noise (edge broker, no payload relay);
-  real two-agent integration test.
+- **AF2d-transport-a** ✅ **Edge QUIC channel-join admission** (`ct-edge::channel_broker::resolve_channel_join`):
+  accepts one `ChannelJoinRequest` over QUIC, looks up the channel's operator pubkey (injected, wired to
+  AF2d-registry), verifies the grant, replies OK/NO, returns the request + advertised endpoint. 2 QUIC
+  integration tests (admit valid; refuse unknown-channel + expired). Gate green.
+- **AF2d-transport-b** ⏳ **Pair two admitted joins**: hold two `resolve_channel_join` results for the same
+  channel, pair via AF2b `authorize_channel_pair`, swap the advertised endpoints back to each agent; the two
+  run a pairwise Noise session (edge broker, no payload relay), relay fallback; real TWO-agent integration
+  test. This is the packet that makes two agents actually talk directly.
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration

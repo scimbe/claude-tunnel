@@ -9,7 +9,12 @@
 //! The socket-level QUIC brokering (generalising `rendezvous.rs` to relay between
 //! two agents) and where the operator key comes from are later sub-packets.
 
-use ct_common::channel::{verify, ChannelId, Direction, GrantError, SignedChannelGrant, UnixSeconds};
+use ct_common::channel::{
+    verify, ChannelId, ChannelJoinRequest, Direction, GrantError, SignedChannelGrant, UnixSeconds,
+};
+use quinn::Endpoint;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The decided pairing for a channel: who dials (initiator) and who accepts, bound
 /// to each side's holder identity (the pubkey its grant is bound to).
@@ -93,9 +98,65 @@ pub fn authorize_channel_pair(
     }
 }
 
+/// Accept one channel-join over QUIC (AF2d-transport): read the presented
+/// [`ChannelJoinRequest`], look up the channel's operator public key via
+/// `operator_for` (wired to the control-plane channel registry), verify the grant
+/// at `now`, reply `OK`/`NO`, and return the request on success. This is the edge
+/// admission gate for a *single* participant; pairing two admitted participants
+/// (via [`authorize_channel_pair`]) and swapping their advertised endpoints is the
+/// next step. Rejects a malformed request, an unknown channel, and a bad/expired
+/// grant — always replying `NO` before erroring so the peer learns it was refused.
+pub async fn resolve_channel_join<F>(
+    endpoint: &Endpoint,
+    now: UnixSeconds,
+    operator_for: F,
+) -> Result<ChannelJoinRequest, BoxError>
+where
+    F: Fn(&ChannelId) -> Option<[u8; 32]>,
+{
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or("endpoint closed with no incoming")?;
+    let conn = incoming.await?;
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let bytes = recv.read_to_end(1024).await?;
+
+    let req = match ChannelJoinRequest::decode(&bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = send.write_all(b"NO").await;
+            let _ = send.finish();
+            return Err("malformed channel join request".into());
+        }
+    };
+    let operator = match operator_for(&req.grant.grant.channel) {
+        Some(op) => op,
+        None => {
+            let _ = send.write_all(b"NO").await;
+            let _ = send.finish();
+            return Err("unknown channel".into());
+        }
+    };
+    match verify(&operator, &req.grant, now) {
+        Ok(()) => {
+            send.write_all(b"OK").await?;
+            send.finish()?;
+            conn.closed().await; // hold the connection so the peer reads the ack
+            Ok(req)
+        }
+        Err(e) => {
+            let _ = send.write_all(b"NO").await;
+            let _ = send.finish();
+            Err(format!("channel grant rejected: {e}").into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use ct_common::channel::{ChannelGrant, Rights};
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -208,5 +269,80 @@ mod tests {
             authorize_channel_pair(&other, &a, &b, 500),
             Err(BrokerError::GrantInvalid(GrantError::BadSignature))
         );
+    }
+
+    // --- AF2d-transport: the QUIC channel-join admission gate ---
+
+    async fn present_join(conn: &quinn::Connection, req_bytes: &[u8]) -> Vec<u8> {
+        let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+        send.write_all(req_bytes).await.expect("write request");
+        send.finish().expect("finish");
+        recv.read_to_end(8).await.unwrap_or_default()
+    }
+
+    fn join_request(channel: [u8; 32], holder: u8, endpoint: &str) -> ChannelJoinRequest {
+        ChannelJoinRequest {
+            grant: grant(channel, holder, Direction::Initiate, 1_000),
+            endpoint: endpoint.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_admits_a_valid_channel_join() {
+        let pk = operator_pubkey();
+        let channel = [0xC1u8; 32];
+        let req = join_request(channel, 0x0a, "203.0.113.9:6001");
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            resolve_channel_join(&server, 500, move |c| (c.0 == channel).then_some(pk))
+                .await
+                .map(|r| r.endpoint)
+                .map_err(|e| e.to_string())
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode()).await;
+        assert_eq!(ack, b"OK");
+        conn.close(0u32.into(), b"done");
+
+        let endpoint = server_task.await.expect("join").expect("admitted");
+        assert_eq!(endpoint, "203.0.113.9:6001", "handler returns the advertised endpoint");
+    }
+
+    #[tokio::test]
+    async fn edge_refuses_unknown_channel_and_expired_grant() {
+        // Unknown channel: the operator lookup returns None -> NO.
+        let unknown = join_request([0xC2u8; 32], 0x0b, "203.0.113.9:6002");
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task =
+            tokio::spawn(
+                async move { resolve_channel_join(&server, 500, |_c| None).await.map(|_| ()) },
+            );
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &unknown.encode()).await;
+        assert_ne!(ack, b"OK", "an unknown channel must be refused");
+        let _ = server_task.await;
+
+        // Known channel but the grant is expired at `now` -> NO.
+        let pk = operator_pubkey();
+        let channel = [0xC3u8; 32];
+        let expired = join_request(channel, 0x0c, "203.0.113.9:6003"); // expires_at = 1_000
+        let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
+        let addr2 = server2.local_addr().expect("addr");
+        let server2_task = tokio::spawn(async move {
+            resolve_channel_join(&server2, 2_000, move |c| (c.0 == channel).then_some(pk))
+                .await
+                .map(|_| ())
+        });
+        let client2 = build_client_endpoint(cert2).expect("client");
+        let conn2 = client2.connect(addr2, "localhost").expect("cfg").await.expect("conn");
+        let ack2 = present_join(&conn2, &expired.encode()).await;
+        assert_ne!(ack2, b"OK", "an expired grant must be refused");
+        let _ = server2_task.await;
     }
 }
