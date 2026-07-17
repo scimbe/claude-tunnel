@@ -666,12 +666,34 @@ mod tests {
         assert_eq!(realm["registrationAllowed"], true, "self-registration on (no shipped credential)");
         assert_eq!(realm["defaultSignatureAlgorithm"], "RS256", "RS256 — the from_rsa_pem path");
 
+        // #42 regression: Keycloak's RealmRepresentation deserializer is STRICT —
+        // any unknown top-level field (e.g. a `_comment` doc note) aborts
+        // --import-realm on every boot and crash-loops the container. Keep the
+        // realm export free of non-schema fields; put explanation in comments in
+        // compose.sso.yml / the runbook instead.
+        for key in realm.as_object().expect("realm is an object").keys() {
+            assert!(
+                !key.starts_with('_'),
+                "non-schema realm field {key:?} breaks Keycloak's strict import"
+            );
+        }
+
         let client = realm["clients"]
             .as_array()
             .and_then(|cs| cs.iter().find(|c| c["clientId"] == "ct-portal"))
             .expect("ct-portal client present");
         assert_eq!(client["publicClient"], false, "confidential client (secret-backed)");
         assert_eq!(client["standardFlowEnabled"], true, "Authorization Code flow");
+
+        // #42 regression: `defaultClientScopes` may only name real Keycloak client
+        // scopes. `openid` is the request-time scope param (the portal sends
+        // scope=openid), NOT a client scope — listing it fails the realm import.
+        if let Some(scopes) = client["defaultClientScopes"].as_array() {
+            assert!(
+                !scopes.iter().any(|s| s == "openid"),
+                "'openid' is not a Keycloak client scope; it breaks the realm import"
+            );
+        }
 
         let redirect = client["redirectUris"]
             .as_array()
