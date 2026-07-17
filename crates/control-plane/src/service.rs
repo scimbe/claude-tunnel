@@ -609,8 +609,14 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem}
  .n{font-size:2rem;font-weight:700} .l{color:#8b949e;font-size:.85rem}
  .ok{color:#3fb950} .bad{color:#f85149} .foot{color:#8b949e;font-size:.8rem;margin-top:1.5rem}
+ .top{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:.75rem}
+ a.btn{display:inline-block;background:#238636;color:#fff;padding:.55rem 1.1rem;border-radius:8px;font-weight:600;text-decoration:none}
+ a.btn:hover{background:#2ea043}
 </style></head><body>
-<h1>claude-tunnel — operator status</h1>
+<div class="top">
+ <h1>claude-tunnel — operator status</h1>
+ <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
+</div>
 <div id="health" class="l">loading…</div>
 <div class="grid">
  <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
@@ -1360,6 +1366,12 @@ mod tests {
         assert!(
             html.contains("registered tunnels") && html.contains("uptime"),
             "renders the key metadata figures"
+        );
+        // #64: the apex landing page must offer a discoverable path to the customer
+        // Portal (sign-up/sign-in). A relative /portal link keeps it host-agnostic.
+        assert!(
+            html.contains(r#"href="/portal""#),
+            "links to the customer portal (#64)"
         );
         assert!(
             !html.contains("http://") && !html.contains("https://") && !html.contains("//cdn"),
