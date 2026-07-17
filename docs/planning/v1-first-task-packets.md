@@ -1458,3 +1458,24 @@ Anlegen) + RB4b (best-effort HTTP-Push-Muster). Reuse der deSEC-Provider-Abstrak
   (Mock-deSEC: A-Record bei Create, empty-records-Clear bei Revoke). Voller Workspace-Gate grün (control-plane 115).
   **Hostname-DNS jetzt vollautomatisch** — kein manueller deSEC-A-Record-Schritt mehr.
 - **DL3** ⏳ Design-Frage (nicht blockierend): Provider-Trait für Nicht-deSEC-Selfhoster (aktuell deSEC-only genügt).
+
+## #42 Toggle-barer Keycloak/OIDC-IdP-Container im Deploy-Stack
+
+Ziel: das SSO-Login (#25) end-to-end klickbar machen — bisher nur hermetisch (HS256-Testdouble) verifiziert, live 503 weil kein
+IdP läuft (`CT_OIDC_ISSUER` leer). Ein **standardmäßig ausgeschalteter**, zuschaltbarer Keycloak-Container mit deklarativ
+importierter Demo-Realm, passend zu dem, was `PortalOidc::from_env`/`OidcVerifier::from_rsa_pem` bereits erwarten.
+
+- **KC1** ✅ **IdP-Container + deklarativer Realm** (default off): `docker/deploy/compose.sso.yml` (Overlay — nur aktiv wenn
+  explizit mit `-f` benannt) fährt `quay.io/keycloak/keycloak:25` mit `start-dev --import-realm` und mountet
+  `docker/deploy/keycloak/ct-demo-realm.json` (Realm `ct-demo`, confidential Client `ct-portal` mit RS256 + Authorization-Code
+  + `/portal/callback`-Redirects, `registrationAllowed` statt mitgeliefertem Credential — **kein Secret im Repo**). Frozen-Test
+  `demo_realm_matches_the_portal_oidc_contract` (`include_str!` des Realm-Exports zur Compile-Zeit → gegen `PortalOidc::from_lookup`
+  gegroundet: client_id/redirect/Realm-Name ergeben exakt Keycloaks Authorize/Token-Endpoints). Gate grün (control-plane 117).
+- **KC2** ⏳ **Realm-Signaturschlüssel → PEM**: den RS256-Public-Key der Realm nach `CT_OIDC_PUBKEY_PATH` exportieren (Init-Schritt:
+  JWKS von Keycloak holen → PEM auf ein geteiltes Volume, das die Control-Plane liest); Test auf der JWKS→PEM-Konvertierung, die
+  `OidcVerifier::from_rsa_pem` füttert.
+- **KC3** ⏳ **Control-Plane-Verdrahtung + Doku**: `CT_OIDC_*`-Env (Issuer/Client-ID/Redirect/Token-URL/PubkeyPath) im Overlay auf
+  den control-plane-Service mergen, `.env.example`-Ergänzungen (Client-Secret aus `.env`, nie im Realm-Export), Operator-Runbook für
+  den vollen Klick-Durchlauf (Sign in → Selbst-Registrierung → `/portal/home` → Konto/Tunnel → Logout). Erst wenn KC1–KC3 erfüllt →
+  **#42 fix-ready**. (Client-Secret-Bereitstellung: Keycloak mintet es beim Import; KC3 zieht es via `kcadm`/Admin-API in die
+  gitignorierte `.env`.)

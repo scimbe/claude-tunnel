@@ -539,6 +539,57 @@ mod tests {
         assert!(PortalOidc::from_lookup(|k| (k == "CT_OIDC_CLIENT_ID").then(|| "x".into())).is_none());
     }
 
+    #[test]
+    fn demo_realm_matches_the_portal_oidc_contract() {
+        // #42 KC1: the declarative Keycloak realm shipped for the SSO overlay must
+        // stay in lock-step with what PortalOidc::from_env will actually consume —
+        // a drifted client_id/redirect/realm-name would 503 the live login. Embed
+        // the realm export at compile time (so a missing/renamed file fails the
+        // build) and ground its client against the portal's own config derivation.
+        let raw = include_str!("../../../docker/deploy/keycloak/ct-demo-realm.json");
+        let realm: serde_json::Value = serde_json::from_str(raw).expect("realm export is valid JSON");
+
+        assert_eq!(realm["realm"], "ct-demo", "realm name");
+        assert_eq!(realm["registrationAllowed"], true, "self-registration on (no shipped credential)");
+        assert_eq!(realm["defaultSignatureAlgorithm"], "RS256", "RS256 — the from_rsa_pem path");
+
+        let client = realm["clients"]
+            .as_array()
+            .and_then(|cs| cs.iter().find(|c| c["clientId"] == "ct-portal"))
+            .expect("ct-portal client present");
+        assert_eq!(client["publicClient"], false, "confidential client (secret-backed)");
+        assert_eq!(client["standardFlowEnabled"], true, "Authorization Code flow");
+
+        let redirect = client["redirectUris"]
+            .as_array()
+            .and_then(|u| u.iter().find_map(|v| v.as_str().filter(|s| s.ends_with("/portal/callback"))))
+            .expect("a /portal/callback redirect URI");
+
+        // Feed the realm's own client_id + redirect + a realm-shaped issuer into
+        // the portal's config derivation: it must resolve to Keycloak's real
+        // authorize/token endpoints for THIS realm. This is the exact wiring KC3
+        // will place in the compose env, proven consistent here.
+        let client_id = client["clientId"].as_str().unwrap().to_string();
+        let redirect_owned = redirect.to_string();
+        let issuer = "https://kc.example/realms/ct-demo".to_string();
+        let cfg = PortalOidc::from_lookup(|k| match k {
+            "CT_OIDC_CLIENT_ID" => Some(client_id.clone()),
+            "CT_OIDC_REDIRECT_URI" => Some(redirect_owned.clone()),
+            "CT_OIDC_ISSUER" => Some(issuer.clone()),
+            _ => None,
+        })
+        .expect("realm-derived config is fully resolvable");
+        assert_eq!(cfg.client_id, "ct-portal");
+        assert_eq!(
+            cfg.authorize_url,
+            "https://kc.example/realms/ct-demo/protocol/openid-connect/auth"
+        );
+        assert_eq!(
+            cfg.token_url,
+            "https://kc.example/realms/ct-demo/protocol/openid-connect/token"
+        );
+    }
+
     #[tokio::test]
     async fn portal_home_renders_the_sso_cta() {
         let app = portal_router(None, TEST_KEY);

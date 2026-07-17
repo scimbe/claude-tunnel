@@ -1,0 +1,38 @@
+{
+  "realm": "ct-demo",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": true,
+  "loginWithEmailAllowed": true,
+  "verifyEmail": false,
+  "resetPasswordAllowed": true,
+  "defaultSignatureAlgorithm": "RS256",
+  "clients": [
+    {
+      "clientId": "ct-portal",
+      "name": "claude-tunnel customer portal",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "https://bunsenbrenner.org/portal/callback",
+        "http://localhost:8090/portal/callback"
+      ],
+      "webOrigins": ["+"],
+      "attributes": {
+        "access.token.signed.response.alg": "RS256",
+        "id.token.signed.response.alg": "RS256",
+        "post.logout.redirect.uris": "https://bunsenbrenner.org/portal+http://localhost:8090/portal"
+      },
+      "defaultClientScopes": ["openid", "email", "profile"]
+    }
+  ],
+  "_comment_secret": "This confidential client's secret is NOT baked into the export. Keycloak mints one on import; KC3 wires it out to CT_OIDC_CLIENT_SECRET in docker/deploy/.env (gitignored). Never commit a real secret here.",
+  "_comment_users": "No demo user is shipped: registrationAllowed=true lets central self-register (register/login click-through) so no credential lives in the repo."
+}
