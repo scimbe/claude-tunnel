@@ -1434,8 +1434,14 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     `connect_via_ladder_picks_first_reachable_and_caches_it` (nur TLS-TCP:443 erreichbar → alle Sprossen der Reihe nach, dann
     gecached → beim Reconnect zuerst probiert, keine blockierte Sprosse erneut), `connect_via_ladder_returns_none_when_every_rung_fails`.
     Gate grün (ct-client 34).
-  - **FD3-b** ⏳ **Live-Verdrahtung**: `main.rs` Single-Tunnel-Pfad auf `connect_via_ladder` umstellen (real `dial_edge`/`tcp_tls_connect`
-    pro Rung, Timeout je Sprosse), Netz-Signatur ableiten (Default-Gateway/lokales Subnetz), Cache über Läufe persistieren.
+  - **FD3-b** ✅ **Live Per-Rung-Dialer** (`ct-client::transport`): `EdgeConn::{Quic(Connection)|Tcp(TlsStream)}` +
+    `dial_rung(rung, edge_ip, cert, timeout) -> Option<EdgeConn>` (QUIC-Rung → `dial_edge`, TLS-TCP-Rung → `tcp_tls_connect`
+    auf dem Rung-Port; `None` bei Timeout/Fehler, damit `connect_via_ladder` weiterläuft). Frozen-Test
+    `dial_rung_walks_the_ladder_to_the_live_quic_rung_and_caches_it`: echter In-Process-Edge auf Ephemeral-QUIC-Port, tote
+    TLS-TCP-Rung zuerst → Leiter überspringt sie, landet live auf QUIC, cached den Rung. Gate grün (ct-client 35).
+  - **FD3-c** ⏳ **`main.rs`-Verdrahtung**: Single-Tunnel-Pfad auf `connect_via_ladder(&dial_rung)` umstellen (EdgeConn-Variante →
+    `client_tunnel_noise_timed` bzw. `..._tcp_timed`), Netz-Signatur ableiten (Default-Gateway/lokales Subnetz), Cache über
+    Läufe persistieren. `CT_CLIENT_FORCE_TCP` weiter respektieren (Rung-Filter).
 - **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
   reuse #23/ADR-0003; reale Domain via #30. **DNS-01 via selbst-gehostetem `ct-dns`** (acme-dns-Pattern, Strato hat keine API):
   - **AD1** ✅ Neue Crate `ct-dns`: hand-rolled DNS-Wire-Codec (`message::parse_query`/`build_response`, TXT, bounds-checked,

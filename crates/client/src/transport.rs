@@ -133,6 +133,46 @@ pub async fn tcp_tls_connect(
     Ok(connector.connect(server_name, tcp).await?)
 }
 
+/// A live Edge connection over whichever ladder rung succeeded (#31 FD3-b): QUIC
+/// (primary/fast) or the TLS-TCP fallback. The tunnel operation dispatches on the
+/// variant — QUIC opens a bi-stream, TCP reuses the single stream — so both the
+/// direct ports and the `:443` front-door rungs converge on one connection type.
+pub enum EdgeConn {
+    Quic(Connection),
+    Tcp(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+/// Dial one ladder [`Rung`](crate::ladder::Rung) at `edge_ip`, trusting
+/// `edge_cert`, bounded by `timeout`. A QUIC rung maps to [`dial_edge`], a TLS-TCP
+/// rung to [`tcp_tls_connect`], each on the rung's own port. Returns `None` on
+/// timeout or failure so [`crate::ladder::connect_via_ladder`] walks to the next
+/// rung instead of surfacing the error — the ladder only cares "did this rung
+/// connect?", and a blocked rung on a restrictive network simply times out.
+pub async fn dial_rung(
+    rung: crate::ladder::Rung,
+    edge_ip: std::net::IpAddr,
+    edge_cert: CertificateDer<'static>,
+    timeout: Duration,
+) -> Option<EdgeConn> {
+    use crate::ladder::Rung;
+    match rung {
+        Rung::Quic(port) => {
+            let addr = SocketAddr::new(edge_ip, port);
+            match tokio::time::timeout(timeout, dial_edge(addr, edge_cert)).await {
+                Ok(Ok(c)) => Some(EdgeConn::Quic(c)),
+                _ => None,
+            }
+        }
+        Rung::TlsTcp(port) => {
+            let addr = SocketAddr::new(edge_ip, port);
+            match tokio::time::timeout(timeout, tcp_tls_connect(addr, edge_cert)).await {
+                Ok(Ok(c)) => Some(EdgeConn::Tcp(c)),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Tunnel `payload` to the Origin over a **TCP-fallback** stream (M12.2c): when
 /// UDP/QUIC is blocked, the Client connects to the Edge via TLS-TCP and runs the
 /// same `'C'` rendezvous + Noise exchange over that single byte stream. Generic
@@ -610,5 +650,41 @@ mod tests {
         )
         .await;
         assert!(r2.is_err(), "closed peer -> inner error surfaced");
+    }
+
+    #[tokio::test]
+    async fn dial_rung_walks_the_ladder_to_the_live_quic_rung_and_caches_it() {
+        // #31 FD3-b: the live per-rung dialer, driven by the FD3-a ladder, skips a
+        // dead rung and lands on the reachable one — then caches it. A real edge
+        // listens on an ephemeral QUIC (UDP) port; nothing listens on TCP there, so
+        // the TLS-TCP rung is refused and the ladder walks on to the QUIC rung.
+        use crate::ladder::{connect_via_ladder, LadderCache, Rung};
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let _conn = server.accept().await.unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        // Dead TLS-TCP rung first (no TCP listener on the QUIC port), then live QUIC.
+        let ladder = vec![Rung::TlsTcp(addr.port()), Rung::Quic(addr.port())];
+        let mut cache = LadderCache::new();
+        let ip = addr.ip();
+        let got = connect_via_ladder(&mut cache, "test-net", &ladder, |rung| {
+            let cert = cert.clone();
+            async move { dial_rung(rung, ip, cert, Duration::from_millis(500)).await }
+        })
+        .await;
+
+        let (rung, conn) = got.expect("a rung connected");
+        assert_eq!(rung, Rung::Quic(addr.port()), "landed on the live QUIC rung");
+        assert!(matches!(conn, EdgeConn::Quic(_)), "connection is the QUIC transport");
+        assert_eq!(
+            cache.remembered("test-net"),
+            Some(Rung::Quic(addr.port())),
+            "the working rung is cached for the network"
+        );
+        edge.abort();
     }
 }
