@@ -212,10 +212,25 @@ async fn create_tunnel(
                 .send()
                 .await
             {
-                Ok(r) if r.status().is_success() => {}
+                // #71: log success too (not just failures), so tunnel creation's
+                // auto-authorize is diagnosable from control-plane logs alone —
+                // previously a success was silent and indistinguishable from the
+                // edge_admin=None skip below.
+                Ok(r) if r.status().is_success() => {
+                    eprintln!("ct-cp: edge authorize-host for {host} succeeded")
+                }
                 Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
                 Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
             }
+        } else {
+            // #71: the most likely silent cause — the edge admin API isn't wired, so
+            // the hostname is never authorized and the agent's bind is rejected under
+            // CT_EDGE_REQUIRE_HOST_AUTH. Say so loudly instead of doing nothing.
+            eprintln!(
+                "ct-cp: edge authorize-host SKIPPED for {host} — edge admin API not configured \
+                 (set CT_CP_EDGE_ADMIN_URL + CT_CP_EDGE_ADMIN_TOKEN); the agent's hostname bind \
+                 will be rejected while CT_EDGE_REQUIRE_HOST_AUTH is on"
+            );
         }
         // #38 DL2: auto-create the A record (host -> edge IP) so the hostname is
         // publicly resolvable without a manual DNS step. Both best-effort; logged.
