@@ -260,10 +260,49 @@ ZQIDAQAB
 
     #[test]
     fn from_rsa_components_rejects_malformed_components() {
-        // The positive round-trip (verify a token) lands in KC2-b with a real key
-        // vector; here, invalid base64url components must surface as an error, not
-        // a panic — the startup path treats that as "SSO key unavailable".
+        // Invalid base64url components must surface as an error, not a panic — the
+        // startup path treats that as "SSO key unavailable".
         let err = OidcVerifier::from_rsa_components("!!not-base64!!", "AQAB", ISSUER);
         assert!(err.is_err(), "garbage modulus is rejected");
+    }
+
+    #[test]
+    fn from_rsa_components_verifies_a_token_signed_by_the_matching_key() {
+        // #42 KC2-b: the end-to-end JWKS -> verifier chain. Generate a throwaway
+        // RSA key AT RUNTIME (never committed — secret-guard forbids a private key
+        // in the tree), publish its (n, e) the way a JWK would, sign an RS256 token
+        // with the private half, and verify it through from_rsa_components.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+
+        let mut rng = rand::rngs::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).expect("generate RSA key");
+        let public = RsaPublicKey::from(&private);
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let pem = private.to_pkcs8_pem(LineEnding::LF).expect("pkcs8 pem");
+
+        let claims = serde_json::json!({ "sub": "user-99", "iss": ISSUER, "exp": now() + 3600 });
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(pem.as_bytes()).expect("signing key"),
+        )
+        .expect("sign RS256");
+
+        // The realm advertises (n, e) at its JWKS; the verifier is built from them.
+        let v = OidcVerifier::from_rsa_components(&n, &e, ISSUER).expect("verifier from components");
+        assert_eq!(v.subject(&token).unwrap(), "user-99", "token verifies via JWKS components");
+
+        // A DIFFERENT key's components must reject the token — proving it checks the
+        // signature, not merely that the components parse.
+        let other_priv = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let other = RsaPublicKey::from(&other_priv);
+        let on = URL_SAFE_NO_PAD.encode(other.n().to_bytes_be());
+        let oe = URL_SAFE_NO_PAD.encode(other.e().to_bytes_be());
+        let v2 = OidcVerifier::from_rsa_components(&on, &oe, ISSUER).unwrap();
+        assert!(v2.subject(&token).is_err(), "a non-matching key rejects the token");
     }
 }

@@ -22,3 +22,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"]
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Test-only: generate a throwaway RSA key at runtime to prove the JWKS -> verifier
+# round-trip (#42 KC2-b) without committing a private key (secret-guard forbids).
+rsa = { version = "0.9", features = ["pem"] }
+base64 = "0.22"

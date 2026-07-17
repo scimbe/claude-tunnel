@@ -1512,8 +1512,10 @@ importierter Demo-Realm, passend zu dem, was `PortalOidc::from_env`/`OidcVerifie
     `use=sig`-oder-fehlt, `alg=RS256`-oder-fehlt; überspringt EC-/Enc-Keys; `None` wenn keiner) + `OidcVerifier::from_rsa_components(n,e,issuer)`
     (jsonwebtoken `DecodingKey::from_rsa_components`, spart den PEM-Umweg). Frozen-Tests `jwks_uri_is_derived_from_the_issuer`,
     `jwks_signing_key_selects_the_rs256_sig_key_among_decoys`, `from_rsa_components_rejects_malformed_components`. Gate grün (control-plane 124).
-  - **KC2-b** ⏳ **Positiver Krypto-Round-Trip**: mit echtem RSA-JWK-Vektor ein RS256-Token signieren → via `from_rsa_components` verifizieren
-    (`subject()` == erwartetes `sub`), damit die JWKS→Verifier-Kette end-to-end bewiesen ist.
+  - **KC2-b** ✅ **Positiver Krypto-Round-Trip**: Frozen-Test `from_rsa_components_verifies_a_token_signed_by_the_matching_key` —
+    generiert zur Laufzeit einen 2048-bit-RSA-Schlüssel (Dev-Deps `rsa`+`base64`, **kein** Private-Key im Baum, Secret-Guard-konform),
+    publiziert `(n,e)` base64url wie ein JWK, signiert ein RS256-Token mit dem Private-Half und verifiziert es über `from_rsa_components`
+    (`subject()`==`user-99`); ein Fremdschlüssel weist das Token ab (prüft die Signatur, nicht nur das Parsen). Gate grün (control-plane 125).
   - **KC2-c** ⏳ **Startup-Fetch**: beim Start das Realm-JWKS (`jwks_uri_for(CT_OIDC_ISSUER)`) via reqwest holen, Signaturschlüssel wählen,
     Verifier bauen — `CT_OIDC_PUBKEY_PATH` als Fallback behalten. Best-effort + geloggt.
 - **KC3** ⏳ **Control-Plane-Verdrahtung + Doku**: `CT_OIDC_*`-Env (Issuer/Client-ID/Redirect/Token-URL/PubkeyPath) im Overlay auf
