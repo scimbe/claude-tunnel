@@ -695,6 +695,22 @@ mod tests {
             );
         }
 
+        // #49: identity-brokering providers (google/github/gitlab) are declared,
+        // with credentials sourced from ${env.KC_*} — never baked into the export.
+        let idps = realm["identityProviders"].as_array().expect("identityProviders present");
+        for want in ["google", "github", "gitlab"] {
+            let idp = idps
+                .iter()
+                .find(|p| p["alias"] == want)
+                .unwrap_or_else(|| panic!("{want} broker declared"));
+            assert_eq!(idp["providerId"], want, "{want} providerId");
+            assert_eq!(idp["trustEmail"], true, "{want} trustEmail (so #43's email gate works)");
+            let cid = idp["config"]["clientId"].as_str().unwrap_or("");
+            let sec = idp["config"]["clientSecret"].as_str().unwrap_or("");
+            assert!(cid.contains("${env."), "{want} clientId from env, not baked: {cid}");
+            assert!(sec.contains("${env."), "{want} clientSecret from env, not baked: {sec}");
+        }
+
         let redirect = client["redirectUris"]
             .as_array()
             .and_then(|u| u.iter().find_map(|v| v.as_str().filter(|s| s.ends_with("/portal/callback"))))

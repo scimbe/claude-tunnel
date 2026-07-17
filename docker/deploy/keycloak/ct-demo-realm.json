@@ -32,5 +32,46 @@
       },
       "defaultClientScopes": ["email", "profile"]
     }
+  ],
+  "identityProviders": [
+    {
+      "alias": "google",
+      "providerId": "google",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "linkOnly": false,
+      "config": {
+        "clientId": "${env.KC_GOOGLE_CLIENT_ID:}",
+        "clientSecret": "${env.KC_GOOGLE_CLIENT_SECRET:}",
+        "syncMode": "IMPORT"
+      }
+    },
+    {
+      "alias": "github",
+      "providerId": "github",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "linkOnly": false,
+      "config": {
+        "clientId": "${env.KC_GITHUB_CLIENT_ID:}",
+        "clientSecret": "${env.KC_GITHUB_CLIENT_SECRET:}",
+        "syncMode": "IMPORT"
+      }
+    },
+    {
+      "alias": "gitlab",
+      "providerId": "gitlab",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "linkOnly": false,
+      "config": {
+        "clientId": "${env.KC_GITLAB_CLIENT_ID:}",
+        "clientSecret": "${env.KC_GITLAB_CLIENT_SECRET:}",
+        "syncMode": "IMPORT"
+      }
+    }
   ]
 }

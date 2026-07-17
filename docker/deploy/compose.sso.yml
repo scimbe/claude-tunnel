@@ -60,6 +60,17 @@ services:
       # X-Forwarded-* — so KC_HOSTNAME pinned to the https URL is what makes
       # Keycloak emit https URLs; no KC_PROXY_HEADERS needed.
       KC_HOSTNAME: "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL=https://<AUTH_PUBLIC_HOST>}"
+      # #49: identity-brokering credentials the realm import substitutes into the
+      # google/github/gitlab providers via ${env.KC_*}. Empty by default — set the
+      # ones you want active in .env (each needs an OAuth app on that platform).
+      # See docs/deploy/keycloak-sso.md. An empty pair leaves that button present
+      # but non-functional; remove/disable unwanted providers in the admin console.
+      KC_GOOGLE_CLIENT_ID: "${KC_GOOGLE_CLIENT_ID:-}"
+      KC_GOOGLE_CLIENT_SECRET: "${KC_GOOGLE_CLIENT_SECRET:-}"
+      KC_GITHUB_CLIENT_ID: "${KC_GITHUB_CLIENT_ID:-}"
+      KC_GITHUB_CLIENT_SECRET: "${KC_GITHUB_CLIENT_SECRET:-}"
+      KC_GITLAB_CLIENT_ID: "${KC_GITLAB_CLIENT_ID:-}"
+      KC_GITLAB_CLIENT_SECRET: "${KC_GITLAB_CLIENT_SECRET:-}"
     volumes:
       - ./keycloak/ct-demo-realm.json:/opt/keycloak/data/import/ct-demo-realm.json:ro
     # #48: NO published port — Keycloak is reached only through the edge :443 front

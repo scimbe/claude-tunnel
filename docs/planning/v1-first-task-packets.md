@@ -1539,6 +1539,22 @@ derselben `:443`-Front-Door wie das Portal (FD4-a), erreichbar per eigenem Hostn
   um `CT_EDGE_AUTH_*` ergänzt. Frozen-Test `sso_compose_wires_the_control_plane_to_the_demo_realm` erweitert (`CT_EDGE_AUTH_HOST` verdrahtet,
   **kein** `KEYCLOAK_PORT`-Publish). Gate grün (control-plane 127). **#48 fix-ready** — central fährt den externen Browser-Klick-Durchlauf.
 
+## #49 Keycloak Identity-Brokering — Google/GitHub/GitLab + Custom-OIDC (KC4)
+
+Ziel: die Portal-„Sign in with SSO" soll Google/GitHub/GitLab (+ beliebiger Custom-OIDC) als Login-Optionen anbieten. **Kein**
+Control-Plane-/Portal-Code ändert sich — Keycloak-Feature *Identity Brokering*; die #43-Email-Gate greift danach unverändert.
+
+- **KC4-a** ✅ **Realm-IdP-Block**: `ct-demo-realm.json` um `identityProviders` (google/github/gitlab, `enabled`, `trustEmail`
+  für die #43-Gate) erweitert; Credentials via `${env.KC_GOOGLE_CLIENT_ID:}` etc. (leerer Default → import-sicher, **kein Secret im
+  Repo**). `compose.sso.yml` reicht `KC_GOOGLE/GITHUB/GITLAB_CLIENT_ID|SECRET` (leer-Default) an Keycloak durch, damit die
+  `${env.*}`-Substitution beim Import greift. Frozen-Test (Erweiterung von `demo_realm_matches_the_portal_oidc_contract`):
+  alle 3 Broker deklariert, `trustEmail`, Creds aus `${env.*}` (nie gebacken). Gate grün (control-plane 127).
+  **Verifikations-Abhängigkeit:** dass Keycloak den IdP-Block *sauber importiert* + die Login-Buttons erscheinen, ist **nicht
+  hermetisch prüfbar** (kein Keycloak im Cargo-Gate) — central verifiziert live (wie #42). Darum #49 **in-progress**, nicht fix-ready.
+- **KC4-b** ⏳ **Runbook**: OAuth-App-Registrierung (Google/GitHub/GitLab) + die `.env`-Keys (`KC_*_CLIENT_ID|SECRET`) + Redirect-URI
+  (`https://auth.<zone>/realms/ct-demo/broker/<alias>/endpoint`) + Schritte für einen Custom-OIDC-Provider via Admin-Console
+  (Identity Providers → Add → OpenID Connect v1.0). Dann #49 **fix-ready**; central fährt den externen Klick-Durchlauf mit echten Creds.
+
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
 
 Ziel: kein manuelles A-Record-Anlegen mehr — beim Setzen eines Tunnel-Hostnamens automatisch den A-Record (Host → Edge-IP)
