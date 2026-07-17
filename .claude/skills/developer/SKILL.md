@@ -130,12 +130,39 @@ When a sweep finds **0 open issues** and the milestone isn't tagged yet, run the
 secret scan and push the next version tag on `main` HEAD (the current milestone
 tag is `v0.1.0`). Do **not** close issues yourself to force this.
 
-## Be active
+## Cadence — at most once every 6h
 
-Designed to run under the bundled `/loop` skill for continuous operation, e.g.
-`/loop 15m /developer`. Each cycle: one sweep, at most one issue. Loop guardrails:
-if the gate fails the same way twice in a row, stop and report rather than
-thrashing. Keep cycles bounded — no open-ended edit storms.
+Run the sweep **at most once every 6 hours**, and **only when there is something
+to do**. Do not self-schedule frequent wake-ups: an idle sweep (nothing in (A)/(B),
+everything else `fix-ready`/`in-progress`/operator-gated) must **not** trigger a
+short re-check. When you finish a cycle (or find nothing qualifies), schedule the
+next sweep ~6h out — e.g. a recurring cloud schedule `0 */6 * * *`, or the longest
+available wake-up — rather than a 15–30 min tick. A backlog only changes when a
+field role (central/agent) or scimbe files/relabels an issue, which is a
+human-paced event; polling faster just produces noise.
+
+Each cycle: one sweep, at most one issue. Loop guardrails: if the gate fails the
+same way twice in a row, stop and report rather than thrashing. Keep cycles
+bounded — no open-ended edit storms.
+
+## Documentation hygiene
+
+When a change touches **user-facing behaviour** — a new/renamed env var, a new
+command or subcommand, a new feature or config file, a changed default, a new
+compose/deploy artifact — the docs must not go stale. After such a change lands
+(gate green, pushed), **spawn a background agent** to reconcile the docs:
+
+- Read `README.md` and **every doc it links** (follow `](docs/…​.md)` relative
+  links transitively); also `docs/install.md`, `docs/architecture.md`, the
+  `docs/deploy/*` runbooks, and `docs/planning/PROGRESS.md`.
+- Update only what the **actual code/config now does** — new env vars (e.g.
+  `CT_*`), new commands, new features, changed defaults. **Verify against the
+  code; never invent.** Preserve voice and structure; make the minimal accurate edit.
+- Run `scripts/check-no-secrets.sh`, then commit as scimbe (same footers) and push
+  to `main`. Docs-only commits use `docs(<scope>): …`.
+
+Delegate this to a background agent so it doesn't block the issue cycle. Purely
+internal changes (refactors, test-only, no behaviour/flag change) need no doc pass.
 
 ## Run a demo on demand
 
