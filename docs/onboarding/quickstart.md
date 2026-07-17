@@ -57,6 +57,11 @@ argument is optional.
 | `CT_AGENT_DIRECT_ADVERTISE` | unset | IP to advertise for a direct P2P path (bypasses the relay). |
 | `CT_AGENT_METRICS_LISTEN` | unset | Address to serve Prometheus `/metrics` on. |
 | `CT_AGENT_EDGE_CERT` | `/shared/edge-cert.der` | Path to the edge CA certificate. |
+| `CT_AGENT_FALLBACK_443` | `false` | If the configured edge port is blocked, also try the edge's unified `:443` front door (TLS-TCP, `ALPN=ct-edge`) (#46). |
+| `CT_AGENT_RECONNECT_MAX_ATTEMPTS` | `10` | Reconnect attempts before the agent exits; `0` = retry forever (for long-lived deployments that must rejoin a redeployed edge) (#36). |
+
+`CT_AGENT_EDGE` and `CT_AGENT_ORIGIN` accept either `IP:port` or `host:port` — a
+hostname (e.g. a Compose service name) is resolved via DNS (#45).
 
 ## What just happened
 

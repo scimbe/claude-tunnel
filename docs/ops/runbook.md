@@ -15,6 +15,11 @@ docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.e
 Brings up the control plane (durable `cpdata` volume) and one edge, both with
 `restart: unless-stopped` and a `/readyz` healthcheck.
 
+**Optional SSO overlay** — add a real Keycloak login to the portal with
+`docker/deploy/compose.sso.yml` (a Keycloak IdP plus the `CT_OIDC_*` env merged
+onto the control plane). See the [Keycloak SSO runbook](../deploy/keycloak-sso.md);
+the base stack runs unchanged without it.
+
 ### Hosted (Kubernetes)
 
 ```bash
@@ -31,13 +36,18 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 |----------|-----------|---------|
 | `CT_CONTROL_PLANE_LISTEN` | control plane | bind address (default `0.0.0.0:8090`) |
 | `CT_CONTROL_PLANE_DB` | control plane | SQLite path (put it on durable storage) |
-| `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL (with `CT_OIDC_PUBKEY_PATH`, enables `/me/*`) |
-| `CT_OIDC_PUBKEY_PATH` | control plane | PEM file with the realm's RSA public key; set with `CT_OIDC_ISSUER` to mount the authenticated `/me/*` endpoints |
+| `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL; **alone** enables OIDC — the realm JWKS is fetched at startup to mount `/me/*` (#42) |
+| `CT_OIDC_PUBKEY_PATH` | control plane | PEM of the realm's RSA public key; an **offline override** of the JWKS fetch (takes precedence when set) |
 | `CT_PAYMENT_WEBHOOK_SECRET` | control plane | provider webhook signing secret (unset ⇒ payment disabled) |
 | `CT_EDGE_LISTEN` | edge | bind address (default `0.0.0.0:4433`) |
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
 | `CT_EDGE_CERT_OUT` | edge | path the edge writes its CA root to |
 | `CT_EDGE_METRICS_LISTEN` | edge | bind address for `GET /metrics` (unset ⇒ off, issue #10) |
+| `CT_FRONT_DOOR` | edge | bind address for the unified :443 front door (SNI/ALPN-multiplexed relay + Portal + browser tunnels); unset ⇒ off, additive to `:4433`/`:8090` (#31) |
+| `CT_EDGE_PORTAL_HOST` | edge | SNI hostname the front door treats as the Portal (terminate + reverse-proxy); other SNIs stay passthrough tunnels |
+| `CT_CP_PROXY_ADDR` | edge | control-plane address the front door reverse-proxies the Portal to (required to serve the Portal on :443) |
+| `CT_EDGE_PORTAL_CERT` / `CT_EDGE_PORTAL_KEY` | edge | PEM cert+key so the front door terminates the Portal's TLS and reverse-proxies HTTP to the control plane (FD4-a, #31); absent ⇒ raw-proxy needing a TLS-speaking upstream |
+| `CT_EDGE_HTTP_REDIRECT` | edge | optional `:80` listener (e.g. `0.0.0.0:80`) that 308-redirects to `:443` (unset ⇒ off) |
 | `CT_CP_EDGE_CERT_PATH` | control plane | path it reads the edge CA root from to publish at `/pki/ca` (default `/shared/edge-cert.der`, issue #11) |
 | `CT_AGENT_EDGE_CERT_URL` | agent | fetch the edge CA root from this control-plane URL instead of a local file (issue #11) |
 
@@ -244,10 +254,12 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 ## Enabling authenticated endpoints
 
 The `/me/*` endpoints (OIDC bearer verification, account derived from the token
-subject) are mounted only when **both** `CT_OIDC_ISSUER` and `CT_OIDC_PUBKEY_PATH`
-are set — the latter pointing at a PEM file with the realm's RSA public key. With
-neither set they are absent (any `/me/*` request → `404`); the unauthenticated
-billing/webhook flow works regardless.
+subject) are mounted when `CT_OIDC_ISSUER` is set: the control plane fetches the
+realm's JWKS at startup and builds the RS256 verifier — no manual key export (#42).
+`CT_OIDC_PUBKEY_PATH` (a PEM of the realm's RSA public key) is an optional offline
+override and takes precedence when set. With `CT_OIDC_ISSUER` unset the endpoints
+are absent (any `/me/*` request → `404`); the unauthenticated billing/webhook flow
+works regardless.
 
 ## Escalation & scope
 

@@ -75,7 +75,7 @@ in the [operations runbook](ops/runbook.md).
 - **`/readyz` returns 503** — the control plane can't reach its database; check the
   data volume mount.
 - **Webhooks return 401** — `CT_PAYMENT_WEBHOOK_SECRET` doesn't match the provider.
-- **`/me/*` returns 404** — OIDC isn't configured; set `CT_OIDC_ISSUER` and
-  `CT_OIDC_PUBKEY_PATH`.
+- **`/me/*` returns 404** — OIDC isn't configured; set `CT_OIDC_ISSUER` (the realm
+  JWKS is fetched at startup; `CT_OIDC_PUBKEY_PATH` is an optional offline override).
 
 More in the runbook's incident-response table.

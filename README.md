@@ -45,7 +45,7 @@ Kubernetes deploy, one-command agent onboarding, and the helper scripts. Plus th
 [operations runbook](docs/ops/runbook.md).
 
 **3. Deep detail** — the reasoning and specification
-The 18 [Architecture Decision Records](docs/adr/), the [specification](docs/SPEC.md),
+The 19 [Architecture Decision Records](docs/adr/), the [specification](docs/SPEC.md),
 and the security set: [whitepaper](docs/security/whitepaper.md) ·
 [threat model](docs/security/threat-model.md) ·
 [TLS everywhere](docs/security/tls-everywhere.md) ·
