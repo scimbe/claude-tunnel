@@ -1806,3 +1806,21 @@ unverified. Mostly architectural (needs scimbe decisions); one clean fix landed.
 - **SEC78c** ⏳ **NEEDS DECISION** — build isolation: drop the host-cache bind-mount / run as a non-host
   uid so a dep `build.rs` can't write the repo or poison the shared cache; pin+verify `cargo-audit`
   instead of cached-reuse (evidence #4). Relates to #77 (skill trust model).
+
+## #82 OIDC hardening (security-review)
+
+GLM-5.2 review: 3 OIDC weaknesses. Decomposed:
+
+- **SEC82a** ✅ **id_token now cryptographically verified** (issue #1, the auth-bypass) + **kid-bound JWKS
+  key selection** (issue #3) + **id_token audience validated** (issue #2, for the id_token specifically):
+  `portal.rs` replaced the insecure `insecure_disable_signature_validation()` decode with
+  `identity_from_verified_id_token` — the exchanger fetches the realm JWKS and verifies the id_token's RS256
+  signature (key chosen by the token's `kid`, `oidc::jwks_signing_key_for_kid`/`token_kid`), issuer,
+  audience (an id_token's aud IS the client) and expiry before trusting sub/email. So a tampered/confused
+  token-endpoint response can no longer inject an arbitrary subject/email. Frozen tests: hermetic runtime-RSA
+  id_token verified (valid → sub+email; forged-key/wrong-issuer/wrong-audience rejected; sub required) +
+  kid selection among multiple JWKS keys. Gate green.
+- **SEC82b** ⏳ **Bearer-token audience (issue #2 for /me/*)**: the access-token verifier
+  (`oidc.rs OidcVerifier`) still has `validate_aud=false` because Keycloak access-token audiences vary by
+  client — enabling it needs the realm's actual access-token `aud` shape confirmed against live Keycloak
+  (central), so it's deliberately not flipped blind. Needs a field-checked audience value.

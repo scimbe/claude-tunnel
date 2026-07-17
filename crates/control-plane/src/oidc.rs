@@ -135,6 +135,37 @@ pub fn jwks_signing_key(jwks: &serde_json::Value) -> Option<(String, String)> {
     })
 }
 
+/// The `kid` (key id) from a JWT header, if present (#82). Lets a verifier pick the
+/// exact JWKS key that signed a token under key rotation.
+pub fn token_kid(token: &str) -> Option<String> {
+    jsonwebtoken::decode_header(token).ok()?.kid
+}
+
+/// Like [`jwks_signing_key`] but selects the RS256 signing key whose `kid` matches
+/// `kid` (#82). Correct under key rotation — a realm that keeps an old key in its
+/// JWKS must verify a token against the exact key that signed it (the token
+/// header's `kid`), not just the first usable key. Returns `None` if no usable
+/// RSA/RS256 key carries that `kid`.
+pub fn jwks_signing_key_for_kid(jwks: &serde_json::Value, kid: &str) -> Option<(String, String)> {
+    jwks.get("keys")?.as_array()?.iter().find_map(|k| {
+        if k.get("kid").and_then(|v| v.as_str()) != Some(kid) {
+            return None;
+        }
+        if k.get("kty").and_then(|v| v.as_str()) != Some("RSA") {
+            return None;
+        }
+        if matches!(k.get("use").and_then(|v| v.as_str()), Some(u) if u != "sig") {
+            return None;
+        }
+        if matches!(k.get("alg").and_then(|v| v.as_str()), Some(a) if a != "RS256") {
+            return None;
+        }
+        let n = k.get("n")?.as_str()?.to_string();
+        let e = k.get("e")?.as_str()?.to_string();
+        Some((n, e))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +349,27 @@ ZQIDAQAB
         let (on, oe, _) = rsa_jwk_and_token("someone-else");
         let v2 = OidcVerifier::from_rsa_components(&on, &oe, ISSUER).unwrap();
         assert!(v2.subject(&token).is_err(), "a non-matching key rejects the token");
+    }
+
+    #[test]
+    fn jwks_signing_key_for_kid_selects_by_key_id() {
+        // #82: with several signing keys in the JWKS (a rotation window), select the
+        // one whose kid matches — not merely the first usable key.
+        let jwks = serde_json::json!({"keys": [
+            {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "old", "n": "N_OLD", "e": "AQAB"},
+            {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "new", "n": "N_NEW", "e": "AQAB"}
+        ]});
+        assert_eq!(jwks_signing_key_for_kid(&jwks, "new"), Some(("N_NEW".into(), "AQAB".into())));
+        assert_eq!(jwks_signing_key_for_kid(&jwks, "old"), Some(("N_OLD".into(), "AQAB".into())));
+        assert_eq!(jwks_signing_key_for_kid(&jwks, "absent"), None, "unknown kid -> None");
+        // token_kid pulls the kid from a token header.
+        let token = encode(
+            &{ let mut h = Header::new(Algorithm::HS256); h.kid = Some("new".into()); h },
+            &serde_json::json!({"sub": "u", "iss": ISSUER, "exp": now() + 60}),
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap();
+        assert_eq!(token_kid(&token).as_deref(), Some("new"));
     }
 
     #[tokio::test]

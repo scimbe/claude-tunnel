@@ -113,6 +113,19 @@ impl PortalOidc {
         })
     }
 
+    /// The realm issuer (an id_token's `iss`), derived from the token endpoint by
+    /// stripping Keycloak's `/protocol/openid-connect/token` suffix (#82).
+    fn issuer(&self) -> &str {
+        self.token_url
+            .strip_suffix("/protocol/openid-connect/token")
+            .unwrap_or(&self.token_url)
+    }
+
+    /// The realm JWKS (signing-key) endpoint used to verify the id_token (#82).
+    fn jwks_url(&self) -> String {
+        crate::oidc::jwks_uri_for(self.issuer())
+    }
+
     /// Build the Authorization Code redirect URL, carrying a CSRF `state`.
     fn authorize_redirect(&self, state: &str) -> String {
         format!(
@@ -219,22 +232,45 @@ fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
                 .get("id_token")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "token response has no id_token".to_string())?;
-            identity_from_id_token(id_token)
+            // #82: verify the id_token's signature against the realm JWKS (kid-bound),
+            // issuer, audience and expiry BEFORE trusting its sub/email. The TLS
+            // back-channel is not a substitute for verifying the token itself — a
+            // tampered/confused response could otherwise inject an arbitrary subject.
+            let jwks: serde_json::Value = reqwest::Client::new()
+                .get(cfg.jwks_url())
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
+            identity_from_verified_id_token(id_token, &jwks, cfg.issuer(), &cfg.client_id)
         })
     })
 }
 
-/// Extract the `sub` (required) and `email` (optional, #43 access-list gate) from
-/// an id_token JWT. Signature validation is disabled deliberately: the token came
-/// straight from the IdP token endpoint over TLS (see [`default_exchanger`]). Kept
-/// standalone so it is unit-tested directly.
-fn identity_from_id_token(jwt: &str) -> Result<ExchangedIdentity, String> {
-    let mut v = jsonwebtoken::Validation::default();
-    v.insecure_disable_signature_validation();
-    v.validate_exp = false;
-    v.validate_aud = false;
-    v.required_spec_claims.clear();
-    let key = jsonwebtoken::DecodingKey::from_secret(b"");
+/// Verify an id_token against the realm JWKS and extract the `sub` (required) and
+/// `email` (optional, #43 access-list gate). #82: replaces the previous insecure
+/// decode — the signature (RS256, key selected by the token's `kid`), the issuer,
+/// the audience (an id_token's `aud` IS the client that requested it) and expiry
+/// are all checked, so a tampered token endpoint response cannot inject a subject.
+/// Kept standalone so it is unit-tested directly against a JWKS.
+fn identity_from_verified_id_token(
+    jwt: &str,
+    jwks: &serde_json::Value,
+    issuer: &str,
+    client_id: &str,
+) -> Result<ExchangedIdentity, String> {
+    let (n, e) = crate::oidc::token_kid(jwt)
+        .as_deref()
+        .and_then(|kid| crate::oidc::jwks_signing_key_for_kid(jwks, kid))
+        .or_else(|| crate::oidc::jwks_signing_key(jwks))
+        .ok_or_else(|| "no usable RS256 signing key in realm JWKS".to_string())?;
+    let key = jsonwebtoken::DecodingKey::from_rsa_components(&n, &e).map_err(|e| e.to_string())?;
+    let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    v.set_issuer(&[issuer]);
+    v.set_audience(&[client_id]);
+    v.validate_exp = true;
     let data = jsonwebtoken::decode::<serde_json::Value>(jwt, &key, &v).map_err(|e| e.to_string())?;
     let subject = data
         .claims
@@ -1052,29 +1088,71 @@ mod tests {
         assert!(cookies.iter().any(|c| c.starts_with("ct_portal_state=;")), "state cleared");
     }
 
+    /// Sign an id_token with a throwaway RSA key (RS256, kid `k1`) and return it
+    /// with the matching JWKS — the realm-signing-key model, hermetic (#82).
+    fn signed_id_token_and_jwks(claims: serde_json::Value) -> (String, serde_json::Value) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+        let mut rng = rand::rngs::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
+        let public = RsaPublicKey::from(&private);
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let pem = private.to_pkcs8_pem(LineEnding::LF).expect("pem");
+        let mut h = Header::new(Algorithm::RS256);
+        h.kid = Some("k1".to_string());
+        let jwt = encode(&h, &claims, &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap()).unwrap();
+        let jwks = serde_json::json!({"keys": [
+            {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k1", "n": n, "e": e}
+        ]});
+        (jwt, jwks)
+    }
+
     #[test]
-    fn identity_from_id_token_reads_sub_and_email() {
-        use jsonwebtoken::{encode, EncodingKey, Header};
-        let jwt = encode(
-            &Header::default(),
-            &serde_json::json!({ "sub": "kc-user-42", "email": "a@becke.biz", "aud": "ct-portal" }),
-            &EncodingKey::from_secret(b"whatever"),
-        )
-        .unwrap();
-        // Signature is not verified (token comes over the TLS back-channel).
-        let id = identity_from_id_token(&jwt).unwrap();
+    fn id_token_signature_issuer_and_audience_are_verified() {
+        let iss = "https://kc.example/realms/ct-demo";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // A validly-signed id_token yields sub + email.
+        let (jwt, jwks) = signed_id_token_and_jwks(
+            serde_json::json!({"sub":"kc-user-42","email":"a@becke.biz","iss":iss,"aud":"ct-portal","exp":now+3600}),
+        );
+        let id = identity_from_verified_id_token(&jwt, &jwks, iss, "ct-portal").unwrap();
         assert_eq!(id.subject, "kc-user-42");
         assert_eq!(id.email.as_deref(), Some("a@becke.biz"));
-        assert!(identity_from_id_token("garbage").is_err());
 
-        // #43: sub is required, email is optional (absent claim -> None).
-        let no_email = encode(
-            &Header::default(),
-            &serde_json::json!({ "sub": "kc-user-7" }),
-            &EncodingKey::from_secret(b"x"),
-        )
-        .unwrap();
-        assert_eq!(identity_from_id_token(&no_email).unwrap().email, None);
+        // #82 core: a token NOT signed by the realm key (attacker-forged, same kid)
+        // is rejected — the JWKS-published key doesn't match the signature.
+        let (forged, _) = signed_id_token_and_jwks(
+            serde_json::json!({"sub":"attacker","iss":iss,"aud":"ct-portal","exp":now+3600}),
+        );
+        assert!(
+            identity_from_verified_id_token(&forged, &jwks, iss, "ct-portal").is_err(),
+            "a token not signed by the realm key must be rejected"
+        );
+
+        // Wrong issuer and wrong audience are rejected.
+        let (bad_iss, j2) = signed_id_token_and_jwks(
+            serde_json::json!({"sub":"x","iss":"https://evil/realms/x","aud":"ct-portal","exp":now+3600}),
+        );
+        assert!(identity_from_verified_id_token(&bad_iss, &j2, iss, "ct-portal").is_err(), "wrong issuer rejected");
+        let (bad_aud, j3) = signed_id_token_and_jwks(
+            serde_json::json!({"sub":"x","iss":iss,"aud":"other-client","exp":now+3600}),
+        );
+        assert!(identity_from_verified_id_token(&bad_aud, &j3, iss, "ct-portal").is_err(), "wrong audience rejected");
+
+        // #43: sub required, email optional; garbage rejected.
+        let (no_email, j4) = signed_id_token_and_jwks(
+            serde_json::json!({"sub":"kc-user-7","iss":iss,"aud":"ct-portal","exp":now+3600}),
+        );
+        assert_eq!(identity_from_verified_id_token(&no_email, &j4, iss, "ct-portal").unwrap().email, None);
+        assert!(identity_from_verified_id_token("garbage", &jwks, iss, "ct-portal").is_err());
     }
 
     #[test]
