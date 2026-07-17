@@ -86,6 +86,17 @@ only (unchanged payload-blindness). A channel is therefore a **hub of pairwise
 agent↔agent Noise sessions**, *not* a multi-party group session — which sidesteps the
 two-party Noise constraint honestly instead of inventing group crypto.
 
+### Key custody (decided 2026-07-17)
+The channel operator's grant-signing key is **agent-held**, not control-plane-held.
+The operator *agent* generates and holds its channel keypair and signs member
+[`ChannelGrant`]s itself; the control-plane channel registry stores only the
+operator **public** key + membership/invitations (it never holds a channel signing
+key). This keeps the fabric's trust layer consistent with the provider-blind, thin
+control plane (ADR-0017) — the operator is the sole authority over who may join its
+channel. Trade-off accepted: the operator agent must be reachable to mint grants and
+honour invitations (the cross-user flow, AF3, brokers the invitation through the
+control plane but the resulting member grant is still agent-signed).
+
 ## Consequences
 
 New building blocks the later sub-packets must add (none exist yet):

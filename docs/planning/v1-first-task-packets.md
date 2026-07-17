@@ -1688,11 +1688,12 @@ Decomposed:
   direct endpoint (host:port tail). encode/decode with non-empty-endpoint + full-grant validation; the AF2b
   broker parses two of these to pair. 1 frozen test (roundtrip + malformed: no endpoint / truncated /
   bad-utf8). Design-robust (independent of the key-custody decision). Gate green.
-- **AF2d** ⏳ **Same-user QUIC brokering + transport** (BLOCKED on a design decision): generalise
-  `rendezvous.rs` to relay/broker two agents over QUIC using AF2b + the AF2c request; the two run a pairwise
-  Noise session (edge broker, no payload relay); real two-agent integration test. Needs scimbe's call on
-  channel-operator **key custody** (agent-held vs. portal/control-plane-held) + the channel registry that
-  supplies the edge the operator pubkey (like host-auth). Do NOT build until answered — avoids rework.
+- **AF2d** ⏳ **Same-user QUIC brokering + transport** (UNBLOCKED — key custody decided 2026-07-17:
+  **agent-held**, ADR-0020). Operator agent holds its channel keypair + signs grants; control-plane
+  channel registry stores only the operator PUBLIC key + membership and hands the edge that pubkey (like
+  host-auth supplies authorized hostnames). Then: generalise `rendezvous.rs` to broker two agents over QUIC
+  using AF2b + the AF2c request; the two run a pairwise Noise session (edge broker, no payload relay); real
+  two-agent integration test. Split if large: AF2d-registry (control-plane store) then AF2d-transport.
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration
