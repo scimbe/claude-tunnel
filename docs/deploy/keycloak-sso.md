@@ -70,6 +70,7 @@ them directly.
 ```bash
 docker compose \
   -f docker/deploy/compose.selfhost.yml \
+  -f docker/deploy/compose.frontdoor.yml \
   -f docker/deploy/compose.sso.yml \
   --env-file docker/deploy/.env up --build -d
 ```
