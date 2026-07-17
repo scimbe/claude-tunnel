@@ -109,9 +109,63 @@ exec "$tmp/ct-agent" onboard
     )
 }
 
+/// Render the PowerShell `/install.ps1` script the Windows one-liner pipes into
+/// `iex` (#75 IS4 — the Windows analog of [`render_install_sh`]). It detects the
+/// arch, downloads the matching prebuilt `ct-agent-windows-<arch>.exe` from
+/// `release_base`, and runs `ct-agent onboard` — which reads
+/// `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN` from the environment the one-liner set (never a
+/// command argument). `release_base` is trusted config, trailing slash trimmed.
+/// This is the served script CONTENT; the `/install.ps1` route is IS3b and the
+/// prebuilt release binaries are IS2. Uses a placeholder + replace rather than
+/// `format!` so PowerShell's `{}` blocks need no brace-escaping.
+pub fn render_install_ps1(release_base: &str) -> String {
+    INSTALL_PS1_TEMPLATE.replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
+}
+
+const INSTALL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
+# claude-tunnel agent installer (#75). Piped from the portal one-liner:
+#   $env:CT_JOIN_TOKEN='...'; $env:CT_AGENT_TOKEN='...'; irm <portal>/install.ps1 | iex
+# Run this on the machine you want to expose (the origin), not your laptop.
+$ErrorActionPreference = 'Stop'
+if (-not $env:CT_JOIN_TOKEN)  { Write-Error 'ct-agent install: set CT_JOIN_TOKEN (from the portal install page)';  exit 1 }
+if (-not $env:CT_AGENT_TOKEN) { Write-Error 'ct-agent install: set CT_AGENT_TOKEN (from the portal install page)'; exit 1 }
+$arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+  'AMD64' { 'x86_64' }
+  'ARM64' { 'aarch64' }
+  default { Write-Error "ct-agent install: unsupported architecture '$($env:PROCESSOR_ARCHITECTURE)'"; exit 1 }
+}
+$asset = "ct-agent-windows-$arch.exe"
+$url = "__RELEASE_BASE__/$asset"
+$dir = Join-Path $env:TEMP ("ct-agent-" + [System.Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$exe = Join-Path $dir $asset
+Write-Host "ct-agent install: downloading $url"
+Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+# Tokens are inherited from the environment (never on the command line).
+& $exe onboard
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_ps1_detects_arch_downloads_and_onboards() {
+        let ps = render_install_ps1("https://github.com/scimbe/claude-tunnel/releases/latest/download/");
+        assert!(ps.contains("#Requires -Version 5"), "PowerShell header");
+        assert!(ps.contains("$ErrorActionPreference = 'Stop'"), "fail-fast");
+        assert!(ps.contains("PROCESSOR_ARCHITECTURE"), "detects arch");
+        assert!(ps.contains("'AMD64'") && ps.contains("'ARM64'") && ps.contains("x86_64") && ps.contains("aarch64"), "normalises arch");
+        assert!(ps.contains(r#"$asset = "ct-agent-windows-$arch.exe""#), "per-arch windows asset");
+        assert!(
+            ps.contains(r#"$url = "https://github.com/scimbe/claude-tunnel/releases/latest/download/$asset""#),
+            "downloads from the release base (trailing slash trimmed)"
+        );
+        assert!(ps.contains("$env:CT_JOIN_TOKEN") && ps.contains("$env:CT_AGENT_TOKEN"), "requires the env tokens");
+        assert!(ps.contains("& $exe onboard"), "runs the agent onboarding");
+        // No secret is ever a positional argument.
+        assert!(!ps.contains("onboard $env:CT_JOIN_TOKEN"), "tokens stay in the env, not argv");
+    }
 
     #[test]
     fn install_sh_detects_os_arch_downloads_and_onboards() {

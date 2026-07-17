@@ -1741,7 +1741,10 @@ prebuilt image dead-ends at the final step. Substantial feature (like #72) → d
   secret in argv). Gate green.
 - **IS3b** ⏳ **`/install.sh` + `/install.ps1` routes**: axum handlers serving the rendered scripts (release
   base from config), replacing the honest-stopgap 404. Wire once IS2 release binaries exist.
-- **IS4** ⏳ **`/install.ps1` route**: same for PowerShell/Windows.
+- **IS4** ✅ **`/install.ps1` script renderer** (`installer::render_install_ps1`): the Windows analog of
+  IS3a — detects arch (PROCESSOR_ARCHITECTURE → x86_64/aarch64), downloads `ct-agent-windows-<arch>.exe`
+  from the release base, `$ErrorActionPreference=Stop`, temp dir, `& $exe onboard` (tokens from env, never
+  argv). 1 frozen test. Gate green. (The route serving it is IS3b; binaries are IS2.)
 - **IS5** ⏳ **Real integration test**: execute the served script in a CLEAN container (no prebuilt
   image), not just the page's text generation. **fix-ready only when a fresh customer can run the
   one-liner end-to-end.**
