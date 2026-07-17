@@ -47,6 +47,9 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_EDGE_PORTAL_HOST` | edge | SNI hostname the front door treats as the Portal (terminate + reverse-proxy); other SNIs stay passthrough tunnels |
 | `CT_CP_PROXY_ADDR` | edge | control-plane address the front door reverse-proxies the Portal to — a hostname (`control-plane:8090`) or literal `IP:port` (required to serve the Portal on :443; a set-but-unresolvable value logs a warning and disables the Portal route) |
 | `CT_EDGE_PORTAL_CERT` / `CT_EDGE_PORTAL_KEY` | edge | PEM cert+key so the front door terminates the Portal's TLS and reverse-proxies HTTP to the control plane (FD4-a, #31); absent ⇒ raw-proxy needing a TLS-speaking upstream |
+| `CT_EDGE_AUTH_HOST` | edge | a second front-door terminate host (e.g. `auth.<zone>`) — routes that SNI to the IdP (Keycloak) behind the same `:443`, no separate published port (#48) |
+| `CT_EDGE_AUTH_ADDR` | edge | upstream the Auth host reverse-proxies to (e.g. `keycloak:8080`); a hostname or `IP:port` |
+| `CT_EDGE_AUTH_CERT` / `CT_EDGE_AUTH_KEY` | edge | PEM cert+key for `CT_EDGE_AUTH_HOST` so the front door terminates its TLS (same BYO-cert story as the Portal) |
 | `CT_EDGE_HTTP_REDIRECT` | edge | optional `:80` listener (e.g. `0.0.0.0:80`) that 308-redirects to `:443` (unset ⇒ off) |
 | `CT_CP_EDGE_CERT_PATH` | control plane | path it reads the edge CA root from to publish at `/pki/ca` (default `/shared/edge-cert.der`, issue #11) |
 | `CT_AGENT_EDGE_CERT_URL` | agent | fetch the edge CA root from this control-plane URL instead of a local file (issue #11) |

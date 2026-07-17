@@ -501,7 +501,9 @@ mod tests {
         let state_e = state.clone();
         let edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
-            let _ = serve_front_door(tcp, &state_e, &acceptor, None, None, None, &challenge).await;
+            let proxies: std::collections::HashMap<String, ct_edge::serve::ProxyTarget> =
+                std::collections::HashMap::new();
+            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge).await;
         });
 
         // Agent: TLS-TCP connect (ALPN=ct-edge set in tcp_tls_connect) + register.

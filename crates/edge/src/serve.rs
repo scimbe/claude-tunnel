@@ -274,6 +274,31 @@ fn resolve_proxy_addr(raw: Option<String>) -> Option<SocketAddr> {
     }
 }
 
+/// Build a front-door terminate-cert acceptor from an env cert/key PEM pair
+/// (#31 FD4-a, #48) — used per proxy host (Portal, Auth IdP). `None` when the pair
+/// is unset (the host is then raw-proxied) or invalid (logged, raw-proxied).
+fn build_front_door_cert(
+    label: &str,
+    cert_env: &str,
+    key_env: &str,
+) -> Option<tokio_rustls::TlsAcceptor> {
+    match (std::env::var(cert_env), std::env::var(key_env)) {
+        (Ok(c), Ok(k)) if !c.is_empty() && !k.is_empty() => {
+            match crate::transport::build_portal_acceptor(&c, &k) {
+                Ok(a) => {
+                    eprintln!("ct-edge: front door terminates {label} TLS ({cert_env})");
+                    Some(a)
+                }
+                Err(e) => {
+                    eprintln!("ct-edge: invalid {label} cert/key ({e}); {label} raw-proxied instead");
+                    None
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Serve one plaintext HTTP/1.x request on `:80` with a `308 Permanent Redirect`
 /// to the HTTPS URL for the same Host + path — so a browser typing
 /// `http://<host>/…` is bounced to `https://<host>/…` on the unified `:443`
@@ -340,20 +365,25 @@ where
 ///
 /// - `EdgeRelay` (ALPN `ct-edge`): terminate TLS with the edge leaf and run the
 ///   TLS-TCP relay protocol ([`serve_tcp_connection`]) — the ADR-0004 fallback.
-/// - `ControlPlane` (Portal SNI, or a web ALPN with no SNI): raw-proxy the whole
-///   TLS stream to the Portal, which terminates it — the edge stays payload-blind.
+/// - `Proxy(host)` (SNI matches a `proxies` terminate-host — the Portal or, since
+///   #48, the Auth IdP): with a TLS acceptor, terminate the browser's TLS and
+///   reverse-proxy plaintext HTTP to that host's upstream (FD4-a); without one,
+///   raw-proxy the TLS stream (a TLS-terminating upstream, e.g. a fronting Caddy).
 /// - `BrowserTunnel(host)`: SNI-passthrough to the bound tunnel (TLS at Origin).
 /// - `Reject`: close.
 ///
-/// Direct `:8090`/`:4433` listeners keep working; the front door is additive and
-/// off unless `CT_FRONT_DOOR` is set.
+/// `proxies` maps a lowercased terminate-host to `(upstream, Option<TlsAcceptor>)`;
+/// `default_host` is the terminate-host a web client with no SNI falls back to
+/// (the Portal). Direct `:8090`/`:4433` listeners keep working; the front door is
+/// additive and off unless `CT_FRONT_DOOR` is set.
+pub type ProxyTarget = (SocketAddr, Option<tokio_rustls::TlsAcceptor>);
+
 pub async fn serve_front_door(
     mut inbound: tokio::net::TcpStream,
     state: &EdgeState<Connection>,
     acceptor: &tokio_rustls::TlsAcceptor,
-    portal_host: Option<&str>,
-    portal_addr: Option<SocketAddr>,
-    portal_tls: Option<&tokio_rustls::TlsAcceptor>,
+    proxies: &std::collections::HashMap<String, ProxyTarget>,
+    default_host: Option<&str>,
     challenge: &Challenge,
 ) -> Result<(), BoxError> {
     let hello = crate::sni::read_client_hello_bytes(&mut inbound)
@@ -361,7 +391,8 @@ pub async fn serve_front_door(
         .ok_or("front door: not a TLS ClientHello")?;
     let alpn = crate::sni::peek_alpn(&hello);
     let sni = crate::sni::peek_sni(&hello);
-    match crate::sni::classify_front_door(&alpn, sni.as_deref(), portal_host) {
+    let hosts: Vec<&str> = proxies.keys().map(|s| s.as_str()).collect();
+    match crate::sni::classify_front_door(&alpn, sni.as_deref(), &hosts, default_host) {
         crate::sni::FrontDoorRoute::EdgeRelay => {
             let joined = Prepend {
                 pre: hello,
@@ -371,29 +402,31 @@ pub async fn serve_front_door(
             let tls = acceptor.accept(joined).await?;
             serve_tcp_connection(tls, state, challenge).await
         }
-        crate::sni::FrontDoorRoute::ControlPlane => {
-            let addr = portal_addr.ok_or("front door: control-plane proxy address not configured")?;
+        crate::sni::FrontDoorRoute::Proxy(host) => {
+            let (addr, tls) = proxies
+                .get(&host)
+                .ok_or("front door: no proxy target for the matched host")?;
             let joined = Prepend {
                 pre: hello,
                 pos: 0,
                 inner: inbound,
             };
-            match portal_tls {
-                // #31 FD4-a: TERMINATE the browser's TLS with the Portal cert, then
-                // reverse-proxy plaintext HTTP to the control plane — so a browser
-                // gets the landing page over HTTPS. The control plane speaks HTTP,
-                // so this is the path that actually serves a page on :443.
+            match tls {
+                // FD4-a / #48: TERMINATE the browser's TLS with this host's cert,
+                // then reverse-proxy plaintext HTTP to its upstream (Portal control
+                // plane, or the Keycloak IdP) — so an HTTP-only upstream serves over
+                // HTTPS on :443, one cert per host.
                 Some(pacc) => {
                     let mut tls = pacc.accept(joined).await?;
-                    let mut upstream = tokio::net::TcpStream::connect(addr).await?;
+                    let mut upstream = tokio::net::TcpStream::connect(*addr).await?;
                     tokio::io::copy_bidirectional(&mut tls, &mut upstream).await?;
                     Ok(())
                 }
-                // Legacy raw-proxy: only serves a page if the upstream itself
-                // terminates TLS (e.g. a fronting Caddy). Kept for that topology.
+                // Raw-proxy: only serves if the upstream itself terminates TLS (e.g.
+                // a fronting Caddy). Kept for that topology.
                 None => {
                     let mut joined = joined;
-                    let mut upstream = tokio::net::TcpStream::connect(addr).await?;
+                    let mut upstream = tokio::net::TcpStream::connect(*addr).await?;
                     tokio::io::copy_bidirectional(&mut joined, &mut upstream).await?;
                     Ok(())
                 }
@@ -824,37 +857,39 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 Ok(fl) => {
                     let fstate = state.clone();
                     let facceptor = acceptor.clone();
-                    let portal_host = std::env::var("CT_EDGE_PORTAL_HOST").ok();
-                    let portal_addr = resolve_proxy_addr(std::env::var("CT_CP_PROXY_ADDR").ok());
-                    // #31 FD4-a: if a Portal cert is supplied, the edge terminates
-                    // the browser's TLS for the Portal host and reverse-proxies HTTP
-                    // to the control plane — so the landing page renders over HTTPS
-                    // on :443 without a fronting terminator. Absent -> legacy
-                    // raw-proxy (needs a TLS-speaking upstream).
-                    let portal_tls = match (
-                        std::env::var("CT_EDGE_PORTAL_CERT"),
-                        std::env::var("CT_EDGE_PORTAL_KEY"),
+                    // #48: build the front door's terminate/reverse-proxy targets —
+                    // the Portal (control plane; also the no-SNI-web default) plus an
+                    // optional Auth IdP (Keycloak on auth.<zone>). Each is
+                    // host -> (upstream, Option<cert-acceptor>); with a cert the edge
+                    // terminates TLS + HTTP-proxies (FD4-a), without it raw-proxies.
+                    let mut proxies: std::collections::HashMap<String, ProxyTarget> =
+                        std::collections::HashMap::new();
+                    let mut default_host: Option<String> = None;
+                    if let (Some(host), Some(addr)) = (
+                        std::env::var("CT_EDGE_PORTAL_HOST").ok().filter(|s| !s.is_empty()),
+                        resolve_proxy_addr(std::env::var("CT_CP_PROXY_ADDR").ok()),
                     ) {
-                        (Ok(c), Ok(k)) if !c.is_empty() && !k.is_empty() => {
-                            match crate::transport::build_portal_acceptor(&c, &k) {
-                                Ok(a) => {
-                                    eprintln!("ct-edge: front door terminates Portal TLS (CT_EDGE_PORTAL_CERT)");
-                                    Some(a)
-                                }
-                                Err(e) => {
-                                    eprintln!("ct-edge: invalid Portal cert/key ({e}); Portal raw-proxied instead");
-                                    None
-                                }
-                            }
-                        }
-                        _ => None,
-                    };
+                        let tls = build_front_door_cert("Portal", "CT_EDGE_PORTAL_CERT", "CT_EDGE_PORTAL_KEY");
+                        let h = host.to_ascii_lowercase();
+                        proxies.insert(h.clone(), (addr, tls));
+                        default_host = Some(h);
+                    }
+                    if let (Some(host), Some(addr)) = (
+                        std::env::var("CT_EDGE_AUTH_HOST").ok().filter(|s| !s.is_empty()),
+                        resolve_proxy_addr(std::env::var("CT_EDGE_AUTH_ADDR").ok()),
+                    ) {
+                        let tls = build_front_door_cert("Auth IdP", "CT_EDGE_AUTH_CERT", "CT_EDGE_AUTH_KEY");
+                        proxies.insert(host.to_ascii_lowercase(), (addr, tls));
+                    }
+                    let n_proxies = proxies.len();
+                    let proxies = std::sync::Arc::new(proxies);
+                    let default_host = std::sync::Arc::new(default_host);
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = fl.accept().await {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
-                            let portal_host = portal_host.clone();
-                            let portal_tls = portal_tls.clone();
+                            let proxies = proxies.clone();
+                            let default_host = default_host.clone();
                             tokio::spawn(async move {
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -863,16 +898,15 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     tcp,
                                     &state,
                                     &acceptor,
-                                    portal_host.as_deref(),
-                                    portal_addr,
-                                    portal_tls.as_ref(),
+                                    &proxies,
+                                    default_host.as_deref(),
                                     &challenge,
                                 )
                                 .await;
                             });
                         }
                     });
-                    eprintln!("ct-edge: unified :443 front door on {listen} (CT_FRONT_DOOR)");
+                    eprintln!("ct-edge: unified :443 front door on {listen} ({n_proxies} proxy host(s), CT_FRONT_DOOR)");
                 }
                 Err(e) => eprintln!("ct-edge: cannot bind CT_FRONT_DOOR {listen}: {e}"),
             },
@@ -1804,16 +1838,11 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(
-                tcp,
-                &state,
-                &acceptor,
-                Some("portal.test"),
-                Some(portal_addr),
-                None, // raw-proxy path (no Portal cert)
-                &challenge,
-            )
-            .await
+            // Portal as a raw-proxy target (no cert).
+            let mut proxies: std::collections::HashMap<String, ProxyTarget> =
+                std::collections::HashMap::new();
+            proxies.insert("portal.test".into(), (portal_addr, None));
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge).await
         });
 
         // Client: send the ClientHello (SNI=portal.test) + extra, read it echoed.
@@ -1943,16 +1972,12 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(
-                tcp,
-                &state,
-                &dummy_acceptor,
-                Some("portal.test"),
-                Some(cp_addr),
-                Some(&portal_tls),
-                &challenge,
-            )
-            .await
+            // Portal as a TLS-terminating target (FD4-a); also the default host.
+            let mut proxies: std::collections::HashMap<String, ProxyTarget> =
+                std::collections::HashMap::new();
+            proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
+            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge)
+                .await
         });
 
         // Browser: a real rustls TLS handshake to the edge, trusting the Portal
@@ -1974,6 +1999,89 @@ mod tests {
         assert!(text.contains("hello portal"), "control-plane body proxied back to the browser");
 
         cp_task.await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
+    async fn front_door_routes_a_second_terminate_host_to_its_own_upstream() {
+        // #48: with two terminate targets in the map (Portal + Auth IdP), a browser
+        // with SNI=auth.test must terminate with the AUTH cert and be proxied to the
+        // AUTH upstream — not the Portal's — proving the host->target map dispatch.
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        // Build a self-signed cert + acceptor and a matching browser root for a host.
+        fn cert_for(host: &str) -> (tokio_rustls::TlsAcceptor, rustls::RootCertStore) {
+            let c = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+            let der = c.cert.der().clone();
+            let cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![der.clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der())),
+                )
+                .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(der).unwrap();
+            (tokio_rustls::TlsAcceptor::from(Arc::new(cfg)), roots)
+        }
+        // A plain-HTTP upstream that replies with a fixed body.
+        async fn http_upstream(body: &'static str) -> SocketAddr {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut s, _)) = l.accept().await {
+                    let mut b = [0u8; 512];
+                    let _ = s.read(&mut b).await;
+                    let _ = s
+                        .write_all(
+                            format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                                .as_bytes(),
+                        )
+                        .await;
+                    let _ = s.shutdown().await;
+                }
+            });
+            a
+        }
+
+        let (portal_tls, _) = cert_for("portal.test");
+        let (auth_tls, auth_roots) = cert_for("auth.test");
+        let portal_up = http_upstream("PORTAL").await;
+        let auth_up = http_upstream("AUTH").await;
+
+        let mut proxies: std::collections::HashMap<String, ProxyTarget> =
+            std::collections::HashMap::new();
+        proxies.insert("portal.test".into(), (portal_up, Some(portal_tls)));
+        proxies.insert("auth.test".into(), (auth_up, Some(auth_tls)));
+
+        let dummy = cert_for("edge.test").0;
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge).await
+        });
+
+        // Browser -> SNI=auth.test -> AUTH cert terminates -> AUTH upstream.
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(auth_roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let tcp = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("auth.test").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.expect("auth-host TLS terminates at the edge");
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: auth.test\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("AUTH"), "routed to the AUTH upstream: {text:?}");
+        assert!(!text.contains("PORTAL"), "not the Portal upstream");
+
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }
 }

@@ -1516,6 +1516,26 @@ Ziel: ein Agent, dessen ausgehendes `:4433` (QUIC+TLS-TCP) von einer Firewall ge
   (`register_unless_revoked`). **#46 damit fix-ready** — Feld-Verifikation: `:4433` per `iptables` DROP blocken, Agent registriert über `:443`.
 - **:80 (Plaintext)** ⏳ separat/niedrigprior — braucht HTTP-`CONNECT`/WebSocket-Upgrade; nur falls ein `:80`-only-Netz auftaucht.
 
+## #48 Keycloak über die unified `:443`-Front-Door (kein separater Port)
+
+Ziel: die IdP (Keycloak) nicht auf einem eigenen Port exponieren, sondern als **zweites Terminate+Reverse-Proxy-Ziel** hinter
+derselben `:443`-Front-Door wie das Portal (FD4-a), erreichbar per eigenem Hostnamen (`auth.<zone>`). Löst das
+`KEYCLOAK_PUBLIC_URL`-Split-Horizon (der `iss`-Claim wird dann eine real extern erreichbare URL).
+
+- **AP-a** ✅ **Multi-Host-Proxy-Map am Edge**: `FrontDoorRoute::ControlPlane` → `Proxy(String)` (der gematchte Terminate-Host);
+  `classify_front_door(alpn, sni, terminate_hosts: &[&str], default_host)` matcht SNI gegen eine Liste von Terminate-Hosts
+  (Portal **und** Auth-IdP), sonst BrowserTunnel; no-SNI-Web → `default_host` (Portal). `serve_front_door` nimmt jetzt eine
+  `HashMap<host, (upstream, Option<TlsAcceptor>)>` + `default_host`: pro Host mit Cert → TLS terminieren + HTTP-Proxy (FD4-a),
+  ohne Cert → Raw-Proxy. `run_edge` baut die Map aus Portal (`CT_EDGE_PORTAL_HOST`/`CT_CP_PROXY_ADDR`/`CT_EDGE_PORTAL_CERT|KEY`)
+  + Auth (`CT_EDGE_AUTH_HOST`/`CT_EDGE_AUTH_ADDR`/`CT_EDGE_AUTH_CERT|KEY`); `build_front_door_cert`-Helper. Frozen-Tests:
+  `classify_front_door_routes_by_alpn_then_sni` (2 Terminate-Hosts), `front_door_routes_a_second_terminate_host_to_its_own_upstream`
+  (echter Browser-Handshake SNI=auth.test → AUTH-Cert terminiert → AUTH-Upstream, nicht Portal); FD2/FD4-a/#46-Tests grün mit
+  Map-Signatur. Gate grün (ct-edge 73). **Edge-Seite damit komplett** — jeder zusätzliche Terminate-Host braucht nur ein Env-Paar.
+- **AP-b** ⏳ **Deploy-Verdrahtung**: `compose.sso.yml` — Keycloak über die Front-Door routen (`CT_EDGE_AUTH_HOST=auth.<zone>`,
+  `CT_EDGE_AUTH_ADDR=keycloak:8080`, BYO-Cert für `auth.<zone>` via deSEC DNS-01), **`KEYCLOAK_PORT`-Publish entfernen**,
+  `KEYCLOAK_PUBLIC_URL=https://auth.<zone>`. Runbook `keycloak-sso.md` aktualisieren. Dann #48 **fix-ready**; central fährt den
+  externen Browser-Klick-Durchlauf.
+
 ## #38 Automatischer DNS-Record-Lifecycle für öffentliche Agent-Hostnamen
 
 Ziel: kein manuelles A-Record-Anlegen mehr — beim Setzen eines Tunnel-Hostnamens automatisch den A-Record (Host → Edge-IP)

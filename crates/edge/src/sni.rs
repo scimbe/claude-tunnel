@@ -118,8 +118,11 @@ pub enum FrontDoorRoute {
     /// Tunnel data plane — the client advertised the `ct-edge` ALPN: hand off to
     /// the edge TLS-TCP relay (the ADR-0004 fallback rung on :443).
     EdgeRelay,
-    /// Control-plane / portal — reverse-proxy to the control plane's HTTP.
-    ControlPlane,
+    /// Terminate TLS + reverse-proxy to a configured terminate-host's upstream —
+    /// the Portal (control plane) or, since #48, any additional host such as the
+    /// Keycloak IdP (`auth.<zone>`). The `String` is the matched, lowercased host;
+    /// the caller looks up its upstream address + cert.
+    Proxy(String),
     /// Browser-Plane passthrough, routed by this SNI hostname against the host
     /// registry (an unknown host is rejected downstream, not here).
     BrowserTunnel(String),
@@ -127,31 +130,36 @@ pub enum FrontDoorRoute {
     Reject,
 }
 
-/// Classify a peeked ClientHello for the unified :443 front door (#31 FD1).
+/// Classify a peeked ClientHello for the unified :443 front door (#31 FD1, #48).
 ///
-/// Precedence: the tunnel data-plane ALPN wins; then the configured portal
-/// hostname; then any other SNI is a Browser-Plane passthrough candidate; a
-/// web ALPN with no SNI (e.g. `curl https://<ip>/`) lands on the control plane;
-/// anything else is refused.
+/// Precedence: the tunnel data-plane ALPN wins; then any **terminate-host** (SNI
+/// matches a configured proxy target — Portal or Auth IdP) is a `Proxy`; then any
+/// other SNI is a Browser-Plane passthrough candidate; a web ALPN with no SNI
+/// (e.g. `curl https://<ip>/`) lands on `default_host` (the Portal); anything else
+/// is refused. `terminate_hosts` and `default_host` are compared case-insensitively.
 pub fn classify_front_door(
     alpn: &[String],
     sni: Option<&str>,
-    portal_host: Option<&str>,
+    terminate_hosts: &[&str],
+    default_host: Option<&str>,
 ) -> FrontDoorRoute {
     if alpn.iter().any(|p| p == CT_EDGE_ALPN) {
         return FrontDoorRoute::EdgeRelay;
     }
-    let sni = sni.map(|s| s.to_ascii_lowercase());
-    if let (Some(sni), Some(portal)) = (sni.as_deref(), portal_host) {
-        if sni == portal.to_ascii_lowercase() {
-            return FrontDoorRoute::ControlPlane;
+    if let Some(sni) = sni.map(|s| s.to_ascii_lowercase()) {
+        if let Some(h) = terminate_hosts
+            .iter()
+            .find(|h| h.to_ascii_lowercase() == sni)
+        {
+            return FrontDoorRoute::Proxy(h.to_ascii_lowercase());
         }
-    }
-    if let Some(sni) = sni {
         return FrontDoorRoute::BrowserTunnel(sni);
     }
+    // No SNI: a plain web client (curl https://<ip>/) defaults to the Portal.
     if alpn.iter().any(|p| p == "http/1.1" || p == "h2") {
-        return FrontDoorRoute::ControlPlane;
+        if let Some(d) = default_host {
+            return FrontDoorRoute::Proxy(d.to_ascii_lowercase());
+        }
     }
     FrontDoorRoute::Reject
 }
@@ -299,30 +307,37 @@ mod tests {
 
     #[test]
     fn classify_front_door_routes_by_alpn_then_sni() {
-        // #31 FD1: the demux precedence for the unified :443 front door.
+        // #31 FD1 / #48: the demux precedence for the unified :443 front door.
         let s = |v: &str| v.to_string();
+        let hosts = ["portal.z", "auth.z"]; // two terminate targets (Portal + IdP)
+        let default = Some("portal.z");
         // Tunnel data-plane ALPN wins, even with an SNI present.
         assert_eq!(
-            classify_front_door(&[s("ct-edge")], Some("whatever.z"), Some("portal.z")),
+            classify_front_door(&[s("ct-edge")], Some("whatever.z"), &hosts, default),
             FrontDoorRoute::EdgeRelay
         );
-        // Configured portal host -> control plane (case-insensitive).
+        // A configured terminate host -> Proxy(host) (case-insensitive) — Portal…
         assert_eq!(
-            classify_front_door(&[s("h2")], Some("Portal.Z"), Some("portal.z")),
-            FrontDoorRoute::ControlPlane
+            classify_front_door(&[s("h2")], Some("Portal.Z"), &hosts, default),
+            FrontDoorRoute::Proxy("portal.z".into())
+        );
+        // …and the #48 Auth IdP host, the second terminate target.
+        assert_eq!(
+            classify_front_door(&[s("h2")], Some("Auth.Z"), &hosts, default),
+            FrontDoorRoute::Proxy("auth.z".into())
         );
         // Any other SNI -> Browser-Plane passthrough candidate.
         assert_eq!(
-            classify_front_door(&[], Some("app1.z"), Some("portal.z")),
+            classify_front_door(&[], Some("app1.z"), &hosts, default),
             FrontDoorRoute::BrowserTunnel("app1.z".into())
         );
-        // Web ALPN, no SNI (curl to the bare IP) -> control plane.
+        // Web ALPN, no SNI (curl to the bare IP) -> the default (Portal).
         assert_eq!(
-            classify_front_door(&[s("http/1.1")], None, Some("portal.z")),
-            FrontDoorRoute::ControlPlane
+            classify_front_door(&[s("http/1.1")], None, &hosts, default),
+            FrontDoorRoute::Proxy("portal.z".into())
         );
         // Nothing usable -> reject.
-        assert_eq!(classify_front_door(&[], None, Some("portal.z")), FrontDoorRoute::Reject);
+        assert_eq!(classify_front_door(&[], None, &hosts, default), FrontDoorRoute::Reject);
     }
 
     #[test]
