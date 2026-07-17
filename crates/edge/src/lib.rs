@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod channel_broker;
 pub mod config;
 pub mod observe;
 pub mod pki;

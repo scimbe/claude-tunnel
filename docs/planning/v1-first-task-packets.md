@@ -1676,9 +1676,17 @@ Decomposed:
   `Rights`{r,w,rw} + `delegable`, fixed-layout wire encode/decode, and stateless `verify(operator_pk, now)`.
   Deliberately NOT a flat bearer token: tampering scope/holder breaks the signature. 7 frozen tests
   (roundtrip all variants, expiry, wrong-key, 4-way tamper, malformed/bad-enum, predicates). Gate green.
-- **AF2b** ⏳ **Same-user rendezvous prototype**: two agents of one user establish a direct channel via the
-  existing rendezvous (edge as broker, no payload relay), authorized by an AF2a grant; real two-agent
-  integration test on the NAT-punch base.
+- **AF2b** ✅ **Edge channel-pairing authorization** (`crates/edge/src/channel_broker.rs`): the pure
+  enforcement core ADR-0020 places at the edge rendezvous gate — `authorize_channel_pair(operator_pk,
+  grant_a, grant_b, now)` verifies both `SignedChannelGrant`s, requires same channel + distinct holders +
+  a compatible Initiate/Accept split, and returns the `ChannelPairing` (who dials, who accepts) or a typed
+  `BrokerError`. No sockets — testable without a network. 7 frozen tests (pairing, role reversal,
+  both-flexible→a-leads, two-initiators/two-acceptors rejected, channel mismatch, same-holder, expired/
+  wrong-key). Gate green.
+- **AF2c** ⏳ **Same-user QUIC brokering + transport**: generalise `rendezvous.rs` to relay/broker two
+  agents over QUIC using the AF2b pairing decision; the two run a pairwise Noise session (edge broker, no
+  payload relay); real two-agent integration test on the NAT-punch base. Needs the operator-key source
+  (control-plane channel registry) wired.
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration

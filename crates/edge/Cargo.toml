@@ -19,3 +19,4 @@ axum = "0.7"
 ct-control-plane = { path = "../control-plane" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+ed25519-dalek = "2"
