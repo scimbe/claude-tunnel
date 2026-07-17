@@ -45,7 +45,7 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_EDGE_METRICS_LISTEN` | edge | bind address for `GET /metrics` (unset ⇒ off, issue #10) |
 | `CT_FRONT_DOOR` | edge | bind address for the unified :443 front door (SNI/ALPN-multiplexed relay + Portal + browser tunnels); unset ⇒ off, additive to `:4433`/`:8090` (#31) |
 | `CT_EDGE_PORTAL_HOST` | edge | SNI hostname the front door treats as the Portal (terminate + reverse-proxy); other SNIs stay passthrough tunnels |
-| `CT_CP_PROXY_ADDR` | edge | control-plane address the front door reverse-proxies the Portal to (required to serve the Portal on :443) |
+| `CT_CP_PROXY_ADDR` | edge | control-plane address the front door reverse-proxies the Portal to — a hostname (`control-plane:8090`) or literal `IP:port` (required to serve the Portal on :443; a set-but-unresolvable value logs a warning and disables the Portal route) |
 | `CT_EDGE_PORTAL_CERT` / `CT_EDGE_PORTAL_KEY` | edge | PEM cert+key so the front door terminates the Portal's TLS and reverse-proxies HTTP to the control plane (FD4-a, #31); absent ⇒ raw-proxy needing a TLS-speaking upstream |
 | `CT_EDGE_HTTP_REDIRECT` | edge | optional `:80` listener (e.g. `0.0.0.0:80`) that 308-redirects to `:443` (unset ⇒ off) |
 | `CT_CP_EDGE_CERT_PATH` | control plane | path it reads the edge CA root from to publish at `/pki/ca` (default `/shared/edge-cert.der`, issue #11) |
