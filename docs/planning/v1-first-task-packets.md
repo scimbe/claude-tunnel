@@ -1787,3 +1787,22 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
 - **SEC81c** ⏳ **Wire the broker into the live edge** (gap 4): mount `broker_channel_rendezvous` in
   serve.rs + a control-plane channel-registry API, ONLY after SEC81b. Endpoint should additionally be
   constrained to match the agent's advertised direct endpoint where possible.
+
+## #78 CI gate / build-isolation security review (security-review)
+
+GLM-5.2 review: no independent CI between push and main; role skills pull+run main each tick; the
+"hermetic" build runs as host uid against a bind-mounted repo + host cache; cargo-audit cached-reused
+unverified. Mostly architectural (needs scimbe decisions); one clean fix landed.
+
+- **SEC78a** ✅ **Un-hardcode the cargo-cache path** (evidence #3): the 3 tracked role skills
+  (agent/central/developer SKILL.md) hardcoded `/home/becke/.cache/ct-cargo` in the hermetic-gate command
+  — a cross-user-write / non-portable footgun on any host without user `becke`. Parameterized to
+  `$HOME/.cache/ct-cargo` (matching `security-audit.sh`). Gate: `git grep '/home/becke/.cache/ct-cargo'`
+  in tracked files == 0.
+- **SEC78b** ⏳ **NEEDS SCIMBE DECISION** — independent server-side CI. Blocked: `.gitignore:40-42`
+  untracks `.github/workflows/ci.yml` because pushing it needs the `workflow` token scope (`gh auth refresh
+  -s workflow`). Decision: grant the scope + add a read-only CI (cargo test + check-no-secrets + cargo
+  audit) that gates main independently of the autonomous agent? This also blocks #75 IS2 (release workflow).
+- **SEC78c** ⏳ **NEEDS DECISION** — build isolation: drop the host-cache bind-mount / run as a non-host
+  uid so a dep `build.rs` can't write the repo or poison the shared cache; pin+verify `cargo-audit`
+  instead of cached-reuse (evidence #4). Relates to #77 (skill trust model).

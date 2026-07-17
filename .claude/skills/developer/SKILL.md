@@ -94,7 +94,7 @@ starve later gates). Persistent CARGO_HOME cache keeps it fast:
 
 ```bash
 docker run --rm -v "$PWD":/work -w /work -u $(id -u):$(id -g) \
-  -v /home/becke/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
+  -v $HOME/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
   -e RUSTFLAGS="-D warnings" \
   rust:1-slim sh -c 'cargo build --workspace 2>&1 && cargo test --workspace 2>&1'
 ```

@@ -58,7 +58,7 @@ Or run the real central services from built binaries (`./target/debug`):
 
 ```bash
 docker run --rm -v "$PWD":/work -w /work -u $(id -u):$(id -g) \
-  -v /home/becke/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
+  -v $HOME/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
   rust:1-slim cargo build --workspace          # produces ct-control-plane, ct-edge
 # then start ct-control-plane (:8090) and ct-edge (:4433); publish edge-cert.der
 ```

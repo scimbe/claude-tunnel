@@ -51,7 +51,7 @@ the binaries hermetically if `./target/debug` is empty:
 
 ```bash
 docker run --rm -v "$PWD":/work -w /work -u $(id -u):$(id -g) \
-  -v /home/becke/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
+  -v $HOME/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
   rust:1-slim cargo build --workspace
 ```
 
