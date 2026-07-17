@@ -13,7 +13,7 @@
 #   ... CT_CLIENT_FORCE_TCP=1 ./scripts/demo.sh    # show the TCP fallback path
 #   ... CT_CLIENT_ITERATIONS=50 ./scripts/demo.sh  # more samples for the latency read
 #
-# Prereqs: built binaries (BIN=./target/debug), socat, curl.
+# Prereqs: built binaries (BIN=./target/debug), socat, curl, jq.
 set -euo pipefail
 
 CENTRAL="${CENTRAL:?set CENTRAL=<host> (control plane :8090, edge :4433)}"
@@ -24,7 +24,8 @@ TENANT="${TENANT:-t1}"
 ORIGIN_PORT="${ORIGIN_PORT:-8080}"
 AGENT_ID="${AGENT_ID:-demo-agent}"
 BIN="${BIN:-./target/debug}"
-WORK="$(mktemp -d)"
+WORK="$(umask 077 && mktemp -d)"
+chmod 700 "$WORK"
 CAP="$WORK/capability.bin"
 ORIGIN_LOG="$WORK/origin.log"
 SECRET="private-origin-$(date +%s)"
@@ -44,6 +45,7 @@ trap cleanup EXIT
 [ -x "$BIN/ct-agent" ] && [ -x "$BIN/ct-client" ] || fail "binaries not built — build the workspace first"
 command -v socat >/dev/null || fail "socat is required (apt-get install socat)"
 command -v curl >/dev/null || fail "curl is required"
+command -v jq >/dev/null || fail "jq is required (apt-get install jq)"
 
 bold "=== claude-tunnel demo: reaching a PRIVATE origin through the tunnel ==="
 
@@ -78,8 +80,11 @@ fi
 
 # 3. Join token + onboard the agent (it registers on the central edge and serves).
 step "Onboarding the agent against the central control plane + edge"
-TOKEN="${CT_JOIN_TOKEN:-$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-        -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')}"
+TOKEN="${CT_JOIN_TOKEN:-$(
+  curl --connect-timeout 5 --max-time 10 -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+    -d "{\"tenant\":\"$TENANT\"}" \
+    | jq -r '.token // empty' 2>/dev/null
+)}"
 [ -n "$TOKEN" ] || fail "could not mint a join token at $CP_URL/enroll/issue"
 CT_AGENT_CP_URL="$CP_URL" CT_AGENT_JOIN_TOKEN="$TOKEN" CT_AGENT_ID="$AGENT_ID" \
 CT_AGENT_EDGE="$EDGE" CT_AGENT_ORIGIN="127.0.0.1:${ORIGIN_PORT}" \

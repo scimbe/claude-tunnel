@@ -13,7 +13,7 @@
 # Browser Plane (public hostname + Let's Encrypt over SNI) is deferred post-v1
 # (ADR-0010) and out of scope here — this is the TLS-terminates-at-origin path.
 #
-# Prereqs: built binaries (BIN=./target/debug), openssl, curl. CENTRAL must be an
+# Prereqs: built binaries (BIN=./target/debug), openssl, curl, jq. CENTRAL must be an
 # IP (the agent's CT_AGENT_EDGE needs a numeric socket address).
 set -euo pipefail
 
@@ -26,7 +26,8 @@ ORIGIN_PORT="${ORIGIN_PORT:-8443}"      # the private HTTPS origin (loopback)
 CLIENT_LISTEN="${CLIENT_LISTEN:-18443}" # the client's local forward port
 AGENT_ID="${AGENT_ID:-https-demo}"
 BIN="${BIN:-./target/debug}"
-W="$(mktemp -d)"
+W="$(umask 077 && mktemp -d)"
+chmod 700 "$W"
 OCERT="$W/origin-cert.pem"   # origin's self-signed cert (curl trusts this)
 OKEY="$W/origin-key.pem"
 CAP="$W/capability.bin"
@@ -43,6 +44,7 @@ trap cleanup EXIT
 [ -x "$BIN/ct-agent" ] && [ -x "$BIN/ct-client" ] || fail "binaries not built (BIN=$BIN)"
 command -v openssl >/dev/null || fail "openssl is required"
 command -v curl >/dev/null || fail "curl is required"
+command -v jq >/dev/null || fail "jq is required (apt-get install jq)"
 
 bold "=== claude-tunnel HTTPS demo: a real HTTPS website through the tunnel ==="
 
@@ -60,8 +62,11 @@ ok "Private HTTPS origin up (bound to loopback — not reachable from another ho
 # 2. Onboard the agent; it bridges the tunnel to the loopback HTTPS origin as raw
 #    bytes (provider-blind — it never terminates TLS).
 step "Onboarding the agent against the central control plane + edge"
-TOKEN="${CT_JOIN_TOKEN:-$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-        -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')}"
+TOKEN="${CT_JOIN_TOKEN:-$(
+  curl --connect-timeout 5 --max-time 10 -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+    -d "{\"tenant\":\"$TENANT\"}" \
+    | jq -r '.token // empty' 2>/dev/null
+)}"
 [ -n "$TOKEN" ] || fail "could not mint a join token at $CP_URL/enroll/issue"
 CT_AGENT_CP_URL="$CP_URL" CT_AGENT_JOIN_TOKEN="$TOKEN" CT_AGENT_ID="$AGENT_ID" \
 CT_AGENT_EDGE="$EDGE" CT_AGENT_ORIGIN="127.0.0.1:${ORIGIN_PORT}" \
