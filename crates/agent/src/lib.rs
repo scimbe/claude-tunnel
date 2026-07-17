@@ -1,6 +1,7 @@
 //! Claude Tunnel Agent — customer-run, outbound-only. Custodian of the Origin
 //! key; mints Capabilities. See ADR-0004 (transport), ADR-0005 (identity).
 
+pub mod acme;
 pub mod capability;
 pub mod config;
 pub mod identity;

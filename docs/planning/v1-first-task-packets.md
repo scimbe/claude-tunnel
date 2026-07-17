@@ -1229,6 +1229,18 @@ terminiert am Origin (öffentlich vertrautes Cert), Edge sieht nur Hostname (SNI
     validierte Hostnamen; takeover-sicher (BP4a); Reconnect-fest. Review-Punkte #1 + #2 + #3 adressiert.
 - **BP4c** ⏳ **Agent-seitiges ACME** (Let's Encrypt DNS-01, ADR-0003) + BYO-Cert-Fallback; nur
   LE-*Staging* hermetisch testbar, Prod-LE in einem manuellen/gated Job. Reale Domain jetzt verfügbar (#30: bunsenbrenner.org).
+  **Dekomponiert (Zyklus: BP4c ist zu groß für einen Takt, braucht neue ACME-Abhängigkeit):**
+  - **BP4c-a** ✅ **Schlüssel + CSR** (`ct-agent::acme`): `generate_csr(hostname) -> CsrBundle { key_pem, csr_pem, csr_der }` —
+    rcgen-`KeyPair::generate` + `CertificateParams::serialize_request` (Hostname via `ct_common::normalize_hostname`
+    normalisiert/validiert → CN + DNS-SAN). Das gemeinsame Artefakt beider Pfade: ACME-Finalize base64url-t die DER, BYO
+    liefert stattdessen ein eigenes Leaf. Frozen-Tests `generate_csr_binds_the_normalized_hostname_and_a_usable_key`
+    (Key-Roundtrip + normalisierter Host verbatim in der DER, Mixed-Case wegnormalisiert), `generate_csr_rejects_an_invalid_hostname`.
+    Gate grün (ct-agent 73). *(CSR-Parsing in rcgen 0.13 braucht das `x509-parser`-Feature — bewusst nicht aktiviert; Test prüft die DER-Bytes.)*
+  - **BP4c-b** ⏳ **ACME-Directory/Account-Client** (RFC 8555): new-account (EAB optional), new-order für den Hostnamen,
+    DNS-01-Challenge lesen. Abhängigkeit `instant-acme` oder handgerollt; LE-Staging-Directory für Hermetik.
+  - **BP4c-c** ⏳ **DNS-01-Erfüllung + Finalize**: TXT-Challenge via `ct-dns`-Provider (AD5 `set_txt`/`clear_txt`) publizieren,
+    pollen, mit der BP4c-a-CSR finalisieren, Leaf holen + speichern/erneuern.
+  - **BP4c-d** ⏳ **BYO-Cert-Fallback**: Operator-Cert+Key aus Env/Pfad laden (überspringt ACME), Renewal-Hook.
 - **BP5** ⏳ **Browser-e2e** (echter/headless Browser lädt `https://<hostname>/` mit öffentlich
   vertrautem Cert durch den Tunnel). Erst wenn BP1–BP5 erfüllt → **#23 fix-ready**.
 
