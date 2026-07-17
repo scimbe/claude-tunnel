@@ -19,7 +19,8 @@ Brings up the control plane (durable `cpdata` volume) and one edge, both with
 
 **Optional `:443` front door** (`compose.frontdoor.yml`, #60) — publishes one
 `:443` that serves the **Portal landing page**, **Browser-Plane subdomains**
-(`help.<zone>`), and the tunnel data-plane relay, all SNI/ALPN-multiplexed. Point
+(`help.<zone>`), and the tunnel data-plane relay, all SNI/ALPN-multiplexed, plus a
+redirect-only `:80` that 308-bounces plain `http://<zone>/` to `https` (#66). Point
 the Portal hostname's DNS at the edge, get a BYO cert for it (LE via deSEC DNS-01),
 then set these in `.env`:
 
@@ -36,7 +37,8 @@ docker compose -f docker/deploy/compose.selfhost.yml \
 ```
 
 `https://<PORTAL_PUBLIC_HOST>/` then serves the operator page, `/portal` the
-customer portal, and `help.<zone>` (a bound Browser-Plane tunnel) passes through.
+customer portal, and `help.<zone>` (a bound Browser-Plane tunnel) passes through;
+plain `http://<PORTAL_PUBLIC_HOST>/` 308-redirects to the `https` URL.
 
 **Optional SSO overlay** — add a real Keycloak login to the portal with
 `docker/deploy/compose.sso.yml` (a Keycloak IdP + `CT_OIDC_*`; Keycloak itself is

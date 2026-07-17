@@ -35,6 +35,10 @@ services:
       # Unified :443 front door: ALPN=ct-edge -> relay; Portal SNI -> terminate+proxy
       # to the control plane; other SNI -> Browser-Plane passthrough.
       CT_FRONT_DOOR: "0.0.0.0:443"
+      # #66: a redirect-only :80 listener so plain http://<zone>/ 308-bounces to
+      # https instead of connection-refused (a bare-domain / http-default first
+      # visit). Redirect only — no cert, no TLS terminated here.
+      CT_EDGE_HTTP_REDIRECT: "0.0.0.0:80"
       CT_EDGE_PORTAL_HOST: "${PORTAL_PUBLIC_HOST:?set PORTAL_PUBLIC_HOST=<zone>}"
       CT_CP_PROXY_ADDR: "control-plane:8090"
       CT_EDGE_PORTAL_CERT: "/certs/portal/fullchain.pem"
@@ -49,6 +53,7 @@ services:
       - "${PORTAL_CERT_DIR:?set PORTAL_CERT_DIR=<dir with portal fullchain.pem+privkey.pem>}:/certs/portal:ro"
     ports:
       - "443:443"
+      - "80:80"
 
   control-plane:
     # Let the control plane authorize hostnames + push revocations to the edge's

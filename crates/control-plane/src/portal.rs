@@ -837,6 +837,10 @@ mod tests {
         assert!(fd.contains(r#""443:443""#), "the :443 port is published");
         // env_file on the edge, so the above are overridable from .env (the gap #60 hit).
         assert!(fd.contains("env_file"), "edge reads .env for the front-door vars");
+        // #66: the :80 -> :443 redirect must also be wired (env var + published port),
+        // else plain http://<zone>/ is connection-refused. Same gap class as #60.
+        assert!(fd.contains("CT_EDGE_HTTP_REDIRECT"), "the :80->:443 redirect listener is enabled");
+        assert!(fd.contains(r#""80:80""#), "the :80 port is published for the redirect");
     }
 
     #[tokio::test]
