@@ -703,6 +703,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sso_compose_wires_the_control_plane_to_the_demo_realm() {
+        // #42 KC3: the SSO overlay must feed the control-plane exactly the
+        // client_id, redirect and realm that the declarative realm + portal code
+        // already agree on (grounded in demo_realm_matches_the_portal_oidc_contract).
+        // Embed the compose at compile time so drift fails the build, and ensure no
+        // client secret is ever committed in the compose.
+        let compose = include_str!("../../../docker/deploy/compose.sso.yml");
+        assert!(
+            compose.contains(r#"CT_OIDC_CLIENT_ID: "ct-portal""#),
+            "compose client id matches the realm's ct-portal client"
+        );
+        assert!(compose.contains("/portal/callback"), "redirect uri hits the /portal/callback route");
+        assert!(compose.contains("/realms/ct-demo"), "issuer points at the ct-demo realm");
+        // The secret must come from .env — never be assigned a value in the compose.
+        let sets_secret = compose
+            .lines()
+            .any(|l| l.trim().starts_with("CT_OIDC_CLIENT_SECRET:"));
+        assert!(!sets_secret, "client secret must live in .env, not the committed compose");
+    }
+
     #[tokio::test]
     async fn portal_home_renders_the_sso_cta() {
         let app = portal_router(None, TEST_KEY);

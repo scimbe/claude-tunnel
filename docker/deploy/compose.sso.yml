@@ -1,6 +1,6 @@
-# Optional SSO overlay (#42 KC1): a Keycloak/OIDC identity provider for exercising
-# the customer-portal flow (#25-#29) end-to-end with a REAL Authorization-Code
-# login, instead of only hermetic HS256 test doubles.
+# Optional SSO overlay (#42): a Keycloak/OIDC identity provider for exercising the
+# customer-portal flow (#25-#29) end-to-end with a REAL Authorization-Code login,
+# instead of only hermetic HS256 test doubles.
 #
 # OFF BY DEFAULT: this is a separate overlay you opt into by naming it explicitly.
 # The base self-host stack runs unchanged without it.
@@ -12,10 +12,17 @@
 #
 # On boot Keycloak imports the declarative demo realm (keycloak/ct-demo-realm.json):
 # realm `ct-demo`, confidential client `ct-portal` (RS256), self-registration on.
-# KC2 will export the realm's RS256 signing key to CT_OIDC_PUBKEY_PATH; KC3 wires
-# the control-plane's CT_OIDC_* env + the demo click-through docs. This first
-# packet (KC1) just stands the IdP + realm up so the rest can build on a running
-# provider.
+# The control-plane fetches the realm's RS256 signing key from its JWKS at startup
+# (KC2-c), so no key export is needed. Full runbook: docs/deploy/keycloak-sso.md.
+#
+# .env keys this overlay reads (see docs/deploy/keycloak-sso.md and .env.example):
+#   KEYCLOAK_PUBLIC_URL   the Keycloak base URL reachable from BOTH the browser and
+#                         the control-plane container (a LAN IP or public hostname,
+#                         NOT localhost — the container can't reach the host's
+#                         localhost). The realm issuer is <KEYCLOAK_PUBLIC_URL>/realms/ct-demo.
+#   PORTAL_PUBLIC_URL     the portal base URL the browser uses (default http://localhost:8090).
+#   CT_OIDC_CLIENT_SECRET the `ct-portal` client secret Keycloak minted on import
+#                         (Clients -> ct-portal -> Credentials); kept only in .env.
 
 name: ct-selfhost
 
@@ -31,6 +38,10 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
+      # Pin the realm issuer to a stable, everyone-reachable base URL so the token's
+      # `iss` matches what the control-plane validates. Must resolve the same from
+      # the browser and the control-plane container (see KEYCLOAK_PUBLIC_URL above).
+      KC_HOSTNAME: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8091}"
     volumes:
       - ./keycloak/ct-demo-realm.json:/opt/keycloak/data/import/ct-demo-realm.json:ro
     ports:
@@ -42,3 +53,19 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+
+  # Merge the OIDC env onto the base control-plane service (#42 KC3). CT_OIDC_ISSUER
+  # alone enables OIDC — the control-plane fetches the realm JWKS at startup (KC2-c);
+  # the client secret comes from .env (inherited env_file from the base service),
+  # never from the realm export. Wait for Keycloak so the boot-time JWKS fetch lands.
+  control-plane:
+    environment:
+      CT_OIDC_ISSUER: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8091}/realms/ct-demo"
+      CT_OIDC_CLIENT_ID: "ct-portal"
+      CT_OIDC_REDIRECT_URI: "${PORTAL_PUBLIC_URL:-http://localhost:8090}/portal/callback"
+      # CT_OIDC_CLIENT_SECRET is read from .env (do NOT put it here).
+      # The email-domain access-list (#43) is optional; set it in .env to restrict
+      # who may register: CT_PORTAL_ALLOWED_EMAIL_DOMAINS=becke.biz
+    depends_on:
+      keycloak:
+        condition: service_healthy

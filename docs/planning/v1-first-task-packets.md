@@ -1521,8 +1521,9 @@ importierter Demo-Realm, passend zu dem, was `PortalOidc::from_env`/`OidcVerifie
     reqwest, `fetch_jwks`, best-effort + geloggt, `None` → /me/* bleibt aus); `CT_OIDC_PUBKEY_PATH` bleibt expliziter Offline-Override
     (Vorrang). `reqwest` um `rustls-tls` erweitert (HTTPS-Issuer). Frozen-Test `verifier_from_jwks_fetches_selects_and_verifies` (Fetch →
     Auswahl → echtes Token verifiziert; Fetch-Fehler/kein RS256-Key → `None`). Gate grün (control-plane 126). **KC2 damit komplett.**
-- **KC3** ⏳ **Control-Plane-Verdrahtung + Doku**: `CT_OIDC_*`-Env (Issuer/Client-ID/Redirect/Token-URL/PubkeyPath) im Overlay auf
-  den control-plane-Service mergen, `.env.example`-Ergänzungen (Client-Secret aus `.env`, nie im Realm-Export), Operator-Runbook für
-  den vollen Klick-Durchlauf (Sign in → Selbst-Registrierung → `/portal/home` → Konto/Tunnel → Logout). Erst wenn KC1–KC3 erfüllt →
-  **#42 fix-ready**. (Client-Secret-Bereitstellung: Keycloak mintet es beim Import; KC3 zieht es via `kcadm`/Admin-API in die
-  gitignorierte `.env`.)
+- **KC3** ✅ **Control-Plane-Verdrahtung + Doku**: `compose.sso.yml` merged die `CT_OIDC_*`-Env auf den control-plane-Service
+  (`CT_OIDC_ISSUER=<KEYCLOAK_PUBLIC_URL>/realms/ct-demo`, `CT_OIDC_CLIENT_ID=ct-portal`, `CT_OIDC_REDIRECT_URI=<PORTAL_PUBLIC_URL>/portal/callback`;
+  Client-Secret aus `.env`, **nie** im Compose), `depends_on keycloak healthy`, Keycloak-`KC_HOSTNAME` für stabilen Issuer. Runbook
+  `docs/deploy/keycloak-sso.md` (Split-Horizon-Caveat zu `KEYCLOAK_PUBLIC_URL`, `.env`-Keys, Bring-up, Klick-Durchlauf). Frozen-Test
+  `sso_compose_wires_the_control_plane_to_the_demo_realm` (`include_str!` des Compose → client-id/redirect/realm konsistent mit Realm+Code,
+  kein Secret im Compose). Gate grün (control-plane 127). **KC1–KC3 erfüllt → #42 fix-ready.**
