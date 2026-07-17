@@ -337,15 +337,25 @@ async fn install_page(
         r#"<h1>Install an agent</h1>
 <p class="help">Run this <strong>on the machine you want to expose</strong> &mdash;
 the <em>origin</em>: the server or device running the service you are tunnelling,
-not the device you are reading this on. It downloads and starts the tunnel agent,
-which connects out to the relay and serves your origin through it (no inbound
-firewall port needed).</p>
-<p class="k"><strong>Single-use token — copy the command now; it is shown only once.</strong></p>
+not the device you are reading this on. The agent connects out to the relay and
+serves your origin through it (no inbound firewall port needed).</p>
+<div class="warn"><strong>&#9888; The one-line installer is not available yet (#75).</strong>
+<code>/install.sh</code> and <code>/install.ps1</code> return 404 until the prebuilt
+<code>ct-agent</code> binaries and the installer endpoint ship, so the
+<code>curl &hellip; | sh</code> command further down does <strong>not work yet</strong>.
+To bring your tunnel up <em>today</em>, run the <code>ct-agent</code> binary (or the
+<code>ct-testbed</code> Docker image that ships it) manually with the two tokens
+below &mdash; see the <a href="https://github.com/scimbe/claude-tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>.</div>
+<h2>Your tunnel's tokens (for manual onboarding)</h2>
+<p class="k"><strong>Single-use token — shown only once; reopen this Install page for a fresh one.</strong></p>
+<pre><code>CT_JOIN_TOKEN={jt}
+CT_AGENT_TOKEN={rt}
+# also set CT_AGENT_CP_URL, CT_AGENT_EDGE, CT_AGENT_ORIGIN (see the onboarding guide), then run: ct-agent onboard</code></pre>
+<h2 class="muted">One-line installer &mdash; coming soon (not functional yet)</h2>
 {blocks}
-<p class="help">Closed the tab or lost the command? Just reopen this Install page
-&mdash; each visit mints a fresh single-use token, so you always get a new working
-command.</p>
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
+        jt = escape(&token),
+        rt = escape(&routing_token),
     );
     Html(page("install", &body)).into_response()
 }
@@ -547,6 +557,8 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  p.help{{margin:.2rem 0 1rem}} .opt{{color:#8b949e;font-weight:400}}
  ol.steps{{color:#8b949e;font-size:.86rem;margin:.2rem 0;padding-left:1.2rem}}
  ol.steps li{{margin:.35rem 0}} ol.steps strong{{color:#e6edf3}}
+ .warn{{background:#3d1e00;border:1px solid #7d4e00;color:#f0c674;border-radius:8px;padding:.7rem .9rem;margin:1rem 0;font-size:.88rem}}
+ .warn code{{background:#2a1500;border-color:#7d4e00}} h2.muted{{color:#6e7681}}
 </style></head><body>
 <div class="card">
 <nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/logout">Sign out</a></nav>
@@ -1010,6 +1022,18 @@ mod tests {
         assert!(
             html.contains("reopen this Install page"),
             "signposts lost-token recovery (a fresh token per visit)"
+        );
+        // #75: the /install.sh + /install.ps1 endpoints don't exist yet, so the page
+        // must NOT present the one-liner as a working command — it must carry an
+        // honest "not available yet" notice and surface the working manual path
+        // (the tokens for `ct-agent onboard`), not a broken copy-paste.
+        assert!(
+            html.contains("not available yet (#75)"),
+            "honestly flags the one-liner as non-functional until #75 ships"
+        );
+        assert!(
+            html.contains("manual onboarding") && html.contains("ct-agent onboard"),
+            "surfaces the working manual onboarding path with the tokens"
         );
 
         // os filter renders just one block.

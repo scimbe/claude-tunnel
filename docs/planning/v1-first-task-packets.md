@@ -1677,3 +1677,25 @@ Decomposed:
 - **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration
   test) + revoke/expiry enforcement. **fix-ready only when real direct A2A data exchange + trust chains +
   tested fallback are all met.**
+
+## #75 Real agent binary distribution + /install.sh//install.ps1 (the one-liner's missing backend)
+
+KRITISCH: the polished install one-liner (#67/#68/#69/#71) points at /install.sh + /install.ps1, which
+404 — no route, no handler, no prebuilt-binary distribution exists at all. A real customer without a
+prebuilt image dead-ends at the final step. Substantial feature (like #72) → decomposed:
+
+- **IS1** ✅ **Honest install page (stopgap)**: the install page no longer presents the broken
+  `curl … | sh` as a working command — it carries a prominent "not available yet (#75)" banner and
+  surfaces the **working manual path** (the `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN` values for `ct-agent onboard`
+  via the binary/`ct-testbed` image, + onboarding-guide link); the one-liner is demoted under a
+  "coming soon (not functional yet)" heading. Frozen test asserts the honesty banner + manual path.
+  Gate: cargo build+test, 0 warnings. Stops misleading real customers immediately.
+- **IS2** ⏳ **Binary distribution**: GitHub Releases (or equivalent) with prebuilt `ct-agent` binaries
+  for Linux x86_64/arm64, macOS, Windows — without this `install.sh` has nothing to download.
+- **IS3** ⏳ **`/install.sh` route**: served POSIX script (rustup/Homebrew pattern) that detects OS/arch,
+  downloads the matching release binary, and runs `ct-agent onboard` with `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN`
+  from the env.
+- **IS4** ⏳ **`/install.ps1` route**: same for PowerShell/Windows.
+- **IS5** ⏳ **Real integration test**: execute the served script in a CLEAN container (no prebuilt
+  image), not just the page's text generation. **fix-ready only when a fresh customer can run the
+  one-liner end-to-end.**
