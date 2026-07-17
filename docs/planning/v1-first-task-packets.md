@@ -1455,6 +1455,15 @@ ACME) und **ADR-0019** (Front-Door-Design). **Diese Epic subsumiert das von mir 
     der #31-Akzeptanz.
 - **FD4** ⏳ Öffentliches **ACME-Cert** auf `:443` (rustls-acme TLS-ALPN-01 in-process **oder** fronting Terminator);
   reuse #23/ADR-0003; reale Domain via #30. **DNS-01 via selbst-gehostetem `ct-dns`** (acme-dns-Pattern, Strato hat keine API):
+  - **FD4-a** ✅ **Edge terminiert Portal-TLS auf `:443`** — der Grund, warum bisher keine Landing-Page erschien: der
+    ControlPlane-Zweig von `serve_front_door` (FD2) **raw-proxyte** den TLS-Strom an die Control-Plane, die aber nur **HTTP**
+    spricht → kein TLS-Abschluss → keine Seite. Jetzt: mit gesetztem `CT_EDGE_PORTAL_CERT`/`CT_EDGE_PORTAL_KEY` (PEM, öffentlich
+    vertrauenswürdig für den Portal-Host — z.B. eine out-of-band bezogene LE-Cert wie beim help-site) terminiert der Edge die
+    Browser-TLS (`transport::build_portal_acceptor`, `rustls-pemfile`) und reverse-proxyt **Klartext-HTTP** an
+    `CT_CP_PROXY_ADDR` (Control-Plane `:8090`). Ohne Cert bleibt der Legacy-Raw-Proxy (für einen TLS-sprechenden Upstream, z.B.
+    fronting Caddy). Frozen-Test `front_door_terminates_portal_tls_and_proxies_http_to_the_control_plane` (echter rustls-Browser-Handshake
+    → HTTP-GET → Control-Plane-Seite kommt über HTTPS zurück). Gate grün (ct-edge 70). *(Cert-Automatisierung — in-process ACME
+    statt BYO — bleibt der ACME/AD-Teil unten + AD4-Operator-Delegation.)*
   - **AD1** ✅ Neue Crate `ct-dns`: hand-rolled DNS-Wire-Codec (`message::parse_query`/`build_response`, TXT, bounds-checked,
     panikfrei wie der SNI-Parser) + `store::AcmeDnsStore` (challenge-name → TXT, poison-safe, case-insensitive, add/set/clear/txt).
     Frozen-Tests `parse_query_reads_the_question`, `build_response_carries_the_txt_answer`,

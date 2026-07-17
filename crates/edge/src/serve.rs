@@ -268,6 +268,7 @@ pub async fn serve_front_door(
     acceptor: &tokio_rustls::TlsAcceptor,
     portal_host: Option<&str>,
     portal_addr: Option<SocketAddr>,
+    portal_tls: Option<&tokio_rustls::TlsAcceptor>,
     challenge: &Challenge,
 ) -> Result<(), BoxError> {
     let hello = crate::sni::read_client_hello_bytes(&mut inbound)
@@ -287,14 +288,31 @@ pub async fn serve_front_door(
         }
         crate::sni::FrontDoorRoute::ControlPlane => {
             let addr = portal_addr.ok_or("front door: control-plane proxy address not configured")?;
-            let mut upstream = tokio::net::TcpStream::connect(addr).await?;
-            let mut joined = Prepend {
+            let joined = Prepend {
                 pre: hello,
                 pos: 0,
                 inner: inbound,
             };
-            tokio::io::copy_bidirectional(&mut joined, &mut upstream).await?;
-            Ok(())
+            match portal_tls {
+                // #31 FD4-a: TERMINATE the browser's TLS with the Portal cert, then
+                // reverse-proxy plaintext HTTP to the control plane — so a browser
+                // gets the landing page over HTTPS. The control plane speaks HTTP,
+                // so this is the path that actually serves a page on :443.
+                Some(pacc) => {
+                    let mut tls = pacc.accept(joined).await?;
+                    let mut upstream = tokio::net::TcpStream::connect(addr).await?;
+                    tokio::io::copy_bidirectional(&mut tls, &mut upstream).await?;
+                    Ok(())
+                }
+                // Legacy raw-proxy: only serves a page if the upstream itself
+                // terminates TLS (e.g. a fronting Caddy). Kept for that topology.
+                None => {
+                    let mut joined = joined;
+                    let mut upstream = tokio::net::TcpStream::connect(addr).await?;
+                    tokio::io::copy_bidirectional(&mut joined, &mut upstream).await?;
+                    Ok(())
+                }
+            }
         }
         crate::sni::FrontDoorRoute::BrowserTunnel(_host) => {
             let joined = Prepend {
@@ -725,11 +743,35 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     let portal_addr = std::env::var("CT_CP_PROXY_ADDR")
                         .ok()
                         .and_then(|s| s.parse::<SocketAddr>().ok());
+                    // #31 FD4-a: if a Portal cert is supplied, the edge terminates
+                    // the browser's TLS for the Portal host and reverse-proxies HTTP
+                    // to the control plane — so the landing page renders over HTTPS
+                    // on :443 without a fronting terminator. Absent -> legacy
+                    // raw-proxy (needs a TLS-speaking upstream).
+                    let portal_tls = match (
+                        std::env::var("CT_EDGE_PORTAL_CERT"),
+                        std::env::var("CT_EDGE_PORTAL_KEY"),
+                    ) {
+                        (Ok(c), Ok(k)) if !c.is_empty() && !k.is_empty() => {
+                            match crate::transport::build_portal_acceptor(&c, &k) {
+                                Ok(a) => {
+                                    eprintln!("ct-edge: front door terminates Portal TLS (CT_EDGE_PORTAL_CERT)");
+                                    Some(a)
+                                }
+                                Err(e) => {
+                                    eprintln!("ct-edge: invalid Portal cert/key ({e}); Portal raw-proxied instead");
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = fl.accept().await {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
                             let portal_host = portal_host.clone();
+                            let portal_tls = portal_tls.clone();
                             tokio::spawn(async move {
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -740,6 +782,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     &acceptor,
                                     portal_host.as_deref(),
                                     portal_addr,
+                                    portal_tls.as_ref(),
                                     &challenge,
                                 )
                                 .await;
@@ -1662,6 +1705,7 @@ mod tests {
                 &acceptor,
                 Some("portal.test"),
                 Some(portal_addr),
+                None, // raw-proxy path (no Portal cert)
                 &challenge,
             )
             .await
@@ -1683,6 +1727,93 @@ mod tests {
         // Close the client so the proxy's client->upstream half sees EOF and
         // serve_front_door returns (the upstream already closed after the echo).
         drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
+    async fn front_door_terminates_portal_tls_and_proxies_http_to_the_control_plane() {
+        // #31 FD4-a: a browser hitting :443 with the Portal SNI gets its TLS
+        // TERMINATED at the edge (Portal cert) and its HTTP reverse-proxied to the
+        // plain-HTTP control plane — so a real landing page renders over HTTPS.
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        // Portal cert for portal.test + the edge's terminating acceptor.
+        let certified = rcgen::generate_simple_self_signed(vec!["portal.test".to_string()]).unwrap();
+        let portal_cert = certified.cert.der().clone();
+        let portal_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![portal_cert.clone()], portal_key)
+            .unwrap();
+        let portal_tls = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        // A plain-HTTP "control plane": read the request line, reply with a page.
+        let cp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cp_addr = cp.local_addr().unwrap();
+        let cp_task = tokio::spawn(async move {
+            let (mut sock, _) = cp.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(buf[..n].starts_with(b"GET "), "control plane sees a plaintext HTTP request");
+            sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n\r\nhello portal")
+                .await
+                .unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        // Front door with the Portal cert wired in (FD4-a path).
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let dummy_acceptor = {
+            let c = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+            let cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![c.cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der())),
+                )
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
+        };
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_front_door(
+                tcp,
+                &state,
+                &dummy_acceptor,
+                Some("portal.test"),
+                Some(cp_addr),
+                Some(&portal_tls),
+                &challenge,
+            )
+            .await
+        });
+
+        // Browser: a real rustls TLS handshake to the edge, trusting the Portal
+        // cert, then a plain HTTP GET — expects the control plane's page back.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(portal_cert).unwrap();
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let tcp = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("portal.test").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.expect("browser TLS terminates at the edge");
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: portal.test\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.0 200 OK"), "landing page served over HTTPS: {text:?}");
+        assert!(text.contains("hello portal"), "control-plane body proxied back to the browser");
+
+        cp_task.await.unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }
 }

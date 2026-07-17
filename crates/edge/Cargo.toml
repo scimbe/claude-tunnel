@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.13"
+rustls-pemfile = "2"
 rand = "0.8"
 axum = "0.7"
 

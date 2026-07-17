@@ -61,6 +61,32 @@ pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'stat
     Ok(CertificateDer::from(std::fs::read(path)?))
 }
 
+/// Build a TLS acceptor for the Portal from an operator-supplied PEM cert chain +
+/// private key (#31 FD4-a). The Edge uses this to TERMINATE TLS for the Portal
+/// host on the unified `:443` front door and reverse-proxy plaintext HTTP to the
+/// control plane — so a browser gets a real landing page over HTTPS, rather than
+/// the raw-proxy path which needs a TLS-speaking upstream. The cert is a publicly
+/// trusted one for the Portal hostname (e.g. an LE cert obtained out-of-band, as
+/// the help-site already does), configured via `CT_EDGE_PORTAL_CERT`/`_KEY`.
+pub fn build_portal_acceptor(
+    cert_pem: impl AsRef<Path>,
+    key_pem: impl AsRef<Path>,
+) -> Result<TlsAcceptor, BoxError> {
+    install_crypto_provider();
+    let mut cr = std::io::BufReader::new(std::fs::File::open(cert_pem)?);
+    let chain: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cr).collect::<Result<_, _>>()?;
+    if chain.is_empty() {
+        return Err("portal cert file had no certificates".into());
+    }
+    let mut kr = std::io::BufReader::new(std::fs::File::open(key_pem)?);
+    let key = rustls_pemfile::private_key(&mut kr)?.ok_or("portal key file had no private key")?;
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    Ok(TlsAcceptor::from(Arc::new(cfg)))
+}
+
 /// Build a QUIC server [`Endpoint`] (P1.1a), discarding the cert.
 pub fn build_server_endpoint() -> Result<Endpoint, BoxError> {
     Ok(build_server_endpoint_with_cert()?.0)
