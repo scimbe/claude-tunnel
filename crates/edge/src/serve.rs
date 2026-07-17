@@ -245,6 +245,35 @@ where
     Ok(())
 }
 
+/// Resolve the `CT_CP_PROXY_ADDR` Portal upstream — a `host:port` (or literal
+/// `IP:port`) — for the `:443` front door (#31; mirrors #45's `resolve_addr` on
+/// the agent). A hostname like `control-plane:8090`, the natural docker-compose
+/// value, resolves via the system resolver; a literal `IP:port` parses directly.
+/// A set-but-unresolvable value is logged and yields `None` (Portal route
+/// disabled) rather than silently becoming a dead route indistinguishable from a
+/// reject — the failure mode scimbe hit when a hostname was configured.
+fn resolve_proxy_addr(raw: Option<String>) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let s = raw?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => Some(a),
+            None => {
+                eprintln!("ct-edge: CT_CP_PROXY_ADDR '{s}' resolved to no address; Portal route disabled");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("ct-edge: CT_CP_PROXY_ADDR '{s}' does not resolve ({e}); Portal route disabled");
+            None
+        }
+    }
+}
+
 /// Serve one plaintext HTTP/1.x request on `:80` with a `308 Permanent Redirect`
 /// to the HTTPS URL for the same Host + path — so a browser typing
 /// `http://<host>/…` is bounced to `https://<host>/…` on the unified `:443`
@@ -796,9 +825,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     let fstate = state.clone();
                     let facceptor = acceptor.clone();
                     let portal_host = std::env::var("CT_EDGE_PORTAL_HOST").ok();
-                    let portal_addr = std::env::var("CT_CP_PROXY_ADDR")
-                        .ok()
-                        .and_then(|s| s.parse::<SocketAddr>().ok());
+                    let portal_addr = resolve_proxy_addr(std::env::var("CT_CP_PROXY_ADDR").ok());
                     // #31 FD4-a: if a Portal cert is supplied, the edge terminates
                     // the browser's TLS for the Portal host and reverse-proxies HTTP
                     // to the control plane — so the landing page renders over HTTPS
@@ -1806,6 +1833,27 @@ mod tests {
         // serve_front_door returns (the upstream already closed after the echo).
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[test]
+    fn resolve_proxy_addr_accepts_hostnames_and_literals() {
+        // #31: CT_CP_PROXY_ADDR must resolve a hostname (control-plane:8090), not
+        // only a literal IP:port — else it silently became None -> dead Portal
+        // route. `localhost` stands in for a resolvable service name in the gate.
+        let a = resolve_proxy_addr(Some("localhost:8090".into())).expect("hostname resolves");
+        assert_eq!(a.port(), 8090);
+        assert!(a.ip().is_loopback());
+        assert_eq!(
+            resolve_proxy_addr(Some("127.0.0.1:8090".into())),
+            Some("127.0.0.1:8090".parse().unwrap()),
+            "literal IP:port parses directly"
+        );
+        assert!(resolve_proxy_addr(None).is_none(), "unset -> None");
+        assert!(resolve_proxy_addr(Some("  ".into())).is_none(), "blank -> None");
+        assert!(
+            resolve_proxy_addr(Some("no-port".into())).is_none(),
+            "unresolvable -> None (not a panic)"
+        );
     }
 
     #[tokio::test]
