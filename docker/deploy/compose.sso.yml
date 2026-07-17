@@ -33,8 +33,11 @@ services:
     environment:
       # Dev-mode bootstrap admin (override in .env for anything reachable). These
       # are Keycloak's own admin-console creds, unrelated to the portal client.
-      KC_BOOTSTRAP_ADMIN_USERNAME: "${KC_ADMIN_USER:-admin}"
-      KC_BOOTSTRAP_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD:-admin}"
+      # NOTE: KEYCLOAK_ADMIN/_PASSWORD are the correct names for the pinned :25.0
+      # image — KC_BOOTSTRAP_ADMIN_* are 26+ only and are silently ignored on 25,
+      # leaving no admin user at all (so you can't fetch the client secret).
+      KEYCLOAK_ADMIN: "${KC_ADMIN_USER:-admin}"
+      KEYCLOAK_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD:-admin}"
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
@@ -48,7 +51,9 @@ services:
       - "${KEYCLOAK_PORT:-8091}:8080"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q UP"]
+      # Keycloak 25 serves /health on the MANAGEMENT interface (:9000), not the
+      # main HTTP port (:8080, which 404s the health path). Probe :9000.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q UP"]
       interval: 15s
       timeout: 5s
       retries: 10

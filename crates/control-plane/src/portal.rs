@@ -744,6 +744,32 @@ mod tests {
             .lines()
             .any(|l| l.trim().starts_with("CT_OIDC_CLIENT_SECRET:"));
         assert!(!sets_secret, "client secret must live in .env, not the committed compose");
+
+        // #42 regression (bug 2): Keycloak 25 serves /health on the management
+        // interface :9000, not the main :8080 — probing 8080 404s and the
+        // healthcheck never passes, so depends_on: service_healthy never resolves.
+        assert!(
+            compose.contains("localhost/9000"),
+            "the Keycloak healthcheck must probe the :9000 management port"
+        );
+        assert!(
+            !compose.contains("localhost/8080"),
+            "the healthcheck must not probe :8080 (health 404s there on KC 25)"
+        );
+
+        // #42 regression (bug 3): on the pinned :25.0 image the admin bootstrap
+        // env is KEYCLOAK_ADMIN[_PASSWORD]; the KC_BOOTSTRAP_ADMIN_* names are
+        // 26+ only and silently create no admin, blocking client-secret retrieval.
+        assert!(compose.contains("KEYCLOAK_ADMIN"), "uses the :25.0 admin bootstrap env names");
+        // Check active (non-comment) lines only — a comment may still mention the
+        // wrong name to explain the pitfall.
+        let sets_bootstrap_admin = compose
+            .lines()
+            .any(|l| l.trim().starts_with("KC_BOOTSTRAP_ADMIN"));
+        assert!(
+            !sets_bootstrap_admin,
+            "KC_BOOTSTRAP_ADMIN_* is ignored on KC 25 — no admin gets created"
+        );
     }
 
     #[tokio::test]
