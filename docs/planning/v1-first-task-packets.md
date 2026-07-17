@@ -1654,3 +1654,26 @@ are control-plane HTML producers with oneshot render tests). Decomposed:
   device — what it does, no inbound port) and signposts lost-token recovery (reopen the page → a fresh
   single-use token per visit, which the code already mints). Frozen test asserts both. **All five friction
   points addressed → #69 fix-ready.**
+
+## #72 Agent Fabric — direct agent-to-agent channels with trust chains (relay fallback)
+
+Substantial new architecture feature (user feedback on "Share"): agents address & talk to each other
+directly, central plane only as fallback, organised by explicit trust chains — incl. cross-user. scimbe
+prescribed design-first (ADR before code). Named "Agent Fabric" / "Channels" to avoid collision with the
+existing "Mesh" terminology (ADR-0010/0013/0015 = client↔origin data plane, not an agent network).
+Decomposed:
+
+- **AF1** ✅ **ADR-0020 — addressing + trust model** (design, no code): `docs/adr/0020-agent-fabric-channels-and-trust-chains.md`.
+  Grounds what exists (subject-scoped tunnel *sharing* = same routing token/full access; client↔agent
+  rendezvous only; flat bearer `RoutingToken`/`Capability`; two-party `Noise_IK`) and decides: Channels
+  addressed by opaque `ChannelId`; structured/expiring/directional `ChannelGrant` for trust chains
+  (vs. flat bearer); cross-user via explicit invitation (distinct from sharing); transport reuses ADR-0015
+  rendezvous (edge broker, pairwise agent↔agent Noise, relay only as payload-blind fallback); a channel is
+  a hub of pairwise 2-party sessions (sidesteps group-crypto). Gate: design artifact — workspace unchanged/green.
+- **AF2** ⏳ **Same-user minimal prototype**: two agents of one user establish a direct channel via the
+  existing rendezvous (edge as broker, no payload relay); real two-agent integration test on the NAT-punch base.
+- **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
+  into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
+- **AF4** ⏳ **Fallback + hardening**: edge relay fallback when direct setup fails (fallback-path integration
+  test) + revoke/expiry enforcement. **fix-ready only when real direct A2A data exchange + trust chains +
+  tested fallback are all met.**
