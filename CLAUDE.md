@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-`claude-tunnel` is a **Claude Code + ruflo (claude-flow v3) orchestration workspace**, not an application. There is no `src/` or `package.json` and no commits yet on `master` — the substance of the repo is its tooling wiring: a 3-layer memory system, Claude Code lifecycle hooks, and a session-management script. When adding real code, follow the File Organization layout below.
+`claude-tunnel` is a **zero-knowledge tunnel**, implemented as a Rust workspace — crates `ct-common`, `ct-edge`, `ct-agent`, `ct-client`, `ct-control-plane`, `ct-dns` (an end-to-end-encrypted data path with a thin, provider-blind control plane). Application code lives under `crates/`; build and test with Cargo (the hermetic Docker gate is the canonical check — see `scripts/`). The `main` branch has a full commit history.
+
+The repo **also** carries a developer-workflow layer for driving Claude Code against it: the role skills under `.claude/skills/`, `scripts/claude-resume.sh`, and `.mcp.json`. Note what is actually tracked here: only `.claude/skills/{agent,central,developer}/SKILL.md` and `.mcp.json` (which declares a single MCP server, `github`). The ruflo/claude-flow **3-layer memory system, `.claude/settings.json` hooks, and `.claude/helpers/*` described below are local, untracked developer tooling** — conveniences on the developer's machine, **not controls enforced by this repository** (the skills' guardrails are therefore prompt-level, not hook-enforced; cf. issue #77).
 
 ## Architecture
 
@@ -60,6 +62,8 @@ An `EXIT` trap runs `session-end` (summary + persist + metrics) when the wrapped
 
 ## MCP servers
 
+The committed `.mcp.json` declares **only `github`**. The table below is the *optional* set a developer may wire up locally (via `claude mcp add …`); it is **not** part of this repo's checked-in config:
+
 | Server | Command | Purpose |
 |--------|---------|---------|
 | claude-flow@alpha | `npx claude-flow@alpha mcp start` | Ruflo orchestration (314+ tools) |
@@ -78,13 +82,12 @@ An `EXIT` trap runs `session-end` (summary + persist + metrics) when the wrapped
 
 ## File Organization
 
-When application code is added, place it under:
+Rust application code lives in a Cargo workspace under `crates/`. Supporting trees:
 
-- `/src` — source code
-- `/tests` — tests
-- `/docs` — documentation (`/docs/adr` for ADRs, `/docs/ddd` for domain docs — see `claudeFlow` config in `.claude/settings.json`)
-- `/config` — configuration
-- `/scripts` — utility scripts (currently `claude-resume.sh`)
+- `/crates` — the Rust workspace (`ct-common`, `ct-edge`, `ct-agent`, `ct-client`, `ct-control-plane`, `ct-dns`); each crate holds its own `src/` and `tests`
+- `/docs` — documentation (`/docs/adr` for ADRs, `/docs/planning` for task packets, `/docs/ops` for the runbook, `/docs/security` for the threat model & whitepaper)
+- `/docker` — deploy manifests (compose, k8s) and the Keycloak realm
+- `/scripts` — utility scripts (`claude-resume.sh`, `check-no-secrets.sh`, gate helpers)
 
 ## Behavioral rules
 
