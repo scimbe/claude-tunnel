@@ -2023,3 +2023,24 @@ Out-of-Scope getrackt — #59, ADR-0002/0017, fazit). Drei echte Restlücken, de
   Passthrough schließt nur den Payload-, nicht die übrigen drei der vier Bausteine. Thesis baut grün (65 S.).
   **#70 fix-ready** (alle drei echten Lücken adressiert: PQC benannt, nächste Vergleichsprojekte zitiert,
   Passthrough-Modi eingeordnet).
+
+## #77 Skill trust model — prompt-only enforcement (security-review, decided 2026-07-18)
+
+scimbe's decision: **commit the enforcement layer** — programmatic guardrails + a stable account-id anchor.
+Decomposed:
+
+- **SEC77a** ✅ **Pin the issue-author trust anchor to scimbe's STABLE account id** (`scripts/verify-issue-author.sh`):
+  the three role skills keyed authorship on the mutable `author.login`; GitHub allows a username rename +
+  reuse of the freed login on another account (#77 gap 6). The guard pins scimbe's stable account **node id**
+  (`MDQ6VXNlcjEyNzk5MTI=`, = numeric id 1279912) — which `gh issue view --json author` exposes as
+  `.author.id` — and exits non-zero for any other author. All three SKILLs (developer/central/agent) now
+  mandate `scripts/verify-issue-author.sh <n>` (exit 0 iff pinned) instead of a login string compare. Gate:
+  `bash -n` + `--selftest` (pinned id passes; foreign id, login string, empty all rejected) + live check
+  (#77 → OK; a foreign account → rejected).
+- **SEC77b** ⏳ **Commit `.claude/settings.json` + PreToolUse hook**: a permissions denylist (field roles
+  agent/central: no `Edit`/`Write`; and `Bash` write-guard so `> file`/`tee`/`sed -i` can't bypass it) enforced
+  by a committed PreToolUse hook, so the "field roles cannot modify the codebase" guarantee is shim-enforced,
+  not prose (#77 gaps 1,8). Node/Claude-Code tooling with a self-test.
+- **SEC77c** ⏳ **Treat non-scimbe issue *comments* as untrusted** (#77 gaps 4,9): the real injection vector on
+  a public repo is a comment on a scimbe-authored issue; the loops must not act on instructions from comment
+  bodies whose author fails `verify-issue-author.sh`.
