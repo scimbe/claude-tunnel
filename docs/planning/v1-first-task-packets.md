@@ -1797,9 +1797,23 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
   the genuine holder signs the challenge and is admitted; a thief who replays the identical grant but signs
   with another key is refused. Broker still NOT live (SEC81c) — this only hardens the gate it will mount.
   Gate green (13 broker tests).
-- **SEC81c** ⏳ **Wire the broker into the live edge** (gap 4): mount `broker_channel_rendezvous` in
-  serve.rs + a control-plane channel-registry API, ONLY after SEC81b (now unblocked). Endpoint should
-  additionally be constrained to match the agent's advertised direct endpoint where possible.
+- **SEC81c** ⏳ **Wire the broker into the live edge** (gap 4), ONLY after SEC81b (now unblocked). Broken
+  into three bounded steps so no live serve-loop code lands before its inputs are proven:
+  - **SEC81c-a** ✅ **Registry→broker `authorize` adapter** (`ct-control-plane::storage`): the broker's
+    admission gate needs `authorize(channel, holder) -> Option<operator_pubkey>` returning the key **iff the
+    holder is a current member**. Added `SqliteChannelStore::authorize_holder`, a single JOIN over
+    `channels`⋈`channel_members` that folds the gap-2 membership/revocation check into the key source (a
+    non-member, a never-added holder, or a removed member all resolve to `None` → refused at the gate, no
+    key rotation). Atomic (no torn read between separate `is_member`/`operator_pubkey` calls). This is the
+    exact production source for `accept_and_read_join`'s closure. Frozen test
+    `channel_authorize_holder_yields_operator_key_only_for_members` (unknown channel / non-member / member /
+    stranger / revoked / re-key). Gate green.
+  - **SEC81c-b** ⏳ **Channel-registry HTTP API** on the control plane: owner-scoped endpoints to
+    register a channel (operator pubkey) and add/remove members, backed by the store above.
+  - **SEC81c-c** ⏳ **Mount the broker in the live edge**: wire `broker_channel_rendezvous` into serve.rs
+    with `authorize` sourced from `authorize_holder` (via the control plane). Endpoint should additionally be
+    constrained to match the agent's advertised direct endpoint where possible. Needs the agent side (#72
+    AF4) to be a usable end-to-end path.
 
 ## #78 CI gate / build-isolation security review (security-review)
 

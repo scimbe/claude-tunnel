@@ -980,6 +980,32 @@ impl SqliteChannelStore {
         Ok(raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
     }
 
+    /// The operator public key for `channel` **iff `holder` is a current member** —
+    /// the exact shape the edge channel broker's `authorize` closure requires (#81
+    /// SEC81c): membership and revocation fold into the key source, so a holder that
+    /// was never added, or was removed, resolves to `None` and is refused at the gate
+    /// with no key rotation or expiry-shortening. A single JOIN keeps membership and
+    /// key lookup atomic (no torn read between an `is_member` and an `operator_pubkey`
+    /// call). This is the production source for `accept_and_read_join`'s `authorize`.
+    pub fn authorize_holder(
+        &self,
+        channel: &ChannelId,
+        holder: &[u8; 32],
+    ) -> rusqlite::Result<Option<[u8; 32]>> {
+        let raw: Option<Vec<u8>> = self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT c.operator FROM channels c \
+                 JOIN channel_members m ON m.channel = c.channel \
+                 WHERE c.channel = ?1 AND m.holder = ?2",
+                params![&channel.0[..], &holder[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
+    }
+
     /// The subject that owns `channel`, if registered.
     pub fn channel_owner(&self, channel: &ChannelId) -> rusqlite::Result<Option<String>> {
         self.conn
@@ -1530,6 +1556,40 @@ mod tests {
         // Owner may re-key their own channel (agent rotates its operator key).
         assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
         assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+    }
+
+    #[test]
+    fn channel_authorize_holder_yields_operator_key_only_for_members() {
+        // #81 SEC81c: the broker's `authorize(channel, holder)` production source.
+        // Returns the operator key iff the holder is a current member — folding the
+        // gap-2 membership/revocation check into the key lookup so a stolen/forged
+        // grant for a non-member (or a removed member) is refused at the edge gate.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0xC0; 32]);
+        let op = [0xEEu8; 32];
+        let member = [0x33u8; 32];
+        let stranger = [0x44u8; 32];
+
+        // Unknown channel -> None (even for any holder).
+        assert_eq!(s.authorize_holder(&ch, &member).unwrap(), None);
+
+        // Registered channel, but holder not yet a member -> None (no key leaked).
+        assert!(s.register_channel(&ch, &op, "alice").unwrap());
+        assert_eq!(s.authorize_holder(&ch, &member).unwrap(), None, "non-member gets no key");
+
+        // Member -> the operator key; a different holder still gets None.
+        assert!(s.add_member(&ch, "alice", &member).unwrap());
+        assert_eq!(s.authorize_holder(&ch, &member).unwrap(), Some(op), "member resolves the key");
+        assert_eq!(s.authorize_holder(&ch, &stranger).unwrap(), None);
+
+        // Revocation: removing the member immediately denies the key at the gate.
+        assert!(s.remove_member(&ch, "alice", &member).unwrap());
+        assert_eq!(s.authorize_holder(&ch, &member).unwrap(), None, "revoked member refused");
+
+        // Re-key tracks through: a re-added member resolves the NEW operator key.
+        assert!(s.add_member(&ch, "alice", &member).unwrap());
+        assert!(s.register_channel(&ch, &[0x55u8; 32], "alice").unwrap());
+        assert_eq!(s.authorize_holder(&ch, &member).unwrap(), Some([0x55u8; 32]));
     }
 
     #[test]
