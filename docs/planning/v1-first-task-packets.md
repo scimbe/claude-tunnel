@@ -1894,9 +1894,16 @@ Decomposed:
   loop so a flood can't exhaust memory/FDs before the PoW gate runs. Frozen test
   `connection_cap_admits_up_to_max_then_sheds_until_a_permit_frees` (admit N, shed N+1, releasing a permit
   frees exactly one slot). Gate green (ct-edge lib, 90 tests).
-- **SEC86c** ⏳ **Follow-ups**: extend the cap to the TCP accept loops (browser/front/rendezvous/tcp-fallback
-  listeners in `run_edge`), optionally PoW-gate `'A'` registration, and reconcile the whitepaper's "rate
-  limit shipped" wording (now opt-in + wired).
+- **SEC86c** ✅ **Extend the cap to the TCP fallback rendezvous loop**: the `tcp_listener` accept loop (the
+  TCP analog of the QUIC path, for clients whose UDP is blocked) now shares the **same** `ConnectionCap` — a
+  clone, so the `CT_EDGE_MAX_CONNECTIONS` budget is global across QUIC+TCP, not per-loop. Over the cap it
+  sheds by dropping the socket. Frozen test `connection_cap_clones_share_one_global_budget` (a permit taken
+  through one handle is unavailable through a clone; releasing frees it for both). Gate green (ct-edge lib,
+  91 tests). With SEC86a+b+c the two reviewer-flagged gaps (rate limiter unwired, no connection limit) are
+  fully closed on both rendezvous surfaces.
+- **SEC86d** ⏳ **Minor remainder**: the HTTP→HTTPS redirect listener (serves only redirects — negligible DoS
+  surface), an optional PoW gate on `'A'` registration, and reconciling the whitepaper's "rate limit shipped"
+  wording (now opt-in + wired). Not core to the finding.
 
 ## #87 Control-plane endpoints: unauth / un-rate-limited / client-priced (security-review)
 

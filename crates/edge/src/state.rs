@@ -699,4 +699,17 @@ mod tests {
         drop(c);
         assert_eq!(cap.available(), 2, "all permits returned");
     }
+
+    #[test]
+    fn connection_cap_clones_share_one_global_budget() {
+        // #86 SEC86c: the QUIC and TCP accept loops hold CLONES of one
+        // ConnectionCap, so the cap must be global — a permit taken through one
+        // handle is unavailable through the other (not a per-loop budget).
+        let cap = ConnectionCap::new(1);
+        let clone = cap.clone();
+        let p = cap.try_admit().expect("global slot admitted via one handle");
+        assert!(clone.try_admit().is_none(), "the clone sees the shared budget exhausted");
+        drop(p);
+        assert!(clone.try_admit().is_some(), "releasing frees the slot for the clone too");
+    }
 }

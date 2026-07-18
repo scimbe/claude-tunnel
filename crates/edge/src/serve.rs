@@ -1011,11 +1011,26 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
 
     // TCP fallback accept loop (for Clients whose outbound UDP is blocked).
     let state_tcp = state.clone();
+    // #86 SEC86c: the TCP fallback is the same rendezvous surface as QUIC, so it
+    // shares the one connection cap (a clone — the budget is global, not per-loop).
+    let conn_cap_tcp = conn_cap.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = tcp_listener.accept().await {
+            // Shed over the cap by dropping the socket (closes it), as on QUIC.
+            let permit = match &conn_cap_tcp {
+                Some(cap) => match cap.try_admit() {
+                    Some(p) => Some(p),
+                    None => {
+                        drop(tcp);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
             tokio::spawn(async move {
+                let _permit = permit; // held for the connection's lifetime
                 if let Ok(tls) = acceptor.accept(tcp).await {
                     let mut nonce = [0u8; 16];
                     rand::rngs::OsRng.fill_bytes(&mut nonce);
