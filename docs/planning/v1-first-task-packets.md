@@ -1767,8 +1767,11 @@ prebuilt image dead-ends at the final step. Substantial feature (like #72) → d
   from the release base, `set -eu` + temp-dir + `exec ct-agent onboard` (tokens from env, never argv).
   1 frozen test (shebang, detection, asset name, download URL, env-token requirement, onboard exec, no
   secret in argv). Gate green.
-- **IS3b** ⏳ **`/install.sh` + `/install.ps1` routes**: axum handlers serving the rendered scripts (release
-  base from config), replacing the honest-stopgap 404. Wire once IS2 release binaries exist.
+- **IS3b** ✅ **`/install.sh` + `/install.ps1` routes** — `installer::installer_router` serves both via axum
+  GET handlers (`text/x-shellscript` / `text/plain`) with the release base from `CT_RELEASE_BASE` (default
+  the GitHub-Releases latest-download base), merged into `persistent_control_plane_router`. The two URLs the
+  portal one-liners fetch no longer 404. Frozen test `installer_routes_serve_the_scripts_that_were_404ing`:
+  both routes return 200 and serve exactly `render_install_sh`/`render_install_ps1` for the release base.
 - **IS4** ✅ **`/install.ps1` script renderer** (`installer::render_install_ps1`): the Windows analog of
   IS3a — detects arch (PROCESSOR_ARCHITECTURE → x86_64/aarch64), downloads `ct-agent-windows-<arch>.exe`
   from the release base, `$ErrorActionPreference=Stop`, temp dir, `& $exe onboard` (tokens from env, never

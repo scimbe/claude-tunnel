@@ -11,6 +11,20 @@
 //! variable**, never as a positional argument, so it stays out of the script's
 //! `argv`. Tests use dummy tokens only.
 
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+
+/// Default GitHub-Releases asset base the served scripts download `ct-agent` from
+/// (#75 IS2 — matches the asset names `release.yml` publishes). Overridable at
+/// deploy time via `CT_RELEASE_BASE` (e.g. a mirror or a pinned tag).
+pub const DEFAULT_RELEASE_BASE: &str =
+    "https://github.com/scimbe/claude-tunnel/releases/latest/download";
+
 /// Target OS family for the copy-paste installer command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallOs {
@@ -145,6 +159,36 @@ Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
 & $exe onboard
 "#;
 
+/// Serve `/install.sh` and `/install.ps1` (#75 IS3b) — the routes every portal
+/// install one-liner (`curl -fsSL <portal>/install.sh | … sh`, `irm
+/// <portal>/install.ps1 | iex`) fetches. Before this, both URLs 404'd and the
+/// customer command dead-ended (the reported bug). `release_base` is the trusted
+/// GitHub-Releases asset base the rendered scripts download the prebuilt
+/// `ct-agent` from (IS2); it is config, never user input. Serving is read-only and
+/// carries no secret — the tokens live only in the environment the one-liner sets.
+pub fn installer_router(release_base: String) -> Router {
+    Router::new()
+        .route("/install.sh", get(serve_install_sh))
+        .route("/install.ps1", get(serve_install_ps1))
+        .with_state(Arc::new(release_base))
+}
+
+async fn serve_install_sh(State(base): State<Arc<String>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        render_install_sh(&base),
+    )
+        .into_response()
+}
+
+async fn serve_install_ps1(State(base): State<Arc<String>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        render_install_ps1(&base),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +239,47 @@ mod tests {
         assert_eq!(InstallOs::parse("macos"), Some(InstallOs::Unix));
         assert_eq!(InstallOs::parse(" Windows "), Some(InstallOs::Windows));
         assert_eq!(InstallOs::parse("plan9"), None);
+    }
+
+    #[tokio::test]
+    async fn installer_routes_serve_the_scripts_that_were_404ing() {
+        // #75 IS3b (the reported bug): the portal one-liners curl/irm these two
+        // URLs, which had no route and returned 404 live. Assert they now serve the
+        // rendered scripts (200 + the matching renderer body + release base) so the
+        // customer command no longer dead-ends.
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let base = "https://github.com/scimbe/claude-tunnel/releases/latest/download";
+        let app = installer_router(base.to_string());
+
+        // /install.sh -> 200 shell script.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/install.sh is served, not 404");
+        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.starts_with("text/x-shellscript"), "sh content-type: {ct}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let sh = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(sh, render_install_sh(base), "serves exactly the rendered installer");
+        assert!(sh.starts_with("#!/bin/sh") && sh.contains(base), "real script for this release base");
+
+        // /install.ps1 -> 200 PowerShell script.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/install.ps1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/install.ps1 is served, not 404");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let ps = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(ps, render_install_ps1(base), "serves exactly the rendered PowerShell installer");
+        assert!(ps.contains("#Requires -Version 5") && ps.contains(base), "real ps1 for this release base");
     }
 
     #[test]

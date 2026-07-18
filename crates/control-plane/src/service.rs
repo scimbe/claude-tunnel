@@ -903,7 +903,16 @@ pub fn persistent_control_plane_router(
                 _ => None,
             },
         ))
-        .merge(pki);
+        .merge(pki)
+        // #75 IS3b: serve /install.sh + /install.ps1 (the portal one-liner targets
+        // that were 404ing). CT_RELEASE_BASE overrides the GitHub-Releases asset
+        // base the served scripts download the prebuilt ct-agent from.
+        .merge(crate::installer::installer_router(
+            std::env::var("CT_RELEASE_BASE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| crate::installer::DEFAULT_RELEASE_BASE.to_string()),
+        ));
     // #81 SEC81c-c (c-i): the live edge queries this to authorize channel-joins (the
     // broker's `authorize` closure). Gated by the shared edge↔CP admin token; mounted
     // only when CT_CP_EDGE_ADMIN_TOKEN is a valid 64-hex value.
