@@ -79,24 +79,30 @@ pub fn install_one_liner(
 /// (`SqliteBootstrap::mint`); the agent redeems the bootstrap token server-side
 /// (`POST /bootstrap/redeem`) and [`parse_install_bundle`]s the result back into the
 /// two tokens — so the real secrets travel in the TLS response body, never in the
-/// one-liner's command string. JSON so the redeem response is self-describing and
-/// forward-compatible.
+/// one-liner's command string.
+///
+/// The format is the deliberately shell-tractable `CT_JOIN_TOKEN=<hex>;CT_AGENT_TOKEN=<hex>`:
+/// the redeem JSON nests this whole bundle inside its `secret` string, and the tokens
+/// are hex (no quotes/whitespace/`;`/`=` collisions), so the install script extracts
+/// `secret` and then each token with a single `sed` each — no nested-JSON parsing and
+/// no `eval` of server data.
 pub fn install_bundle_secret(join_token: &str, routing_token: &str) -> String {
-    serde_json::json!({
-        "join_token": join_token,
-        "routing_token": routing_token,
-    })
-    .to_string()
+    format!("CT_JOIN_TOKEN={join_token};CT_AGENT_TOKEN={routing_token}")
 }
 
 /// Parse the bundle produced by [`install_bundle_secret`] back into
-/// `(join_token, routing_token)`. Returns `None` if the JSON is malformed or either
-/// field is missing/non-string.
+/// `(join_token, routing_token)`. Returns `None` if either field is missing.
 pub fn parse_install_bundle(secret: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(secret).ok()?;
-    let join = v.get("join_token")?.as_str()?.to_string();
-    let routing = v.get("routing_token")?.as_str()?.to_string();
-    Some((join, routing))
+    let mut join = None;
+    let mut routing = None;
+    for field in secret.split(';') {
+        if let Some(v) = field.strip_prefix("CT_JOIN_TOKEN=") {
+            join = Some(v.to_string());
+        } else if let Some(v) = field.strip_prefix("CT_AGENT_TOKEN=") {
+            routing = Some(v.to_string());
+        }
+    }
+    Some((join?, routing?))
 }
 
 /// Render the copy-paste one-liner in its **bootstrap-token** form (#90/#97 SEC90b):
@@ -277,12 +283,13 @@ Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
 /// `release_base` is trusted config (never user input) and has any trailing slash
 /// trimmed. The script is `set -eu`, fails loudly on an unsupported OS/arch, and
 /// installs into a fresh temp dir.
-pub fn render_install_sh(release_base: &str) -> String {
+pub fn render_install_sh(portal_base: &str, release_base: &str) -> String {
     let base = release_base.trim_end_matches('/');
+    let portal = portal_base.trim_end_matches('/');
     format!(
         r#"#!/bin/sh
 # claude-tunnel agent installer (#75). Piped from the portal one-liner:
-#   curl -fsSL <portal>/install.sh | CT_JOIN_TOKEN=... CT_AGENT_TOKEN=... sh
+#   curl -fsSL <portal>/install.sh | CT_BOOTSTRAP=... sh
 # Run this on the machine you want to expose (the origin), not your laptop.
 set -eu
 
@@ -298,8 +305,21 @@ case "$os" in
   *) echo "ct-agent install: unsupported OS '$os' (use the manual path)" >&2; exit 1 ;;
 esac
 
-: "${{CT_JOIN_TOKEN:?set CT_JOIN_TOKEN (from the portal install page)}}"
-: "${{CT_AGENT_TOKEN:?set CT_AGENT_TOKEN (from the portal install page)}}"
+# #90/#97 SEC90b: if a short-lived bootstrap token is set, redeem it server-side
+# over TLS for the real tokens (kept off the command line / shell history / ps);
+# otherwise fall back to tokens set directly in the environment (manual path). The
+# redeemed bundle and its tokens are hex, so each is lifted with a single sed — no
+# nested-JSON parsing and no eval of server data.
+if [ -n "${{CT_BOOTSTRAP:-}}" ]; then
+  resp=$(curl -fsSL -X POST -H 'content-type: application/json' \
+    --data "{{\"token\":\"$CT_BOOTSTRAP\"}}" "{portal}/bootstrap/redeem")
+  bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')
+  CT_JOIN_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')
+  CT_AGENT_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')
+  export CT_JOIN_TOKEN CT_AGENT_TOKEN
+fi
+: "${{CT_JOIN_TOKEN:?set CT_BOOTSTRAP (or CT_JOIN_TOKEN) from the portal install page}}"
+: "${{CT_AGENT_TOKEN:?set CT_BOOTSTRAP (or CT_AGENT_TOKEN) from the portal install page}}"
 
 asset="ct-agent-${{os}}-${{arch}}"
 url="{base}/${{asset}}"
@@ -312,6 +332,7 @@ chmod +x "$tmp/ct-agent"
 exec "$tmp/ct-agent" onboard
 "#,
         base = base,
+        portal = portal,
     )
 }
 
@@ -324,17 +345,27 @@ exec "$tmp/ct-agent" onboard
 /// This is the served script CONTENT; the `/install.ps1` route is IS3b and the
 /// prebuilt release binaries are IS2. Uses a placeholder + replace rather than
 /// `format!` so PowerShell's `{}` blocks need no brace-escaping.
-pub fn render_install_ps1(release_base: &str) -> String {
-    INSTALL_PS1_TEMPLATE.replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
+pub fn render_install_ps1(portal_base: &str, release_base: &str) -> String {
+    INSTALL_PS1_TEMPLATE
+        .replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
+        .replace("__PORTAL_BASE__", portal_base.trim_end_matches('/'))
 }
 
 const INSTALL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
 # claude-tunnel agent installer (#75). Piped from the portal one-liner:
-#   $env:CT_JOIN_TOKEN='...'; $env:CT_AGENT_TOKEN='...'; irm <portal>/install.ps1 | iex
+#   $env:CT_BOOTSTRAP='...'; irm <portal>/install.ps1 | iex
 # Run this on the machine you want to expose (the origin), not your laptop.
 $ErrorActionPreference = 'Stop'
-if (-not $env:CT_JOIN_TOKEN)  { Write-Error 'ct-agent install: set CT_JOIN_TOKEN (from the portal install page)';  exit 1 }
-if (-not $env:CT_AGENT_TOKEN) { Write-Error 'ct-agent install: set CT_AGENT_TOKEN (from the portal install page)'; exit 1 }
+# #90/#97 SEC90b: redeem a short-lived bootstrap token server-side over TLS for the
+# real tokens (kept off the command line); else fall back to env tokens (manual path).
+if ($env:CT_BOOTSTRAP) {
+  $resp = Invoke-RestMethod -Method Post -Uri '__PORTAL_BASE__/bootstrap/redeem' -ContentType 'application/json' -Body (ConvertTo-Json @{ token = $env:CT_BOOTSTRAP })
+  $bundle = $resp.secret
+  if ($bundle -match 'CT_JOIN_TOKEN=([^;]*)')  { $env:CT_JOIN_TOKEN  = $Matches[1] }
+  if ($bundle -match 'CT_AGENT_TOKEN=([^;]*)') { $env:CT_AGENT_TOKEN = $Matches[1] }
+}
+if (-not $env:CT_JOIN_TOKEN)  { Write-Error 'ct-agent install: set CT_BOOTSTRAP (or CT_JOIN_TOKEN) from the portal install page';  exit 1 }
+if (-not $env:CT_AGENT_TOKEN) { Write-Error 'ct-agent install: set CT_BOOTSTRAP (or CT_AGENT_TOKEN) from the portal install page'; exit 1 }
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
   'AMD64' { 'x86_64' }
   'ARM64' { 'aarch64' }
@@ -358,44 +389,55 @@ Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
 /// GitHub-Releases asset base the rendered scripts download the prebuilt
 /// `ct-agent` from (IS2); it is config, never user input. Serving is read-only and
 /// carries no secret — the tokens live only in the environment the one-liner sets.
-pub fn installer_router(release_base: String) -> Router {
+pub fn installer_router(portal_base: String, release_base: String) -> Router {
     Router::new()
         .route("/install.sh", get(serve_install_sh))
         .route("/install.ps1", get(serve_install_ps1))
         // #100: the A2A channel runner scripts, served the same way as the installer.
         .route("/channel.sh", get(serve_channel_sh))
         .route("/channel.ps1", get(serve_channel_ps1))
-        .with_state(Arc::new(release_base))
+        .with_state(InstallerState {
+            portal_base: Arc::new(portal_base),
+            release_base: Arc::new(release_base),
+        })
 }
 
-async fn serve_install_sh(State(base): State<Arc<String>>) -> Response {
+/// Served-script config: the portal origin (for the bootstrap-redeem call the
+/// install scripts make) and the release asset base (for the `ct-agent` download).
+#[derive(Clone)]
+struct InstallerState {
+    portal_base: Arc<String>,
+    release_base: Arc<String>,
+}
+
+async fn serve_install_sh(State(st): State<InstallerState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        render_install_sh(&base),
+        render_install_sh(&st.portal_base, &st.release_base),
     )
         .into_response()
 }
 
-async fn serve_install_ps1(State(base): State<Arc<String>>) -> Response {
+async fn serve_install_ps1(State(st): State<InstallerState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        render_install_ps1(&base),
+        render_install_ps1(&st.portal_base, &st.release_base),
     )
         .into_response()
 }
 
-async fn serve_channel_sh(State(base): State<Arc<String>>) -> Response {
+async fn serve_channel_sh(State(st): State<InstallerState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        render_channel_sh(&base),
+        render_channel_sh(&st.release_base),
     )
         .into_response()
 }
 
-async fn serve_channel_ps1(State(base): State<Arc<String>>) -> Response {
+async fn serve_channel_ps1(State(st): State<InstallerState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        render_channel_ps1(&base),
+        render_channel_ps1(&st.release_base),
     )
         .into_response()
 }
@@ -406,7 +448,10 @@ mod tests {
 
     #[test]
     fn install_ps1_detects_arch_downloads_and_onboards() {
-        let ps = render_install_ps1("https://github.com/scimbe/claude-tunnel/releases/latest/download/");
+        let ps = render_install_ps1(
+            "https://portal.example/",
+            "https://github.com/scimbe/claude-tunnel/releases/latest/download/",
+        );
         assert!(ps.contains("#Requires -Version 5"), "PowerShell header");
         assert!(ps.contains("$ErrorActionPreference = 'Stop'"), "fail-fast");
         assert!(ps.contains("PROCESSOR_ARCHITECTURE"), "detects arch");
@@ -420,11 +465,20 @@ mod tests {
         assert!(ps.contains("& $exe onboard"), "runs the agent onboarding");
         // No secret is ever a positional argument.
         assert!(!ps.contains("onboard $env:CT_JOIN_TOKEN"), "tokens stay in the env, not argv");
+        // #90/#97 SEC90b: redeems CT_BOOTSTRAP against the portal (trailing slash trimmed).
+        assert!(ps.contains("if ($env:CT_BOOTSTRAP)"), "has the bootstrap-redeem branch");
+        assert!(
+            ps.contains("-Uri 'https://portal.example/bootstrap/redeem'"),
+            "redeems against the portal origin"
+        );
     }
 
     #[test]
     fn install_sh_detects_os_arch_downloads_and_onboards() {
-        let sh = render_install_sh("https://github.com/scimbe/claude-tunnel/releases/latest/download/");
+        let sh = render_install_sh(
+            "https://portal.example/",
+            "https://github.com/scimbe/claude-tunnel/releases/latest/download/",
+        );
         // POSIX + fail-fast.
         assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang");
         assert!(sh.contains("set -eu"), "fail-fast");
@@ -442,6 +496,13 @@ mod tests {
         assert!(sh.contains(r#"exec "$tmp/ct-agent" onboard"#), "execs the agent onboarding");
         // No secret is ever a positional argument.
         assert!(!sh.contains("onboard $CT_JOIN_TOKEN") && !sh.contains("onboard \""), "tokens stay in the env");
+        // #90/#97 SEC90b: redeems CT_BOOTSTRAP against the portal (trailing slash trimmed).
+        assert!(sh.contains(r#"if [ -n "${CT_BOOTSTRAP:-}" ]; then"#), "has the bootstrap-redeem branch");
+        assert!(
+            sh.contains("https://portal.example/bootstrap/redeem"),
+            "redeems against the portal origin"
+        );
+        assert!(!sh.contains("$CT_BOOTSTRAP\" \\"), "bootstrap token is not on a command line as an arg");
     }
 
     #[tokio::test]
@@ -468,7 +529,7 @@ mod tests {
         assert!(ps.contains("$env:CT_CHANNEL_ROLE"), "ps requires the channel env");
 
         // Route: GET /channel.sh -> 200 serving exactly the rendered script.
-        let app = installer_router(base.to_string());
+        let app = installer_router("https://portal.example".to_string(), base.to_string());
         let resp = app
             .clone()
             .oneshot(Request::get("/channel.sh").body(Body::empty()).unwrap())
@@ -555,7 +616,10 @@ mod tests {
         use tower::ServiceExt;
 
         // The served script — fetched through the real route, not rendered inline.
-        let app = installer_router("http://release.invalid/base".to_string());
+        let app = installer_router(
+            "https://portal.example".to_string(),
+            "http://release.invalid/base".to_string(),
+        );
         let resp = app
             .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
             .await
@@ -606,6 +670,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #90/#97 SEC90b end-to-end: with only CT_BOOTSTRAP set, the served install.sh
+    /// redeems it server-side, extracts the two real tokens from the bundle, and
+    /// onboards with them — proving the sed extraction + export works in a real POSIX
+    /// `sh` and that no real token was ever on the command line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_install_sh_redeems_a_bootstrap_token_for_the_real_tokens() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tower::ServiceExt;
+
+        let app = installer_router(
+            "https://portal.example".to_string(),
+            "http://release.invalid/base".to_string(),
+        );
+        let resp = app
+            .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let script = String::from_utf8(body.to_vec()).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("ct-is5b-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let write_exec = |path: &std::path::Path, body: &str| {
+            fs::write(path, body).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        let stub = dir.join("ct-agent-stub");
+        write_exec(&stub, "#!/bin/sh\necho \"$1|$CT_JOIN_TOKEN|$CT_AGENT_TOKEN\" > \"$CT_IS5_OUT\"\n");
+        // Fake curl: a `-o <target>` call is the binary download (copy the stub); any
+        // other call is the /bootstrap/redeem POST — emit the {secret:...} JSON the
+        // real handler returns, wrapping the shell-tractable bundle.
+        write_exec(
+            &dir.join("bin/curl"),
+            "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift 2;; *) shift;; esac; done\nif [ -n \"$out\" ]; then cp \"$CT_IS5_STUB\" \"$out\"; else printf '%s' '{\"secret\":\"CT_JOIN_TOKEN=join-BOOT;CT_AGENT_TOKEN=agent-BOOT\"}'; fi\n",
+        );
+        let script_path = dir.join("install.sh");
+        fs::write(&script_path, &script).unwrap();
+        let out = dir.join("out.txt");
+
+        let status = Command::new("sh")
+            .arg(&script_path)
+            .env("PATH", format!("{}/bin:{}", dir.display(), std::env::var("PATH").unwrap_or_default()))
+            // Only the bootstrap token is present — NOT the real tokens.
+            .env("CT_BOOTSTRAP", "boot-XYZ")
+            .env_remove("CT_JOIN_TOKEN")
+            .env_remove("CT_AGENT_TOKEN")
+            .env("CT_IS5_STUB", &stub)
+            .env("CT_IS5_OUT", &out)
+            .status()
+            .expect("run served install.sh with a bootstrap token");
+        assert!(status.success(), "the served installer redeems + runs to completion");
+
+        let recorded = fs::read_to_string(&out).expect("stub ct-agent ran");
+        assert_eq!(
+            recorded.trim(),
+            "onboard|join-BOOT|agent-BOOT",
+            "the bootstrap token was redeemed server-side into the two real tokens, passed via env"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn installer_routes_serve_the_scripts_that_were_404ing() {
         // #75 IS3b (the reported bug): the portal one-liners curl/irm these two
@@ -617,8 +750,9 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
+        let portal = "https://portal.example";
         let base = "https://github.com/scimbe/claude-tunnel/releases/latest/download";
-        let app = installer_router(base.to_string());
+        let app = installer_router(portal.to_string(), base.to_string());
 
         // /install.sh -> 200 shell script.
         let resp = app
@@ -631,7 +765,7 @@ mod tests {
         assert!(ct.starts_with("text/x-shellscript"), "sh content-type: {ct}");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let sh = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(sh, render_install_sh(base), "serves exactly the rendered installer");
+        assert_eq!(sh, render_install_sh(portal, base), "serves exactly the rendered installer");
         assert!(sh.starts_with("#!/bin/sh") && sh.contains(base), "real script for this release base");
 
         // /install.ps1 -> 200 PowerShell script.
@@ -643,7 +777,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "/install.ps1 is served, not 404");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let ps = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(ps, render_install_ps1(base), "serves exactly the rendered PowerShell installer");
+        assert_eq!(ps, render_install_ps1(portal, base), "serves exactly the rendered PowerShell installer");
         assert!(ps.contains("#Requires -Version 5") && ps.contains(base), "real ps1 for this release base");
     }
 
@@ -688,11 +822,13 @@ mod tests {
         let boot = "dummy-bootstrap-token-0123456789";
         let base = "https://portal.example/"; // trailing slash trimmed
 
-        // The bundle the portal mints a bootstrap token over round-trips exactly.
+        // The bundle the portal mints a bootstrap token over round-trips exactly, in
+        // the shell-tractable CT_JOIN_TOKEN=..;CT_AGENT_TOKEN=.. form.
         let bundle = install_bundle_secret(jt, rt);
+        assert_eq!(bundle, "CT_JOIN_TOKEN=dummy-join-token-xyz;CT_AGENT_TOKEN=dummy-routing-token-abc");
         assert_eq!(parse_install_bundle(&bundle), Some((jt.to_string(), rt.to_string())));
-        assert_eq!(parse_install_bundle("not json"), None);
-        assert_eq!(parse_install_bundle(r#"{"join_token":"x"}"#), None, "missing routing_token -> None");
+        assert_eq!(parse_install_bundle("garbage"), None);
+        assert_eq!(parse_install_bundle("CT_JOIN_TOKEN=x"), None, "missing routing token -> None");
 
         let unix = install_one_liner_bootstrap(base, boot, InstallOs::Unix);
         assert_eq!(

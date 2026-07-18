@@ -2282,11 +2282,22 @@ Two secret-exposure observations. Decomposed:
     `bootstrap_one_liner_carries_only_the_bootstrap_token_not_the_real_secrets` (bundle round-trips + rejects
     malformed; neither real token appears in either OS one-liner; bootstrap token carried exactly once). Gate
     green. The embedded-token `install_one_liner` stays for the manual/back-compat path.
-  - **SEC90b-installer-wire** ⏳ last: portal mints the bootstrap token over `install_bundle_secret(...)` and
-    shows `install_one_liner_bootstrap(...)`; `render_install_sh`/`.ps1` redeem `CT_BOOTSTRAP` server-side
-    (`POST {portal}/bootstrap/redeem`) → parse the bundle → `onboard`. Tied to the #75 live install-flow (needs
-    the portal_base threaded into the install scripts + shell JSON extraction). After that the secret-in-argv
-    exposure is gone and #90/#97 can close.
+  - **SEC90b-installer-wire** ✅ **The served `/install.sh` + `/install.ps1` redeem `CT_BOOTSTRAP` server-side.**
+    `render_install_sh`/`render_install_ps1` gained a `portal_base` param and a redeem branch: when
+    `CT_BOOTSTRAP` is set they `POST {portal}/bootstrap/redeem`, lift the two tokens out of the returned bundle
+    (a single `sed`/regex each — no nested-JSON parse, no `eval` of server data, enabled by switching
+    `install_bundle_secret` to the flat `CT_JOIN_TOKEN=…;CT_AGENT_TOKEN=…` form) and `export` them; otherwise
+    they fall back to tokens already in the env (manual/back-compat path). `installer_router` now takes
+    `portal_base` (wired from `CT_PORTAL_BASE_URL`) via a small `InstallerState`. Frozen tests: content
+    (`install_sh`/`install_ps1` assert the redeem branch + portal URL) and a Unix end-to-end
+    `served_install_sh_redeems_a_bootstrap_token_for_the_real_tokens` (only `CT_BOOTSTRAP` set → a fake curl
+    serves the redeem JSON → the stub agent onboards with the two real tokens, proving the extraction works in
+    a real POSIX `sh`); the pre-existing embedded-token end-to-end test still passes (back-compat). Gate green.
+  - **SEC90b-installer-portal** ⏳ last: the portal install page mints a bootstrap token over
+    `install_bundle_secret(join, routing)` (`SqliteBootstrap` threaded into `PortalApiState`) and shows
+    `install_one_liner_bootstrap(...)` instead of the embedded-token `install_one_liner`. Small glue; after it
+    the shown one-liner carries no real secret and #90/#97 can close. (Both paths already interoperate, so
+    nothing is broken meanwhile.)
 
 ## #95 Rendezvous rate-limit + connection cap are opt-in / off by default (security-review)
 

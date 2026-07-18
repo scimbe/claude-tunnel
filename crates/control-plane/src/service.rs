@@ -1229,9 +1229,11 @@ pub fn persistent_control_plane_router(
         ))
         .merge(pki)
         // #75 IS3b: serve /install.sh + /install.ps1 (the portal one-liner targets
-        // that were 404ing). CT_RELEASE_BASE overrides the GitHub-Releases asset
-        // base the served scripts download the prebuilt ct-agent from.
+        // that were 404ing). CT_PORTAL_BASE_URL is the origin the served scripts POST
+        // /bootstrap/redeem to (#90/#97 SEC90b); CT_RELEASE_BASE overrides the
+        // GitHub-Releases asset base the scripts download the prebuilt ct-agent from.
         .merge(crate::installer::installer_router(
+            std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
             std::env::var("CT_RELEASE_BASE")
                 .ok()
                 .filter(|s| !s.is_empty())
