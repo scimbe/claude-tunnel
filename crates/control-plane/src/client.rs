@@ -71,12 +71,16 @@ impl ControlPlaneClient {
     }
 
     /// `POST /enroll/redeem` — redeem a join token, binding this Agent's public
-    /// key to the tenant. Returns the bound tenant.
+    /// key to the tenant. `proof` is the Agent's ed25519 signature over the join
+    /// token (#88 SEC88c), proving it holds the private key for `pubkey`; the
+    /// durable control plane rejects a redemption whose proof doesn't match.
+    /// Returns the bound tenant.
     pub async fn redeem(
         &self,
         join_token: &[u8; 32],
         agent: &AgentId,
         pubkey: &[u8; 32],
+        proof: &[u8; 64],
     ) -> CpResult<TenantId> {
         let resp = self
             .http
@@ -85,6 +89,7 @@ impl ControlPlaneClient {
                 "token": hex_encode(join_token),
                 "agent": agent.0,
                 "pubkey": hex_encode(pubkey),
+                "proof": hex_encode(proof),
             }))
             .send()
             .await?;
@@ -289,7 +294,7 @@ mod tests {
             .issue_join_token(&TenantId("tenant-x".to_string()))
             .await
             .unwrap();
-        let tenant = cp.redeem(&join, &agent, &[7u8; 32]).await.unwrap();
+        let tenant = cp.redeem(&join, &agent, &[7u8; 32], &[0u8; 64]).await.unwrap();
         assert_eq!(tenant.0, "tenant-x", "redeem binds the issuing tenant");
 
         // Agent registers its tunnel's routing token.
@@ -322,9 +327,9 @@ mod tests {
         let agent = AgentId("a".to_string());
         let join = cp.issue_join_token(&TenantId("t".to_string())).await.unwrap();
 
-        cp.redeem(&join, &agent, &[1u8; 32]).await.unwrap();
+        cp.redeem(&join, &agent, &[1u8; 32], &[0u8; 64]).await.unwrap();
         // Single-use: the second redemption is rejected (409) as a Status error.
-        let second = cp.redeem(&join, &agent, &[1u8; 32]).await;
+        let second = cp.redeem(&join, &agent, &[1u8; 32], &[0u8; 64]).await;
         assert!(matches!(second, Err(CpError::Status(_))), "join token is single-use");
     }
 

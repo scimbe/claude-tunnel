@@ -67,6 +67,8 @@ struct RedeemReq {
     token: String,
     agent: String,
     pubkey: String,
+    /// Hex ed25519 signature over the join token by `pubkey` (#88 SEC88c).
+    proof: String,
 }
 #[derive(Serialize, Deserialize)]
 struct RedeemResp {
@@ -81,8 +83,10 @@ async fn redeem(
         hex_decode_32(&req.token).ok_or((StatusCode::BAD_REQUEST, "malformed token".to_string()))?;
     let pubkey = hex_decode_32(&req.pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "malformed pubkey".to_string()))?;
+    let proof = hex_decode_64(&req.proof)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed proof".to_string()))?;
     let tenant = store
-        .redeem(&JoinToken(token), &AgentId(req.agent), pubkey)
+        .redeem_with_proof(&JoinToken(token), &AgentId(req.agent), pubkey, &proof)
         .map_err(|e| {
             let code = match &e {
                 RedeemError::Enroll(EnrollError::TokenAlreadyUsed) => StatusCode::CONFLICT,
@@ -1105,6 +1109,17 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
+    if s.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,22 +1207,27 @@ mod tests {
     /// same DB file and confirm the consumed token stays consumed.
     #[tokio::test]
     async fn enrollment_survives_service_restart() {
+        use ed25519_dalek::{Signer, SigningKey};
         let db = temp_db_path();
         let agent = AgentId("agent-x".to_string());
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = sk.verifying_key().to_bytes();
         let token;
+        let proof;
         {
             let cp = ControlPlaneClient::new(spawn(&db).await);
             token = cp
                 .issue_join_token(&TenantId("tenant-x".to_string()))
                 .await
                 .unwrap();
-            let tenant = cp.redeem(&token, &agent, &[7u8; 32]).await.unwrap();
+            proof = sk.sign(&token).to_bytes();
+            let tenant = cp.redeem(&token, &agent, &pubkey, &proof).await.unwrap();
             assert_eq!(tenant.0, "tenant-x", "redeem binds the tenant");
         }
 
         // Fresh service instance on the same database (a restart).
         let cp2 = ControlPlaneClient::new(spawn(&db).await);
-        let replay = cp2.redeem(&token, &agent, &[7u8; 32]).await;
+        let replay = cp2.redeem(&token, &agent, &pubkey, &proof).await;
         assert!(
             matches!(replay, Err(crate::client::CpError::Status(_))),
             "the token stays consumed across a service restart"
@@ -1325,17 +1345,22 @@ mod tests {
     /// instance, restart on the same file, and confirm every concern persisted.
     #[tokio::test]
     async fn unified_control_plane_survives_restart() {
+        use ed25519_dalek::{Signer, SigningKey};
         let db = temp_db_path();
         let agent = AgentId("agent-u".to_string());
         let token = RoutingToken([0x33; 32]);
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let pubkey = sk.verifying_key().to_bytes();
         let join;
+        let proof;
         let account;
         {
             let base = spawn_unified(&db).await;
             let cp = ControlPlaneClient::new(base.clone());
             // enrollment
             join = cp.issue_join_token(&TenantId("tu".to_string())).await.unwrap();
-            cp.redeem(&join, &agent, &[5u8; 32]).await.unwrap();
+            proof = sk.sign(&join).to_bytes();
+            cp.redeem(&join, &agent, &pubkey, &proof).await.unwrap();
             // registry
             cp.register(&token, &TenantId("tu".to_string()), &agent).await.unwrap();
             // billing — credit via the signed provider webhook (production path;
@@ -1349,7 +1374,7 @@ mod tests {
         // Restart on the same database file.
         let cp2 = ControlPlaneClient::new(spawn_unified(&db).await);
         assert!(
-            cp2.redeem(&join, &agent, &[5u8; 32]).await.is_err(),
+            cp2.redeem(&join, &agent, &pubkey, &proof).await.is_err(),
             "enrollment persisted (token consumed)"
         );
         let (t, a) = cp2.resolve(&token).await.unwrap();

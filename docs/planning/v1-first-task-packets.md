@@ -2050,9 +2050,13 @@ with **no** proof-of-possession, so an intercepted token can bind an attacker's 
   `redeem_with_proof_requires_possession_of_the_bound_key` (wrong-key proof → BadProof + nothing bound;
   genuine proof binds + single-use). Gate green. *Scope note:* PoP binds the redemption to a proven key
   holder; it does not by itself stop an on-path attacker who captured the token (bearer secret; TLS-protected).
-- **SEC88c-wire** ⏳ **Require the proof end-to-end**: `RedeemReq` gains a `proof` field; the `/enroll/redeem`
-  handler calls `redeem_with_proof`; `ControlPlaneClient::redeem` + agent `onboard` sign the join token with
-  the identity key and send it. Cross-crate wire change (client + agent + both handlers + call sites).
+- **SEC88c-wire** ✅ **Proof required end-to-end**: `RedeemReq` gained a `proof` field; the durable
+  `/enroll/redeem` handler now calls `redeem_with_proof` (malformed proof → `400`, bad proof → `403`);
+  `ControlPlaneClient::redeem` takes a `proof: &[u8; 64]` and sends it; the agent `onboard` signs the join
+  token with its identity key (`identity.sign(join_token)`); `cp_selftest` signs too. Existing durable-path
+  redeem tests reworked to present a real keypair + signature. Gate green (workspace `-D warnings`; ct-agent
+  85 + ct-control-plane 149 tests). *(The in-memory `http.rs`/`Enrollment` dev router is unchanged — it
+  ignores the extra field; the live/durable path is the one that enforces PoP.)*
 - **SEC88d** ⏳ **Clock-skew hardening**: `verify` trusts a caller-supplied `now`; a backwards-skewed edge
   clock extends validity. (ChannelGrant *revocation* is already covered via #81's membership check.)
 

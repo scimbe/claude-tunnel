@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ct_common::{AgentId, RoutingToken, TenantId};
 use ct_control_plane::client::ControlPlaneClient;
+use ed25519_dalek::{Signer, SigningKey};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -39,8 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let join =
         join.ok_or_else(|| format!("control-plane never became reachable: {last_err:?}"))?;
 
-    // Agent enrolls: redeem the join token to bind the tenant.
-    let bound = cp.redeem(&join, &agent, &[9u8; 32]).await?;
+    // Agent enrolls: redeem the join token to bind the tenant, proving possession
+    // of the identity key (#88 SEC88c) by signing the join token.
+    let sk = SigningKey::from_bytes(&[9u8; 32]);
+    let proof = sk.sign(&join).to_bytes();
+    let bound = cp.redeem(&join, &agent, &sk.verifying_key().to_bytes(), &proof).await?;
     if bound.0 != "tenant-smoke" {
         return Err(format!("redeem bound the wrong tenant: {}", bound.0).into());
     }

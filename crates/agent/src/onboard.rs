@@ -132,8 +132,11 @@ pub async fn onboard(
 ) -> Result<OnboardedAgent, CpError> {
     let identity = AgentIdentity::generate();
     let cp = ControlPlaneClient::new(cp_url);
+    // #88 SEC88c: prove possession of the identity key being bound by signing the
+    // join token, so the control plane won't bind a key we don't control.
+    let proof = identity.sign(join_token).to_bytes();
     let tenant = cp
-        .redeem(join_token, &agent_id, &identity.public_key_bytes())
+        .redeem(join_token, &agent_id, &identity.public_key_bytes(), &proof)
         .await?;
     Ok(OnboardedAgent {
         identity,
