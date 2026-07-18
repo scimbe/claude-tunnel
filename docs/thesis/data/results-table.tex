@@ -1,24 +1,24 @@
 \begin{table}[t]
   \centering
-  \caption{Tunnel-Roundtrip-Latenz je Betriebsart unter emulierten Netzbedingungen (\texttt{tc netem}); Mittel mit 95\%-Konfidenzintervall.}
+  \caption{Tunnel-Roundtrip-Latenz je Betriebsart unter emulierten Netzbedingungen (\texttt{tc netem}); Median~(p50) und p95 als robuste Tail-Metriken. Auf ein symmetrisches Normal-Konfidenzintervall wird wegen der Rechtsschiefe der Verlustverteilungen verzichtet, und das p99 f\"allt bei $n=30$ mit dem Stichprobenmaximum zusammen; beide werden nicht berichtet.}
   \label{tab:latency}
-  \begin{tabular}{lllrrrrr}
+  \begin{tabular}{lllrrrr}
     \toprule
-    Modus & Verzögerung & Verlust & $n$ & Mittel $\pm$ KI & p50 & p95 & p99 \\
-     &  &  &  & (ms) & (ms) & (ms) & (ms) \\
+    Modus & Verzögerung & Verlust & $n$ & Mittel & p50 & p95 \\
+     &  &  &  & (ms) & (ms) & (ms) \\
     \midrule
-    single & 0ms & 0\% & 30 & 8.4 $\pm$ 0.5 & 8.0 & 11.8 & 12.5 \\
-    single & 0ms & 1\% & 30 & 9.6 $\pm$ 1.8 & 8.2 & 12.7 & 34.8 \\
-    single & 0ms & 5\% & 30 & 80.8 $\pm$ 91.9 & 9.3 & 1010.7 & 1039.7 \\
-    single & 20ms & 0\% & 30 & 129.0 $\pm$ 1.5 & 128.0 & 132.4 & 149.8 \\
-    single & 20ms & 1\% & 30 & 172.5 $\pm$ 66.6 & 128.3 & 244.8 & 1147.0 \\
-    single & 20ms & 5\% & 30 & 184.0 $\pm$ 66.4 & 130.3 & 223.6 & 1149.5 \\
-    single & 50ms & 0\% & 30 & 311.2 $\pm$ 3.3 & 309.6 & 312.6 & 359.6 \\
-    single & 50ms & 1\% & 30 & 323.4 $\pm$ 14.9 & 308.2 & 456.2 & 456.7 \\
-    single & 50ms & 5\% & 30 & 395.1 $\pm$ 76.2 & 308.6 & 826.7 & 1356.6 \\
-    single & 100ms & 0\% & 30 & 613.4 $\pm$ 6.6 & 609.9 & 613.3 & 710.9 \\
-    single & 100ms & 1\% & 29 & 616.3 $\pm$ 13.5 & 609.5 & 612.5 & 809.6 \\
-    single & 100ms & 5\% & 30 & 788.9 $\pm$ 117.3 & 610.2 & 1708.0 & 1711.0 \\
+    single & 0ms & 0\% & 30 & 8.4 & 8.0 & 11.8 \\
+    single & 0ms & 1\% & 30 & 9.6 & 8.2 & 12.7 \\
+    single & 0ms & 5\% & 30 & 80.8 & 9.3 & 1010.7 \\
+    single & 20ms & 0\% & 30 & 129.0 & 128.0 & 132.4 \\
+    single & 20ms & 1\% & 30 & 172.5 & 128.3 & 244.8 \\
+    single & 20ms & 5\% & 30 & 184.0 & 130.3 & 223.6 \\
+    single & 50ms & 0\% & 30 & 311.2 & 309.6 & 312.6 \\
+    single & 50ms & 1\% & 30 & 323.4 & 308.2 & 456.2 \\
+    single & 50ms & 5\% & 30 & 395.1 & 308.6 & 826.7 \\
+    single & 100ms & 0\% & 30 & 613.4 & 609.9 & 613.3 \\
+    single & 100ms & 1\% & 29 & 616.3 & 609.5 & 612.5 \\
+    single & 100ms & 5\% & 30 & 788.9 & 610.2 & 1708.0 \\
     \bottomrule
   \end{tabular}
 \end{table}

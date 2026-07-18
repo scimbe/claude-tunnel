@@ -45,6 +45,20 @@ Iteration frisch verbunden wird, enthält jede gemessene Latenz den vollen
 Handschlag-Anteil und ist damit eine konservative (obere) Schätzung gegenüber
 einem gehaltenen Datenpfad.
 
+\paragraph{Statistische Darstellung.} Die Ergebnisse werden mit robusten
+Lagemaßen berichtet. Da die Latenzverteilung unter Paketverlust stark
+\emph{rechtsschief} ist, wäre ein symmetrisches Normal-Konfidenzintervall
+irreführend --- es kann eine negative Untergrenze implizieren --- weshalb
+Tabelle~\ref{tab:latency} Median~(p50) und p95 ausweist und auf ein
+$\pm$-KI verzichtet. Belastbare Aussagen über \emph{extreme} Quantile setzen ein
+deutlich größeres $n$ voraus: Bei $n=30$ fällt das p99 faktisch mit dem
+Stichprobenmaximum zusammen und wird von einem einzelnen Ausreißer dominiert. Wo
+die folgende Analyse das p99 dennoch heranzieht, geschieht dies ausdrücklich nur
+als grober \emph{Größenordnungs-Indikator} des verlustinduzierten Tails, nicht als
+stabile Punktschätzung; die belastbare zentrale Aussage tragen Median~(p50) und
+p95. Perzentil-Bootstrap-Konfidenzintervalle und ECDF-Darstellungen bleiben einer
+Messreihe mit größerem $n$ vorbehalten.
+
 \paragraph{Reproduzierbarkeit.} Die gesamte Pipeline ist skriptgesteuert und
 selbst containerisiert. \texttt{scripts/sweep.sh} fährt die Bedingungsmatrix ab
 und sammelt die Ergebnisse als CSV
@@ -93,11 +107,10 @@ Abbildung~\ref{fig:latency-loss} über dem Paketverlust.
 
 \paragraph{FF2 -- Grund-Overhead.} Ohne emulierte Netzverzögerung und ohne
 Verlust beträgt der Roundtrip im Mittel 8{,}39\,ms
-($\pm$0{,}53\,ms 95\%-KI, p50~8{,}0\,ms, p95~11{,}85\,ms, p99~12{,}46\,ms bei
-$n=30$). Dies ist der Eigenanteil des Tunnels über den Loopback: die Summe aus
+(p50~8{,}0\,ms, p95~11{,}85\,ms bei $n=30$). Dies ist der Eigenanteil des Tunnels über den Loopback: die Summe aus
 QUIC-Verbindungsaufbau, PoW-Rendezvous, \texttt{Noise\_IK}-Handschlag und dem
-Mehrsprung-Relay. Die geringe Standardabweichung (1{,}48\,ms) und das enge
-Konfidenzintervall belegen, dass dieser Grund-Overhead stabil und
+Mehrsprung-Relay. Die geringe Standardabweichung (1{,}48\,ms) und die eng
+beieinanderliegenden Quantile belegen, dass dieser Grund-Overhead stabil und
 vorhersagbar ist -- eine Voraussetzung dafür, dass die restlichen Bedingungen
 als Aufschläge auf einen bekannten Sockel gelesen werden können.
 
@@ -119,12 +132,13 @@ und ohne nennenswerten Tail.
 \paragraph{FF3 -- Verhalten unter Paketverlust.} Verlust verändert nicht den
 Median, sondern den Tail. Bei jeder Verzögerungsstufe bleibt der p50 nahe am
 verlustfreien Wert (z.\,B. 100\,ms/5\,\%: p50~610{,}2\,ms gegenüber
-609{,}9\,ms bei 0\,\%), während p95 und p99 stark ansteigen: 100\,ms/5\,\%
-erreicht p95~1708{,}0\,ms und p99~1711{,}0\,ms bei einem Mittelwert von
+609{,}9\,ms bei 0\,\%), während der p95 stark ansteigt: 100\,ms/5\,\%
+erreicht p95~1708{,}0\,ms bei einem Mittelwert von
 788{,}9\,ms und einer Standardabweichung von 327{,}7\,ms. Der extremste Fall
 tritt bei niedriger Grundlatenz und hohem Verlust auf: 0\,ms/5\,\% hat einen
-Median von nur 9{,}3\,ms, aber ein p95 von 1010{,}7\,ms und ein p99 von
-1039{,}7\,ms (Mittel~80{,}8\,ms, Standardabweichung 256{,}9\,ms). Die Ursache
+Median von nur 9{,}3\,ms, aber ein p95 von 1010{,}7\,ms
+(Mittel~80{,}8\,ms) --- hier wird der Mittelwert vollständig vom Tail dominiert
+und liegt weit über dem typischen Median-Wert. Die Ursache
 sind Neuübertragungen im QUIC- und Handschlag-Aufbau: Geht ein
 handschlagkritisches Paket verloren, greift der Retransmission-Timer, dessen
 Wartezeit die Latenz einzelner Iterationen um Größenordnungen anhebt, ohne die

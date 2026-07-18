@@ -1957,3 +1957,22 @@ Two secret-exposure observations. Decomposed:
   the join/routing tokens appear in the shown one-liner (`CT_JOIN_TOKEN=<hex> … sh`), so they land in shell
   history and `ps`. Removing them from the command string needs a bootstrap-token exchange (server-side
   hand-off), which is tied to the #75 install-flow redesign (install scripts aren't live yet). Track with #75.
+
+## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
+
+Gutachten: Tabelle 7.1 „80,8 ± 91,9 ms" impliziert negative Latenz (symmetrisches Normal-KI auf
+rechtsschiefen Verlustdaten), und p99 aus n=30 ist faktisch das Stichprobenmaximum. Nur die
+aggregierte `latency.csv` (Mittel/p50/p95/p99/ci95) ist eingecheckt — die Roh-Stichproben (für
+Bootstrap-KI/ECDF) und größeres n brauchen einen echten Testbett-Lauf. Dekomposition:
+
+- **T52.1** ✅ **Ungültiges symmetrisches KI entfernen + p99 aus der Headline-Tabelle** (deterministisch aus
+  den vorhandenen Aggregaten): `scripts/tabulate.py` gibt jetzt Mittel + robuste p50/p95 aus (kein `±`-KI,
+  kein p99), Tabelle aus `latency.csv` **neu generiert** (`results-table.{tex,md}`) → keine negative
+  KI-Untergrenze mehr. Neuer Absatz „Statistische Darstellung" in `evaluation.tex`: symmetrisches
+  Normal-KI wegen Rechtsschiefe verworfen; p99 nur als grober Größenordnungs-Indikator (bei n=30 = Maximum),
+  belastbare Aussage über Median + p95; FF2/FF3-Fließtext entsprechend bereinigt (kein `±`-KI, p95 statt
+  p95+p99). Thesis baut grün (`thesis-build.sh` exit 0, 0 undefined, 63 S.).
+- **T52.2** ⏳ **Roh-Daten-Re-Analyse** (braucht Testbett): Roh-Stichproben je Bedingung sichern, ausreichend
+  großes n (mehrere Hundert), Perzentil-Bootstrap-KI + ECDF/Violin, und die p99-zentrische Tiefenanalyse in
+  §7.x (p99-Schwierigkeitstabelle, „Warum Verlust das p99 aufbläht") auf die robuste Basis umstellen.
+  **fix-ready erst mit T52.2** (Bootstrap-KI dokumentiert, ECDF gezeigt).

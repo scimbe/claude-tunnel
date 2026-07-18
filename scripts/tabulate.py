@@ -9,8 +9,12 @@ missing stats render as "-"). Emits two tables, grouped by (mode, delay, loss):
   results-table.md   — GitHub-Markdown (for PROGRESS / review)
   results-table.tex  — LaTeX booktabs tabular (for the thesis, German headers)
 
-Each row reports the mean with its 95% confidence interval (mean +/- ci95) plus
-the p50/p95/p99 percentiles. Pure stdlib; run inside a python container.
+Each row reports the mean plus the robust p50/p95 percentiles. The symmetric
+normal 95% CI and the p99 are intentionally omitted (#52): the loss-regime
+distributions are strongly right-skewed, so a symmetric mean +/- ci95 is
+methodologically wrong (it can imply negative latency), and p99 at n=30 coincides
+with the sample maximum and is not a stable quantile. Pure stdlib; run in a
+python container.
 """
 import csv
 import os
@@ -50,25 +54,18 @@ def f1(r, k):
     return f"{float(v):.1f}" if v not in (None, "") else "-"
 
 
-def mean_ci(r):
-    """'mean +/- ci95' when the CI is present, else just the mean."""
-    m = f1(r, "mean_ms")
-    ci = r.get("ci95_ms")
-    return f"{m} +/- {float(ci):.1f}" if ci not in (None, "") else m
-
-
 def write_md(rows, mode_col, rate_col):
     head = (["Modus"] if mode_col else []) + ["Verzögerung", "Verlust"]
     if rate_col:
         head.append("Rate")
-    head += ["n", "Mittel±KI (ms)", "p50 (ms)", "p95 (ms)", "p99 (ms)"]
+    head += ["n", "Mittel (ms)", "p50 (ms)", "p95 (ms)"]
     align = ["---"] * len(head)
     lines = ["| " + " | ".join(head) + " |", "| " + " | ".join(align) + " |"]
     for r in rows:
         cells = ([mode_of(r)] if mode_col else []) + [r["delay"] or "0ms", r["loss"] or "0%"]
         if rate_col:
             cells.append(r["rate"] or "—")
-        cells += [r["n"], mean_ci(r), f1(r, "p50_ms"), f1(r, "p95_ms"), f1(r, "p99_ms")]
+        cells += [r["n"], f1(r, "mean_ms"), f1(r, "p50_ms"), f1(r, "p95_ms")]
         lines.append("| " + " | ".join(cells) + " |")
     with open(OUT_MD, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -79,26 +76,24 @@ def tex_esc(s):
     return s.replace("%", r"\%").replace("_", r"\_")
 
 
-def tex_mean_ci(r):
-    m = f1(r, "mean_ms")
-    ci = r.get("ci95_ms")
-    return f"{m} $\\pm$ {float(ci):.1f}" if ci not in (None, "") else m
-
-
 def write_tex(rows, mode_col, rate_col):
-    cols = ("l" if mode_col else "") + "ll" + ("l" if rate_col else "") + "rrrrr"
+    cols = ("l" if mode_col else "") + "ll" + ("l" if rate_col else "") + "rrrr"
     head = (["Modus"] if mode_col else []) + ["Verzögerung", "Verlust"]
     if rate_col:
         head.append("Rate")
-    head += ["$n$", r"Mittel $\pm$ KI", "p50", "p95", "p99"]
+    head += ["$n$", "Mittel", "p50", "p95"]
     lead = 3 if rate_col else 2
     lead += 1 if mode_col else 0
-    unit = [""] * lead + ["", "(ms)", "(ms)", "(ms)", "(ms)"]
+    unit = [""] * lead + ["", "(ms)", "(ms)", "(ms)"]
     out = [
         r"\begin{table}[t]",
         r"  \centering",
         r"  \caption{Tunnel-Roundtrip-Latenz je Betriebsart unter emulierten "
-        r"Netzbedingungen (\texttt{tc netem}); Mittel mit 95\%-Konfidenzintervall.}",
+        r"Netzbedingungen (\texttt{tc netem}); Median~(p50) und p95 als robuste "
+        r"Tail-Metriken. Auf ein symmetrisches Normal-Konfidenzintervall wird wegen "
+        r"der Rechtsschiefe der Verlustverteilungen verzichtet, und das p99 f\"allt "
+        r"bei $n=30$ mit dem Stichprobenmaximum zusammen; beide werden nicht "
+        r"berichtet.}",
         r"  \label{tab:latency}",
         r"  \begin{tabular}{" + cols + "}",
         r"    \toprule",
@@ -111,7 +106,7 @@ def write_tex(rows, mode_col, rate_col):
         cells += [tex_esc(r["delay"] or "0ms"), tex_esc(r["loss"] or "0%")]
         if rate_col:
             cells.append(tex_esc(r["rate"] or "--"))
-        cells += [r["n"], tex_mean_ci(r), f1(r, "p50_ms"), f1(r, "p95_ms"), f1(r, "p99_ms")]
+        cells += [r["n"], f1(r, "mean_ms"), f1(r, "p50_ms"), f1(r, "p95_ms")]
         out.append("    " + " & ".join(cells) + r" \\")
     out += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     with open(OUT_TEX, "w") as f:
