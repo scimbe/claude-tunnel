@@ -3,6 +3,7 @@
 
 pub mod acme;
 pub mod capability;
+pub mod channel;
 pub mod config;
 pub mod ladder;
 pub mod identity;

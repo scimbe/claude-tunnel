@@ -1710,9 +1710,17 @@ Decomposed:
   learns the other's endpoint + roles follow directions). Gate green (channel_broker 10).
 - **AF3** ⏳ **Cross-user invitation**: operator issues an invitation → another user's agent redeems it into
   a scoped member grant (agent-signed); trust-fail (deny/expiry/revoke) rules + tests.
-- **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**: agent joins/operates a channel
-  (dials the peer endpoint from the broker), runs a pairwise Noise session over the direct path, edge relay
-  fallback when the direct dial fails; real end-to-end two-agent data-exchange + fallback integration test.
+- **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**. Split:
+  - **AF4-join** ✅ **Agent-side channel-join client** (`ct-agent::channel::present_channel_join`): the client
+    half of the broker handshake — sends the `u16`-framed `ChannelJoinRequest`, answers the edge's 32-byte
+    possession challenge with a 64-byte ed25519 signature under the holder key, and parses the `OK[ <peer>]`/
+    `NO` ack into a `ChannelJoinOutcome` (`Admitted { peer_endpoint }` / `Refused`). This is the production
+    counterpart to the broker's inline test client, and it's the piece SEC81c-c will drive once the broker is
+    mounted live. Two frozen round-trip tests against the **real** `ct_edge::channel_broker` (ct-agent already
+    dev-deps ct-edge): a genuine holder is admitted while a wrong possession key is refused; and two clients
+    paired via `broker_channel_rendezvous` each parse the peer's advertised endpoint. Gate green.
+  - **AF4-session** ⏳ dial the parsed `peer_endpoint`, run a pairwise Noise session over the direct path, with
+    edge-relay fallback when the direct dial fails; real two-agent data-exchange + fallback integration test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
