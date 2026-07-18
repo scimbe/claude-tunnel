@@ -1901,9 +1901,14 @@ Decomposed:
   through one handle is unavailable through a clone; releasing frees it for both). Gate green (ct-edge lib,
   91 tests). With SEC86a+b+c the two reviewer-flagged gaps (rate limiter unwired, no connection limit) are
   fully closed on both rendezvous surfaces.
-- **SEC86d** ⏳ **Minor remainder**: the HTTP→HTTPS redirect listener (serves only redirects — negligible DoS
-  surface), an optional PoW gate on `'A'` registration, and reconciling the whitepaper's "rate limit shipped"
-  wording (now opt-in + wired). Not core to the finding.
+- **SEC86d** ✅ **Doc reconciliation + closeout**: updated `docs/security/threat-model.md` so the rendezvous-
+  flood row states the truth — PoW is always on, while the per-token rate limit and connection cap are wired
+  but **opt-in** (`CT_EDGE_RENDEZVOUS_MAX_PER_MIN` / `CT_EDGE_MAX_CONNECTIONS`), no longer implying an
+  always-on limit. The reviewer's two core gaps (rate limiter unwired, no connection limit) are now closed on
+  both rendezvous surfaces (SEC86a/b/c), so #86 is marked fix-ready. Deliberately **not** capping the
+  HTTP→HTTPS redirect listener: it would share the one rendezvous budget, so a plaintext-redirect flood could
+  starve real rendezvous — a negligible-value surface not worth that risk. An optional PoW gate on `'A'`
+  registration is a separate hardening enhancement, outside this finding.
 
 ## #87 Control-plane endpoints: unauth / un-rate-limited / client-priced (security-review)
 

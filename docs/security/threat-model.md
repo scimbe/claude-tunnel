@@ -30,7 +30,7 @@ claim is "we can't read what you send", not anonymity.
 | On-path eavesdropper | Noise_IK E2E; QUIC/TLS transport; edge sees only ciphertext | shipped (M8, M20) |
 | Rogue/rotated edge cert | Internal CA, clients trust the CA root (rotation without re-pinning) | shipped (M20) |
 | Unauthenticated actor | OIDC bearer verification on `/me/*`; account derived from the token subject | shipped (M19) |
-| Rendezvous flood (unfunded) | PoW gate + per-token fixed-window rate limit | shipped (ADR-0018) |
+| Rendezvous flood (unfunded) | PoW gate (always on) + per-token rendezvous rate limit and per-edge connection cap, both opt-in via `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` / `CT_EDGE_MAX_CONNECTIONS` | shipped (ADR-0018; #86) |
 | Single account exhausting issuance | Per-subject issuance rate limit → 429 before any ledger touch | shipped (M23.1) |
 | Vulnerable dependency | `cargo audit` against a committed, pinned `Cargo.lock` | shipped (M23.2) |
 | Committed credential leak | `scripts/check-no-secrets.sh` guard (PEM keys, cloud keys, tracked `.env`) | shipped (M23.3) |
