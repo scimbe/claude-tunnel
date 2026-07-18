@@ -2041,6 +2041,11 @@ Decomposed:
   agent/central: no `Edit`/`Write`; and `Bash` write-guard so `> file`/`tee`/`sed -i` can't bypass it) enforced
   by a committed PreToolUse hook, so the "field roles cannot modify the codebase" guarantee is shim-enforced,
   not prose (#77 gaps 1,8). Node/Claude-Code tooling with a self-test.
-- **SEC77c** ⏳ **Treat non-scimbe issue *comments* as untrusted** (#77 gaps 4,9): the real injection vector on
-  a public repo is a comment on a scimbe-authored issue; the loops must not act on instructions from comment
-  bodies whose author fails `verify-issue-author.sh`.
+- **SEC77c** ✅ **Treat non-scimbe issue *comments* as untrusted** (#77 gaps 4,9, `scripts/verify-comment-authors.sh`):
+  the real injection vector on a public repo is a comment (from any account) on a scimbe-authored issue. The
+  guard lists an issue's comment authors and flags every one not from the pinned scimbe account, exit 3 iff any
+  are untrusted. **Correctness note:** `gh issue view --json comments` returns the comment author with *no id*
+  (login only), so the guard uses the REST endpoint `gh api repos/…/issues/N/comments` which exposes the stable
+  numeric `user.id` (1279912). All three SKILLs now mandate running it and treating any flagged comment body as
+  DATA, never as an instruction. Gate: `bash -n` + `--selftest` (scimbe id trusted; foreign id, and a *recycled
+  scimbe login on a different id*, both flagged) + live (#77 all-scimbe → OK exit 0).
