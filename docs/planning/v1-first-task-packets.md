@@ -1791,10 +1791,17 @@ Decomposed:
     `run_channel_session`. Frozen test `channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data`
     (initiator learns peer addr+key from the ack, dials, data flows; a stub broker supplies the loopback peer
     since the real `safe_endpoint` rejects loopback). Gate green.
-  - **AF4-session-resilience** ⏳ **THE interesting part (scimbe steer): the *connection-difficulty* paths, not
-    happy-path data exchange.** When the direct A2A dial **fails** (peer unreachable / NAT / firewall / dial
-    timeout), fall back to the **edge relay**; surface clear errors; retry/backoff. Tests must target the
-    hard-to-connect cases (dial timeout → relay, refusal, unresolvable peer), not just "bytes flow".
+  - **AF4-session-resilience** (scimbe steer: the *connection-difficulty* paths are what matter):
+    - **AF4-resilience-classify** ✅ **Bounded, classified direct dial.** `dial_peer_direct(addr, timeout)`
+      returns `ChannelDialError::Unreachable` (timeout — the **relay-fallback signal**) vs `Failed(..)`
+      (malformed dial), instead of hanging on the QUIC handshake. `run_channel_join`'s initiator uses it with
+      `DIRECT_DIAL_TIMEOUT` (5 s) and, on `Unreachable`, returns a clear actionable error (relay is the next
+      packet). Frozen test `direct_dial_to_an_unreachable_peer_fails_fast_as_unreachable` **induces** the hard
+      case (a bound-but-silent UDP port blackholes the handshake) and asserts fast `Unreachable`, not a hang.
+    - **AF4-resilience-relay** ⏳ on `Unreachable`, route the session through the **edge relay** (the edge
+      forwards the two agents' encrypted frames — Noise stays end-to-end). Test induces a blocked direct path
+      and asserts the tunnel still carries data via the relay.
+    - Also: refused-join and unresolvable-peer error surfacing; retry/backoff.
   - **AF4-session-cli-join** ⏳ a thin `ct-agent channel-join` subcommand wiring env → `run_channel_join`.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it

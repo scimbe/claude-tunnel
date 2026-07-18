@@ -131,8 +131,21 @@ where
             let addr = peer_endpoint
                 .parse()
                 .map_err(|_| format!("broker returned an unparseable peer endpoint: {peer_endpoint:?}"))?;
-            let dialer = crate::transport::build_channel_dialer()?;
-            let conn = dialer.connect(addr, "localhost")?.await?;
+            let conn = match dial_peer_direct(addr, DIRECT_DIAL_TIMEOUT).await {
+                Ok(conn) => conn,
+                // #72 AF4-session-resilience: the direct path is blocked
+                // (NAT/firewall/down). Edge-relay fallback is the next packet; until
+                // it's wired, surface a clear, actionable error instead of hanging.
+                Err(ChannelDialError::Unreachable) => {
+                    return Err(format!(
+                        "direct A2A dial to {addr} timed out — peer unreachable on the direct \
+                         path (NAT/firewall/down); edge-relay fallback not yet wired \
+                         (#72 AF4-session-resilience)"
+                    )
+                    .into());
+                }
+                Err(ChannelDialError::Failed(e)) => return Err(e),
+            };
             run_channel_session(&conn, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
         }
         ChannelRole::Accept => {
@@ -142,6 +155,54 @@ where
         }
     }
     Ok(())
+}
+
+/// Bound on a direct A2A dial before giving up (#72 AF4-session-resilience). Kept
+/// short so a peer that's unreachable on the direct path (NAT / firewall / down) fails
+/// fast — the signal to fall back to the edge relay — instead of hanging on the QUIC
+/// handshake's retransmits.
+pub const DIRECT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why a direct dial to a paired peer did not connect (#72 AF4-session-resilience).
+#[derive(Debug)]
+pub enum ChannelDialError {
+    /// The dial did not complete within the timeout — the peer is unreachable on the
+    /// **direct** path. This is the signal to fall back to the edge relay, not an error
+    /// to surface to the user.
+    Unreachable,
+    /// The dial failed for another reason (bad address, endpoint setup, connect error).
+    Failed(BoxError),
+}
+
+impl std::fmt::Display for ChannelDialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelDialError::Unreachable => write!(f, "peer unreachable on the direct path"),
+            ChannelDialError::Failed(e) => write!(f, "direct dial failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ChannelDialError {}
+
+/// Dial a paired peer's advertised endpoint directly over QUIC (accept-any transport —
+/// Noise_IK is the real auth), bounded by `timeout`. A timeout is classified as
+/// [`ChannelDialError::Unreachable`] rather than a generic error, so the caller can
+/// distinguish "the direct path is blocked, fall back to the relay" from "the dial
+/// itself is malformed" — the crux of the connection-difficulty handling.
+pub async fn dial_peer_direct(
+    addr: std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> Result<Connection, ChannelDialError> {
+    let dialer = crate::transport::build_channel_dialer().map_err(ChannelDialError::Failed)?;
+    let connecting = dialer
+        .connect(addr, "localhost")
+        .map_err(|e| ChannelDialError::Failed(Box::new(e)))?;
+    match tokio::time::timeout(timeout, connecting).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(ChannelDialError::Failed(Box::new(e))),
+        Err(_elapsed) => Err(ChannelDialError::Unreachable),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -466,6 +527,29 @@ mod tests {
         a_task.abort();
         resp_task.abort();
         broker_task.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_dial_to_an_unreachable_peer_fails_fast_as_unreachable() {
+        // #72 AF4-session-resilience — THE case that matters: a peer that can't be
+        // reached on the direct path (NAT/firewall/blackhole). The dial must classify
+        // as `Unreachable` (the relay-fallback signal) and fail FAST, not hang on the
+        // QUIC handshake's retransmits. A bound-but-silent UDP socket blackholes the
+        // handshake (the port is "open", so no ICMP reject short-circuits it).
+        use std::time::{Duration, Instant};
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+        let addr = sink.local_addr().expect("sink addr"); // occupied, never answers QUIC
+
+        let start = Instant::now();
+        let result = dial_peer_direct(addr, Duration::from_millis(400)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(ChannelDialError::Unreachable)),
+            "an unreachable peer classifies as Unreachable (relay-fallback signal), got {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "failed fast in {elapsed:?}, did not hang");
+        drop(sink);
     }
 
     #[tokio::test]
