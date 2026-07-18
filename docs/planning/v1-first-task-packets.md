@@ -1732,9 +1732,18 @@ Decomposed:
     The authed `POST /me/channels/:channel/members` now takes `{holder, noise_pubkey}`. Frozen tests:
     `channel_member_noise_key_round_trips_and_reflects_revocation` (set/update/revoke) + the HTTP round-trip in
     `authed_channel_registry_is_owner_scoped`. Gate green. This is the input AF4-session pins.
-  - **AF4-session** ⏳ dial the parsed `peer_endpoint`, fetch the peer's `member_noise_key`, run a pairwise
-    Noise_IK session over the direct path, with edge-relay fallback when the direct dial fails; real two-agent
-    data-exchange + fallback integration test.
+  - **AF4-session-core** ✅ **The A2A Noise session + data path exists and is proven end-to-end.**
+    `ct_common::a2a` drives a pairwise **Noise_IK** session (generic over the stream): `a2a_initiate` (pins the
+    peer's member Noise pubkey), `a2a_respond`, and framed `a2a_send`/`a2a_recv`. Three frozen tests:
+    (1) `two_agents_establish_a_session_and_exchange_data_both_ways` (duplex, bidirectional payload);
+    (2) `a_session_only_forms_with_the_intended_peer_key` (IK auth — an impostor peer key yields no session);
+    (3) **`ct_agent::channel::two_agents_carry_data_over_a_channel_session`** — two agents over a **real QUIC
+    connection** run the session and exchange application data both ways (the live tunnel-to-tunnel path). Gate
+    green (full `cargo test --workspace -D warnings`).
+  - **AF4-session-wire** ⏳ glue: after `present_channel_join` returns `Admitted { peer_endpoint }`, fetch the
+    peer's `member_noise_key` from the registry, dial `peer_endpoint`, and run `a2a_initiate`/`a2a_respond` —
+    plus **edge-relay fallback** when the direct dial fails, with a fallback integration test. (The session
+    primitive it calls is done; this wires it into the agent's runtime + role selection.)
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

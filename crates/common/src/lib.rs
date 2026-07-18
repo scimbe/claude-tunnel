@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod a2a;
 pub mod channel;
 pub mod credential;
 pub mod metrics;

@@ -193,4 +193,48 @@ mod tests {
             "agent B learns A's endpoint"
         );
     }
+
+    #[tokio::test]
+    async fn two_agents_carry_data_over_a_channel_session() {
+        // #72 AF4-session end-to-end over a REAL QUIC connection: this is the payoff
+        // of the rendezvous above. Once each agent has learned its peer's endpoint,
+        // the initiator dials the responder and they run a Noise_IK A2A session keyed
+        // on their member Noise static keys, then exchange application data BOTH ways
+        // — the live, encrypted, mutually-authenticated tunnel-to-tunnel data path.
+        use ct_common::a2a::{a2a_initiate, a2a_recv, a2a_respond, a2a_send};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+
+        let initiator = generate_static_keypair();
+        let responder = generate_static_keypair();
+        let resp_priv = responder.private;
+
+        // The responder listens on its advertised endpoint; the initiator dials it.
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let (mut s, mut r) = conn.accept_bi().await.expect("accept_bi");
+            let mut sess = a2a_respond(&mut s, &mut r, &resp_priv).await.expect("responder handshake");
+            let got = a2a_recv(&mut r, &mut sess).await.expect("recv");
+            assert_eq!(got, b"hello from agent A", "responder decrypts A's application data");
+            a2a_send(&mut s, &mut sess, b"ack from agent B").await.expect("send ack");
+            // Keep the connection (and endpoint) alive until the initiator is done so
+            // the ack is delivered before teardown.
+            conn.closed().await;
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        let mut sess = a2a_initiate(&mut s, &mut r, &initiator.private, &responder.public)
+            .await
+            .expect("initiator handshake");
+        a2a_send(&mut s, &mut sess, b"hello from agent A").await.expect("send");
+        let ack = a2a_recv(&mut r, &mut sess).await.expect("recv");
+        assert_eq!(ack, b"ack from agent B", "agent A decrypts agent B's encrypted reply");
+        conn.close(0u32.into(), b"done");
+        srv.await.expect("responder task");
+    }
 }
