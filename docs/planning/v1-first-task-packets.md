@@ -1810,9 +1810,18 @@ Decomposed:
       `relay_two_connections`, so two members that can't go direct tunnel through the edge (ciphertext; Noise
       E2E). Frozen test `broker_channel_relay_splices_two_members_tunnels`: both members present valid joins,
       open data streams, and bytes cross both ways through the edge. Gate green.
-    - **AF4-relay-clientwire** ⏳ agent-side: on `ChannelDialError::Unreachable`, both agents reconnect to the
-      edge relay endpoint (present join → open data stream) and run the Noise session over the relayed stream;
-      `run_channel_join` chooses direct-then-relay. Test induces a blocked direct path end-to-end.
+    - **AF4-relay-clientwire** ✅ **Agent relay path + end-to-end proof.** `join_via_relay` presents the grant
+      to the edge relay endpoint (possession proof) and runs the Noise_IK session over the spliced stream by
+      reusing `run_channel_session` (the relay preserves the direct-path roles). Corrected the relay to be
+      **role-aware** (`relay::relay_initiator_to_acceptor`: accept the initiator's opened stream, *open* one to
+      the acceptor) — the symmetric accept-both version silently hung on the read-first Noise responder, which
+      the raw-bytes test had hidden. **Capstone frozen test** `agents_tunnel_a_noise_session_over_the_edge_relay`:
+      two agents fall back to the relay, run a REAL Noise session over it, and application data flows through
+      the edge (ciphertext; Noise E2E). Gate green.
+    - **AF4-relay-orchestrate** ⏳ the thin final wire: `run_channel_join`, on `Unreachable`, auto-invokes
+      `join_via_relay` (direct-then-relay) instead of erroring; both members need the relay endpoint address +
+      a listen-timeout so the acceptor also falls back. Test: induce a blocked direct path and assert the
+      tunnel auto-recovers via the relay with no caller intervention.
     - Also: refused-join and unresolvable-peer error surfacing; retry/backoff.
   - **AF4-session-cli-join** ⏳ a thin `ct-agent channel-join` subcommand wiring env → `run_channel_join`.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**

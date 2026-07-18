@@ -111,6 +111,28 @@ pub async fn relay_two_connections(
     relay_quic(send_a, recv_a, send_b, recv_b, label).await
 }
 
+/// Splice a channel tunnel through the edge, **preserving the direct-path stream
+/// roles** (#72 AF4-session-resilience) so the agents' `run_channel_session` works
+/// unchanged over the relay: the **initiator** opens its data bi-stream (the edge
+/// *accepts* it), and the **acceptor** accepts a bi-stream (the edge *opens* it). This
+/// matters because in `Noise_IK` the responder reads first — it never writes to
+/// actualize an opened stream — so a symmetric accept-both relay would hang. The edge
+/// forwards ciphertext between the two; the Noise session stays end-to-end.
+pub async fn relay_initiator_to_acceptor(
+    initiator_conn: &quinn::Connection,
+    acceptor_conn: &quinn::Connection,
+    label: &str,
+) -> std::io::Result<(u64, u64)> {
+    let to_io = |e: quinn::ConnectionError| std::io::Error::new(std::io::ErrorKind::Other, e);
+    // Initiator opened its data stream (actualised by Noise msg1) — accept it.
+    let (send_i, recv_i) = initiator_conn.accept_bi().await.map_err(to_io)?;
+    // Open the data stream toward the acceptor; it becomes visible to the acceptor's
+    // accept_bi as soon as relay_quic writes the first relayed bytes into it.
+    let (send_a, recv_a) = acceptor_conn.open_bi().await.map_err(to_io)?;
+    // a = initiator, b = acceptor: recv_i (msg1…) → send_a, recv_a (msg2…) → send_i.
+    relay_quic(send_i, recv_i, send_a, recv_a, label).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -157,6 +157,35 @@ where
     Ok(())
 }
 
+/// Agent-side relay fallback (#72 AF4-session-resilience): when the direct dial to a
+/// paired peer is [`ChannelDialError::Unreachable`], the agent reconnects to the edge
+/// **relay** endpoint (`ct_edge::channel_broker::broker_channel_relay`), presents its
+/// grant (proving possession), and runs the Noise_IK session over the stream the edge
+/// splices to the peer. Both members call this; the edge pairs + splices them while
+/// preserving the direct-path stream roles, so this simply presents the join and then
+/// reuses [`run_channel_session`] over the edge connection. Noise stays end-to-end —
+/// the edge only forwards ciphertext.
+pub async fn join_via_relay<P>(
+    relay_conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    match present_channel_join(relay_conn, request, holder).await? {
+        ChannelJoinOutcome::Admitted { .. } => {}
+        ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
+    }
+    run_channel_session(relay_conn, role, own_noise_private, peer_noise_public, local)
+        .await
+        .map_err(Into::into)
+}
+
 /// Bound on a direct A2A dial before giving up (#72 AF4-session-resilience). Kept
 /// short so a peer that's unreachable on the direct path (NAT / firewall / down) fails
 /// fast — the signal to fall back to the edge relay — instead of hanging on the QUIC
@@ -527,6 +556,80 @@ mod tests {
         a_task.abort();
         resp_task.abort();
         broker_task.abort();
+    }
+
+    #[tokio::test]
+    async fn agents_tunnel_a_noise_session_over_the_edge_relay() {
+        // #72 AF4-session-resilience CAPSTONE — the connection-difficulty case that
+        // matters: two agents that can't reach each other directly both fall back to
+        // the edge RELAY endpoint, run a real Noise_IK session over the relayed stream,
+        // and application data flows THROUGH the edge (the edge only sees ciphertext).
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::broker_channel_relay;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x21u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x22u8; 32]);
+        let channel = [0xE1u8; 32];
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        let req_a = ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: "203.0.113.1:7001".to_string() };
+        let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".to_string() };
+
+        // Edge relay endpoint pairs + splices the two members.
+        let (relay_ep, cert) = build_server_endpoint_with_cert().expect("relay ep");
+        let relay_addr = relay_ep.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
+                (c.0 == channel).then_some((op_pub, None))
+            })
+            .await
+            .map(|_| ())
+        });
+
+        // Both agents fall back to the relay (they never reach each other directly).
+        let cert_b = cert.clone();
+        let (mut a_local_test, a_local_run) = tokio::io::duplex(8192);
+        let (na, nbpub) = (noise_a.private, noise_b.public);
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(relay_addr, "localhost").expect("cfg").await.expect("conn");
+            join_via_relay(&conn, &req_a, &holder_a, ChannelRole::Initiate, &na, &nbpub, a_local_run).await
+        });
+        let (nb, napub) = (noise_b.private, noise_a.public);
+        let (mut b_local_test, b_local_run) = tokio::io::duplex(8192);
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(relay_addr, "localhost").expect("cfg").await.expect("conn");
+            join_via_relay(&conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &napub, b_local_run).await
+        });
+
+        // Application data flows A -> B over the relayed, encrypted A2A tunnel.
+        let payload = b"tunnel carried over the edge relay when direct was blocked";
+        a_local_test.write_all(payload).await.expect("write");
+        a_local_test.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        b_local_test.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, payload, "B receives A's data via the edge relay (Noise stays E2E)");
+
+        a.abort();
+        b.abort();
+        relay_task.abort();
     }
 
     #[tokio::test]

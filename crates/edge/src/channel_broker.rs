@@ -366,13 +366,20 @@ where
 
     match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
         Ok(pairing) => {
-            // Ack both, then splice their next bi-stream (the tunnel data) — no
-            // endpoints are exchanged, the edge carries the ciphertext.
+            // Ack both, then splice the tunnel — no endpoints are exchanged, the edge
+            // carries the ciphertext. Preserve the direct-path stream roles so the
+            // agents' `run_channel_session` works unchanged: the initiator opens its
+            // data stream, the acceptor accepts one the edge opens.
             send_a.write_all(b"OK").await?;
             send_b.write_all(b"OK").await?;
             send_a.finish()?;
             send_b.finish()?;
-            crate::relay::relay_two_connections(&conn_a, &conn_b, "channel-relay").await?;
+            let (init_conn, acc_conn) = if pairing.initiator_holder == req_a.grant.grant.holder {
+                (&conn_a, &conn_b)
+            } else {
+                (&conn_b, &conn_a)
+            };
+            crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay").await?;
             Ok(pairing)
         }
         Err(e) => {
@@ -723,12 +730,14 @@ mod tests {
             .map(|_| ())
         });
 
+        // Roles preserved through the relay (as the real Noise session needs): the
+        // INITIATOR opens its data stream; the ACCEPTOR accepts one the edge opens.
         let cert_b = cert.clone();
         let a = tokio::spawn(async move {
             let c = build_client_endpoint(cert).expect("client");
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
             assert_eq!(present_join(&conn, &req_a.encode(), &holder_a).await, b"OK", "A admitted to relay");
-            let (mut s, mut r) = conn.open_bi().await.expect("a data bi");
+            let (mut s, mut r) = conn.open_bi().await.expect("a data bi"); // initiator opens
             s.write_all(b"tunnel A->B via edge").await.expect("a write");
             let mut got = vec![0u8; 20];
             r.read_exact(&mut got).await.expect("a read");
@@ -739,11 +748,12 @@ mod tests {
             let c = build_client_endpoint(cert_b).expect("client");
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
             assert_eq!(present_join(&conn, &req_b.encode(), &holder_b).await, b"OK", "B admitted to relay");
-            let (mut s, mut r) = conn.open_bi().await.expect("b data bi");
-            s.write_all(b"tunnel B->A via edge").await.expect("b write");
+            let (mut s, mut r) = conn.accept_bi().await.expect("b data bi"); // acceptor accepts the edge-opened stream
             let mut got = vec![0u8; 20];
             r.read_exact(&mut got).await.expect("b read");
-            conn.close(0u32.into(), b"done");
+            s.write_all(b"tunnel B->A via edge").await.expect("b write");
+            let _ = s.finish();
+            conn.closed().await;
             got
         });
 
