@@ -35,6 +35,7 @@ claim is "we can't read what you send", not anonymity.
 | Vulnerable dependency | `cargo audit` against a committed, pinned `Cargo.lock` | shipped (M23.2) |
 | Committed credential leak | `scripts/check-no-secrets.sh` guard (PEM keys, cloud keys, tracked `.env`) | shipped (M23.3) |
 | State loss on restart | Durable SQLite (enrollment/registry/ledger) | shipped (M18) |
+| Poisoned local build (gate write-mount) | Server-side CI (`.github/workflows/ci.yml`) re-runs build+test+audit+secret-guard on `main`, independent of the local gate | accepted residual (#78 SEC78c; mitigated by SEC78b) |
 | Funded sybil / billing fraud | **unresolved** — PoW does not deter a paying adversary | open (SPEC §9.1) |
 
 ## Secrets inventory & handling
