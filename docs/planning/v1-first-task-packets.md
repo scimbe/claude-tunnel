@@ -1771,10 +1771,16 @@ Decomposed:
     `authorize` delegates to it, unchanged for the broker). So the edge can look up the peer's **attested**
     Noise key (not agent-advertised — addresses #101) during rendezvous. Frozen tests: CP
     `internal_channel_authorize_…` asserts the key is served; edge `resolve_carries_the_members_attested_noise_key`.
+  - **#100 channel-scripts** ✅ **Served `/channel.sh` + `/channel.ps1`** (curl-pipe delivery, mirrors
+    install.sh): `render_channel_sh`/`render_channel_ps1` detect OS/arch, download `ct-agent` from the release
+    base, and `exec ct-agent channel` reading `CT_CHANNEL_*` from the env (keys never argv). Mounted in
+    `installer_router`. So the operator can hand out one URL:
+    `curl -fsSL <portal>/channel.sh | CT_CHANNEL_ROLE=… CT_CHANNEL_ADDR=… CT_CHANNEL_NOISE_KEY=… CT_CHANNEL_PEER_NOISE_KEY=… sh`.
+    Frozen test `channel_scripts_are_served_and_exec_ct_agent_channel` (content + both routes 200).
   - **AF4-session-wire** ⏳ last mile: (a) the broker calls `resolve` for each paired member and **relays the
     peer's `noise_pubkey`** in the `OK` response (swap), with `present_channel_join` returning it in
     `Admitted`; (b) a `ct-agent channel-join` that drives present→session with the learned key+endpoint;
-    (c) a served `/channel.sh` route; (d) **edge-relay fallback** when the direct dial fails, with a test.
+    (c) **edge-relay fallback** when the direct dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

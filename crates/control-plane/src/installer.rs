@@ -141,6 +141,85 @@ pub fn channel_one_liner(p: &ChannelOneLiner, os: InstallOs) -> String {
     }
 }
 
+/// Render the POSIX `/channel.sh` script the A2A one-liner pipes into `sh` (#100).
+/// It detects OS+arch, downloads the matching prebuilt `ct-agent` from `release_base`,
+/// and execs `ct-agent channel` — which reads the `CT_CHANNEL_*` config (role, addr,
+/// Noise keys) from the environment the one-liner set, so no key is ever a script
+/// argument. Mirrors [`render_install_sh`]; the served route is in [`installer_router`].
+pub fn render_channel_sh(release_base: &str) -> String {
+    let base = release_base.trim_end_matches('/');
+    format!(
+        r#"#!/bin/sh
+# claude-tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
+#   curl -fsSL <portal>/channel.sh | CT_CHANNEL_ROLE=... CT_CHANNEL_ADDR=... \
+#     CT_CHANNEL_NOISE_KEY=... CT_CHANNEL_PEER_NOISE_KEY=... sh
+# Brings this machine up as a channel member and pipes stdin/stdout over the
+# encrypted agent-to-agent tunnel.
+set -eu
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in
+  x86_64|amd64) arch=x86_64 ;;
+  aarch64|arm64) arch=aarch64 ;;
+  *) echo "ct-agent channel: unsupported architecture '$arch'" >&2; exit 1 ;;
+esac
+case "$os" in
+  linux|darwin) ;;
+  *) echo "ct-agent channel: unsupported OS '$os'" >&2; exit 1 ;;
+esac
+
+: "${{CT_CHANNEL_ROLE:?set CT_CHANNEL_ROLE (accept|initiate)}}"
+: "${{CT_CHANNEL_ADDR:?set CT_CHANNEL_ADDR (bind host:port for accept, peer host:port for initiate)}}"
+: "${{CT_CHANNEL_NOISE_KEY:?set CT_CHANNEL_NOISE_KEY (this member's Noise private key, hex)}}"
+: "${{CT_CHANNEL_PEER_NOISE_KEY:?set CT_CHANNEL_PEER_NOISE_KEY (the peer's Noise public key, hex)}}"
+
+asset="ct-agent-${{os}}-${{arch}}"
+url="{base}/${{asset}}"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "ct-agent channel: downloading $url" >&2
+curl -fsSL "$url" -o "$tmp/ct-agent"
+chmod +x "$tmp/ct-agent"
+# Keys are inherited from the environment (never on the command line).
+exec "$tmp/ct-agent" channel
+"#,
+        base = base,
+    )
+}
+
+/// Render the PowerShell `/channel.ps1` script (#100 — the Windows analog of
+/// [`render_channel_sh`]). Detects the arch, downloads `ct-agent-windows-<arch>.exe`
+/// from `release_base`, and runs `ct-agent channel` reading `CT_CHANNEL_*` from the
+/// environment. Placeholder + replace so PowerShell's `{}` need no brace-escaping.
+pub fn render_channel_ps1(release_base: &str) -> String {
+    CHANNEL_PS1_TEMPLATE.replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
+}
+
+const CHANNEL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
+# claude-tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
+#   $env:CT_CHANNEL_ROLE='...'; ...; irm <portal>/channel.ps1 | iex
+$ErrorActionPreference = 'Stop'
+if (-not $env:CT_CHANNEL_ROLE)            { Write-Error 'ct-agent channel: set CT_CHANNEL_ROLE (accept|initiate)'; exit 1 }
+if (-not $env:CT_CHANNEL_ADDR)            { Write-Error 'ct-agent channel: set CT_CHANNEL_ADDR'; exit 1 }
+if (-not $env:CT_CHANNEL_NOISE_KEY)       { Write-Error 'ct-agent channel: set CT_CHANNEL_NOISE_KEY'; exit 1 }
+if (-not $env:CT_CHANNEL_PEER_NOISE_KEY)  { Write-Error 'ct-agent channel: set CT_CHANNEL_PEER_NOISE_KEY'; exit 1 }
+$arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+  'AMD64' { 'x86_64' }
+  'ARM64' { 'aarch64' }
+  default { Write-Error "ct-agent channel: unsupported architecture '$($env:PROCESSOR_ARCHITECTURE)'"; exit 1 }
+}
+$asset = "ct-agent-windows-$arch.exe"
+$url = "__RELEASE_BASE__/$asset"
+$dir = Join-Path $env:TEMP ("ct-agent-" + [System.Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$exe = Join-Path $dir $asset
+Write-Host "ct-agent channel: downloading $url"
+Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+# Keys are inherited from the environment (never on the command line).
+& $exe channel
+"#;
+
 /// Render the POSIX `/install.sh` script the Unix one-liner pipes into `sh`
 /// (#75 IS3a). It detects OS+arch, downloads the matching prebuilt `ct-agent`
 /// binary from `release_base` (the GitHub-Releases-style asset base, e.g.
@@ -238,6 +317,9 @@ pub fn installer_router(release_base: String) -> Router {
     Router::new()
         .route("/install.sh", get(serve_install_sh))
         .route("/install.ps1", get(serve_install_ps1))
+        // #100: the A2A channel runner scripts, served the same way as the installer.
+        .route("/channel.sh", get(serve_channel_sh))
+        .route("/channel.ps1", get(serve_channel_ps1))
         .with_state(Arc::new(release_base))
 }
 
@@ -253,6 +335,22 @@ async fn serve_install_ps1(State(base): State<Arc<String>>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         render_install_ps1(&base),
+    )
+        .into_response()
+}
+
+async fn serve_channel_sh(State(base): State<Arc<String>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        render_channel_sh(&base),
+    )
+        .into_response()
+}
+
+async fn serve_channel_ps1(State(base): State<Arc<String>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        render_channel_ps1(&base),
     )
         .into_response()
 }
@@ -299,6 +397,46 @@ mod tests {
         assert!(sh.contains(r#"exec "$tmp/ct-agent" onboard"#), "execs the agent onboarding");
         // No secret is ever a positional argument.
         assert!(!sh.contains("onboard $CT_JOIN_TOKEN") && !sh.contains("onboard \""), "tokens stay in the env");
+    }
+
+    #[tokio::test]
+    async fn channel_scripts_are_served_and_exec_ct_agent_channel() {
+        // #100: /channel.sh + /channel.ps1 are served (like /install.sh) and run
+        // `ct-agent channel`, requiring the CT_CHANNEL_* keys from the environment
+        // (never argv) and downloading the agent from the release base.
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let base = "https://github.com/scimbe/claude-tunnel/releases/latest/download";
+
+        // Content: POSIX script requires the channel env, execs the subcommand.
+        let sh = render_channel_sh(base);
+        assert!(sh.starts_with("#!/bin/sh") && sh.contains("set -eu"), "POSIX + fail-fast");
+        assert!(sh.contains("CT_CHANNEL_ROLE:?") && sh.contains("CT_CHANNEL_NOISE_KEY:?"), "requires channel env");
+        assert!(sh.contains(r#"exec "$tmp/ct-agent" channel"#), "execs ct-agent channel");
+        assert!(sh.contains(&format!("{base}/${{asset}}")), "downloads from the release base");
+        assert!(!sh.contains("channel $CT_CHANNEL_NOISE_KEY"), "keys stay in the env, not argv");
+        let ps = render_channel_ps1(base);
+        assert!(ps.contains("#Requires -Version 5") && ps.contains("& $exe channel"), "ps runs channel");
+        assert!(ps.contains("$env:CT_CHANNEL_ROLE"), "ps requires the channel env");
+
+        // Route: GET /channel.sh -> 200 serving exactly the rendered script.
+        let app = installer_router(base.to_string());
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/channel.sh").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/channel.sh is served");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), render_channel_sh(base), "serves the rendered script");
+        let resp2 = app
+            .oneshot(Request::get("/channel.ps1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK, "/channel.ps1 is served");
     }
 
     #[test]

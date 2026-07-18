@@ -65,12 +65,15 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_CONTROL_PLANE_DB` | control plane | SQLite path (put it on durable storage) |
 | `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL; **alone** enables OIDC — the realm JWKS is fetched at startup to mount `/me/*` (#42) |
 | `CT_OIDC_PUBKEY_PATH` | control plane | PEM of the realm's RSA public key; an **offline override** of the JWKS fetch (takes precedence when set) |
+| `CT_OIDC_ACCESS_AUD` | control plane | **opt-in** access-token `aud` enforcement for `/me/*` (#82); set to your realm's field-checked access-token audience so a token whose `aud` omits it is rejected. Unset ⇒ audience not checked |
 | `CT_PAYMENT_WEBHOOK_SECRET` | control plane | provider webhook signing secret (unset ⇒ payment disabled) |
+| `CT_CP_UNAUTH_WRITE_PER_MIN` | control plane | **opt-in** per-IP rate cap on the unauthenticated DB-writer endpoints, bounding disk-DoS from a single address (#87); positive integer ⇒ on, unset ⇒ off |
 | `CT_PORTAL_BASE_URL` | control plane | public base URL embedded in the customer install one-liner (`/portal/tunnels/{id}/install`), e.g. `https://<zone>`; **unset ⇒ silently defaults to `https://localhost`** (warned at startup, #68). The front-door overlay wires it from `PORTAL_PUBLIC_HOST` |
+| `CT_RELEASE_BASE` | control plane | base URL the served `/install.sh` + `/install.ps1` scripts download the `ct-agent` binary from (#75); unset ⇒ GitHub Releases `latest/download`. Point at a mirror or pinned tag to override |
 | `CT_EDGE_LISTEN` | edge | bind address (default `0.0.0.0:4433`) |
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
-| `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` | edge | per-token rendezvous rate limit (rendezvous attempts per routing token per minute); unset ⇒ off (opt-in abuse gate, #86) |
-| `CT_EDGE_MAX_CONNECTIONS` | edge | cap on concurrent connections, shared globally across the QUIC + TCP accept loops; unset (or `0`) ⇒ off (opt-in abuse gate, #86) |
+| `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` | edge | per-token rendezvous rate limit (rendezvous attempts per routing token per minute); **on by default at 600/min** (#95) — set a positive value to tune, or `0`/`off` to disable (#86/#95) |
+| `CT_EDGE_MAX_CONNECTIONS` | edge | cap on concurrent connections, shared globally across the QUIC + TCP accept loops; **on by default at 8192** (#95) — set a positive value to tune, or `0`/`off` to disable (#86/#95) |
 | `CT_EDGE_CERT_OUT` | edge | path the edge writes its CA root to |
 | `CT_EDGE_METRICS_LISTEN` | edge | bind address for `GET /metrics` (unset ⇒ off, issue #10) |
 | `CT_FRONT_DOOR` | edge | bind address for the unified :443 front door (SNI/ALPN-multiplexed relay + Portal + browser tunnels); unset ⇒ off, additive to `:4433`/`:8090` (#31) |
