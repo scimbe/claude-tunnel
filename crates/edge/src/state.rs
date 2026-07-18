@@ -15,7 +15,42 @@ use ct_common::ratelimit::RateLimiter;
 use ct_common::RoutingToken;
 use ct_common::sync::MutexExt;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use std::sync::Arc;
+
+/// A concurrency cap for the edge accept loop (#86 SEC86b, ADR-0018's connection-
+/// flood half): at most `max` connections are handled at once. [`try_admit`] hands
+/// out an owned permit that the caller holds for the connection's lifetime; when the
+/// cap is reached it returns `None` and the caller sheds the connection (quinn
+/// `Incoming::ignore`), so a flood can't exhaust memory / file descriptors before the
+/// PoW gate even runs. Load-shedding (not queueing) keeps a rejected connection cheap.
+///
+/// [`try_admit`]: ConnectionCap::try_admit
+#[derive(Clone)]
+pub struct ConnectionCap {
+    sem: Arc<Semaphore>,
+}
+
+impl ConnectionCap {
+    /// A cap admitting at most `max` concurrent connections.
+    pub fn new(max: usize) -> Self {
+        Self {
+            sem: Arc::new(Semaphore::new(max)),
+        }
+    }
+
+    /// Try to admit one connection: `Some(permit)` when below the cap (hold it for
+    /// the connection's lifetime), `None` when full (shed the connection). Never
+    /// blocks.
+    pub fn try_admit(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.sem).try_acquire_owned().ok()
+    }
+
+    /// Currently free slots (for tests / metrics).
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+}
 
 /// A boxed bidirectional byte stream — the concrete handoff type for a
 /// TCP-fallback agent rendezvous (issue #3 / P1.2c-3), where a single stream
@@ -640,5 +675,28 @@ mod tests {
         let _rx = state.park_tcp_agent(token(9));
         state.remove(&token(9));
         assert!(!state.has_tcp_agent(&token(9)));
+    }
+
+    #[test]
+    fn connection_cap_admits_up_to_max_then_sheds_until_a_permit_frees() {
+        // #86 SEC86b: the accept-loop cap admits at most `max` concurrent
+        // connections and sheds the rest; dropping a held permit frees a slot.
+        let cap = ConnectionCap::new(2);
+        assert_eq!(cap.available(), 2);
+
+        let a = cap.try_admit().expect("1st admitted");
+        let b = cap.try_admit().expect("2nd admitted");
+        assert_eq!(cap.available(), 0, "both slots taken");
+        assert!(cap.try_admit().is_none(), "over the cap -> shed");
+
+        // Releasing one held permit frees exactly one slot.
+        drop(a);
+        assert_eq!(cap.available(), 1);
+        let c = cap.try_admit().expect("slot freed -> admits again");
+        assert!(cap.try_admit().is_none(), "back at the cap");
+
+        drop(b);
+        drop(c);
+        assert_eq!(cap.available(), 2, "all permits returned");
     }
 }

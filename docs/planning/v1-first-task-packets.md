@@ -1880,10 +1880,16 @@ Decomposed:
   now reject a token over its per-minute budget AFTER PoW — PoW raises per-attempt cost, this caps
   per-token volume a solver farm could still push. Frozen test on the state method (off by default; caps
   N per window; per-token independent; new window resets). Gate green.
-- **SEC86b** ⏳ **Connection cap on the accept loops**: bound concurrent connection-handling tasks (a
-  `tokio::sync::Semaphore` permit per accepted connection, and/or a quinn endpoint concurrency cap) so a
-  connection flood can't exhaust memory/FDs — the first availability gap. Optionally PoW-gate `'A'`
-  registration. Doc: reconcile the whitepaper's "rate limit shipped" claim (now opt-in + wired).
+- **SEC86b** ✅ **Connection cap on the primary QUIC accept loop**: added `state::ConnectionCap` — a
+  `tokio::sync::Semaphore` handing out an owned permit per admitted connection (held for the connection's
+  lifetime), with load-shedding (`try_admit → None` ⇒ quinn `Incoming::ignore`) rather than unbounded
+  queueing. Opt-in via `CT_EDGE_MAX_CONNECTIONS` (>0); off otherwise. Wired into `run_edge`'s QUIC accept
+  loop so a flood can't exhaust memory/FDs before the PoW gate runs. Frozen test
+  `connection_cap_admits_up_to_max_then_sheds_until_a_permit_frees` (admit N, shed N+1, releasing a permit
+  frees exactly one slot). Gate green (ct-edge lib, 90 tests).
+- **SEC86c** ⏳ **Follow-ups**: extend the cap to the TCP accept loops (browser/front/rendezvous/tcp-fallback
+  listeners in `run_edge`), optionally PoW-gate `'A'` registration, and reconcile the whitepaper's "rate
+  limit shipped" wording (now opt-in + wired).
 
 ## #87 Control-plane endpoints: unauth / un-rate-limited / client-priced (security-review)
 

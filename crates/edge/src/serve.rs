@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::config::EdgeConfig;
 use crate::relay::{relay, relay_quic};
-use crate::state::EdgeState;
+use crate::state::{ConnectionCap, EdgeState};
 use crate::pki::{build_dual_edge_from_ca, Ca};
 use crate::transport::save_cert;
 use ct_common::pow::{check_request, Challenge};
@@ -817,6 +817,17 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         state.set_rendezvous_limit(n);
         eprintln!("ct-edge: per-token rendezvous rate limit {n}/min (CT_EDGE_RENDEZVOUS_MAX_PER_MIN, #86)");
     }
+    // #86 SEC86b (ADR-0018): opt-in cap on concurrently-handled QUIC connections.
+    // Off unless CT_EDGE_MAX_CONNECTIONS is set (>0); on a public edge it bounds a
+    // connection flood so memory / FDs can't be exhausted before the PoW gate runs.
+    let conn_cap = std::env::var("CT_EDGE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| {
+            eprintln!("ct-edge: max {n} concurrent connections (CT_EDGE_MAX_CONNECTIONS, #86)");
+            ConnectionCap::new(n)
+        });
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
@@ -1017,8 +1028,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
 
     // QUIC accept loop (primary).
     while let Some(incoming) = endpoint.accept().await {
+        // #86 SEC86b: when a connection cap is configured and full, shed this
+        // connection cheaply (no handshake response) rather than spawning unbounded.
+        let permit = match &conn_cap {
+            Some(cap) => match cap.try_admit() {
+                Some(p) => Some(p),
+                None => {
+                    incoming.ignore();
+                    continue;
+                }
+            },
+            None => None,
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            // Hold the admission permit for the whole connection lifetime, so the
+            // slot frees only when this handler returns.
+            let _permit = permit;
             if let Ok(conn) = incoming.await {
                 let mut nonce = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
