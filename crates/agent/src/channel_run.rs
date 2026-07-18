@@ -195,6 +195,112 @@ where
         .map_err(Into::into)
 }
 
+/// How long the acceptor waits for a direct connection before falling back to the
+/// edge relay in the plane-brokered CLI flow (#72 / #98 / #103).
+const CHANNEL_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Config for the **plane-brokered** `ct-agent channel` flow (#98 / #103): present a
+/// grant to the edge rendezvous, learn the peer via the broker (keys relayed — no
+/// out-of-band `CT_CHANNEL_*` exchange), and connect direct-then-relay. Read from
+/// `CT_CHANNEL_*` so it fits the `/channel.sh` one-liner. This is the cross-host path
+/// (NAT traversal via the broker), distinct from the direct-address [`ChannelRunConfig`].
+pub struct ChannelJoinCliConfig {
+    pub role: ChannelRole,
+    /// Edge rendezvous endpoint (`CT_CHANNEL_BROKER`, `CT_EDGE_CHANNEL_LISTEN` on the plane).
+    pub broker_addr: SocketAddr,
+    /// Edge relay endpoint used on direct-dial failure (`CT_CHANNEL_RELAY`).
+    pub relay_addr: SocketAddr,
+    /// The operator-signed channel grant this member holds (`CT_CHANNEL_GRANT`, hex).
+    pub grant: ct_common::channel::SignedChannelGrant,
+    /// The holder ed25519 private key that proves possession (`CT_CHANNEL_HOLDER_KEY`, hex). SECRET.
+    pub holder: SigningKey,
+    /// This member's Noise (X25519) private key (`CT_CHANNEL_NOISE_KEY`, hex). SECRET.
+    pub own_noise_private: [u8; 32],
+    /// The host:port this member advertises for the direct path (`CT_CHANNEL_LISTEN`).
+    pub listen_addr: SocketAddr,
+}
+
+impl ChannelJoinCliConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let role = match f("CT_CHANNEL_ROLE").as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(ref r) if r == "initiate" || r == "initiator" => ChannelRole::Initiate,
+            Some(ref r) if r == "accept" || r == "responder" || r == "listen" => ChannelRole::Accept,
+            other => return Err(format!("CT_CHANNEL_ROLE must be initiate|accept, got {other:?}")),
+        };
+        let addr = |k: &str, what: &str| -> Result<SocketAddr, String> {
+            f(k).ok_or_else(|| format!("{k} required ({what})"))?
+                .trim()
+                .parse()
+                .map_err(|e| format!("{k} invalid: {e}"))
+        };
+        let broker_addr = addr("CT_CHANNEL_BROKER", "edge rendezvous host:port")?;
+        let relay_addr = addr("CT_CHANNEL_RELAY", "edge relay host:port")?;
+        let listen_addr = addr("CT_CHANNEL_LISTEN", "advertised host:port")?;
+        let grant_bytes = f("CT_CHANNEL_GRANT")
+            .as_deref()
+            .and_then(hex_bytes)
+            .ok_or("CT_CHANNEL_GRANT required (hex signed grant)")?;
+        let grant = ct_common::channel::SignedChannelGrant::decode(&grant_bytes)
+            .map_err(|e| format!("CT_CHANNEL_GRANT malformed: {e}"))?;
+        let holder = SigningKey::from_bytes(
+            &f("CT_CHANNEL_HOLDER_KEY")
+                .as_deref()
+                .and_then(hex32)
+                .ok_or("CT_CHANNEL_HOLDER_KEY required (64 hex)")?,
+        );
+        let own_noise_private = f("CT_CHANNEL_NOISE_KEY")
+            .as_deref()
+            .and_then(hex32)
+            .ok_or("CT_CHANNEL_NOISE_KEY required (64 hex)")?;
+        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr })
+    }
+}
+
+/// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
+/// rendezvous + relay, present the grant, and pipe **stdin/stdout** over the A2A tunnel
+/// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
+/// relays the peer's Noise key, so no `CT_CHANNEL_PEER_*` is needed.
+pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), BoxError> {
+    let request = ChannelJoinRequest {
+        grant: cfg.grant,
+        endpoint: cfg.listen_addr.to_string(),
+    };
+    // Dial the broker + relay accept-any (the grant + possession proof are the auth;
+    // Noise_IK authenticates the peer end-to-end).
+    let broker_conn = crate::transport::build_channel_dialer()?
+        .connect(cfg.broker_addr, "localhost")?
+        .await?;
+    let relay_conn = crate::transport::build_channel_dialer()?
+        .connect(cfg.relay_addr, "localhost")?
+        .await?;
+    let listener = match cfg.role {
+        ChannelRole::Accept => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
+        ChannelRole::Initiate => None,
+    };
+    eprintln!(
+        "ct-agent channel: plane-brokered {:?} via broker {} (relay {})",
+        cfg.role, cfg.broker_addr, cfg.relay_addr
+    );
+    let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    run_channel_join(
+        &broker_conn,
+        &relay_conn,
+        &request,
+        &cfg.holder,
+        cfg.role,
+        &cfg.own_noise_private,
+        listener,
+        DIRECT_DIAL_TIMEOUT,
+        CHANNEL_ACCEPT_TIMEOUT,
+        local,
+    )
+    .await
+}
+
 /// Bound on a direct A2A dial before giving up (#72 AF4-session-resilience). Kept
 /// short so a peer that's unreachable on the direct path (NAT / firewall / down) fails
 /// fast — the signal to fall back to the edge relay — instead of hanging on the QUIC
@@ -392,6 +498,53 @@ mod tests {
     }
 
     const K64: &str = "aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20";
+
+    #[test]
+    fn channel_join_cli_config_parses_the_plane_one_liner() {
+        // #98 / #103: the plane-brokered one-liner's config contract — broker + relay
+        // addrs, the operator-signed grant (hex), the holder + Noise keys, and the
+        // advertised endpoint. Round-trips a real grant through decode.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer;
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let holder = SigningKey::from_bytes(&[0x11u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId([0xABu8; 32]),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant_hex = hex_encode(&SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode());
+        let hk = "1111111111111111111111111111111111111111111111111111111111111111";
+        let nk = "2222222222222222222222222222222222222222222222222222222222222222";
+        let base: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_ROLE", "initiate".into()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+            ("CT_CHANNEL_LISTEN", "203.0.113.5:7000".into()),
+            ("CT_CHANNEL_GRANT", grant_hex),
+            ("CT_CHANNEL_HOLDER_KEY", hk.into()),
+            ("CT_CHANNEL_NOISE_KEY", nk.into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+        };
+        let cfg = lookup(&base).expect("plane-brokered config parses");
+        assert_eq!(cfg.role, ChannelRole::Initiate);
+        assert_eq!(cfg.broker_addr, "203.0.113.5:9443".parse().unwrap());
+        assert_eq!(cfg.relay_addr, "203.0.113.5:9444".parse().unwrap());
+        assert_eq!(cfg.listen_addr, "203.0.113.5:7000".parse().unwrap());
+        assert_eq!(cfg.grant.grant.channel, ChannelId([0xABu8; 32]), "the grant round-trips through decode");
+
+        // Each required field is enforced.
+        for drop_key in ["CT_CHANNEL_BROKER", "CT_CHANNEL_RELAY", "CT_CHANNEL_GRANT", "CT_CHANNEL_HOLDER_KEY", "CT_CHANNEL_LISTEN"] {
+            let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
+            assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
+        }
+    }
 
     #[test]
     fn channel_config_parses_roles_keys_and_the_initiator_cert_requirement() {

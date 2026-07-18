@@ -41,6 +41,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // an Agent-Fabric A2A channel and pipe stdin/stdout over the encrypted Noise_IK
     // tunnel to the paired peer. Config comes from CT_CHANNEL_* so it fits a one-liner.
     if std::env::args().nth(1).as_deref() == Some("channel") {
+        // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
+        // the grant, learn the peer via the broker (keys relayed), connect
+        // direct-then-relay. Otherwise the direct-address path (CT_CHANNEL_ADDR).
+        if std::env::var("CT_CHANNEL_BROKER").map(|v| !v.is_empty()).unwrap_or(false) {
+            let cfg = ct_agent::channel_run::ChannelJoinCliConfig::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            return ct_agent::channel_run::run_channel_join_command(cfg).await;
+        }
         let cfg = ct_agent::channel_run::ChannelRunConfig::from_env()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         return ct_agent::channel_run::run_channel_command(cfg).await;

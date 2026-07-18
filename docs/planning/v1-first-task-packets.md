@@ -1826,6 +1826,16 @@ Decomposed:
       *induces* the failure (the rendezvous hands a bound-but-silent blackhole endpoint; the 400 ms direct dial
       times out) and asserts the tunnel auto-recovers via the edge relay and carries data. Gate green.
 
+  - **AF4-cli-brokered** ✅ **Plane-brokered `ct-agent channel` flow (#98/#103).** When `CT_CHANNEL_BROKER`
+    is set, `main` dispatches to `run_channel_join_command`: `ChannelJoinCliConfig` parses the cross-host
+    one-liner env (`CT_CHANNEL_BROKER`/`_RELAY`/`_GRANT`(hex)/`_HOLDER_KEY`/`_NOISE_KEY`/`_LISTEN`/`_ROLE`),
+    dials the edge rendezvous + relay (accept-any; grant + possession are the auth), presents the grant, and
+    pipes stdio over the tunnel with automatic direct-then-relay recovery — the broker relays the peer Noise
+    key, so **no out-of-band `CT_CHANNEL_PEER_*`**. Otherwise the direct-address path (`CT_CHANNEL_ADDR`) is
+    used. Frozen test `channel_join_cli_config_parses_the_plane_one_liner` (grant round-trips through decode;
+    each required field enforced). Gate green. *(Live plane pairing (#103) is blocked on the operator
+    deploying the broker on bunsenbrenner.org — `CT_EDGE_CHANNEL_LISTEN` + the channel port — not on code.)*
+
   **AF4-session-resilience is complete** (scimbe's connection-difficulty focus): fast **classified** dial
   (`Unreachable`) → role-aware edge relay-forward → relay-mode admission handler → agent relay path with a
   real Noise session over the relay → **automatic direct-then-relay recovery**, each with an induced-failure
