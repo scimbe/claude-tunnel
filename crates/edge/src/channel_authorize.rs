@@ -30,6 +30,17 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
+    if s.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 #[derive(Serialize)]
 struct AuthorizeReq {
     channel: String,
@@ -41,14 +52,18 @@ struct AuthorizeResp {
     operator_pubkey: String,
     #[serde(default)]
     noise_pubkey: Option<String>,
+    #[serde(default)]
+    noise_attestation: Option<String>,
 }
 
-/// A resolved channel membership: the operator key (verifies the grant) and, when
-/// the registry has one, the member's attested Noise static key (#72 AF4 / #100) —
-/// which the broker relays to the paired peer so an A2A initiator can pin it.
+/// A resolved channel membership: the operator key (verifies the grant), the member's
+/// attested Noise static key, and the holder-signed attestation over it (#72 AF4 /
+/// #100 / #101) — the broker relays the key + attestation to the paired peer so an A2A
+/// initiator can verify the key is genuinely the holder's before pinning it.
 pub struct MemberResolution {
     pub operator_pubkey: [u8; 32],
     pub noise_pubkey: Option<[u8; 32]>,
+    pub noise_attestation: Option<[u8; 64]>,
 }
 
 /// Resolves channel-join authorization by querying the control plane's c-i endpoint.
@@ -103,6 +118,7 @@ impl ChannelAuthorizer {
         Some(MemberResolution {
             operator_pubkey: hex_decode_32(&body.operator_pubkey)?,
             noise_pubkey: body.noise_pubkey.as_deref().and_then(hex_decode_32),
+            noise_attestation: body.noise_attestation.as_deref().and_then(hex_decode_64),
         })
     }
 }
@@ -129,6 +145,7 @@ mod tests {
             Ok(Json(serde_json::json!({
                 "operator_pubkey": hex(&[0xEEu8; 32]),
                 "noise_pubkey": hex(&[0x55u8; 32]),
+                "noise_attestation": hex(&[0x66u8; 64]),
             })))
         } else {
             Err(axum::http::StatusCode::NOT_FOUND)
@@ -178,6 +195,7 @@ mod tests {
         let m = good.resolve(&channel, &[0x33u8; 32]).await.expect("member resolves");
         assert_eq!(m.operator_pubkey, [0xEEu8; 32], "operator key");
         assert_eq!(m.noise_pubkey, Some([0x55u8; 32]), "attested Noise key delivered");
+        assert_eq!(m.noise_attestation, Some([0x66u8; 64]), "the holder attestation is delivered too (#101)");
         // A non-member still resolves to None (fail-closed).
         assert!(good.resolve(&channel, &[0x44u8; 32]).await.is_none(), "non-member denied");
     }

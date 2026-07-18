@@ -2247,9 +2247,15 @@ handshake. Fix: **attest** the Noise key with the member's holder key and verify
   operator-forged key is rejected `400`. `/internal/channel/authorize` returns the attestation alongside the
   key. Frozen coverage in `authed_channel_registry_is_owner_scoped` (valid attestation → stored; all-zero →
   `400`). Gate green.
-- **SEC101c** ⏳ **Relay + verify end-to-end**: the broker relays the attestation with the peer's Noise key;
-  the initiator calls `verify_member_noise_attestation` before pinning (`a2a_initiate`) — so even a tampered
-  DB can't make an initiator pin an unattested key.
+- **SEC101c-i** ✅ **Edge resolver carries the attestation.** `AuthorizeResp`/`MemberResolution` gained
+  `noise_attestation`; `ChannelAuthorizer::resolve` parses the CP-served attestation (hex→`[u8;64]`). Frozen
+  test `resolve_carries_the_members_attested_noise_key` asserts it. Gate green — the edge now has the
+  attestation ready to relay.
+- **SEC101c-ii** ⏳ **Relay + verify end-to-end**: the broker's authorize closure returns the attestation too,
+  `broker_channel_rendezvous` appends it (+ the peer holder) to the ack, `present_channel_join` parses it into
+  `Admitted`, and `run_channel_join`/`join_via_relay` call `verify_member_noise_attestation` before
+  `a2a_initiate` pins — so even a tampered DB can't make an initiator pin an unattested key. (Same
+  closure-signature ripple as the noise-key swap.)
 
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
