@@ -149,11 +149,11 @@ mod tests {
         let holder_b = SigningKey::from_bytes(&[0x22u8; 32]);
         let req_a = ChannelJoinRequest {
             grant: signed_grant(channel, &holder_a, Direction::Initiate),
-            endpoint: "10.0.0.1:7001".to_string(),
+            endpoint: "203.0.113.1:7001".to_string(),
         };
         let req_b = ChannelJoinRequest {
             grant: signed_grant(channel, &holder_b, Direction::Accept),
-            endpoint: "10.0.0.2:7002".to_string(),
+            endpoint: "203.0.113.2:7002".to_string(),
         };
 
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
@@ -184,12 +184,12 @@ mod tests {
         let _ = srv.await;
         assert_eq!(
             out_a,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "10.0.0.2:7002".to_string() },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string() },
             "agent A learns B's endpoint"
         );
         assert_eq!(
             out_b,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "10.0.0.1:7001".to_string() },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string() },
             "agent B learns A's endpoint"
         );
     }

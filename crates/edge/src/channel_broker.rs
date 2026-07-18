@@ -100,16 +100,41 @@ pub fn authorize_channel_pair(
     }
 }
 
-/// Endpoint policy (#81 gap 3): the peer will *dial* this advertised address, so it
-/// must be a real socket address and not an SSRF target. Reject anything that isn't
-/// a parseable `SocketAddr`, and reject loopback / unspecified / multicast (dial-to-
-/// self and nonsense targets). Private (LAN) and global unicast are allowed —
-/// legitimate agent-to-agent P2P. Returns the parsed address when acceptable.
+/// Endpoint policy (#81 gap 3, tightened for #94): a peer agent will *dial* this
+/// advertised address, so it must be a real, **publicly-routable** socket address and
+/// not an SSRF / internal-pivot target. A malicious holder must not be able to make the
+/// peer dial into the operator's LAN (`10.0.0.5:22`, a metadata service, an internal
+/// admin API). Reject anything that isn't a parseable `SocketAddr`, and reject
+/// loopback / unspecified / multicast **plus** every private / internal range: RFC1918,
+/// link-local (`169.254/16`, `fe80::/10`), CGNAT (`100.64/10`) and IPv6 unique-local
+/// (`fc00::/7`). Only global unicast passes. Returns the parsed address when acceptable.
 fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
+    use std::net::IpAddr;
     let addr: std::net::SocketAddr = ep.parse().ok()?;
     let ip = addr.ip();
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return None;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            // RFC1918 private + link-local (169.254/16) + shared/CGNAT (100.64/10).
+            if v4.is_private() || v4.is_link_local() {
+                return None;
+            }
+            let o = v4.octets();
+            if o[0] == 100 && (64..=127).contains(&o[1]) {
+                return None; // 100.64.0.0/10
+            }
+        }
+        IpAddr::V6(v6) => {
+            let s0 = v6.segments()[0];
+            if (s0 & 0xfe00) == 0xfc00 {
+                return None; // unique-local fc00::/7
+            }
+            if (s0 & 0xffc0) == 0xfe80 {
+                return None; // link-local fe80::/10
+            }
+        }
     }
     Some(addr)
 }
@@ -392,6 +417,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_endpoint_rejects_private_and_internal_ranges() {
+        // #94: a peer dials the advertised endpoint, so only publicly-routable
+        // addresses may pass — a holder must not be able to make the peer dial the
+        // operator's LAN, the cloud metadata service, or a link-local host.
+        for bad in [
+            "127.0.0.1:22",        // loopback
+            "0.0.0.0:80",          // unspecified
+            "224.0.0.1:80",        // multicast
+            "10.0.0.5:22",         // RFC1918
+            "172.16.0.1:22",       // RFC1918
+            "192.168.1.1:22",      // RFC1918
+            "169.254.169.254:80",  // link-local (cloud metadata!)
+            "100.64.0.1:22",       // CGNAT 100.64/10
+            "[::1]:22",            // v6 loopback
+            "[fe80::1]:22",        // v6 link-local
+            "[fc00::1]:22",        // v6 unique-local
+            "[fd12:3456::1]:22",   // v6 unique-local
+            "not-an-address",
+        ] {
+            assert!(safe_endpoint(bad).is_none(), "{bad} must be rejected");
+        }
+        for ok in [
+            "203.0.113.10:7001",             // public unicast (TEST-NET stand-in)
+            "8.8.8.8:443",                   // public unicast
+            "[2001:4860:4860::8888]:443",    // public v6 unicast
+        ] {
+            assert!(safe_endpoint(ok).is_some(), "{ok} must be allowed");
+        }
+    }
+
     // --- AF2d-transport: the QUIC channel-join admission gate ---
 
     /// A holder keypair with a real ed25519 public key (unlike the `[byte; 32]`
@@ -537,11 +593,11 @@ mod tests {
         let ib = holder_b.verifying_key().to_bytes()[0];
         let req_a = ChannelJoinRequest {
             grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
-            endpoint: "10.0.0.1:7001".to_string(),
+            endpoint: "203.0.113.1:7001".to_string(),
         };
         let req_b = ChannelJoinRequest {
             grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
-            endpoint: "10.0.0.2:7002".to_string(),
+            endpoint: "203.0.113.2:7002".to_string(),
         };
         let cert_b = cert.clone();
         let a = tokio::spawn(async move {
@@ -564,8 +620,8 @@ mod tests {
         let paired = server_task.await.expect("join").expect("paired");
 
         // Each agent learned the PEER's endpoint (independent of edge accept order).
-        assert!(ack_a.contains("10.0.0.2:7002"), "agent A learns B's endpoint, got {ack_a:?}");
-        assert!(ack_b.contains("10.0.0.1:7001"), "agent B learns A's endpoint, got {ack_b:?}");
+        assert!(ack_a.contains("203.0.113.2:7002"), "agent A learns B's endpoint, got {ack_a:?}");
+        assert!(ack_b.contains("203.0.113.1:7001"), "agent B learns A's endpoint, got {ack_b:?}");
         // The initiator is the Initiate-holder, the acceptor the Accept-holder.
         assert_eq!(paired, (ia, ib), "roles follow the grants' directions");
     }

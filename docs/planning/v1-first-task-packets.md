@@ -1845,10 +1845,17 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
     `authed_channel_registry_is_owner_scoped`: unauth → 401; owner registers + adds a member (which then
     resolves via `authorize_holder`); a non-owner can neither add members nor re-key (403, key unchanged);
     owner revokes → the authorize lookup denies. Gate green.
-  - **SEC81c-c** ⏳ **Mount the broker in the live edge**: wire `broker_channel_rendezvous` into serve.rs
-    with `authorize` sourced from `authorize_holder` (via the control plane). Endpoint should additionally be
-    constrained to match the agent's advertised direct endpoint where possible. Needs the agent side (#72
-    AF4) to be a usable end-to-end path.
+  - **#94 SSRF hardening** ✅ **`safe_endpoint` rejects private/internal ranges** (prerequisite to mounting the
+    broker on a public edge): the guard rejected only loopback/unspecified/multicast and *allowed* RFC1918 /
+    link-local / CGNAT / IPv6 unique-local — so a holder could make the peer dial the operator's LAN or the
+    cloud metadata IP (`169.254.169.254`). Now only globally-routable unicast passes (v4: `is_private` +
+    `is_link_local` + `100.64/10`; v6: `fc00::/7` + `fe80::/10`). Frozen test
+    `safe_endpoint_rejects_private_and_internal_ranges`; broker/agent tests moved to `203.0.113.x`. Gate green.
+  - **SEC81c-c** ⏳ **Mount the broker in the live edge** — the roadmap "many things wait for" (scimbe). Steps:
+    (c-i) a CP internal endpoint exposing `authorize_holder` (operator key iff member), gated by the shared
+    edge-admin token; (c-ii) an edge-side resolver that queries it as the `authorize` closure; (c-iii) mount
+    `broker_channel_rendezvous` into `run_edge`'s accept path. Then #72 AF4-session (dial peer + Noise_IK using
+    the peer's `member_noise_key` + relay fallback) makes it a usable end-to-end tunnel.
 
 ## #78 CI gate / build-isolation security review (security-review)
 
