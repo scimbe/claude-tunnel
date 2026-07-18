@@ -1724,8 +1724,17 @@ Decomposed:
     mounted live. Two frozen round-trip tests against the **real** `ct_edge::channel_broker` (ct-agent already
     dev-deps ct-edge): a genuine holder is admitted while a wrong possession key is refused; and two clients
     paired via `broker_channel_rendezvous` each parse the peer's advertised endpoint. Gate green.
-  - **AF4-session** ⏳ dial the parsed `peer_endpoint`, run a pairwise Noise session over the direct path, with
-    edge-relay fallback when the direct dial fails; real two-agent data-exchange + fallback integration test.
+  - **AF4-keydist** ✅ **Registry carries each member's X25519 Noise static key** (scimbe decision 2026-07-18,
+    `ct-control-plane::storage`): Noise_IK needs the peer's static X25519 key pinned, but the grant carried only
+    ed25519 signing keys. `channel_members` gains a `noise_pubkey` column (additive `ensure_column` migration, #44);
+    `add_member(channel, owner, holder, noise_pubkey)` pins it (re-add updates it); new `member_noise_key(channel,
+    holder) -> Option<[u8;32]>` lookup (a peer fetches the other side's key; revoked/pre-migration member → None).
+    The authed `POST /me/channels/:channel/members` now takes `{holder, noise_pubkey}`. Frozen tests:
+    `channel_member_noise_key_round_trips_and_reflects_revocation` (set/update/revoke) + the HTTP round-trip in
+    `authed_channel_registry_is_owner_scoped`. Gate green. This is the input AF4-session pins.
+  - **AF4-session** ⏳ dial the parsed `peer_endpoint`, fetch the peer's `member_noise_key`, run a pairwise
+    Noise_IK session over the direct path, with edge-relay fallback when the direct dial fails; real two-agent
+    data-exchange + fallback integration test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

@@ -462,6 +462,9 @@ async fn channel_register(
 #[derive(Deserialize)]
 struct MemberReq {
     holder: String,
+    /// The member's X25519 Noise static key (#72 AF4) — the peer pins this for the
+    /// direct-path Noise_IK handshake.
+    noise_pubkey: String,
 }
 
 async fn channel_add_member(
@@ -475,9 +478,11 @@ async fn channel_add_member(
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let holder = hex_decode_32(&req.holder)
         .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let noise_pubkey = hex_decode_32(&req.noise_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
     let ok = state
         .channels
-        .add_member(&ChannelId(channel), &owner, &holder)
+        .add_member(&ChannelId(channel), &owner, &holder, &noise_pubkey)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // false → not the owner (or unknown channel): only the owner manages members.
     if ok {
@@ -1373,10 +1378,11 @@ mod tests {
         .unwrap()
         .status();
         assert_eq!(s, StatusCode::OK, "owner registers");
+        let nk = "d4".repeat(32);
         let s = post(
             format!("/me/channels/{ch}/members"),
             Some(alice.clone()),
-            format!(r#"{{"holder":"{holder}"}}"#),
+            format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}"}}"#),
         )
         .await
         .unwrap()
@@ -1387,12 +1393,17 @@ mod tests {
             Some(hex_decode_32(&op).unwrap()),
             "an added member resolves the operator key (drives SEC81c-a)"
         );
+        assert_eq!(
+            probe.member_noise_key(&chan, &hbytes).unwrap(),
+            Some(hex_decode_32(&nk).unwrap()),
+            "the member's pinned X25519 Noise key round-trips (AF4 key distribution)"
+        );
 
         // Mallory cannot manage or re-key alice's channel.
         let s = post(
             format!("/me/channels/{ch}/members"),
             Some(mallory.clone()),
-            format!(r#"{{"holder":"{}"}}"#, "ee".repeat(32)),
+            format!(r#"{{"holder":"{}","noise_pubkey":"{}"}}"#, "ee".repeat(32), "d4".repeat(32)),
         )
         .await
         .unwrap()
