@@ -470,6 +470,16 @@ impl SqliteLedger {
     /// Register a payment intent (top-up of `credits` against `account`);
     /// returns an opaque [`PaymentId`]. Unconfirmed until [`Self::confirm_payment`].
     pub fn create_intent(&self, account: &AccountId, credits: u64) -> rusqlite::Result<PaymentId> {
+        // #83: SQLite INTEGER is i64. A `credits` above i64::MAX would wrap NEGATIVE
+        // via `credits as i64`, and on confirmation add a negative amount and return
+        // it `as u64` — turning a balance into ~u64::MAX. Reject the absurd value at
+        // creation (a >9.2-quintillion top-up is never legitimate) so no negative
+        // credits row can ever exist.
+        if credits > i64::MAX as u64 {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                format!("payment credits {credits} exceeds the maximum {}", i64::MAX).into(),
+            ));
+        }
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         self.conn.lock_safe().execute(
@@ -496,6 +506,13 @@ impl SqliteLedger {
             row.ok_or(PaymentOpError::Payment(PaymentError::UnknownPayment))?;
         if confirmed != 0 {
             return Err(PaymentOpError::Payment(PaymentError::AlreadyConfirmed));
+        }
+        // #83 defence in depth: never credit a negative amount (create_intent now
+        // prevents them, but a legacy/corrupt row must not corrupt a balance).
+        if credits < 0 {
+            return Err(PaymentOpError::Db(rusqlite::Error::IntegralValueOutOfRange(
+                1, credits,
+            )));
         }
         let bal: i64 = tx
             .query_row(
@@ -1390,6 +1407,34 @@ mod tests {
             "second confirmation rejected"
         );
         assert_eq!(ledger.balance(&acct).unwrap(), 100, "credited exactly once");
+    }
+
+    #[test]
+    fn create_intent_rejects_credits_above_i64_max() {
+        // #83: a credits value above i64::MAX would wrap negative in SQLite and, on
+        // confirmation, corrupt the balance (e.g. 0 -> ~u64::MAX). Reject at creation.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+
+        assert!(
+            ledger.create_intent(&acct, u64::MAX).is_err(),
+            "an over-i64::MAX top-up is rejected, not stored as a negative credits row"
+        );
+        assert!(
+            ledger.create_intent(&acct, (i64::MAX as u64) + 1).is_err(),
+            "just above i64::MAX is rejected"
+        );
+        assert_eq!(ledger.balance(&acct).unwrap(), 0, "no intent created, balance untouched");
+
+        // The boundary value i64::MAX is accepted and confirms to the exact amount —
+        // no wrap, no corruption.
+        let big = ledger.create_intent(&acct, i64::MAX as u64).unwrap();
+        assert_eq!(
+            ledger.confirm_payment(&big).unwrap(),
+            i64::MAX as u64,
+            "the maximum valid top-up credits the exact amount"
+        );
+        assert_eq!(ledger.balance(&acct).unwrap(), i64::MAX as u64);
     }
 
     /// Production requirement: billing state survives a restart. Open + credit +
