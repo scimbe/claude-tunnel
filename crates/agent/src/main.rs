@@ -37,6 +37,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // `channel` subcommand (#72 AF4 / #98/#100): bring this agent up as one side of
+    // an Agent-Fabric A2A channel and pipe stdin/stdout over the encrypted Noise_IK
+    // tunnel to the paired peer. Config comes from CT_CHANNEL_* so it fits a one-liner.
+    if std::env::args().nth(1).as_deref() == Some("channel") {
+        let cfg = ct_agent::channel_run::ChannelRunConfig::from_env()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        return ct_agent::channel_run::run_channel_command(cfg).await;
+    }
+
     // One-command onboarding: if a join token is present (env or `onboard`
     // subcommand), auto-enroll against the control plane before serving. This
     // is the "install -> enroll -> tunnel" single step — the operator supplies

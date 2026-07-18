@@ -1747,10 +1747,16 @@ Decomposed:
     is exactly what a CLI wires to stdin/stdout — "netcat over the channel". Frozen test
     `runner_pipes_local_data_over_the_a2a_tunnel`: two agents over a REAL QUIC connection, bytes written to the
     initiator's local side arrive at the responder's local side. Gate green (full `cargo test --workspace -D warnings`).
-  - **AF4-session-wire** ⏳ remaining glue to make it invocable end-to-end: (a) a `ct-agent channel` subcommand
-    that reads config (role, keys, peer endpoint/listen) and calls `run_channel_session` with stdio as `local`
-    (#98/#100 — the CLI runner); (b) deliver the peer's `member_noise_key` to the initiator (broker swap or CP
-    fetch — #101 attestation applies); (c) **edge-relay fallback** when the direct dial fails, with a test.
+  - **AF4-session-cli** ✅ **`ct-agent channel` subcommand — the runner is now invocable.** `ChannelRunConfig`
+    reads `CT_CHANNEL_*` (role, bind/peer addr, own+peer Noise keys, peer cert as hex) so it fits a one-liner;
+    `run_channel_command` brings the agent up as responder (binds via `build_direct_listener_at`, prints its
+    cert hex for the peer to trust) or initiator (`dial_quic` trusting the configured peer cert) and pipes
+    **stdin/stdout** over the A2A tunnel via `run_channel_session`. `main.rs` dispatches `channel`. Frozen test
+    `channel_config_parses_roles_keys_and_the_initiator_cert_requirement`. Gate green (added tokio `io-std`).
+  - **AF4-session-wire** ⏳ remaining to make the one-liner *self-contained*: (a) **#100** render the actual
+    copy-paste `CT_CHANNEL_*=… ct-agent channel` command from a channel grant; (b) deliver the peer's
+    `member_noise_key` **and** transport cert automatically (broker swap or CP fetch — #101 attestation
+    applies) instead of manual hex; (c) **edge-relay fallback** when the direct dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
