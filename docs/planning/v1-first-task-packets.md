@@ -1740,10 +1740,17 @@ Decomposed:
     (3) **`ct_agent::channel::two_agents_carry_data_over_a_channel_session`** — two agents over a **real QUIC
     connection** run the session and exchange application data both ways (the live tunnel-to-tunnel path). Gate
     green (full `cargo test --workspace -D warnings`).
-  - **AF4-session-wire** ⏳ glue: after `present_channel_join` returns `Admitted { peer_endpoint }`, fetch the
-    peer's `member_noise_key` from the registry, dial `peer_endpoint`, and run `a2a_initiate`/`a2a_respond` —
-    plus **edge-relay fallback** when the direct dial fails, with a fallback integration test. (The session
-    primitive it calls is done; this wires it into the agent's runtime + role selection.)
+  - **AF4-session-runner** ✅ **The runnable engine.** `ct_agent::channel_run::run_channel_session(conn, role,
+    own_noise_priv, peer_noise_pub, local)` selects initiator/responder by `ChannelRole` (from the grant
+    `Direction`), completes the A2A handshake over the QUIC connection, and then `noise_pump`s a **local byte
+    stream over the encrypted tunnel** (a `BiStream` adapter presents the quinn bi-stream as one duplex). This
+    is exactly what a CLI wires to stdin/stdout — "netcat over the channel". Frozen test
+    `runner_pipes_local_data_over_the_a2a_tunnel`: two agents over a REAL QUIC connection, bytes written to the
+    initiator's local side arrive at the responder's local side. Gate green (full `cargo test --workspace -D warnings`).
+  - **AF4-session-wire** ⏳ remaining glue to make it invocable end-to-end: (a) a `ct-agent channel` subcommand
+    that reads config (role, keys, peer endpoint/listen) and calls `run_channel_session` with stdio as `local`
+    (#98/#100 — the CLI runner); (b) deliver the peer's `member_noise_key` to the initiator (broker swap or CP
+    fetch — #101 attestation applies); (c) **edge-relay fallback** when the direct dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.
