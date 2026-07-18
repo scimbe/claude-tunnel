@@ -46,6 +46,9 @@ pub enum CredError {
     BadKey,
     /// The wire bytes were not a well-formed credential.
     Malformed,
+    /// A previously-accepted credential was presented again before its expiry
+    /// (#88 SEC88b) — rejected by the replay cache in [`verify_fresh`].
+    Replayed,
 }
 
 impl std::fmt::Display for CredError {
@@ -55,6 +58,7 @@ impl std::fmt::Display for CredError {
             CredError::Expired => write!(f, "credential expired"),
             CredError::BadKey => write!(f, "issuer public key invalid"),
             CredError::Malformed => write!(f, "credential bytes malformed"),
+            CredError::Replayed => write!(f, "credential replayed"),
         }
     }
 }
@@ -132,6 +136,27 @@ pub fn verify(
     Ok(())
 }
 
+/// Like [`verify`], but additionally rejects a **replay** (#88 SEC88b). A captured
+/// credential is otherwise valid until `expires_at` *any number of times*; `cache`
+/// records the credential's 64-byte signature (unique per token — a replay carries
+/// the identical bytes) until that expiry, so the first presentation of a valid,
+/// unexpired credential succeeds and any later presentation of the same signature
+/// fails with [`CredError::Replayed`]. Call this at the single admission point that
+/// owns `cache`; the cache evicts on expiry so it stays bounded. Signature/expiry
+/// are checked first, so an invalid or expired credential never populates the cache.
+pub fn verify_fresh(
+    issuer_pubkey: &[u8; 32],
+    signed: &SignedCredential,
+    now: UnixSeconds,
+    cache: &mut crate::replay::ReplayCache,
+) -> Result<(), CredError> {
+    verify(issuer_pubkey, signed, now)?;
+    if !cache.check_and_record(&signed.signature, signed.credential.expires_at, now) {
+        return Err(CredError::Replayed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +197,31 @@ mod tests {
         let (pk, mut signed) = signed_cred(1_000);
         signed.credential.expires_at = 9_999;
         assert_eq!(verify(&pk, &signed, 500), Err(CredError::BadSignature));
+    }
+
+    #[test]
+    fn verify_fresh_admits_once_then_rejects_the_replay() {
+        // #88 SEC88b: a valid, unexpired credential is admitted the first time and
+        // rejected as a replay thereafter; an expired credential is rejected on
+        // expiry and never cached (so it can't consume a slot or mask itself).
+        use crate::replay::ReplayCache;
+        let (pk, signed) = signed_cred(1_000);
+        let mut cache = ReplayCache::new();
+
+        assert_eq!(verify_fresh(&pk, &signed, 500, &mut cache), Ok(()), "first use admitted");
+        assert_eq!(
+            verify_fresh(&pk, &signed, 700, &mut cache),
+            Err(CredError::Replayed),
+            "the same credential again is a replay"
+        );
+
+        // An expired credential is rejected on expiry, not by the cache.
+        let (pk2, expired) = signed_cred(1_000);
+        assert_eq!(
+            verify_fresh(&pk2, &expired, 1_000, &mut cache),
+            Err(CredError::Expired),
+            "an expired credential is rejected before the cache"
+        );
     }
 
     #[test]

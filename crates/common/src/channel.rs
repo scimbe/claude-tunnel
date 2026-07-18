@@ -164,6 +164,9 @@ pub enum GrantError {
     BadKey,
     /// The wire bytes were not a well-formed grant.
     Malformed,
+    /// A previously-accepted grant was presented again before its expiry
+    /// (#88 SEC88b) — rejected by the replay cache in [`verify_fresh`].
+    Replayed,
 }
 
 impl std::fmt::Display for GrantError {
@@ -173,6 +176,7 @@ impl std::fmt::Display for GrantError {
             GrantError::Expired => write!(f, "channel grant expired"),
             GrantError::BadKey => write!(f, "operator public key invalid"),
             GrantError::Malformed => write!(f, "channel grant bytes malformed"),
+            GrantError::Replayed => write!(f, "channel grant replayed"),
         }
     }
 }
@@ -298,6 +302,29 @@ pub fn verify(
     Ok(())
 }
 
+/// Like [`verify`], but additionally rejects a **replay** (#88 SEC88b). A captured
+/// grant is otherwise valid until `expires_at` *any number of times*; `cache` records
+/// the grant's 64-byte signature (unique per grant — a replay carries the identical
+/// bytes) until that expiry, so the first presentation of an authentic, unexpired
+/// grant succeeds and any later presentation of the same signature fails with
+/// [`GrantError::Replayed`]. Call this at the single admission point (the broker) that
+/// owns `cache`; the cache evicts on expiry so it stays bounded. Signature/expiry are
+/// checked first, so an invalid or expired grant never populates the cache. This is
+/// orthogonal to holder-possession (#81) and membership/revocation — all three gate
+/// admission together.
+pub fn verify_fresh(
+    operator_pubkey: &[u8; 32],
+    signed: &SignedChannelGrant,
+    now: UnixSeconds,
+    cache: &mut crate::replay::ReplayCache,
+) -> Result<(), GrantError> {
+    verify(operator_pubkey, signed, now)?;
+    if !cache.check_and_record(&signed.signature, signed.grant.expires_at, now) {
+        return Err(GrantError::Replayed);
+    }
+    Ok(())
+}
+
 /// Verify a holder's **proof of possession** (#81 gap 1): `signature` must be the
 /// holder's ed25519 signature over the edge-issued `challenge`. This closes "stolen
 /// grant = bearer token" — presenting a valid [`SignedChannelGrant`] is not enough;
@@ -363,6 +390,37 @@ mod tests {
         let (_pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
         let other = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
         assert_eq!(verify(&other, &signed, 500), Err(GrantError::BadSignature));
+    }
+
+    #[test]
+    fn verify_fresh_admits_once_then_rejects_the_replay() {
+        // #88 SEC88b: an authentic, unexpired grant is admitted the first time and
+        // rejected as a replay on any later presentation of the same signature —
+        // while a different grant (its own signature) is still admitted, and a
+        // bad-key grant is rejected on the signature before ever touching the cache.
+        use crate::replay::ReplayCache;
+        let (pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
+        let mut cache = ReplayCache::new();
+
+        assert_eq!(verify_fresh(&pk, &signed, 500, &mut cache), Ok(()), "first use admitted");
+        assert_eq!(
+            verify_fresh(&pk, &signed, 600, &mut cache),
+            Err(GrantError::Replayed),
+            "the same grant again is a replay"
+        );
+
+        // A distinct grant has its own signature and is independently admitted.
+        let (pk2, signed2) = signed_grant(Direction::Initiate, Rights::Read, false, 1_000);
+        assert_eq!(verify_fresh(&pk2, &signed2, 600, &mut cache), Ok(()), "a different grant is fresh");
+
+        // A forged grant fails signature verification and is never cached.
+        let other = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
+        let (_pk3, signed3) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
+        assert_eq!(
+            verify_fresh(&other, &signed3, 600, &mut cache),
+            Err(GrantError::BadSignature),
+            "a bad-key grant is rejected before the cache"
+        );
     }
 
     #[test]

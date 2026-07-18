@@ -2030,8 +2030,15 @@ with **no** proof-of-possession, so an intercepted token can bind an attacker's 
   holds currently-valid ids. Caller-supplied time (deterministic, mirrors `ratelimit`). The `id` is opaque —
   a token's 64-byte signature works (a replay carries the identical signature) as does an explicit nonce, so
   it wires into both credential and grant paths without a format change. 4 frozen tests. Gate green.
-- **SEC88b** ⏳ **Consult the cache in `SignedCredential`/`ChannelGrant` verify** — key on the signature bytes
-  (no nonce/format change needed) at the edge admission + broker paths, threading a shared `ReplayCache`.
+- **SEC88b-api** ✅ **Replay-checking verify** — `credential::verify_fresh` and `channel::verify_fresh` wrap
+  the existing `verify` (signature+expiry) and then consult a caller-owned `ReplayCache` keyed on the token's
+  64-byte signature: first presentation of a valid, unexpired token is admitted; any later presentation of
+  the same signature fails with `CredError::Replayed` / `GrantError::Replayed`. Signature/expiry are checked
+  first, so an invalid/expired token never populates the cache. No wire/format change. 2 frozen tests
+  (admit-once-then-replay; distinct token still fresh; bad-key/expired rejected before the cache). Gate green.
+- **SEC88b-wire** ⏳ **Thread a shared `ReplayCache` at the live call sites** — the edge credential-admission
+  (`edge/src/auth.rs`) and the channel broker (`edge/src/channel_broker.rs`) hold one cache per process and
+  call `verify_fresh` instead of `verify`. Bounded follow (state-threading + a broker/auth test).
 - **SEC88c** ⏳ **Enrollment proof-of-possession**: `redeem` must verify a signature over the join token by
   the pubkey being bound (agent already holds an ed25519 identity). Cross-crate wire change (agent onboard +
   `ControlPlaneClient::redeem` + both `redeem` handlers + `SqliteEnrollment`/`Enrollment` + call sites) — its
