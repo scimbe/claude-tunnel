@@ -157,7 +157,17 @@ ausgeführt; sie modelliert reale Wide-Area-Pfade nur näherungsweise und lässt
 Konkurrenzverkehr, reale Routerpuffer und Mehrbenutzerlast außen vor.
 \emph{Viertens} bleiben die oben genannten offenen Punkte -- finanzierter
 Angreifer, Einregion-Betrieb, teilweise realisierte Mesh-Ebene -- ausdrücklich
-außerhalb der Belege dieser Arbeit. Der Kern ist gleichwohl erreicht: ein
+außerhalb der Belege dieser Arbeit. \emph{Fünftens} ruht die
+Ende-zu-Ende-Schicht auf klassischer Elliptic-Curve-Kryptographie: Die
+Noise-Sitzung nutzt das Muster \texttt{Noise\_IK\_25519\_ChaChaPoly\_BLAKE2s},
+dessen Schlüsselaustausch (X25519) gegen einen künftigen kryptographisch
+relevanten Quantencomputer nicht sicher ist. Ein Angreifer, der heute
+Chiffretext aufzeichnet, könnte ihn nachträglich entschlüsseln
+(\emph{harvest-now, decrypt-later}). Post-Quanten-Kryptographie -- etwa ein
+hybrider Schlüsselaustausch mit den 2024 von der NIST standardisierten
+gitterbasierten Verfahren (ML-KEM~\cite{nistfips203}) -- ist in dieser Version
+bewusst nicht umgesetzt und bleibt ein naheliegender nächster Schritt für eine
+Folgeversion. Der Kern ist gleichwohl erreicht: ein
 belegbar providerblinder Tunnel, der als betreibbarer Dienst mit
 Hochverfügbarkeit, Beobachtbarkeit, Selbstbedienungs-PKI, ausfallfreier
 Schlüsselrotation und HTTPS bis zum Origin real nachgewiesen ist.

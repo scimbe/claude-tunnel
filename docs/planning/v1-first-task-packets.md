@@ -1993,3 +1993,21 @@ wird. Dekomposition:
 - **T56.2** ⏳ **Quantifizieren/mitigieren** (braucht Testbett): Kontroll-Läufe mit `CPU`-Pinning je
   Container + protokollierter Auslastung (oder reduzierter Contention), um den Contention-Anteil am
   Tail von der Netzbedingung zu trennen. **fix-ready erst mit T56.2** (explizite Messung/Pinning-Kontrolle).
+
+## #70 USP-Einwand einordnen — PQC-Lücke, Ockam/Nebula/Headscale, Passthrough-Modi (thesis)
+
+Externer USP-Einwand; per central-Analyse trifft er nur teilweise (die Arbeit beansprucht die
+Vier-Bausteine-Kombination, nicht „provider-blind" allein; Metadaten/Dezentralität bereits als
+Out-of-Scope getrackt — #59, ADR-0002/0017, fazit). Drei echte Restlücken, dekomponiert:
+
+- **T70.1** ✅ **PQC-Lücke benennen** (`fazit.tex` §Grenzen der Arbeit): neuer „Fünftens"-Punkt — die
+  E2E-Schicht ruht auf klassischer EC-Kryptographie (`Noise_IK_25519_ChaChaPoly_BLAKE2s`, X25519, belegt in
+  `noise.rs:13`), nicht quantensicher; harvest-now-decrypt-later benannt; hybrider PQC-Schlüsselaustausch mit
+  NIST-standardisiertem ML-KEM (FIPS 203, 2024) als bewusst zurückgestellter nächster Schritt. Neue
+  Bib-Quelle `nistfips203`. Thesis baut grün (0 undefined, 64 S.). Analog zum bestehenden
+  Metadaten-/Dezentralitäts-Disclaimer — schließt die „PQC fehlt auch als Erwähnung"-Lücke.
+- **T70.2** ⏳ **Ockam, Nebula, Headscale/Tailscale-DERP** in `relatedwork.tex` + `references.bib` aufnehmen
+  (architektonisch nächste Vergleichsprojekte), sauber referenziert, kein Overclaim (die „mathematisch
+  beweisbar blind"-Formulierung des Einwands auf die belegbare Architektur-Property abschwächen).
+- **T70.3** ⏳ **Abgrenzungstabelle** (`relatedwork.tex` §3.5) um die **Passthrough-/Raw-TCP-Modi** der bereits
+  zitierten Tools (Cloudflare Tunnel/ngrok/Tailscale Funnel) ergänzen — diese wären ebenfalls payload-blind.
