@@ -1758,10 +1758,17 @@ Decomposed:
     the `CT_CHANNEL_*=… ct-agent channel` form (POSIX) + `$env:` PowerShell analog, targeting the shipped
     subcommand. Keys/cert ride in env, never argv (SEC90; inline-secret residual is #97). Frozen test
     `channel_one_liner_renders_the_ct_agent_channel_command`. Gate green.
-  - **AF4-session-wire** ⏳ remaining to make the one-liner *self-contained* (no manual hex): (a) a
-    broker-mediated `ct-agent channel-join` that presents the grant, learns the peer endpoint, and **fetches
-    the peer's `member_noise_key` + cert** from the rendezvous (broker swap or CP fetch — #101 attestation
-    applies); (b) a served `channel.sh`/`channel.ps1` + `/channel.sh` route so the operator emits one URL;
+  - **AF4-session-nocert** ✅ **Initiator dials accept-any — no transport cert conveyed.** `build_channel_dialer`
+    (agent transport) uses an `AcceptAnyServerCert` rustls verifier (accepts any cert, still checks handshake
+    signature consistency); `run_channel_command`'s initiator uses it when no cert is pinned, and
+    `CT_CHANNEL_PEER_CERT` is now optional (the one-liner drops it). Safe because Noise_IK is the real mutual
+    auth — a transport MITM can't complete the handshake without the peer's Noise private key. Frozen test
+    `initiator_dials_without_a_pre_shared_cert_noise_authenticates` (responder self-signs a cert the initiator
+    never sees; data flows). Gate green. **So the one-liner now needs only the peer's Noise key, not a cert.**
+  - **AF4-session-wire** ⏳ last mile to a *fully hands-off* one-liner: (a) a broker-mediated `ct-agent
+    channel-join` that presents the grant and **auto-fetches the peer's `member_noise_key`** from the
+    rendezvous (broker swap / CP fetch — #101 attestation applies), so even the Noise key isn't pasted;
+    (b) a served `channel.sh`/`channel.ps1` + `/channel.sh` route so the operator emits one URL;
     (c) **edge-relay fallback** when the direct dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it

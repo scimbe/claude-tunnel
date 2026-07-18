@@ -49,6 +49,68 @@ pub fn build_direct_listener() -> Result<(Endpoint, CertificateDer<'static>), Bo
     build_direct_listener_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
 }
 
+/// A rustls verifier that accepts **any** server certificate but still checks the
+/// handshake signature is internally consistent (the peer holds the key for the cert
+/// it presented). This is intentional for the Agent-Fabric A2A channel dialer
+/// (#72/#100): the QUIC/TLS layer is only transport, and the *real* mutual
+/// authentication is the Noise_IK session keyed on the members' pinned static keys —
+/// a transport-layer MITM cannot complete the Noise handshake without the peer's
+/// private key. So the initiator needs no pre-shared transport cert (only the peer's
+/// Noise key), which is what lets the A2A one-liner stay self-contained.
+#[derive(Debug)]
+struct AcceptAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Build the Agent-Fabric A2A channel **dialer** (#72/#100): a QUIC client endpoint
+/// that trusts any responder transport cert (see [`AcceptAnyServerCert`]), so the
+/// initiator can dial a paired peer without a pre-shared cert. Authentication is the
+/// Noise_IK session run over the connection, not the QUIC cert.
+pub fn build_channel_dialer() -> Result<Endpoint, BoxError> {
+    install_crypto_provider();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+        .with_no_client_auth();
+    let cfg = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    ));
+    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    endpoint.set_default_client_config(cfg);
+    Ok(endpoint)
+}
+
 /// Advertise the Agent's direct-path listener to the Edge (M11.4b-ii): send a
 /// `'D'` message — `token(32) | addr_len(1) | addr | cert_len(2 BE) | cert` — so
 /// Clients querying with `'P'` can discover and connect to it directly.

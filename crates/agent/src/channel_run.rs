@@ -164,13 +164,12 @@ impl ChannelRunConfig {
             .as_deref()
             .and_then(hex32)
             .ok_or("CT_CHANNEL_PEER_NOISE_KEY required (64 hex chars)")?;
+        // Optional: pin the peer's transport cert. Omit it and the initiator dials
+        // accept-any (Noise_IK authenticates), which keeps the one-liner self-contained.
         let peer_cert_der = match f("CT_CHANNEL_PEER_CERT").filter(|s| !s.trim().is_empty()) {
             Some(h) => Some(hex_bytes(&h).ok_or("CT_CHANNEL_PEER_CERT must be hex DER")?),
             None => None,
         };
-        if role == ChannelRole::Initiate && peer_cert_der.is_none() {
-            return Err("CT_CHANNEL_PEER_CERT required for role=initiate (hex DER of the peer's cert)".into());
-        }
         Ok(Self { role, addr, own_noise_private, peer_noise_public, peer_cert_der })
     }
 }
@@ -206,8 +205,16 @@ pub async fn run_channel_command(cfg: ChannelRunConfig) -> Result<(), BoxError> 
             .await?;
         }
         ChannelRole::Initiate => {
-            let der = cfg.peer_cert_der.clone().ok_or("initiator requires a peer cert")?;
-            let conn = crate::transport::dial_quic(cfg.addr, CertificateDer::from(der)).await?;
+            // Pin the peer's transport cert if one was supplied; otherwise dial with
+            // the accept-any channel dialer — Noise_IK is the real auth, so no cert
+            // needs to be conveyed (self-contained one-liner, #100).
+            let conn = match cfg.peer_cert_der.clone() {
+                Some(der) => crate::transport::dial_quic(cfg.addr, CertificateDer::from(der)).await?,
+                None => {
+                    let endpoint = crate::transport::build_channel_dialer()?;
+                    endpoint.connect(cfg.addr, "localhost")?.await?
+                }
+            };
             eprintln!("ct-agent channel: connected to {} (initiator)", cfg.addr);
             run_channel_session(
                 &conn,
@@ -253,14 +260,16 @@ mod tests {
         assert_eq!(acc.addr, "0.0.0.0:9000".parse().unwrap());
         assert!(acc.peer_cert_der.is_none());
 
-        // Initiator without a cert -> rejected; with a hex cert -> parsed.
+        // Initiator without a cert is valid (dials accept-any; Noise authenticates);
+        // a hex cert, if given, is parsed and pinned.
         let base = [
             ("CT_CHANNEL_ROLE", "initiate"),
             ("CT_CHANNEL_ADDR", "203.0.113.9:9000"),
             ("CT_CHANNEL_NOISE_KEY", K64),
             ("CT_CHANNEL_PEER_NOISE_KEY", K64),
         ];
-        assert!(cfg_from(&base).is_err(), "initiator requires CT_CHANNEL_PEER_CERT");
+        let no_cert = cfg_from(&base).expect("initiator without a cert is valid (accept-any dial)");
+        assert!(no_cert.peer_cert_der.is_none());
         let mut with_cert = base.to_vec();
         with_cert.push(("CT_CHANNEL_PEER_CERT", "deadbeef"));
         let init = cfg_from(&with_cert).expect("initiator with a cert is valid");
@@ -319,6 +328,51 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         resp_local_test.read_exact(&mut got).await.expect("read peer local");
         assert_eq!(got, payload, "the responder's local side receives exactly what A sent");
+
+        init_task.abort();
+        resp_task.abort();
+    }
+
+    #[tokio::test]
+    async fn initiator_dials_without_a_pre_shared_cert_noise_authenticates() {
+        // #100 self-containment: the initiator uses the accept-any channel dialer, so
+        // NO transport cert is conveyed — only the peer's Noise key. The responder
+        // self-signs (a cert the initiator has never seen); the A2A session still
+        // forms and data flows, because Noise_IK is the real mutual auth.
+        use crate::transport::{build_channel_dialer, build_direct_listener_at};
+        let initiator = generate_static_keypair();
+        let responder = generate_static_keypair();
+        let resp_priv = responder.private;
+        let init_priv = initiator.private;
+        let resp_pub = responder.public;
+
+        let (server, _cert) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+        let addr = server.local_addr().expect("addr");
+
+        let (mut resp_local_test, resp_local_run) = tokio::io::duplex(8192);
+        let resp_task = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &[0u8; 32], resp_local_run)
+                .await
+                .expect("responder session");
+        });
+
+        let (mut init_local_test, init_local_run) = tokio::io::duplex(8192);
+        let endpoint = build_channel_dialer().expect("dialer");
+        // Dial with NO peer cert — the accept-any verifier trusts the transport.
+        let conn = endpoint.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let init_task = tokio::spawn(async move {
+            run_channel_session(&conn, ChannelRole::Initiate, &init_priv, &resp_pub, init_local_run)
+                .await
+                .expect("initiator session");
+        });
+
+        let payload = b"self-contained: no transport cert was conveyed";
+        init_local_test.write_all(payload).await.expect("write");
+        init_local_test.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        resp_local_test.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, payload, "data flows without a pre-shared transport cert");
 
         init_task.abort();
         resp_task.abort();

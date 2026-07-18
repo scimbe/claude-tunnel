@@ -322,21 +322,26 @@ mod tests {
         // Secret hygiene: the private key is an env assignment, not a bare argv token.
         assert!(!sh.contains("channel a1a1"), "key never in argv");
 
+        // Self-contained initiator: no peer cert (accept-any dial; Noise authenticates).
         let initiator = ChannelOneLiner {
             side: ChannelSide::Initiator,
             addr: "198.51.100.7:9443",
             own_noise_private_hex: "c3c3",
             peer_noise_public_hex: "d4d4",
-            peer_cert_hex: Some("deadbeef"),
+            peer_cert_hex: None,
         };
         let sh_i = channel_one_liner(&initiator, InstallOs::Unix);
         assert!(sh_i.contains("CT_CHANNEL_ROLE=initiate"), "initiator role");
-        assert!(sh_i.contains("CT_CHANNEL_PEER_CERT=deadbeef"), "initiator carries the peer cert");
+        assert!(!sh_i.contains("CT_CHANNEL_PEER_CERT"), "no cert needed — accept-any dial");
+        assert!(sh_i.trim_end().ends_with("ct-agent channel"), "invokes the subcommand");
+
+        // An optional pinned cert, if supplied, is included.
+        let pinned = ChannelOneLiner { peer_cert_hex: Some("deadbeef"), ..initiator };
+        assert!(channel_one_liner(&pinned, InstallOs::Unix).contains("CT_CHANNEL_PEER_CERT=deadbeef"), "optional pin");
 
         // Windows analog uses $env: assignments and the same subcommand.
         let ps = channel_one_liner(&initiator, InstallOs::Windows);
         assert!(ps.contains("$env:CT_CHANNEL_ROLE='initiate';"), "ps role");
-        assert!(ps.contains("$env:CT_CHANNEL_PEER_CERT='deadbeef';"), "ps peer cert");
         assert!(ps.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
     }
 
