@@ -2134,10 +2134,22 @@ took a **client-supplied `price`** so `price:0` minted a routing token for free.
     a live deployment is gated automatically. `/enroll/redeem` is unchanged (already agent-authed by its
     single-use token + PoP proof, #88). Frozen test `enroll_issue_requires_the_admin_token_when_configured`
     (401 no/wrong token, 200 correct, open when unset). Gate green.
-  - **SEC87b-auth-customer** ⏳ next: OIDC bearer on the customer-facing writers (`/accounts/open`,
-    `/payment/intent`) — they have `/me/*` authed equivalents to converge on; `/registry/register` likewise.
-  The per-IP rate cap (SEC87b-rl) stays as defense-in-depth. Still overlaps #77/#78; blocks the #81 SEC81c-b
-  channel-registry HTTP API (same auth question) for the customer slice.
+  - **SEC87b-auth-billing** ✅ **The billing writers (`/accounts/open`, `/payment/intent`, `/billing/issue`)
+    gated behind the shared admin token.** These three take a **client-supplied** account (or mint an
+    anonymous one), so left open they are an unauthenticated durable-SQLite writer surface (#87). The **real
+    customer top-up path is not here**: it is the session-authenticated portal (`POST /portal/account/credits`,
+    which derives the account from the verified subject and calls the ledger in-process). Traced: no live caller
+    hits these HTTP routes — only `ControlPlaneClient` (tests); `cp_selftest`/agent don't. So — exactly like
+    `/enroll/issue` — they're a machine/operator surface, gated with the same `CT_CP_EDGE_ADMIN_TOKEN`.
+    New `billing_writers_gated(ledger, Option<[u8;32]>)` + a `require_billing_admin` layer (constant-time
+    `x-ct-admin-token` compare) applied only when a token is configured; open when unset (dev/back-compat).
+    `/payment/webhook` (provider-signature-authed) and the `/me/*` + portal customer paths are untouched.
+    `persistent_control_plane_router` shares one `admin_token` for both the enrollment and billing gates.
+    Frozen test `billing_writers_require_the_admin_token_when_configured` (401 without/wrong on
+    `/accounts/open` + `/payment/intent`, 200 with correct token, open when unset). Gate green.
+  - **SEC87b-auth-customer** ⏳ remaining: `/registry/register` (agent/edge routing-token write). The per-IP
+    rate cap (SEC87b-rl) stays as defense-in-depth. Still overlaps #77/#78; blocks the #81 SEC81c-b
+    channel-registry HTTP API (same auth question) for the customer slice.
 
 ## #88 Replay cache + enrollment proof-of-possession (security-review, medium)
 

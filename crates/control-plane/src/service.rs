@@ -205,6 +205,62 @@ pub fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
         .with_state(store)
 }
 
+/// Shared token for the billing-writer admin gate (#87 SEC87b-auth-billing).
+#[derive(Clone)]
+struct BillingAdmin {
+    token: [u8; 32],
+}
+
+/// Build the **production** billing-writer router — `/accounts/open`,
+/// `/payment/intent`, `/billing/issue` — optionally gated behind the shared admin
+/// token (#87 SEC87b-auth-billing).
+///
+/// These three routes take a **client-supplied** account (or mint an anonymous one),
+/// so left open they are an unauthenticated durable-SQLite writer surface (#87). The
+/// real customer top-up path is **not** here: it is the session-authenticated portal
+/// (`POST /portal/account/credits`, which derives the account from the verified
+/// subject and calls the ledger in-process). So — exactly like `/enroll/issue` — these
+/// HTTP routes are a machine/operator surface, gated with the same
+/// `CT_CP_EDGE_ADMIN_TOKEN` the edge/operator already hold rather than an OIDC user
+/// bearer. When `admin_token` is `None` they stay open (dev/back-compat). `/payment/webhook`
+/// (provider-signature-authed) and the customer `/me/*` / portal paths are unaffected.
+pub fn billing_writers_gated(store: Arc<SqliteLedger>, admin_token: Option<[u8; 32]>) -> Router {
+    let writers = Router::new()
+        .route("/accounts/open", post(open_account))
+        .route("/payment/intent", post(create_payment_intent))
+        .route("/billing/issue", post(buy_token))
+        .with_state(store);
+    match admin_token {
+        Some(token) => writers.layer(from_fn_with_state(BillingAdmin { token }, require_billing_admin)),
+        None => writers,
+    }
+}
+
+/// Reject a billing write that does not carry the correct `x-ct-admin-token`
+/// (constant-time compare). Applied only when the CP has an admin token configured.
+async fn require_billing_admin(
+    State(state): State<BillingAdmin>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ok = headers
+        .get("x-ct-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .and_then(hex_decode_32)
+        .map(|got| ct_token_eq(&got, &state.token))
+        .unwrap_or(false);
+    if ok {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            "billing writes require the admin token\n",
+        )
+            .into_response()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct AccountResp {
     account: String,
@@ -971,12 +1027,10 @@ pub fn persistent_control_plane_router(
     // Production billing surface: accounts, payment intents and credit-gated
     // issuance, but **no** client-callable `/payment/confirm` — credits flow only
     // from a signature-verified provider webhook (M24). That defuses the M18 stub
-    // where any caller could top up an account for free.
-    let billing = Router::new()
-        .route("/accounts/open", post(open_account))
-        .route("/payment/intent", post(create_payment_intent))
-        .route("/billing/issue", post(buy_token))
-        .with_state(ledger.clone());
+    // where any caller could top up an account for free. #87 SEC87b-auth-billing:
+    // these three client-supplied-account writers are gated behind the shared admin
+    // token when the CP has one configured (the customer path is the session-authed
+    // portal, not these HTTP routes); wired just below with `issue_admin_token`.
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
     // the three stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(
@@ -993,17 +1047,20 @@ pub fn persistent_control_plane_router(
     let pki = pki_router(
         std::env::var("CT_CP_EDGE_CERT_PATH").unwrap_or_else(|_| "/shared/edge-cert.der".to_string()),
     );
-    // #87 SEC87b-auth: gate join-token issuance behind the shared admin token when the
-    // CP has one configured (the same CT_CP_EDGE_ADMIN_TOKEN the edge/operator hold), so
-    // a public deployment can't have anyone mint join tokens. The real portal flow mints
-    // in-process, not via this route, so this is transparent to customers.
-    let issue_admin_token = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
+    // #87 SEC87b-auth: gate the machine/operator durable-writer surfaces behind the
+    // shared admin token when the CP has one configured (the same CT_CP_EDGE_ADMIN_TOKEN
+    // the edge/operator hold), so a public deployment can't have anyone mint join tokens
+    // (`/enroll/issue`) or grow the billing store with client-supplied accounts
+    // (`/accounts/open`, `/payment/intent`, `/billing/issue`). The real customer flows
+    // (in-process portal mint / session-authed top-up) don't use these routes, so this is
+    // transparent to customers.
+    let admin_token = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
         .and_then(|s| hex_decode_32(&s));
-    let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), issue_admin_token)
+    let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), admin_token)
         .merge(registry_router_sqlite(registry))
-        .merge(billing)
+        .merge(billing_writers_gated(ledger.clone(), admin_token))
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
@@ -1267,6 +1324,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "issuance open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn billing_writers_require_the_admin_token_when_configured() {
+        // #87 SEC87b-auth-billing: with an admin token configured, the client-supplied-account
+        // billing writers (/accounts/open, /payment/intent, /billing/issue) require
+        // x-ct-admin-token (401 without / wrong). With none configured they stay open
+        // (dev/back-compat). The customer path is the session-authed portal, not these routes.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x3cu8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let gated = billing_writers_gated(ledger.clone(), Some(admin));
+        let open_req = |tok: Option<String>| {
+            let mut req = Request::post("/accounts/open").header("content-type", "application/json");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            gated.clone().oneshot(req.body(Body::from("{}")).unwrap())
+        };
+        assert_eq!(open_req(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no token -> 401");
+        assert_eq!(
+            open_req(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token -> 401"
+        );
+        // Correct token opens an account (200 with a JSON account id).
+        let r = open_req(Some(hex_encode(&admin))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "correct admin token opens an account");
+
+        // /payment/intent is gated too (needs a real account first — open one with the token).
+        let intent_no_tok = gated
+            .clone()
+            .oneshot(
+                Request::post("/payment/intent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"account":"00","credits":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(intent_no_tok.status(), StatusCode::UNAUTHORIZED, "/payment/intent gated");
+
+        // No admin token configured -> writers stay open (dev/back-compat).
+        let open = billing_writers_gated(Arc::new(SqliteLedger::open_in_memory().unwrap()), None);
+        let r = open
+            .oneshot(
+                Request::post("/accounts/open")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "billing writers open when no admin token is configured");
     }
 
     #[tokio::test]
