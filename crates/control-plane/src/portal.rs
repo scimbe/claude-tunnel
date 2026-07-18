@@ -204,6 +204,27 @@ fn portal_router_with(
 /// `sub` from the returned `id_token`. The id_token is obtained directly from
 /// the token endpoint over the authenticated TLS back-channel, so its `sub` is
 /// taken as-is; full JWKS signature verification is a hardening follow-up.
+/// Timeout for the OIDC back-channel calls a portal login makes (#96): each callback
+/// fetches the token exchange + the realm JWKS, so a slow/hanging IdP must fail fast
+/// rather than pile up blocked login requests and wedge the login path. Kept short —
+/// these are single HTTP round-trips to the realm.
+const OIDC_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A reqwest client for the OIDC back-channel with a bounded total + connect timeout
+/// (#96), so a hanging IdP errors instead of blocking forever. `timeout` is
+/// parameterised so tests can drive a short window; production uses [`OIDC_HTTP_TIMEOUT`].
+fn oidc_http_client_with(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn oidc_http_client() -> reqwest::Client {
+    oidc_http_client_with(OIDC_HTTP_TIMEOUT)
+}
+
 fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
     Arc::new(move |code: String| {
         let oidc = oidc.clone();
@@ -218,7 +239,7 @@ fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
                 ("client_id", cfg.client_id.as_str()),
                 ("client_secret", secret.as_str()),
             ];
-            let resp = reqwest::Client::new()
+            let resp = oidc_http_client()
                 .post(&cfg.token_url)
                 .form(&form)
                 .send()
@@ -236,7 +257,7 @@ fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
             // issuer, audience and expiry BEFORE trusting its sub/email. The TLS
             // back-channel is not a substitute for verifying the token itself — a
             // tampered/confused response could otherwise inject an arbitrary subject.
-            let jwks: serde_json::Value = reqwest::Client::new()
+            let jwks: serde_json::Value = oidc_http_client()
                 .get(cfg.jwks_url())
                 .send()
                 .await
@@ -638,6 +659,35 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn oidc_back_channel_client_times_out_a_hanging_idp() {
+        // #96: a hanging IdP (accepts the TCP connection but never sends a response)
+        // must make the OIDC back-channel call fail FAST via the client timeout, not
+        // block the login path forever piling up requests.
+        use std::time::{Duration, Instant};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    // Hold the connection open, never writing a response.
+                    tokio::spawn(async move {
+                        let _held = sock;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            }
+        });
+
+        let client = oidc_http_client_with(Duration::from_millis(400));
+        let start = Instant::now();
+        let result = client.get(format!("http://{addr}/token")).send().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a hanging IdP errors, it does not hang the login path");
+        assert!(elapsed < Duration::from_secs(2), "failed fast in {elapsed:?}, not forever");
+    }
 
     const TEST_KEY: &[u8] = b"portal-test-session-key";
 

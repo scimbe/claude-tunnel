@@ -2266,6 +2266,18 @@ handshake. Fix: **attest** the Noise key with the member's holder key and verify
 (SEC101b), and relayed + **verified by the initiator before pinning** (SEC101c) — closing the DB-operator
 MITM vector on the A2A direct path end-to-end.
 
+## #96 OIDC back-channel: JWKS + token-exchange fetched per callback with no timeout (security-review)
+
+Each portal login callback fired `reqwest` calls to the IdP (token exchange + JWKS) with a fresh client and
+**no timeout** — a slow/hanging IdP wedges the login path (login DoS).
+
+- **Fix ✅** `oidc_http_client()` builds a reqwest client with a bounded total timeout (`OIDC_HTTP_TIMEOUT`
+  = 10 s) + a 5 s connect timeout; both back-channel calls use it. `oidc_http_client_with(timeout)` is
+  parameterised for tests. Frozen test `oidc_back_channel_client_times_out_a_hanging_idp` (a hanging IdP →
+  error in <2 s, not a hang). Gate green.
+- **Follow ⏳** no explicit response-size cap on the JWKS/token JSON — the timeout bounds a slow-drip huge
+  response, but a fast huge response could still spike memory; a byte-capped read is a small hardening follow.
+
 ## #105 broker_channel_rendezvous: no per-round timeout — a stalled connection wedges the broker (bug)
 
 A connection that completes the QUIC handshake but never submits a join blocked `read_join_on_connection`'s
