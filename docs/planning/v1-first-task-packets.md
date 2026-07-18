@@ -1808,8 +1808,15 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
     exact production source for `accept_and_read_join`'s closure. Frozen test
     `channel_authorize_holder_yields_operator_key_only_for_members` (unknown channel / non-member / member /
     stranger / revoked / re-key). Gate green.
-  - **SEC81c-b** ⏳ **Channel-registry HTTP API** on the control plane: owner-scoped endpoints to
-    register a channel (operator pubkey) and add/remove members, backed by the store above.
+  - **SEC81c-b** ✅ **Channel-registry HTTP API** (`ct-control-plane::service`): `authed_channel_router`
+    exposes owner-scoped `POST /me/channels` (register), `POST /me/channels/:channel/members` (add), and
+    `POST /me/channels/:channel/members/:holder/remove` (revoke), backed by `SqliteChannelStore`. **OIDC-
+    authenticated** — `owner` is the verified token subject, never a request field, and the router is mounted
+    only when an OIDC verifier is configured (like `/me/*`). So it adds **no** unauthenticated DB-writing
+    surface (sidesteps the #87 SEC87b auth question rather than being blocked by it). Frozen test
+    `authed_channel_registry_is_owner_scoped`: unauth → 401; owner registers + adds a member (which then
+    resolves via `authorize_holder`); a non-owner can neither add members nor re-key (403, key unchanged);
+    owner revokes → the authorize lookup denies. Gate green.
   - **SEC81c-c** ⏳ **Mount the broker in the live edge**: wire `broker_channel_rendezvous` into serve.rs
     with `authorize` sourced from `authorize_holder` (via the control plane). Endpoint should additionally be
     constrained to match the agent's advertised direct endpoint where possible. Needs the agent side (#72

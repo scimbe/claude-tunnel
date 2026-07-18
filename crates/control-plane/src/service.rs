@@ -21,8 +21,10 @@ use crate::payment::{PaymentError, PaymentId};
 use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
-    LedgerOpError, PaymentOpError, RedeemError, SqliteEnrollment, SqliteLedger, SqliteRegistry,
+    LedgerOpError, PaymentOpError, RedeemError, SqliteChannelStore, SqliteEnrollment, SqliteLedger,
+    SqliteRegistry,
 };
+use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
 use ct_common::{AgentId, RoutingToken, TenantId};
 use ct_common::sync::MutexExt;
@@ -393,17 +395,139 @@ pub fn authed_billing_router(
         })
 }
 
-/// Extract + verify the bearer token, returning the authenticated subject.
-fn authed_subject(state: &AuthedState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+/// Shared state for the authenticated Agent-Fabric channel registry (#81 SEC81c-b):
+/// the durable channel store + the OIDC verifier. The channel `owner` is always the
+/// verified token subject, never a request field, so a caller can only register or
+/// manage channels they own.
+#[derive(Clone)]
+pub struct AuthedChannelState {
+    channels: Arc<SqliteChannelStore>,
+    verifier: Arc<OidcVerifier>,
+}
+
+/// Build the **authenticated** Agent-Fabric channel-registry router (#81 SEC81c-b):
+/// owner-scoped channel registration + membership management, backed by
+/// [`SqliteChannelStore`]. Like `/me/*`, mounted only when an OIDC verifier is
+/// configured; the `owner` is the verified subject, so this adds **no** unauthenticated
+/// DB-writing surface (cf. #87). It provides the operator-key + membership records that
+/// the edge channel broker's `authorize` lookup (SEC81c-a `authorize_holder`) reads.
+///
+/// * `POST /me/channels` `{channel, operator_pubkey}` → register (owner = subject); `403` if
+///   the channel is already owned by another subject
+/// * `POST /me/channels/:channel/members` `{holder}` → add a member (owner-scoped)
+/// * `POST /me/channels/:channel/members/:holder/remove` → remove a member (revocation)
+pub fn authed_channel_router(
+    channels: Arc<SqliteChannelStore>,
+    verifier: Arc<OidcVerifier>,
+) -> Router {
+    Router::new()
+        .route("/me/channels", post(channel_register))
+        .route("/me/channels/:channel/members", post(channel_add_member))
+        .route(
+            "/me/channels/:channel/members/:holder/remove",
+            post(channel_remove_member),
+        )
+        .with_state(AuthedChannelState { channels, verifier })
+}
+
+#[derive(Deserialize)]
+struct ChannelRegisterReq {
+    channel: String,
+    operator_pubkey: String,
+}
+
+async fn channel_register(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Json(req): Json<ChannelRegisterReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&req.channel)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let operator = hex_decode_32(&req.operator_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed operator_pubkey".to_string()))?;
+    let ok = state
+        .channels
+        .register_channel(&ChannelId(channel), &operator, &owner)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // `register_channel` returns false only when the channel already belongs to a
+    // different subject — never let one owner re-key another's channel.
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "channel owned by another subject".to_string()))
+    }
+}
+
+#[derive(Deserialize)]
+struct MemberReq {
+    holder: String,
+}
+
+async fn channel_add_member(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<MemberReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let holder = hex_decode_32(&req.holder)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let ok = state
+        .channels
+        .add_member(&ChannelId(channel), &owner, &holder)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // false → not the owner (or unknown channel): only the owner manages members.
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
+    }
+}
+
+async fn channel_remove_member(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path((channel_hex, holder_hex)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let holder = hex_decode_32(&holder_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let ok = state
+        .channels
+        .remove_member(&ChannelId(channel), &owner, &holder)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
+    }
+}
+
+/// Extract + verify the `Authorization: Bearer` token against `verifier`,
+/// returning the authenticated subject. Shared by every self-scoped endpoint so
+/// the acting identity always comes from a verified token, never the request body.
+fn subject_of(
+    verifier: &OidcVerifier,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, String)> {
     let token = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
-    state
-        .verifier
+    verifier
         .subject(token)
         .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
+}
+
+/// Extract + verify the bearer token, returning the authenticated subject.
+fn authed_subject(state: &AuthedState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+    subject_of(&state.verifier, headers)
 }
 
 /// The authenticated customer's own account view (#26): account id, current
@@ -709,6 +833,7 @@ pub fn persistent_control_plane_router(
     let registry = Arc::new(SqliteRegistry::open(db_path)?);
     let ledger = Arc::new(SqliteLedger::open(db_path)?);
     let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open(db_path)?);
+    let channels = Arc::new(SqliteChannelStore::open(db_path)?);
     let verifier = Arc::new(WebhookVerifier::new(
         webhook_secret.to_vec(),
         WEBHOOK_TOLERANCE_SECS,
@@ -777,11 +902,15 @@ pub fn persistent_control_plane_router(
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
     if let Some(oidc) = oidc {
-        app = app.merge(authed_billing_router(
-            ledger.clone(),
-            oidc,
-            AUTHED_ISSUES_PER_WINDOW,
-        ));
+        app = app
+            .merge(authed_billing_router(
+                ledger.clone(),
+                oidc.clone(),
+                AUTHED_ISSUES_PER_WINDOW,
+            ))
+            // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
+            // verified subject), so it carries no unauthenticated write surface.
+            .merge(authed_channel_router(channels, oidc));
     }
     Ok(app.merge(health_router(ledger)))
 }
@@ -1176,6 +1305,129 @@ mod tests {
         // Paying the token price succeeds and debits exactly that.
         assert_eq!(issue(1).await.unwrap().status(), StatusCode::OK, "paying TOKEN_PRICE mints a token");
         assert_eq!(probe.balance(&acct).unwrap(), 4, "the token price was debited");
+    }
+
+    #[tokio::test]
+    async fn authed_channel_registry_is_owner_scoped() {
+        // #81 SEC81c-b: the channel registry is authenticated and owner-scoped —
+        // owner = verified subject. Only the owner registers/manages a channel; a
+        // non-owner is forbidden; and the records drive the SEC81c-a authorize
+        // lookup (add → resolvable, remove → denied).
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let probe = channels.clone();
+        let app = authed_channel_router(channels, verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(secret),
+            )
+            .unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        let ch = "a1".repeat(32);
+        let op = "b2".repeat(32);
+        let holder = "c3".repeat(32);
+        let chan = ChannelId(hex_decode_32(&ch).unwrap());
+        let hbytes = hex_decode_32(&holder).unwrap();
+
+        // Unauthenticated registration is rejected.
+        let s = post(
+            "/me/channels".into(),
+            None,
+            format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "no bearer -> 401");
+
+        // Alice registers her channel and adds a member.
+        let s = post(
+            "/me/channels".into(),
+            Some(alice.clone()),
+            format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::OK, "owner registers");
+        let s = post(
+            format!("/me/channels/{ch}/members"),
+            Some(alice.clone()),
+            format!(r#"{{"holder":"{holder}"}}"#),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::OK, "owner adds a member");
+        assert_eq!(
+            probe.authorize_holder(&chan, &hbytes).unwrap(),
+            Some(hex_decode_32(&op).unwrap()),
+            "an added member resolves the operator key (drives SEC81c-a)"
+        );
+
+        // Mallory cannot manage or re-key alice's channel.
+        let s = post(
+            format!("/me/channels/{ch}/members"),
+            Some(mallory.clone()),
+            format!(r#"{{"holder":"{}"}}"#, "ee".repeat(32)),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::FORBIDDEN, "non-owner cannot add members");
+        let s = post(
+            "/me/channels".into(),
+            Some(mallory),
+            format!(r#"{{"channel":"{ch}","operator_pubkey":"{}"}}"#, "ff".repeat(32)),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::FORBIDDEN, "non-owner cannot re-key");
+        assert_eq!(
+            probe.operator_pubkey(&chan).unwrap(),
+            Some(hex_decode_32(&op).unwrap()),
+            "operator key unchanged by the refused re-key"
+        );
+
+        // Alice revokes the member → the authorize lookup denies it.
+        let s = post(
+            format!("/me/channels/{ch}/members/{holder}/remove"),
+            Some(alice),
+            String::new(),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::OK, "owner removes a member");
+        assert_eq!(
+            probe.authorize_holder(&chan, &hbytes).unwrap(),
+            None,
+            "a revoked member is no longer authorized"
+        );
     }
 
     #[tokio::test]
