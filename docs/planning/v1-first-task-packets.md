@@ -1753,10 +1753,16 @@ Decomposed:
     cert hex for the peer to trust) or initiator (`dial_quic` trusting the configured peer cert) and pipes
     **stdin/stdout** over the A2A tunnel via `run_channel_session`. `main.rs` dispatches `channel`. Frozen test
     `channel_config_parses_roles_keys_and_the_initiator_cert_requirement`. Gate green (added tokio `io-std`).
-  - **AF4-session-wire** ⏳ remaining to make the one-liner *self-contained*: (a) **#100** render the actual
-    copy-paste `CT_CHANNEL_*=… ct-agent channel` command from a channel grant; (b) deliver the peer's
-    `member_noise_key` **and** transport cert automatically (broker swap or CP fetch — #101 attestation
-    applies) instead of manual hex; (c) **edge-relay fallback** when the direct dial fails, with a test.
+  - **#100 one-liner-gen** ✅ **`installer::channel_one_liner(ChannelOneLiner, os)`** renders the copy-paste
+    command that brings a machine up as a channel `Responder`/`Initiator` and pipes stdio over the tunnel —
+    the `CT_CHANNEL_*=… ct-agent channel` form (POSIX) + `$env:` PowerShell analog, targeting the shipped
+    subcommand. Keys/cert ride in env, never argv (SEC90; inline-secret residual is #97). Frozen test
+    `channel_one_liner_renders_the_ct_agent_channel_command`. Gate green.
+  - **AF4-session-wire** ⏳ remaining to make the one-liner *self-contained* (no manual hex): (a) a
+    broker-mediated `ct-agent channel-join` that presents the grant, learns the peer endpoint, and **fetches
+    the peer's `member_noise_key` + cert** from the rendezvous (broker swap or CP fetch — #101 attestation
+    applies); (b) a served `channel.sh`/`channel.ps1` + `/channel.sh` route so the operator emits one URL;
+    (c) **edge-relay fallback** when the direct dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

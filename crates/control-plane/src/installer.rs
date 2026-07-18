@@ -73,6 +73,74 @@ pub fn install_one_liner(
     }
 }
 
+/// Which side of an Agent-Fabric channel a one-liner brings the machine up as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelSide {
+    /// Binds and waits for the peer to dial (grant `Direction::Accept`).
+    Responder,
+    /// Dials the responder's advertised endpoint (grant `Direction::Initiate`).
+    Initiator,
+}
+
+/// Everything a per-test-system A2A channel one-liner needs (#100). The keys/cert
+/// travel in **environment variables** (never argv), matching the `ct-agent channel`
+/// subcommand's `CT_CHANNEL_*` contract and the install one-liner's secret hygiene.
+pub struct ChannelOneLiner<'a> {
+    pub side: ChannelSide,
+    /// Responder: the local bind address (`0.0.0.0:<port>`). Initiator: the peer's
+    /// advertised `host:port`.
+    pub addr: &'a str,
+    /// This member's Noise (X25519) **private** key, hex.
+    pub own_noise_private_hex: &'a str,
+    /// The peer member's Noise **public** key, hex (pinned by the initiator).
+    pub peer_noise_public_hex: &'a str,
+    /// Initiator only: the responder's QUIC cert (hex DER) to trust for the dial.
+    pub peer_cert_hex: Option<&'a str>,
+}
+
+/// Render the copy-paste command that brings a machine up as one side of an A2A
+/// channel and pipes stdin/stdout over the encrypted tunnel (#100). It targets the
+/// already-installed `ct-agent channel` subcommand (run the install one-liner first),
+/// setting the `CT_CHANNEL_*` env the subcommand reads. The Noise keys/cert ride in
+/// the environment, never the argument vector (SEC90 hygiene; the still-inline-secret
+/// concern is #97). `os` selects the POSIX `env VAR=… cmd` vs PowerShell `$env:` form.
+pub fn channel_one_liner(p: &ChannelOneLiner, os: InstallOs) -> String {
+    let role = match p.side {
+        ChannelSide::Responder => "accept",
+        ChannelSide::Initiator => "initiate",
+    };
+    match os {
+        InstallOs::Unix => {
+            let mut cmd = format!(
+                "CT_CHANNEL_ROLE={role} CT_CHANNEL_ADDR={addr} \
+                 CT_CHANNEL_NOISE_KEY={own} CT_CHANNEL_PEER_NOISE_KEY={peer}",
+                addr = p.addr,
+                own = p.own_noise_private_hex,
+                peer = p.peer_noise_public_hex,
+            );
+            if let Some(cert) = p.peer_cert_hex {
+                cmd.push_str(&format!(" CT_CHANNEL_PEER_CERT={cert}"));
+            }
+            cmd.push_str(" ct-agent channel");
+            cmd
+        }
+        InstallOs::Windows => {
+            let mut cmd = format!(
+                "$env:CT_CHANNEL_ROLE='{role}'; $env:CT_CHANNEL_ADDR='{addr}'; \
+                 $env:CT_CHANNEL_NOISE_KEY='{own}'; $env:CT_CHANNEL_PEER_NOISE_KEY='{peer}'; ",
+                addr = p.addr,
+                own = p.own_noise_private_hex,
+                peer = p.peer_noise_public_hex,
+            );
+            if let Some(cert) = p.peer_cert_hex {
+                cmd.push_str(&format!("$env:CT_CHANNEL_PEER_CERT='{cert}'; "));
+            }
+            cmd.push_str("ct-agent channel");
+            cmd
+        }
+    }
+}
+
 /// Render the POSIX `/install.sh` script the Unix one-liner pipes into `sh`
 /// (#75 IS3a). It detects OS+arch, downloads the matching prebuilt `ct-agent`
 /// binary from `release_base` (the GitHub-Releases-style asset base, e.g.
@@ -231,6 +299,45 @@ mod tests {
         assert!(sh.contains(r#"exec "$tmp/ct-agent" onboard"#), "execs the agent onboarding");
         // No secret is ever a positional argument.
         assert!(!sh.contains("onboard $CT_JOIN_TOKEN") && !sh.contains("onboard \""), "tokens stay in the env");
+    }
+
+    #[test]
+    fn channel_one_liner_renders_the_ct_agent_channel_command() {
+        // #100: the copy-paste A2A one-liner. Keys ride in CT_CHANNEL_* env, never
+        // argv; the responder needs no peer cert, the initiator carries one; the
+        // command invokes `ct-agent channel`.
+        let responder = ChannelOneLiner {
+            side: ChannelSide::Responder,
+            addr: "0.0.0.0:9443",
+            own_noise_private_hex: "a1a1",
+            peer_noise_public_hex: "b2b2",
+            peer_cert_hex: None,
+        };
+        let sh = channel_one_liner(&responder, InstallOs::Unix);
+        assert!(sh.starts_with("CT_CHANNEL_ROLE=accept "), "role prefix");
+        assert!(sh.contains("CT_CHANNEL_ADDR=0.0.0.0:9443"), "bind addr");
+        assert!(sh.contains("CT_CHANNEL_NOISE_KEY=a1a1") && sh.contains("CT_CHANNEL_PEER_NOISE_KEY=b2b2"), "keys in env");
+        assert!(sh.trim_end().ends_with("ct-agent channel"), "invokes the subcommand");
+        assert!(!sh.contains("CT_CHANNEL_PEER_CERT"), "responder needs no peer cert");
+        // Secret hygiene: the private key is an env assignment, not a bare argv token.
+        assert!(!sh.contains("channel a1a1"), "key never in argv");
+
+        let initiator = ChannelOneLiner {
+            side: ChannelSide::Initiator,
+            addr: "198.51.100.7:9443",
+            own_noise_private_hex: "c3c3",
+            peer_noise_public_hex: "d4d4",
+            peer_cert_hex: Some("deadbeef"),
+        };
+        let sh_i = channel_one_liner(&initiator, InstallOs::Unix);
+        assert!(sh_i.contains("CT_CHANNEL_ROLE=initiate"), "initiator role");
+        assert!(sh_i.contains("CT_CHANNEL_PEER_CERT=deadbeef"), "initiator carries the peer cert");
+
+        // Windows analog uses $env: assignments and the same subcommand.
+        let ps = channel_one_liner(&initiator, InstallOs::Windows);
+        assert!(ps.contains("$env:CT_CHANNEL_ROLE='initiate';"), "ps role");
+        assert!(ps.contains("$env:CT_CHANNEL_PEER_CERT='deadbeef';"), "ps peer cert");
+        assert!(ps.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
     }
 
     #[test]
