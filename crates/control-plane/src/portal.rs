@@ -806,6 +806,38 @@ mod tests {
     }
 
     #[test]
+    fn realm_ct_portal_access_token_carries_sub_claim() {
+        // #92: setting the ct-portal client's `defaultClientScopes` explicitly
+        // ("email"/"profile") overrides Keycloak's realm defaults and drops the
+        // built-in `basic` scope that emits `sub`, so the ACCESS token loses `sub`.
+        // That breaks OidcVerifier::subject() for EVERY /me/* bearer endpoint
+        // (billing + the #81 channel registry). Guard that the client ships an
+        // explicit protocol mapper putting `sub` into the access token, so this
+        // realm-config regression is caught hermetically instead of only live.
+        let raw = include_str!("../../../docker/deploy/keycloak/ct-demo-realm.json");
+        let realm: serde_json::Value = serde_json::from_str(raw).expect("realm export is valid JSON");
+        let client = realm["clients"]
+            .as_array()
+            .and_then(|cs| cs.iter().find(|c| c["clientId"] == "ct-portal"))
+            .expect("ct-portal client present");
+
+        let sub_mapper = client["protocolMappers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["config"]["claim.name"] == "sub")
+            .expect("ct-portal must ship a `sub` protocol mapper (else the access token has no sub — #92)");
+
+        assert_eq!(
+            sub_mapper["config"]["access.token.claim"], "true",
+            "the sub mapper must emit into the ACCESS token — that is the token /me/* verifies"
+        );
+        // Maps the user's stable id (the same value the id_token's sub carries), not
+        // a recyclable username, so the bearer identity matches the browser-session one.
+        assert_eq!(sub_mapper["config"]["user.attribute"], "id", "sub = the user's stable id");
+    }
+
+    #[test]
     fn sso_compose_wires_the_control_plane_to_the_demo_realm() {
         // #42 KC3: the SSO overlay must feed the control-plane exactly the
         // client_id, redirect and realm that the declarative realm + portal code

@@ -31,6 +31,22 @@
         "id.token.signed.response.alg": "RS256",
         "post.logout.redirect.uris": "https://bunsenbrenner.org/portal+http://localhost:8090/portal"
       },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "id",
+            "claim.name": "sub",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ],
       "defaultClientScopes": ["email", "profile"]
     }
   ],
