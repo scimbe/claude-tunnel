@@ -32,13 +32,37 @@ use ct_common::ratelimit::KeyedRateLimiter;
 use ct_common::{AgentId, RoutingToken, TenantId};
 use ct_common::sync::MutexExt;
 
+/// State for the enrollment router: the durable store plus, when configured, the
+/// shared admin token that gates `/enroll/issue` (#87 SEC87b-auth).
+#[derive(Clone)]
+struct EnrollState {
+    store: Arc<SqliteEnrollment>,
+    /// When `Some`, `/enroll/issue` requires this token (machine-to-machine auth —
+    /// minting join tokens is an operator action, not a public one). `None` leaves it
+    /// open (dev/back-compat); the live CP sets it from `CT_CP_EDGE_ADMIN_TOKEN`.
+    issue_admin_token: Option<[u8; 32]>,
+}
+
 /// Build the persistent enrollment router: `POST /enroll/issue`,
-/// `POST /enroll/redeem`, backed by a durable [`SqliteEnrollment`].
+/// `POST /enroll/redeem`, backed by a durable [`SqliteEnrollment`]. `/enroll/issue`
+/// is unauthenticated (dev/back-compat); use [`enrollment_router_sqlite_with_admin`]
+/// to require the admin token on issuance.
 pub fn enrollment_router_sqlite(store: Arc<SqliteEnrollment>) -> Router {
+    enrollment_router_sqlite_with_admin(store, None)
+}
+
+/// Like [`enrollment_router_sqlite`] but gates `POST /enroll/issue` behind the shared
+/// admin token (#87 SEC87b-auth): a caller must present `x-ct-admin-token`. `/enroll/redeem`
+/// stays open — an agent redeems with its single-use join token + proof-of-possession,
+/// which is its own auth. Only the *issuance* of join tokens is restricted here.
+pub fn enrollment_router_sqlite_with_admin(
+    store: Arc<SqliteEnrollment>,
+    issue_admin_token: Option<[u8; 32]>,
+) -> Router {
     Router::new()
         .route("/enroll/issue", post(issue))
         .route("/enroll/redeem", post(redeem))
-        .with_state(store)
+        .with_state(EnrollState { store, issue_admin_token })
 }
 
 #[derive(Deserialize)]
@@ -51,10 +75,25 @@ struct IssueResp {
 }
 
 async fn issue(
-    State(store): State<Arc<SqliteEnrollment>>,
+    State(st): State<EnrollState>,
+    headers: HeaderMap,
     Json(req): Json<IssueReq>,
 ) -> Result<Json<IssueResp>, (StatusCode, String)> {
-    let token = store
+    // #87 SEC87b-auth: when configured, minting a join token requires the admin token
+    // (constant-time compare) — closing "anyone mints a join token for any tenant".
+    if let Some(expected) = st.issue_admin_token {
+        let ok = headers
+            .get("x-ct-admin-token")
+            .and_then(|v| v.to_str().ok())
+            .and_then(hex_decode_32)
+            .map(|t| ct_token_eq(&t, &expected))
+            .unwrap_or(false);
+        if !ok {
+            return Err((StatusCode::UNAUTHORIZED, "join-token issuance requires the admin token".to_string()));
+        }
+    }
+    let token = st
+        .store
         .issue_join_token(&TenantId(req.tenant))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(IssueResp {
@@ -76,7 +115,7 @@ struct RedeemResp {
 }
 
 async fn redeem(
-    State(store): State<Arc<SqliteEnrollment>>,
+    State(st): State<EnrollState>,
     Json(req): Json<RedeemReq>,
 ) -> Result<Json<RedeemResp>, (StatusCode, String)> {
     let token =
@@ -85,7 +124,8 @@ async fn redeem(
         .ok_or((StatusCode::BAD_REQUEST, "malformed pubkey".to_string()))?;
     let proof = hex_decode_64(&req.proof)
         .ok_or((StatusCode::BAD_REQUEST, "malformed proof".to_string()))?;
-    let tenant = store
+    let tenant = st
+        .store
         .redeem_with_proof(&JoinToken(token), &AgentId(req.agent), pubkey, &proof)
         .map_err(|e| {
             let code = match &e {
@@ -953,7 +993,15 @@ pub fn persistent_control_plane_router(
     let pki = pki_router(
         std::env::var("CT_CP_EDGE_CERT_PATH").unwrap_or_else(|_| "/shared/edge-cert.der".to_string()),
     );
-    let mut app = enrollment_router_sqlite(enrollment.clone())
+    // #87 SEC87b-auth: gate join-token issuance behind the shared admin token when the
+    // CP has one configured (the same CT_CP_EDGE_ADMIN_TOKEN the edge/operator hold), so
+    // a public deployment can't have anyone mint join tokens. The real portal flow mints
+    // in-process, not via this route, so this is transparent to customers.
+    let issue_admin_token = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| hex_decode_32(&s));
+    let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), issue_admin_token)
         .merge(registry_router_sqlite(registry))
         .merge(billing)
         .merge(payment_webhook_router(ledger.clone(), verifier))
@@ -1174,6 +1222,52 @@ fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
 mod tests {
     use super::*;
     use crate::client::ControlPlaneClient;
+
+    #[tokio::test]
+    async fn enroll_issue_requires_the_admin_token_when_configured() {
+        // #87 SEC87b-auth: with an admin token configured, POST /enroll/issue requires
+        // x-ct-admin-token (401 without / wrong, 200 with). With none configured it's
+        // open (dev/back-compat). /enroll/redeem is unaffected (agent-authed by its
+        // single-use token + proof).
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = enrollment_router_sqlite_with_admin(store, Some(admin));
+        let issue = |tok: Option<String>| {
+            let mut req = Request::post("/enroll/issue").header("content-type", "application/json");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            app.clone().oneshot(req.body(Body::from(r#"{"tenant":"t1"}"#)).unwrap())
+        };
+        assert_eq!(issue(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no token -> 401");
+        assert_eq!(
+            issue(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token -> 401"
+        );
+        assert_eq!(
+            issue(Some(hex_encode(&admin))).await.unwrap().status(),
+            StatusCode::OK,
+            "correct admin token issues a join token"
+        );
+
+        // No admin token configured -> issuance is open (dev/back-compat).
+        let open = enrollment_router_sqlite_with_admin(Arc::new(SqliteEnrollment::open_in_memory().unwrap()), None);
+        let r = open
+            .oneshot(
+                Request::post("/enroll/issue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tenant":"t"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "issuance open when no admin token is configured");
+    }
 
     #[tokio::test]
     async fn unauthenticated_writers_are_rate_limited_per_ip() {

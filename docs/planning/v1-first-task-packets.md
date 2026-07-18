@@ -2122,9 +2122,22 @@ took a **client-supplied `price`** so `price:0` minted a routing token for free.
   `main.rs` now serves with `into_make_service_with_connect_info`. Frozen test
   `unauthenticated_writers_are_rate_limited_per_ip` (3rd metered POST from one IP → 429; other IP
   independent; non-listed path + reads unmetered). Gate green.
-- **SEC87b-auth** ⏳ **Authentication on those writers**: still the control-plane auth-model decision
-  (overlaps #77/#78); sybil account creation is acknowledged by-design (`accounts.rs`). Blocks the #81
-  SEC81c-b channel-registry HTTP API (same auth question). Maintainer call — not code-blocked here.
+- **SEC87b-auth** ⏳ **Authentication on those writers** (decision: scimbe → gate the writers, 2026-07-18).
+  Landing it per-writer, one bounded slice at a time:
+  - **SEC87b-auth-issue** ✅ **`/enroll/issue` gated behind the shared admin token.** The join-token
+    *issuance* route is a machine/operator surface — the real portal flow mints in-process
+    (`portal_api.rs::issue_join_token`), not over HTTP — so it's gated with the same `CT_CP_EDGE_ADMIN_TOKEN`
+    the edge/operator already hold rather than an OIDC user bearer. New `EnrollState { store, issue_admin_token }`
+    + `enrollment_router_sqlite_with_admin(store, Option<[u8;32]>)`; the `issue` handler requires
+    `x-ct-admin-token` (constant-time compare) when a token is configured, `401` otherwise; with none
+    configured issuance stays open (dev/back-compat). `persistent_control_plane_router` wires the env token, so
+    a live deployment is gated automatically. `/enroll/redeem` is unchanged (already agent-authed by its
+    single-use token + PoP proof, #88). Frozen test `enroll_issue_requires_the_admin_token_when_configured`
+    (401 no/wrong token, 200 correct, open when unset). Gate green.
+  - **SEC87b-auth-customer** ⏳ next: OIDC bearer on the customer-facing writers (`/accounts/open`,
+    `/payment/intent`) — they have `/me/*` authed equivalents to converge on; `/registry/register` likewise.
+  The per-IP rate cap (SEC87b-rl) stays as defense-in-depth. Still overlaps #77/#78; blocks the #81 SEC81c-b
+  channel-registry HTTP API (same auth question) for the customer slice.
 
 ## #88 Replay cache + enrollment proof-of-possession (security-review, medium)
 
