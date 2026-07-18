@@ -15,6 +15,11 @@ use ct_common::{AgentId, RoutingToken, TenantId};
 pub struct ControlPlaneClient {
     base: String,
     http: reqwest::Client,
+    /// Optional shared admin token (hex) presented as `x-ct-admin-token` on the
+    /// machine/operator writer routes the durable CP gates (#87 SEC87b-auth):
+    /// `/enroll/issue`, `/registry/register`, `/accounts/open`, `/payment/intent`,
+    /// `/billing/issue`. `None` → no header (dev/back-compat, ungated CP).
+    admin_token: Option<String>,
 }
 
 /// Errors talking to the control-plane service.
@@ -54,14 +59,31 @@ impl ControlPlaneClient {
         Self {
             base: base_url.into().trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+            admin_token: None,
+        }
+    }
+
+    /// Present `token_hex` as the `x-ct-admin-token` on the gated writer routes
+    /// (#87 SEC87b-auth), so this client can drive them against a CP that has the
+    /// shared admin token configured (e.g. an operator selftest). Ungated routes
+    /// are unaffected.
+    pub fn with_admin_token(mut self, token_hex: impl Into<String>) -> Self {
+        self.admin_token = Some(token_hex.into());
+        self
+    }
+
+    /// Attach the admin token header to a request builder when one is configured.
+    fn admin(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.admin_token {
+            Some(tok) => rb.header("x-ct-admin-token", tok),
+            None => rb,
         }
     }
 
     /// `POST /enroll/issue` — mint a single-use join token for a tenant.
     pub async fn issue_join_token(&self, tenant: &TenantId) -> CpResult<[u8; 32]> {
         let resp = self
-            .http
-            .post(format!("{}/enroll/issue", self.base))
+            .admin(self.http.post(format!("{}/enroll/issue", self.base)))
             .json(&serde_json::json!({ "tenant": tenant.0 }))
             .send()
             .await?;
@@ -115,8 +137,7 @@ impl ControlPlaneClient {
         agent: &AgentId,
     ) -> CpResult<()> {
         let resp = self
-            .http
-            .post(format!("{}/registry/register", self.base))
+            .admin(self.http.post(format!("{}/registry/register", self.base)))
             .json(&serde_json::json!({
                 "token": hex_encode(&token.0),
                 "tenant": tenant.0,
@@ -145,8 +166,7 @@ impl ControlPlaneClient {
     /// `POST /accounts/open` — open a fresh pseudonymous account (M15.4b).
     pub async fn open_account(&self) -> CpResult<[u8; 32]> {
         let resp = self
-            .http
-            .post(format!("{}/accounts/open", self.base))
+            .admin(self.http.post(format!("{}/accounts/open", self.base)))
             .send()
             .await?;
         let resp = ok(resp)?;
@@ -158,8 +178,7 @@ impl ControlPlaneClient {
     /// opaque payment id to confirm.
     pub async fn create_payment_intent(&self, account: &[u8; 32], credits: u64) -> CpResult<[u8; 32]> {
         let resp = self
-            .http
-            .post(format!("{}/payment/intent", self.base))
+            .admin(self.http.post(format!("{}/payment/intent", self.base)))
             .json(&serde_json::json!({ "account": hex_encode(account), "credits": credits }))
             .send()
             .await?;
@@ -185,8 +204,7 @@ impl ControlPlaneClient {
     /// the account. A [`CpError::Status`] (402) means insufficient credit.
     pub async fn buy_token(&self, account: &[u8; 32], price: u64) -> CpResult<RoutingToken> {
         let resp = self
-            .http
-            .post(format!("{}/billing/issue", self.base))
+            .admin(self.http.post(format!("{}/billing/issue", self.base)))
             .json(&serde_json::json!({ "account": hex_encode(account), "price": price }))
             .send()
             .await?;

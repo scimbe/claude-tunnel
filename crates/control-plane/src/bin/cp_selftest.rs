@@ -16,7 +16,13 @@ use ed25519_dalek::{Signer, SigningKey};
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = std::env::var("CT_CONTROL_PLANE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let cp = ControlPlaneClient::new(url.clone());
+    // This selftest drives the machine/operator writer routes (enroll/issue,
+    // register). A production CP gates them behind CT_CP_EDGE_ADMIN_TOKEN (#87
+    // SEC87b-auth); present it so the selftest still passes against a gated CP.
+    let cp = match std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()) {
+        Some(tok) => ControlPlaneClient::new(url.clone()).with_admin_token(tok),
+        None => ControlPlaneClient::new(url.clone()),
+    };
 
     let tenant = TenantId("tenant-smoke".to_string());
     let agent = AgentId("agent-smoke".to_string());

@@ -148,6 +148,33 @@ pub fn registry_router_sqlite(store: Arc<SqliteRegistry>) -> Router {
         .with_state(store)
 }
 
+/// Build the **production** registry router with the write route (`POST
+/// /registry/register`) optionally gated behind the shared admin token (#87
+/// SEC87b-auth-registry), while the read route (`GET /registry/resolve/:token`)
+/// stays open (the rendezvous lookup a client needs, no durable write).
+///
+/// `/registry/register` maps a client-supplied routing token → `(tenant, agent)`
+/// in the durable registry; left open it is an unauthenticated durable-SQLite
+/// writer surface (#87). No live customer path uses it — the agent registers its
+/// tunnel over the **QUIC data path to the edge** (`register_tunnel_stream`), not
+/// this HTTP route; the only HTTP caller is the operator selftest (`cp_selftest`),
+/// which now presents the admin token. So — like `/enroll/issue` and the billing
+/// writers — it's gated with the same `CT_CP_EDGE_ADMIN_TOKEN`. When `admin_token`
+/// is `None` it stays open (dev/back-compat).
+pub fn registry_router_sqlite_gated(store: Arc<SqliteRegistry>, admin_token: Option<[u8; 32]>) -> Router {
+    let resolve = Router::new()
+        .route("/registry/resolve/:token", get(resolve_tunnel))
+        .with_state(store.clone());
+    let register = Router::new()
+        .route("/registry/register", post(register_tunnel))
+        .with_state(store);
+    let register = match admin_token {
+        Some(token) => register.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
+        None => register,
+    };
+    resolve.merge(register)
+}
+
 #[derive(Deserialize)]
 struct RegisterReq {
     token: String,
@@ -205,10 +232,37 @@ pub fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
         .with_state(store)
 }
 
-/// Shared token for the billing-writer admin gate (#87 SEC87b-auth-billing).
+/// Shared token for a machine/operator-writer admin gate (#87 SEC87b-auth): the
+/// `x-ct-admin-token` a caller must present to reach a gated durable-writer route.
 #[derive(Clone)]
-struct BillingAdmin {
+struct AdminGate {
     token: [u8; 32],
+}
+
+/// Reject a request that does not carry the correct `x-ct-admin-token`
+/// (constant-time compare). Applied as a layer only when the CP has an admin
+/// token configured; shared by the billing and registry writer gates.
+async fn require_admin_token(
+    State(state): State<AdminGate>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ok = headers
+        .get("x-ct-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .and_then(hex_decode_32)
+        .map(|got| ct_token_eq(&got, &state.token))
+        .unwrap_or(false);
+    if ok {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            "this control-plane write requires the admin token\n",
+        )
+            .into_response()
+    }
 }
 
 /// Build the **production** billing-writer router — `/accounts/open`,
@@ -231,33 +285,8 @@ pub fn billing_writers_gated(store: Arc<SqliteLedger>, admin_token: Option<[u8; 
         .route("/billing/issue", post(buy_token))
         .with_state(store);
     match admin_token {
-        Some(token) => writers.layer(from_fn_with_state(BillingAdmin { token }, require_billing_admin)),
+        Some(token) => writers.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
         None => writers,
-    }
-}
-
-/// Reject a billing write that does not carry the correct `x-ct-admin-token`
-/// (constant-time compare). Applied only when the CP has an admin token configured.
-async fn require_billing_admin(
-    State(state): State<BillingAdmin>,
-    headers: HeaderMap,
-    req: Request,
-    next: Next,
-) -> Response {
-    let ok = headers
-        .get("x-ct-admin-token")
-        .and_then(|v| v.to_str().ok())
-        .and_then(hex_decode_32)
-        .map(|got| ct_token_eq(&got, &state.token))
-        .unwrap_or(false);
-    if ok {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            "billing writes require the admin token\n",
-        )
-            .into_response()
     }
 }
 
@@ -1050,16 +1079,18 @@ pub fn persistent_control_plane_router(
     // #87 SEC87b-auth: gate the machine/operator durable-writer surfaces behind the
     // shared admin token when the CP has one configured (the same CT_CP_EDGE_ADMIN_TOKEN
     // the edge/operator hold), so a public deployment can't have anyone mint join tokens
-    // (`/enroll/issue`) or grow the billing store with client-supplied accounts
-    // (`/accounts/open`, `/payment/intent`, `/billing/issue`). The real customer flows
-    // (in-process portal mint / session-authed top-up) don't use these routes, so this is
-    // transparent to customers.
+    // (`/enroll/issue`), grow the billing store with client-supplied accounts
+    // (`/accounts/open`, `/payment/intent`, `/billing/issue`), or write the durable
+    // routing registry (`/registry/register`). The real customer/agent flows (in-process
+    // portal mint / session-authed top-up / QUIC tunnel registration to the edge) don't
+    // use these routes, so this is transparent to customers; `/registry/resolve` (read)
+    // stays open. The operator selftest presents the token via ControlPlaneClient.
     let admin_token = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
         .and_then(|s| hex_decode_32(&s));
     let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), admin_token)
-        .merge(registry_router_sqlite(registry))
+        .merge(registry_router_sqlite_gated(registry, admin_token))
         .merge(billing_writers_gated(ledger.clone(), admin_token))
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
@@ -1381,6 +1412,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "billing writers open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn registry_register_requires_the_admin_token_but_resolve_stays_open() {
+        // #87 SEC87b-auth-registry: with an admin token configured, POST /registry/register
+        // requires x-ct-admin-token (401 without / wrong, 200 with), while GET
+        // /registry/resolve stays open (a read, no durable write). With no token
+        // configured, register is open (dev/back-compat).
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x5eu8; 32];
+        let store = Arc::new(SqliteRegistry::open_in_memory().unwrap());
+        let gated = registry_router_sqlite_gated(store.clone(), Some(admin));
+        let tok = hex_encode(&[0x11u8; 32]); // routing token to register/resolve
+        let reg = |admin_hdr: Option<String>| {
+            let mut req = Request::post("/registry/register").header("content-type", "application/json");
+            if let Some(t) = admin_hdr {
+                req = req.header("x-ct-admin-token", t);
+            }
+            gated.clone().oneshot(
+                req.body(Body::from(format!(
+                    r#"{{"token":"{tok}","tenant":"t","agent":"a"}}"#
+                )))
+                .unwrap(),
+            )
+        };
+        assert_eq!(reg(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no token -> 401");
+        assert_eq!(
+            reg(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token -> 401"
+        );
+        assert_eq!(
+            reg(Some(hex_encode(&admin))).await.unwrap().status(),
+            StatusCode::OK,
+            "correct admin token registers"
+        );
+        // Resolve (read) is open even with a token configured, and returns the row
+        // the authorized register just wrote.
+        let resolved = gated
+            .clone()
+            .oneshot(Request::get(format!("/registry/resolve/{tok}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK, "resolve stays open (no admin token needed)");
+
+        // No admin token configured -> register is open (dev/back-compat).
+        let open = registry_router_sqlite_gated(Arc::new(SqliteRegistry::open_in_memory().unwrap()), None);
+        let r = open
+            .oneshot(
+                Request::post("/registry/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{tok}","tenant":"t","agent":"a"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "register open when no admin token is configured");
     }
 
     #[tokio::test]

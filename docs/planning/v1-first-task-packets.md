@@ -2147,9 +2147,27 @@ took a **client-supplied `price`** so `price:0` minted a routing token for free.
     `persistent_control_plane_router` shares one `admin_token` for both the enrollment and billing gates.
     Frozen test `billing_writers_require_the_admin_token_when_configured` (401 without/wrong on
     `/accounts/open` + `/payment/intent`, 200 with correct token, open when unset). Gate green.
-  - **SEC87b-auth-customer** ⏳ remaining: `/registry/register` (agent/edge routing-token write). The per-IP
-    rate cap (SEC87b-rl) stays as defense-in-depth. Still overlaps #77/#78; blocks the #81 SEC81c-b
-    channel-registry HTTP API (same auth question) for the customer slice.
+  - **SEC87b-auth-registry** ✅ **`/registry/register` gated behind the shared admin token; `ControlPlaneClient`
+    + `cp_selftest` made admin-aware.** `/registry/register` maps a client-supplied routing token →
+    `(tenant, agent)` in the durable registry — an unauthenticated durable-writer surface (#87). No live
+    customer path uses it: the agent registers its tunnel over the **QUIC data path to the edge**
+    (`register_tunnel_stream`), not this HTTP route; the only HTTP caller is the operator selftest
+    (`cp_selftest`). So gated with the same `CT_CP_EDGE_ADMIN_TOKEN` via the reusable `AdminGate` /
+    `require_admin_token` layer (factored out of the billing gate); the **read** `/registry/resolve` stays
+    open. New `registry_router_sqlite_gated(store, Option<[u8;32]>)`. To keep the operator selftest working
+    against a gated CP, `ControlPlaneClient` gained `with_admin_token(hex)` (sends `x-ct-admin-token` on the
+    five gated writers — issue / register / accounts-open / payment-intent / billing-issue) and `cp_selftest`
+    reads `CT_CP_EDGE_ADMIN_TOKEN` and presents it. Frozen test
+    `registry_register_requires_the_admin_token_but_resolve_stays_open` (401 without/wrong, 200 with,
+    resolve open, open when unset). Gate green.
+  - **Net for SEC87b-auth:** every unauthenticated durable-writer the review flagged
+    (`/enroll/issue`, `/accounts/open`, `/payment/intent`, `/billing/issue`, `/registry/register`) is now gated
+    behind the shared admin token in production (open in dev when unset), the operator client/selftest presents
+    the token, and reads/customer paths are untouched. Combined with SEC87a (price floor) and SEC87b-rl (per-IP
+    cap), #87's surface is closed. Note the *mechanism* is the shared admin token rather than an OIDC user
+    bearer, because these are machine/operator routes — the customer flows are the session-authed portal and
+    the OIDC `/me/*` router, neither of which touches these; a maintainer can still layer OIDC if a future
+    customer-facing use of these routes appears.
 
 ## #88 Replay cache + enrollment proof-of-possession (security-review, medium)
 
