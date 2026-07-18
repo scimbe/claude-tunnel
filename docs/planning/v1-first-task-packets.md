@@ -1976,3 +1976,20 @@ Bootstrap-KI/ECDF) und größeres n brauchen einen echten Testbett-Lauf. Dekompo
   großes n (mehrere Hundert), Perzentil-Bootstrap-KI + ECDF/Violin, und die p99-zentrische Tiefenanalyse in
   §7.x (p99-Schwierigkeitstabelle, „Warum Verlust das p99 aufbläht") auf die robuste Basis umstellen.
   **fix-ready erst mit T52.2** (Bootstrap-KI dokumentiert, ECDF gezeigt).
+
+## #56 CPU-Contention-Confound (Single-Host, 4 Container) auf die Latenz-Tails (thesis)
+
+Gutachten [Mittel/Hoch]: alle vier Container teilen sich die CPU eines Hosts; PoW + asymmetrische
+Krypto konkurrieren um Rechenzeit und treiben die p99-Tails artifiziell, ohne dass das analysiert
+wird. Dekomposition:
+
+- **T56.1** ✅ **Confound benennen + Tails einordnen** (deterministisch, `evaluation.tex`
+  §Limitierungen): neuer Validitätspunkt „CPU-Contention auf geteilten Kernen" — die absoluten
+  Tails (p95 und darüber) sind teils Emulations-/Contention-Artefakt (PoW + `Noise_IK`-Krypto auf
+  geteilten Kernen; `netem` modelliert stochastische Drops, keinen realen Congestion-Tail). Der
+  Interne-Validität-Absatz verweist jetzt darauf und wurde zugleich mit #52 T52.1 versöhnt (das
+  ungültige symmetrische `±117,261 ms`-KI durch Median/Mittel/Stddev + Skew-Aussage ersetzt).
+  Thesis baut grün (`thesis-build.sh` exit 0, 0 undefined, 63 S.).
+- **T56.2** ⏳ **Quantifizieren/mitigieren** (braucht Testbett): Kontroll-Läufe mit `CPU`-Pinning je
+  Container + protokollierter Auslastung (oder reduzierter Contention), um den Contention-Anteil am
+  Tail von der Netzbedingung zu trennen. **fix-ready erst mit T56.2** (explizite Messung/Pinning-Kontrolle).

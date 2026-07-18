@@ -293,6 +293,18 @@ externe Validität betreffen.
     lineare Skalierung mit der Verzögerung (FF3) ist jedoch ein
     strukturelles Ergebnis, das von dieser Einschränkung nur im Absolutwert,
     nicht in der Form berührt wird.
+  \item[CPU-Contention auf geteilten Kernen.] Die vier Container (Client, Edge,
+    Agent, Origin) teilen sich die CPU desselben Hosts. Gerade die
+    rechenintensiven Schritte -- der Proof-of-Work des Rendezvous und die
+    asymmetrischen \texttt{Noise\_IK}-Handschlag-Operationen -- konkurrieren dabei
+    um Rechenzeit, und \texttt{netem} modelliert stochastische Paketverwerfungen,
+    keinen realen, staubedingten Congestion-Tail-Drop. Beides legt nahe, dass die
+    \emph{absoluten} Latenz-Tails (p95 und darüber) teils ein Emulations- und
+    Contention-Artefakt sind und nicht allein die emulierte Netzbedingung
+    widerspiegeln. Eine belastbare Trennung erforderte Kontroll-Läufe mit
+    \texttt{CPU}-Pinning je Container und protokollierter Auslastung während der
+    Messung; sie bleibt der in Kapitel~\ref{ch:fazit} skizzierten erweiterten
+    Messreihe vorbehalten.
   \item[Einseitige \texttt{netem}-Verzögerung.] \texttt{netem} verzögert je
     Knoten einseitig auf der Egress. Die gemessene Latenz ist damit eine untere
     Schranke gegenüber einer voll bidirektional verzögerten Strecke; der
@@ -329,11 +341,14 @@ sie teils die interne, teils die externe Validität der Ergebnisse.
 
 \paragraph{Interne Validität.} Die Latenzmatrix beruht auf $n=30$ Iterationen je
 Bedingung -- eine moderate Stichprobengröße. Im verlustfreien Regime ist das
-unkritisch, weil die Verteilung eng ist; unter Paketverlust erzeugt die
-rechtsschiefe Verteilung jedoch breite Konfidenzintervalle (etwa 100\,ms/5\,\%:
-$\pm$117{,}261\,ms 95\%-KI), sodass insbesondere die absoluten Tail-Kennzahlen
-(p95, p99) mit Vorsicht als Punktschätzer zu lesen sind und ihre \emph{Richtung}
-belastbarer ist als ihr \emph{Betrag}. Hinzu kommt, dass ausschließlich der
+unkritisch, weil die Verteilung eng ist; unter Paketverlust ist die Verteilung
+dagegen stark rechtsschief (etwa 100\,ms/5\,\%: Median 610{,}2\,ms bei einem
+Mittel von 788{,}9\,ms und einer Standardabweichung von 327{,}7\,ms), sodass ein
+symmetrisches Normal-Konfidenzintervall methodisch nicht trägt (Abschnitt~\ref{sec:ergebnisse})
+und die absoluten Tail-Kennzahlen nur mit Vorsicht als Punktschätzer zu lesen
+sind; ihre \emph{Richtung} ist belastbarer als ihr \emph{Betrag}. Verschärft wird
+dies dadurch, dass die geteilte CPU (siehe oben) die Tails zusätzlich
+contention-bedingt anhebt. Hinzu kommt, dass ausschließlich der
 Betriebsmodus \texttt{single} latenzvermessen wurde. Die weiteren Datenpfade --
 der \texttt{stream}-Modus, der UDP-Transport und der TLS-über-TCP-Fallback --
 sind funktional nachgewiesen (Abschnitt~\ref{sec:funktionsexperimente}), aber
