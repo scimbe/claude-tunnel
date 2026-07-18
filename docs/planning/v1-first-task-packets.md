@@ -2057,8 +2057,14 @@ with **no** proof-of-possession, so an intercepted token can bind an attacker's 
   redeem tests reworked to present a real keypair + signature. Gate green (workspace `-D warnings`; ct-agent
   85 + ct-control-plane 149 tests). *(The in-memory `http.rs`/`Enrollment` dev router is unchanged — it
   ignores the extra field; the live/durable path is the one that enforces PoP.)*
-- **SEC88d** ⏳ **Clock-skew hardening**: `verify` trusts a caller-supplied `now`; a backwards-skewed edge
-  clock extends validity. (ChannelGrant *revocation* is already covered via #81's membership check.)
+- **SEC88d** ✅→**accepted residual (no in-`ct-common` fix)**: `verify`/`verify_fresh` trust a caller-supplied
+  `now`, so a backwards-skewed edge clock extends validity. The verifying host owns its clock, so this is an
+  operational control (NTP + monotonic-time discipline), recorded in `docs/security/threat-model.md` §Residual
+  risks #4. Replay is bounded independently (broker possession-challenge #81; `verify_fresh` primitive; #88
+  SEC88c PoP). (ChannelGrant *revocation* is already covered via #81's membership check.)
+
+**#88 complete:** all three reviewer gaps addressed (SEC88a/b-api/c-core/c-wire ✅; SEC88b-wire N/A) and the
+secondary clock-skew note accepted as an operational residual → fix-ready.
 
 ## #90 Secret-handling: token in install one-liner + routing token in revoke logs (security-review, low)
 

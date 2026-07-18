@@ -59,3 +59,14 @@ rotate the edge CA by restart (clients trust the CA root, so no re-pinning).
 2. **Control-plane metadata** — the operator sees account id, routing and billing
    metadata (not payload). Minimize retention; document in the privacy policy.
 3. **Jurisdiction / lawful-floor process** — operational, not code (SPEC §9.2–9.3).
+4. **Trust-primitive clock skew (#88 SEC88d)** — `credential::verify`/`verify_fresh`
+   and `channel::verify`/`verify_fresh` (`SignedCredential`, `ChannelGrant`) take a
+   caller-supplied `now`, so a **backwards-skewed edge clock extends a token's
+   validity window** beyond its `expires_at`. There is no fix inside `ct-common` —
+   the verifying host owns its clock — so this is an operational control: run edge
+   hosts under NTP with monotonic-time discipline and alert on large steps.
+   *Replay* itself is bounded independently of skew: the channel broker gates every
+   join on a fresh single-use possession challenge (#81), the `ReplayCache` /
+   `verify_fresh` primitive (#88 SEC88a/b) is available for any future live
+   `SignedCredential` path, and enrollment now requires proof-of-possession (#88
+   SEC88c). accepted residual.
