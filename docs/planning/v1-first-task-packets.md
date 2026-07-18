@@ -1804,10 +1804,15 @@ Decomposed:
       `relay_two_connections_splices_two_channel_members_and_tears_down_cleanly`: bytes cross both ways over
       real QUIC, AND when one member drops the relay returns (no hang) — the teardown behaviour a fallback
       needs. (Added tokio `time` to ct-edge for the timeout guard.) Gate green.
-    - **AF4-relay-fallback** ⏳ wire it end-to-end: on `ChannelDialError::Unreachable`, both agents reconnect
-      to an edge **relay endpoint** (which pairs by channel + `relay_two_connections`) and run the Noise
-      session over the relayed stream. Test **induces a blocked direct path** and asserts the tunnel still
-      carries data via the relay — the headline connection-difficulty win.
+    - **AF4-relay-endpoint** ✅ **Edge relay-mode admission handler.** `broker_channel_relay(endpoint, now,
+      authorize)` accepts + authorizes two joins for the same channel (reusing `accept_and_read_join` — the
+      possession-proof/membership gate), acks `OK`, then splices each side's next bi-stream via
+      `relay_two_connections`, so two members that can't go direct tunnel through the edge (ciphertext; Noise
+      E2E). Frozen test `broker_channel_relay_splices_two_members_tunnels`: both members present valid joins,
+      open data streams, and bytes cross both ways through the edge. Gate green.
+    - **AF4-relay-clientwire** ⏳ agent-side: on `ChannelDialError::Unreachable`, both agents reconnect to the
+      edge relay endpoint (present join → open data stream) and run the Noise session over the relayed stream;
+      `run_channel_join` chooses direct-then-relay. Test induces a blocked direct path end-to-end.
     - Also: refused-join and unresolvable-peer error surfacing; retry/backoff.
   - **AF4-session-cli-join** ⏳ a thin `ct-agent channel-join` subcommand wiring env → `run_channel_join`.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**

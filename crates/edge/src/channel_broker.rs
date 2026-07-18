@@ -341,6 +341,50 @@ where
     }
 }
 
+/// Relay-mode admission for two channel members that can't reach each other on the
+/// **direct** path (#72 AF4-session-resilience). Like [`broker_channel_rendezvous`] it
+/// accepts + authorizes two joins for the same channel, but instead of swapping
+/// endpoints for a direct dial it acks `OK` and then splices each side's *next*
+/// bi-stream through the edge via [`crate::relay::relay_two_connections`] — so the
+/// tunnel flows through the edge as ciphertext (the Noise_IK session the agents run
+/// over the relayed stream stays end-to-end; the edge sees only opaque bytes). This is
+/// the edge endpoint two agents fall back to when the direct dial is `Unreachable`.
+/// Returns the pairing when the relay ends (either side closing tears it down).
+pub async fn broker_channel_relay<F, Fut>(
+    endpoint: &Endpoint,
+    now: UnixSeconds,
+    authorize: F,
+) -> Result<ChannelPairing, BoxError>
+where
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>)>>,
+{
+    let (conn_a, mut send_a, req_a, operator, _na) =
+        accept_and_read_join(endpoint, now, &authorize).await?;
+    let (conn_b, mut send_b, req_b, _op_b, _nb) =
+        accept_and_read_join(endpoint, now, &authorize).await?;
+
+    match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
+        Ok(pairing) => {
+            // Ack both, then splice their next bi-stream (the tunnel data) — no
+            // endpoints are exchanged, the edge carries the ciphertext.
+            send_a.write_all(b"OK").await?;
+            send_b.write_all(b"OK").await?;
+            send_a.finish()?;
+            send_b.finish()?;
+            crate::relay::relay_two_connections(&conn_a, &conn_b, "channel-relay").await?;
+            Ok(pairing)
+        }
+        Err(e) => {
+            let _ = send_a.write_all(b"NO").await;
+            let _ = send_b.write_all(b"NO").await;
+            let _ = send_a.finish();
+            let _ = send_b.finish();
+            Err(format!("channel relay pair refused: {e}").into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +692,66 @@ mod tests {
         let ack2 = present_join(&conn2, &expired.encode(), &holder_sk(0x0c)).await;
         assert_ne!(ack2, b"OK", "an expired grant must be refused");
         let _ = server2_task.await;
+    }
+
+    #[tokio::test]
+    async fn broker_channel_relay_splices_two_members_tunnels() {
+        // #72 AF4-relay-fallback (edge side): the connection-difficulty path. Two
+        // members that can't go direct both join the RELAY endpoint; the edge auths +
+        // pairs them and splices their data streams, so the tunnel flows THROUGH the
+        // edge (ciphertext). Prove bytes cross both ways over the relay.
+        let pk = operator_pubkey();
+        let channel = [0xE0u8; 32];
+        let holder_a = holder_sk(0xa1);
+        let holder_b = holder_sk(0xb2);
+        let req_a = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.1:7001".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
+            endpoint: "203.0.113.2:7002".to_string(),
+        };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&server, 500, move |c, _h| async move {
+                (c.0 == channel).then_some((pk, None))
+            })
+            .await
+            .map(|_| ())
+        });
+
+        let cert_b = cert.clone();
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            assert_eq!(present_join(&conn, &req_a.encode(), &holder_a).await, b"OK", "A admitted to relay");
+            let (mut s, mut r) = conn.open_bi().await.expect("a data bi");
+            s.write_all(b"tunnel A->B via edge").await.expect("a write");
+            let mut got = vec![0u8; 20];
+            r.read_exact(&mut got).await.expect("a read");
+            conn.close(0u32.into(), b"done");
+            got
+        });
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            assert_eq!(present_join(&conn, &req_b.encode(), &holder_b).await, b"OK", "B admitted to relay");
+            let (mut s, mut r) = conn.open_bi().await.expect("b data bi");
+            s.write_all(b"tunnel B->A via edge").await.expect("b write");
+            let mut got = vec![0u8; 20];
+            r.read_exact(&mut got).await.expect("b read");
+            conn.close(0u32.into(), b"done");
+            got
+        });
+
+        let got_a = a.await.expect("a");
+        let got_b = b.await.expect("b");
+        let _ = relay_task.await;
+        assert_eq!(&got_a, b"tunnel B->A via edge", "A receives B's bytes through the edge relay");
+        assert_eq!(&got_b, b"tunnel A->B via edge", "B receives A's bytes through the edge relay");
     }
 
     #[tokio::test]
