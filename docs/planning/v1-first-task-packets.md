@@ -2036,13 +2036,23 @@ with **no** proof-of-possession, so an intercepted token can bind an attacker's 
   the same signature fails with `CredError::Replayed` / `GrantError::Replayed`. Signature/expiry are checked
   first, so an invalid/expired token never populates the cache. No wire/format change. 2 frozen tests
   (admit-once-then-replay; distinct token still fresh; bad-key/expired rejected before the cache). Gate green.
-- **SEC88b-wire** ⏳ **Thread a shared `ReplayCache` at the live call sites** — the edge credential-admission
-  (`edge/src/auth.rs`) and the channel broker (`edge/src/channel_broker.rs`) hold one cache per process and
-  call `verify_fresh` instead of `verify`. Bounded follow (state-threading + a broker/auth test).
-- **SEC88c** ⏳ **Enrollment proof-of-possession**: `redeem` must verify a signature over the join token by
-  the pubkey being bound (agent already holds an ed25519 identity). Cross-crate wire change (agent onboard +
-  `ControlPlaneClient::redeem` + both `redeem` handlers + `SqliteEnrollment`/`Enrollment` + call sites) — its
-  own packet.
+- **SEC88b-wire** ✅→**N/A (redundant on the live paths)**: on review the two live-ish `verify` sites are
+  already replay-safe or not live. The channel broker (`channel_broker.rs::read_join_on_connection`) gates
+  every join on a **fresh single-use possession challenge** — a captured grant's old signature can't answer a
+  new challenge, so a `ReplayCache` there is dead weight. The credential path (`edge/src/auth.rs`) is **not
+  mounted in the live edge** (`serve.rs` never verifies a `SignedCredential`). `verify_fresh` remains the
+  correct API to use if/when a `SignedCredential` is verified on a live long-lived path.
+- **SEC88c-core** ✅ **Enrollment proof-of-possession — verification on the live durable store.**
+  `enrollment::verify_join_proof(token, pubkey, proof)` checks `proof` is `pubkey`'s ed25519 signature over
+  the join token; `SqliteEnrollment::redeem_with_proof` verifies it **before** consuming the token (a bad
+  proof burns nothing → new `EnrollError::BadProof`, mapped to `403` in the redeem handler). This ensures a
+  redemption can only bind a key the caller proves it controls. Frozen test
+  `redeem_with_proof_requires_possession_of_the_bound_key` (wrong-key proof → BadProof + nothing bound;
+  genuine proof binds + single-use). Gate green. *Scope note:* PoP binds the redemption to a proven key
+  holder; it does not by itself stop an on-path attacker who captured the token (bearer secret; TLS-protected).
+- **SEC88c-wire** ⏳ **Require the proof end-to-end**: `RedeemReq` gains a `proof` field; the `/enroll/redeem`
+  handler calls `redeem_with_proof`; `ControlPlaneClient::redeem` + agent `onboard` sign the join token with
+  the identity key and send it. Cross-crate wire change (client + agent + both handlers + call sites).
 - **SEC88d** ⏳ **Clock-skew hardening**: `verify` trusts a caller-supplied `now`; a backwards-skewed edge
   clock extends validity. (ChannelGrant *revocation* is already covered via #81's membership check.)
 

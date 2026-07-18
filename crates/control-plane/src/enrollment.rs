@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use ct_common::{AgentId, TenantId};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 
 /// An Agent's public identity key (ed25519 verifying-key bytes).
@@ -24,6 +25,10 @@ pub enum EnrollError {
     UnknownToken,
     /// The token was already redeemed once; join tokens are single-use.
     TokenAlreadyUsed,
+    /// The proof-of-possession signature didn't verify against the presented
+    /// public key (#88 SEC88c) — the redeemer didn't prove it holds the private
+    /// key for the key it's binding.
+    BadProof,
 }
 
 impl std::fmt::Display for EnrollError {
@@ -31,11 +36,27 @@ impl std::fmt::Display for EnrollError {
         match self {
             EnrollError::UnknownToken => write!(f, "unknown join token"),
             EnrollError::TokenAlreadyUsed => write!(f, "join token already used"),
+            EnrollError::BadProof => write!(f, "join-token proof-of-possession invalid"),
         }
     }
 }
 
 impl std::error::Error for EnrollError {}
+
+/// Verify an agent's proof-of-possession for a join-token redemption (#88 SEC88c):
+/// `proof` must be `pubkey`'s ed25519 signature over the 32-byte join token. This
+/// proves the redeemer holds the **private** key for the public key it is binding,
+/// so a redemption can't bind a key the caller doesn't control (e.g. a victim's key
+/// lifted from elsewhere, or a confused-deputy binding). Note the bound: it does not
+/// by itself stop an on-path attacker who captured the token from redeeming it with
+/// *their own* keypair — the join token is a bearer secret whose confidentiality
+/// rests on the TLS transport; PoP binds the redemption to a proven key holder.
+pub fn verify_join_proof(token: &JoinToken, pubkey: &AgentPublicKey, proof: &[u8; 64]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+        return false;
+    };
+    vk.verify(&token.0, &Signature::from_bytes(proof)).is_ok()
+}
 
 /// In-memory enrollment service.
 #[derive(Default)]

@@ -152,6 +152,26 @@ impl SqliteEnrollment {
         Ok(TenantId(tenant))
     }
 
+    /// Redeem a join token **only** if the caller proves possession of the private
+    /// key for `pubkey` (#88 SEC88c): `proof` must be `pubkey`'s ed25519 signature
+    /// over the join token (see [`crate::enrollment::verify_join_proof`]). The proof
+    /// is checked *before* the token is consumed, so a bad proof burns nothing and
+    /// returns [`EnrollError::BadProof`]; a valid proof falls through to the normal
+    /// single-use [`Self::redeem`]. This closes the "redeem binds an unproven key"
+    /// gap — a redemption can no longer bind a public key the caller doesn't control.
+    pub fn redeem_with_proof(
+        &self,
+        token: &JoinToken,
+        agent: &AgentId,
+        pubkey: AgentPublicKey,
+        proof: &[u8; 64],
+    ) -> Result<TenantId, RedeemError> {
+        if !crate::enrollment::verify_join_proof(token, &pubkey, proof) {
+            return Err(RedeemError::Enroll(EnrollError::BadProof));
+        }
+        self.redeem(token, agent, pubkey)
+    }
+
     /// The binding recorded for `agent`, if enrolled.
     pub fn binding(
         &self,
@@ -1326,6 +1346,46 @@ mod tests {
             result,
             Err(RedeemError::Enroll(EnrollError::UnknownToken))
         ));
+    }
+
+    #[test]
+    fn redeem_with_proof_requires_possession_of_the_bound_key() {
+        // #88 SEC88c: a redemption must prove it holds the private key for the
+        // public key it binds. A valid signature over the join token binds; a
+        // proof made with a different key (i.e. binding a key the caller doesn't
+        // control) is rejected with BadProof and does NOT consume the token.
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let token = store.issue_join_token(&tenant()).unwrap();
+        let agent = AgentId("agent-1".into());
+
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = sk.verifying_key().to_bytes();
+        let wrong = SigningKey::from_bytes(&[43u8; 32]);
+
+        // Proof signed by the wrong key -> BadProof, token untouched.
+        let forged = wrong.sign(&token.0).to_bytes();
+        assert!(
+            matches!(
+                store.redeem_with_proof(&token, &agent, pubkey, &forged),
+                Err(RedeemError::Enroll(EnrollError::BadProof))
+            ),
+            "a proof that doesn't match the bound key is rejected"
+        );
+        assert!(store.binding(&agent).unwrap().is_none(), "nothing bound on a bad proof");
+
+        // Genuine proof by the bound key -> binds, and the token is now single-use.
+        let proof = sk.sign(&token.0).to_bytes();
+        assert_eq!(store.redeem_with_proof(&token, &agent, pubkey, &proof).unwrap(), tenant());
+        assert_eq!(store.binding(&agent).unwrap(), Some((tenant(), pubkey)));
+        assert!(
+            matches!(
+                store.redeem_with_proof(&token, &agent, pubkey, &proof),
+                Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))
+            ),
+            "the token is consumed after a successful proven redemption"
+        );
     }
 
     /// The production requirement: state survives a restart. Issue + redeem

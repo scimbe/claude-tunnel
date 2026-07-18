@@ -87,6 +87,7 @@ async fn redeem(
             let code = match &e {
                 RedeemError::Enroll(EnrollError::TokenAlreadyUsed) => StatusCode::CONFLICT,
                 RedeemError::Enroll(EnrollError::UnknownToken) => StatusCode::NOT_FOUND,
+                RedeemError::Enroll(EnrollError::BadProof) => StatusCode::FORBIDDEN,
                 RedeemError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (code, e.to_string())
