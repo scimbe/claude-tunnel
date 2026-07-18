@@ -752,6 +752,21 @@ fn ca_key_path_for(cert_out: &str) -> String {
 /// Run the Edge daemon: bind to `config.listen`, write the cert to `cert_out`
 /// (shared volume), and serve each incoming connection via [`serve_connection`]
 /// with a fresh per-connection PoW challenge.
+/// #84: decide whether hostname-ownership authorization is required. An explicit
+/// `CT_EDGE_REQUIRE_HOST_AUTH` wins — any truthy value enables it, and `"0"` /
+/// `"false"` / empty explicitly disable it. When unset, it **fail-closes by default
+/// whenever a public front door is exposed** (`CT_FRONT_DOOR` set): a public `:443`
+/// with unauthenticated hostname binds lets any routing-token holder squat an
+/// unbound name. A mesh-only edge (no front door) stays off, so zero-config `:4433`
+/// deployments are unaffected.
+fn host_auth_required(require_env: Option<&str>, front_door_set: bool) -> bool {
+    match require_env {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.trim().is_empty() => false,
+        Some(_) => true,
+        None => front_door_set,
+    }
+}
+
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
     // Issue the Edge's leaf from an internal CA (M20.3b) and listen on both QUIC
     // (primary) and TLS-TCP (fallback) with that one shared leaf. Persist the CA
@@ -777,11 +792,24 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     {
         state.set_admin_token(tok);
         eprintln!("ct-edge: tunnel revocation enabled (CT_EDGE_ADMIN_TOKEN set)");
-        // #23 BP4b: require hostname-ownership authorization for 'H' binds. Enable
-        // this before exposing :443 — an anonymous bind then can't claim a name.
-        if std::env::var_os("CT_EDGE_REQUIRE_HOST_AUTH").is_some() {
+        // #23 BP4b / #84: require hostname-ownership authorization for 'H'/'B' binds —
+        // fail-closed by default when a public front door is exposed (CT_FRONT_DOOR),
+        // so an anonymous bind can't squat an unbound name on :443.
+        let front_door_set = std::env::var_os("CT_FRONT_DOOR").is_some();
+        if host_auth_required(
+            std::env::var("CT_EDGE_REQUIRE_HOST_AUTH").ok().as_deref(),
+            front_door_set,
+        ) {
             state.require_host_auth();
-            eprintln!("ct-edge: hostname-ownership authorization required (CT_EDGE_REQUIRE_HOST_AUTH)");
+            eprintln!(
+                "ct-edge: hostname-ownership authorization required (#84 — fail-closed default under \
+                 CT_FRONT_DOOR; set CT_EDGE_REQUIRE_HOST_AUTH=0 to disable)"
+            );
+        } else if front_door_set {
+            eprintln!(
+                "ct-edge: WARNING — CT_FRONT_DOOR is exposed with host-auth DISABLED; any routing-token \
+                 holder can squat an unbound hostname (#84)"
+            );
         }
         // #27 RB4: serve the authenticated admin API (POST /admin/revoke/:token)
         // the control plane calls on a customer revoke — only when an admin
@@ -981,6 +1009,25 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    #[test]
+    fn host_auth_fail_closes_under_a_front_door_by_default() {
+        // #84: explicit setting wins in both directions.
+        assert!(host_auth_required(Some("1"), false), "explicit truthy -> on");
+        assert!(host_auth_required(Some("true"), false), "explicit true -> on");
+        assert!(!host_auth_required(Some("0"), true), "explicit 0 -> off even with a front door");
+        assert!(!host_auth_required(Some("false"), true), "explicit false -> off");
+        assert!(!host_auth_required(Some(""), true), "explicit empty -> off");
+        // Unset: fail-closed only when a public front door is exposed.
+        assert!(
+            host_auth_required(None, true),
+            "unset + CT_FRONT_DOOR -> ON (no unbound-hostname squatting on :443)"
+        );
+        assert!(
+            !host_auth_required(None, false),
+            "unset + mesh-only (:4433, no front door) -> OFF (zero-config unaffected)"
+        );
+    }
 
     #[tokio::test]
     async fn agent_registers_and_becomes_known() {
