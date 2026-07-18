@@ -93,9 +93,67 @@ pub async fn relay_quic(
     relay_pair(client_recv, client_send, agent_recv, agent_send, label).await
 }
 
+/// Splice two channel members' connections through the edge relay (#72
+/// AF4-session-resilience). When two paired agents cannot reach each other on the
+/// direct path (NAT / firewall / dial timeout — see `ChannelDialError::Unreachable`),
+/// each connects to the edge instead; the edge accepts one bidirectional stream from
+/// each connection and forwards **ciphertext** between them via [`relay_quic`], so the
+/// Noise_IK session stays end-to-end (the edge sees only opaque bytes). Returns the
+/// `(a→b, b→a)` byte counts when either side closes. Reuses the ADR-0015 relay core.
+pub async fn relay_two_connections(
+    conn_a: &quinn::Connection,
+    conn_b: &quinn::Connection,
+    label: &str,
+) -> std::io::Result<(u64, u64)> {
+    let to_io = |e: quinn::ConnectionError| std::io::Error::new(std::io::ErrorKind::Other, e);
+    let (send_a, recv_a) = conn_a.accept_bi().await.map_err(to_io)?;
+    let (send_b, recv_b) = conn_b.accept_bi().await.map_err(to_io)?;
+    relay_quic(send_a, recv_a, send_b, recv_b, label).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_two_connections_splices_two_channel_members_and_tears_down_cleanly() {
+        // #72 AF4-session-resilience: two agents that can't go direct both connect to
+        // the edge, which splices their streams so the tunnel still flows through it
+        // (ciphertext only). Prove bytes cross both ways, and that when one side drops
+        // the relay tears down and returns — no hang — the behaviour a fallback needs.
+        use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            let ca = server.accept().await.expect("inc a").await.expect("conn a");
+            let cb = server.accept().await.expect("inc b").await.expect("conn b");
+            relay_two_connections(&ca, &cb, "test").await
+        });
+
+        let ea = build_client_endpoint(cert.clone()).expect("ea");
+        let conn_a = ea.connect(addr, "localhost").expect("cfg").await.expect("conn a");
+        let eb = build_client_endpoint(cert).expect("eb");
+        let conn_b = eb.connect(addr, "localhost").expect("cfg").await.expect("conn b");
+
+        let (mut sa, mut ra) = conn_a.open_bi().await.expect("a bi");
+        let (mut sb, mut rb) = conn_b.open_bi().await.expect("b bi");
+        // Actualise both streams (open_bi is lazy) so the edge's two accept_bi resolve.
+        sa.write_all(b"a->b through the edge").await.expect("a write");
+        sb.write_all(b"b->a reply").await.expect("b write");
+
+        let mut on_b = vec![0u8; 21];
+        rb.read_exact(&mut on_b).await.expect("b reads a");
+        assert_eq!(&on_b, b"a->b through the edge", "A's bytes reach B through the edge");
+        let mut on_a = vec![0u8; 10];
+        ra.read_exact(&mut on_a).await.expect("a reads b");
+        assert_eq!(&on_a, b"b->a reply", "B's bytes reach A through the edge");
+
+        // One side drops -> the relay must return, not hang.
+        conn_a.close(0u32.into(), b"gone");
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
+        assert!(done.is_ok(), "relay tore down when a member dropped (no hang)");
+    }
 
     #[tokio::test]
     async fn relays_bytes_both_directions() {

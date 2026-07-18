@@ -1798,9 +1798,16 @@ Decomposed:
       `DIRECT_DIAL_TIMEOUT` (5 s) and, on `Unreachable`, returns a clear actionable error (relay is the next
       packet). Frozen test `direct_dial_to_an_unreachable_peer_fails_fast_as_unreachable` **induces** the hard
       case (a bound-but-silent UDP port blackholes the handshake) and asserts fast `Unreachable`, not a hang.
-    - **AF4-resilience-relay** ⏳ on `Unreachable`, route the session through the **edge relay** (the edge
-      forwards the two agents' encrypted frames — Noise stays end-to-end). Test induces a blocked direct path
-      and asserts the tunnel still carries data via the relay.
+    - **AF4-relay-splice** ✅ **Edge relay-forward for two channel members**, reusing the ADR-0015 relay core.
+      `relay::relay_two_connections(conn_a, conn_b, label)` accepts one bi-stream from each connection and
+      splices them via the existing (tested) `relay_quic` — ciphertext only, Noise stays E2E. Frozen test
+      `relay_two_connections_splices_two_channel_members_and_tears_down_cleanly`: bytes cross both ways over
+      real QUIC, AND when one member drops the relay returns (no hang) — the teardown behaviour a fallback
+      needs. (Added tokio `time` to ct-edge for the timeout guard.) Gate green.
+    - **AF4-relay-fallback** ⏳ wire it end-to-end: on `ChannelDialError::Unreachable`, both agents reconnect
+      to an edge **relay endpoint** (which pairs by channel + `relay_two_connections`) and run the Noise
+      session over the relayed stream. Test **induces a blocked direct path** and asserts the tunnel still
+      carries data via the relay — the headline connection-difficulty win.
     - Also: refused-join and unresolvable-peer error surfacing; retry/backoff.
   - **AF4-session-cli-join** ⏳ a thin `ct-agent channel-join` subcommand wiring env → `run_channel_join`.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
