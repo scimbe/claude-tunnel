@@ -1927,3 +1927,20 @@ took a **client-supplied `price`** so `price:0` minted a routing token for free.
   `/registry/register`, `/payment/intent`): flood → SQLite growth (DoS/disk). Needs the control-plane auth
   model decision (overlaps #77/#78); sybil account creation is acknowledged by-design (`accounts.rs`). Blocks
   the #81 SEC81c-b channel-registry HTTP API (same auth question). Maintainer call.
+
+## #90 Secret-handling: token in install one-liner + routing token in revoke logs (security-review, low)
+
+Two secret-exposure observations. Decomposed:
+
+- **SEC90a** ✅ **Redact the routing token in edge-revoke failure logs** (`portal_api.rs`): on a failed
+  `POST {edge}/admin/revoke/{routing_token}`, the handler logged the raw `reqwest` error, whose `Display`
+  embeds the request URL — leaking the routing token (a server-side secret never rendered in listings) into
+  control-plane logs. Added `redact_routing_tokens`, a pure helper that replaces any maximal run of ≥64
+  lowercase-hex chars (the token shape) with `<redacted-token>`, applied to the error before logging — so the
+  secret is stripped wherever in the error chain the URL surfaces. Frozen test
+  `redact_routing_tokens_strips_the_token_from_a_revoke_error` (token gone + marker present + non-secret
+  context and short hex preserved). Gate green.
+- **SEC90b** ⏳ **Install one-liner embeds tokens in the command string** (`installer.rs::install_one_liner`):
+  the join/routing tokens appear in the shown one-liner (`CT_JOIN_TOKEN=<hex> … sh`), so they land in shell
+  history and `ps`. Removing them from the command string needs a bootstrap-token exchange (server-side
+  hand-off), which is tied to the #75 install-flow redesign (install scripts aren't live yet). Track with #75.

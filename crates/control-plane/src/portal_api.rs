@@ -278,7 +278,12 @@ async fn delete_tunnel(
             {
                 Ok(r) if r.status().is_success() => {}
                 Ok(r) => eprintln!("ct-cp: edge revoke for tunnel {id} returned {}", r.status()),
-                Err(e) => eprintln!("ct-cp: edge revoke for tunnel {id} failed: {e}"),
+                // #90: the reqwest error's Display embeds the request URL, which
+                // carries the routing token — redact it before logging.
+                Err(e) => eprintln!(
+                    "ct-cp: edge revoke for tunnel {id} failed: {}",
+                    redact_routing_tokens(&e.to_string())
+                ),
             }
         }
     }
@@ -529,6 +534,35 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Redact routing-token-shaped substrings (#90): a routing token is a 32-byte
+/// value rendered as 64 lowercase-hex chars, and it appears in the edge-revoke URL
+/// path — so a `reqwest` error's `Display` (which embeds the request URL) would leak
+/// it into control-plane logs. Replace any maximal run of ≥64 lowercase-hex chars
+/// with a marker before logging, so the secret never reaches the log regardless of
+/// where in the error chain the URL surfaces.
+fn redact_routing_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= 64 {
+            out.push_str("<redacted-token>");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in s.chars() {
+        if matches!(c, '0'..='9' | 'a'..='f') {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// Shared page chrome: dark card layout, a title and body. `body` is trusted
 /// (built from escaped parts by the caller).
 pub(crate) fn page(title: &str, body: &str) -> String {
@@ -595,6 +629,27 @@ mod tests {
     use tower::ServiceExt;
 
     const KEY: &[u8] = b"portal-api-test-key";
+
+    #[test]
+    fn redact_routing_tokens_strips_the_token_from_a_revoke_error() {
+        // #90: a routing token is 64 lowercase-hex chars and rides in the edge-revoke
+        // URL, which reqwest's error Display embeds — so it must be redacted before
+        // logging. Mirror that error shape and assert the token is gone.
+        let token = "a".repeat(64);
+        let err = format!(
+            "error sending request for url (https://edge.example/admin/revoke/{token}): \
+             connection refused"
+        );
+        let red = redact_routing_tokens(&err);
+        assert!(!red.contains(&token), "the routing token must not survive redaction");
+        assert!(red.contains("<redacted-token>"), "token replaced by the marker");
+        // Non-secret context is preserved so the log line is still useful.
+        assert!(red.contains("admin/revoke/"), "url structure kept");
+        assert!(red.contains("connection refused"), "error reason kept");
+
+        // A short hex value (e.g. a status code fragment) is left alone.
+        assert_eq!(redact_routing_tokens("returned 503 deadbeef"), "returned 503 deadbeef");
+    }
 
     fn session_header(subject: &str) -> String {
         format!("ct_portal_session={}", sign_session_for_test(KEY, subject))
