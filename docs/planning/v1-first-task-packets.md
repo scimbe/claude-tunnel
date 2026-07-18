@@ -1884,3 +1884,21 @@ Decomposed:
   `tokio::sync::Semaphore` permit per accepted connection, and/or a quinn endpoint concurrency cap) so a
   connection flood can't exhaust memory/FDs — the first availability gap. Optionally PoW-gate `'A'`
   registration. Doc: reconcile the whitepaper's "rate limit shipped" claim (now opt-in + wired).
+
+## #87 Control-plane endpoints: unauth / un-rate-limited / client-priced (security-review)
+
+Several `service.rs` endpoints require no auth + no rate limit and write durable SQLite, and issuance
+took a **client-supplied `price`** so `price:0` minted a routing token for free. Decomposed:
+
+- **SEC87a** ✅ **Reject issuance below the token price** (the free-token mint): `billing::issuance_price_ok`
+  (`price >= TOKEN_PRICE`) is now enforced in both live issuance handlers — `buy_token` (`/billing/issue`)
+  and `me_issue` (`/me/issue`) — *before* the ledger is touched, returning `402` for an underpayment. So a
+  funded, in-rate subject can no longer buy a token for less than it costs, and `price:0` mints/debits
+  nothing. The rate-limit test that abused `price:0` to isolate the limiter now funds the subject and pays
+  the token price. Frozen test `issuance_rejects_price_below_the_token_price` (price:0 → 402, balance
+  unchanged; price:TOKEN_PRICE → 200, debited). Gate green. (The parallel `http.rs`/`issue_token_for_payment`
+  surface is **not** wired into `main` — no live vuln — but must adopt the same floor if ever mounted.)
+- **SEC87b** ⏳ **Auth + rate limits on the unauthenticated DB-writers** (`/enroll/issue`, `/accounts/open`,
+  `/registry/register`, `/payment/intent`): flood → SQLite growth (DoS/disk). Needs the control-plane auth
+  model decision (overlaps #77/#78); sybil account creation is acknowledged by-design (`accounts.rs`). Blocks
+  the #81 SEC81c-b channel-registry HTTP API (same auth question). Maintainer call.

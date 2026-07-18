@@ -237,6 +237,14 @@ async fn buy_token(
 ) -> Result<Json<TokenResp>, (StatusCode, String)> {
     let account = hex_decode_32(&req.account)
         .ok_or((StatusCode::BAD_REQUEST, "malformed account".to_string()))?;
+    // #87 SEC87a: a token costs at least TOKEN_PRICE — reject an underpayment
+    // (notably price:0) before touching the ledger, so it can't mint a free token.
+    if !crate::billing::issuance_price_ok(req.price) {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            format!("a routing token costs at least {} credit(s)", crate::billing::TOKEN_PRICE),
+        ));
+    }
     // Debit first: only mint the token if the account can pay.
     store.debit(&AccountId(account), req.price).map_err(|e| {
         let code = match &e {
@@ -450,6 +458,14 @@ async fn me_issue(
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "issue rate limit exceeded".to_string(),
+        ));
+    }
+    // #87 SEC87a: reject an underpayment (notably price:0) before the ledger, so a
+    // funded, in-rate subject still cannot mint a token for less than TOKEN_PRICE.
+    if !crate::billing::issuance_price_ok(req.price) {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            format!("a routing token costs at least {} credit(s)", crate::billing::TOKEN_PRICE),
         ));
     }
     let account = state
@@ -1067,6 +1083,10 @@ mod tests {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
 
+        // Fund user-1 so issuance at the token price succeeds and only the rate
+        // limit — not credit or the #87 price floor — decides the outcome.
+        let acct = ledger.account_for_subject("user-1").unwrap();
+        ledger.credit(&acct, 2).unwrap();
         // Cap issuance at 2 per window for each subject.
         let app = authed_billing_router(ledger, verifier, 2);
 
@@ -1081,13 +1101,14 @@ mod tests {
             &EncodingKey::from_secret(secret),
         )
         .unwrap();
-        // price 0 so issuance never fails on credit — isolates the rate limit.
+        // price 1 (the token price) with a funded account — issuance succeeds until
+        // the rate limit bites, which is what this test isolates.
         let issue = || {
             app.clone().oneshot(
                 Request::post("/me/issue")
                     .header("authorization", format!("Bearer {jwt}"))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"price":0}"#))
+                    .body(Body::from(r#"{"price":1}"#))
                     .unwrap(),
             )
         };
@@ -1100,6 +1121,61 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "3rd over the per-subject cap is throttled"
         );
+    }
+
+    #[tokio::test]
+    async fn issuance_rejects_price_below_the_token_price() {
+        // #87 SEC87a: /me/issue took a client-supplied `price`, and price:0 minted a
+        // routing token for free (debiting nothing). A funded, in-rate subject must
+        // still not be able to buy a token below TOKEN_PRICE, and a refusal must not
+        // touch the ledger.
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+
+        // Fund the subject so any refusal is the price floor, not insufficient credit,
+        // and set a high rate cap so the limiter never interferes.
+        let acct = ledger.account_for_subject("payer").unwrap();
+        ledger.credit(&acct, 5).unwrap();
+        let probe = ledger.clone();
+        let app = authed_billing_router(ledger, verifier, 100);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "payer", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        let issue = |price: u64| {
+            app.clone().oneshot(
+                Request::post("/me/issue")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"price":{price}}}"#)))
+                    .unwrap(),
+            )
+        };
+
+        // price:0 is refused and mints/debits nothing — the free-token hole is closed.
+        assert_eq!(
+            issue(0).await.unwrap().status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "price:0 must not mint a free token"
+        );
+        assert_eq!(probe.balance(&acct).unwrap(), 5, "a refused issuance debits nothing");
+
+        // Paying the token price succeeds and debits exactly that.
+        assert_eq!(issue(1).await.unwrap().status(), StatusCode::OK, "paying TOKEN_PRICE mints a token");
+        assert_eq!(probe.balance(&acct).unwrap(), 4, "the token price was debited");
     }
 
     #[tokio::test]

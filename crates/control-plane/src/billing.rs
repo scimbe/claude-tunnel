@@ -16,6 +16,15 @@ use crate::accounts::{AccountId, Ledger, LedgerError};
 /// Default credit price of issuing one tunnel routing token.
 pub const TOKEN_PRICE: u64 = 1;
 
+/// Whether a client-supplied issuance `price` is acceptable: a routing token is
+/// sold at the fixed [`TOKEN_PRICE`], so anything below it — notably `price:0` —
+/// must be refused, otherwise a caller mints a free token (#87 SEC87a). The debit
+/// itself still enforces sufficient balance; this is the *policy floor* on top of
+/// it, so a funded account cannot buy a token for less than it costs.
+pub fn issuance_price_ok(price: u64) -> bool {
+    price >= TOKEN_PRICE
+}
+
 /// Issue a fresh routing token, charging `price` credits to `account`.
 ///
 /// The debit and the mint are one operation: [`Ledger::debit`] runs first, so
