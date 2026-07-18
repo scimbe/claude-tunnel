@@ -2066,6 +2066,23 @@ with **no** proof-of-possession, so an intercepted token can bind an attacker's 
 **#88 complete:** all three reviewer gaps addressed (SEC88a/b-api/c-core/c-wire ✅; SEC88b-wire N/A) and the
 secondary clock-skew note accepted as an operational residual → fix-ready.
 
+## #89 Keycloak demo realm: unverified-email + open registration + social trustEmail (security-review, low)
+
+`ct-demo-realm.json` had `verifyEmail=false` + `registrationAllowed=true` +
+`registrationEmailAsUsername=true` and `trustEmail=true` on google/github/gitlab. Impact is bounded — billing
+identity is the Keycloak `sub`, not email (#82/#92 sub mapper), and free issuance is closed (#87 SEC87a) — so
+priority:low. Decomposed:
+
+- **SEC89a** ✅ **Stop blindly trusting unverified social emails**: set `trustEmail=false` on **github** and
+  **gitlab** (both can assert unverified emails); **google** keeps `trustEmail=true` because it reliably
+  asserts `email_verified`. Non-breaking (the social IDPs use empty `${KC_*_CLIENT_ID:}` defaults — not wired
+  on the test plane — and an untrusted email just imports as unverified rather than blocking login). Gate:
+  realm JSON still parses; flags verified google=true, github=false, gitlab=false.
+- **SEC89b** ⏳ **Realm registration/verification policy**: `verifyEmail=true` needs SMTP configured on the KC
+  deployment (turning it on blind breaks registration + reset on the live test plane, `bunsenbrenner.org`),
+  and `registrationAllowed=false` (invite-only) is a signup-model decision (overlaps the operator-invite
+  direction). Maintainer + infra call — not code-blocked here, but not safe to flip unilaterally.
+
 ## #90 Secret-handling: token in install one-liner + routing token in revoke logs (security-review, low)
 
 Two secret-exposure observations. Decomposed:
