@@ -38,7 +38,13 @@ services:
       - cpdata:/data
       - shared:/shared:ro
     ports:
-      - "${CONTROL_PLANE_PORT:-8090}:8090"
+      # #85: bind the control plane's plain-HTTP :8090 to LOOPBACK only. It carries
+      # OIDC bearer tokens + portal session cookies in cleartext, so it must never be
+      # published on a public interface (docs/security/tls-everywhere.md). Public
+      # access goes through the :443 front door (compose.frontdoor.yml), which
+      # terminates TLS and reverse-proxies over the internal docker network; a local
+      # reverse proxy / debugging still reaches 127.0.0.1:8090.
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8090}:8090"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8090/readyz"]
@@ -56,16 +62,18 @@ services:
       CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
       # Expose live gauges (ct_edge_active_tunnels/-agents + relay counters, #10).
       # The control plane scrapes this internally for /status (#17); it is also
-      # published to the host below so operators can scrape it directly (#19).
+      # published to the host loopback below so operators can scrape it locally (#19).
       CT_EDGE_METRICS_LISTEN: "0.0.0.0:9600"
     volumes:
       - shared:/shared
     ports:
       - "${EDGE_PORT:-4433}:4433/udp"
       - "${EDGE_PORT:-4433}:4433/tcp"
-      # Operator-facing metrics scrape endpoint (#19). Override the host port with
-      # EDGE_METRICS_PORT in .env; defaults to 9600.
-      - "${EDGE_METRICS_PORT:-9600}:9600"
+      # Operator-facing metrics scrape endpoint (#19), bound to LOOPBACK (#85) — it's
+      # unauthenticated, so it must not be published on a public interface; scrape it
+      # from 127.0.0.1 (or internally via the docker network at edge:9600). Override
+      # the host port with EDGE_METRICS_PORT in .env; defaults to 9600.
+      - "127.0.0.1:${EDGE_METRICS_PORT:-9600}:9600"
     restart: unless-stopped
     depends_on:
       control-plane:

@@ -903,6 +903,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selfhost_compose_binds_plaintext_ports_to_loopback() {
+        // #85: the base self-host stack must NOT publish the control plane's plain-HTTP
+        // :8090 (OIDC bearer tokens + portal session cookies in cleartext) or the
+        // unauthenticated edge /metrics :9600 on a public interface — bind both host
+        // publishes to loopback. Public access is the :443 front door. The mesh-plane
+        // :4433 data plane stays public (opaque, authenticated).
+        let sh = include_str!("../../../docker/deploy/compose.selfhost.yml");
+        // Only `ports:` list items (`- "host:container"`), not env-var lines.
+        let published = |container_port: &str| -> Vec<String> {
+            sh.lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("- \"") && l.trim_end_matches('"').ends_with(container_port))
+                .map(|l| l.trim_start_matches("- \"").trim_end_matches('"').to_string())
+                .collect()
+        };
+        for line in published(":8090") {
+            assert!(line.starts_with("127.0.0.1:"), "control-plane :8090 must be loopback-bound, got {line:?}");
+        }
+        for line in published(":9600") {
+            assert!(line.starts_with("127.0.0.1:"), "edge metrics :9600 must be loopback-bound, got {line:?}");
+        }
+        // The mesh-plane data plane is intentionally still published to all interfaces.
+        assert!(
+            sh.contains(":4433/tcp") && !sh.contains("127.0.0.1:${EDGE_PORT:-4433}:4433"),
+            "the :4433 tunnel data plane stays publicly reachable"
+        );
+    }
+
     #[tokio::test]
     async fn portal_home_renders_the_sso_cta() {
         let app = portal_router(None, TEST_KEY);

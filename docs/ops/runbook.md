@@ -92,16 +92,21 @@ never commit them. Verify with `./scripts/check-no-secrets.sh`.
 
 ### Distribute the edge CA root cross-host (issue #11)
 On a single host the edge CA root reaches agents/clients via the shared Docker
-volume. **Cross-host**, publish it over HTTP: the control plane serves the current
-root at `GET /pki/ca` (public key material only — the CA signing key never leaves
-the edge; the root is stable across edge redeploys thanks to the persisted CA).
-A remote agent/client then fetches it self-serve instead of an out-of-band copy:
+volume. **Cross-host**, the control plane serves the current root at `GET /pki/ca`
+(public key material only — the CA signing key never leaves the edge; the root is
+stable across edge redeploys thanks to the persisted CA). A remote agent/client
+fetches it self-serve instead of an out-of-band copy.
+
+Reach it over the **`:443` front door** (`compose.frontdoor.yml`), which terminates
+TLS and reverse-proxies the control plane. The base stack's plain-HTTP `:8090` is
+bound to **loopback** (#85), so it is not reachable cross-host — and fetching a
+trust root over plain HTTP would be MITM-able anyway. Use the HTTPS front-door URL:
 
 ```bash
 # agent — fetches the root automatically, no local file needed:
-CT_AGENT_EDGE_CERT_URL=http://<central-host>:8090 ct-agent onboard
+CT_AGENT_EDGE_CERT_URL=https://<zone> ct-agent onboard
 # client (kept HTTP-client-free) — fetch once with curl, then point it at the file:
-curl -s http://<central-host>:8090/pki/ca -o edge-cert.der
+curl -s https://<zone>/pki/ca -o edge-cert.der
 CT_CLIENT_EDGE_CERT=edge-cert.der ct-client
 ```
 
@@ -109,9 +114,10 @@ CT_CLIENT_EDGE_CERT=edge-cert.der ct-client
 
 - **Dashboard**: `GET /` on the control plane — a self-contained operator
   landing page showing health plus live counts (tunnels, agents, accounts,
-  confirmed payments, uptime), auto-refreshing. Open `http://<host>:8090/`.
-  It shows metadata and health only; the payload is end-to-end encrypted and
-  never visible here.
+  confirmed payments, uptime), auto-refreshing. `:8090` is loopback-bound (#85), so
+  open it locally at `http://localhost:8090/`, or publicly via the `:443` front door
+  at `https://<zone>/`. It shows metadata and health only; the payload is
+  end-to-end encrypted and never visible here.
 - **Status (JSON)**: `GET /status` — the machine-readable data behind the
   dashboard: `{ready, tunnels, agents, accounts, payments_confirmed, uptime_seconds}`.
   Scrape or alert on it.
