@@ -1863,7 +1863,14 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
       non-member/401/transport error → `None`, so an unresolvable authorization denies admission). Frozen test
       `resolver_returns_operator_key_only_for_a_member_with_the_admin_token` against a mock CP (member → key; non-
       member, bad token, unreachable CP → None). Gate green. c-iii wraps this as the broker's `authorize` closure.
-    - **c-iii** ⏳ mount `broker_channel_rendezvous` into `run_edge`'s accept path with that closure.
+    - **c-iii-1** ✅ **Broker `authorize` closure made async** (`ct-edge::channel_broker`): the three broker fns
+      (`accept_and_read_join`/`resolve_channel_join`/`broker_channel_rendezvous`) now take
+      `F: Fn(ChannelId, [u8;32]) -> Fut, Fut: Future<Output=Option<[u8;32]>>` and `.await` it — required so the
+      async c-ii resolver can be the `authorize` source (a sync closure couldn't do the HTTP round-trip). All 14
+      broker + 2 agent channel tests updated to `|c,_h| async move { … }` closures; gate green.
+    - **c-iii-2** ⏳ refactor the broker to accept a `quinn::Connection` (not own the `Endpoint`), so channel-joins
+      can be dispatched from `run_edge`'s existing accept loop (new role byte) rather than a separate endpoint.
+    - **c-iii-3** ⏳ mount it in `run_edge`, wiring `ChannelAuthorizer` (CT_CP_URL + admin token) as the closure.
     Then #72 AF4-session (dial peer + Noise_IK using the peer's `member_noise_key` + relay fallback) makes it a
     usable end-to-end tunnel.
 

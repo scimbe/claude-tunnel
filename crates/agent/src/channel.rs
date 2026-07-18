@@ -107,7 +107,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(op_pub))
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(op_pub) })
                 .await
                 .map(|_| ())
         });
@@ -127,7 +127,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let srv2 = tokio::spawn(async move {
-            resolve_channel_join(&server2, 500, move |c, _h| (c.0 == channel).then_some(op_pub))
+            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some(op_pub) })
                 .await
                 .map(|_| ())
         });
@@ -159,7 +159,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
-            broker_channel_rendezvous(&server, 500, move |c, _h| (c.0 == channel).then_some(op_pub))
+            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(op_pub) })
                 .await
                 .map(|_| ())
         });

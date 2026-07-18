@@ -157,13 +157,14 @@ fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
 /// presenter must answer with a 64-byte ed25519 signature over it under `holder`
 /// before the edge acks. (A plain `read_to_end` would force the presenter to finish
 /// its send stream, leaving no room for the possession round-trip.)
-async fn accept_and_read_join<F>(
+async fn accept_and_read_join<F, Fut>(
     endpoint: &Endpoint,
     now: UnixSeconds,
     authorize: &F,
 ) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
 where
-    F: Fn(&ChannelId, &[u8; 32]) -> Option<[u8; 32]>,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<[u8; 32]>>,
 {
     let incoming = endpoint
         .accept()
@@ -201,7 +202,7 @@ where
     }
     // #81 gap 2: the holder must be a current member; `authorize` yields the
     // operator key only then, so a revoked member is refused here.
-    let operator = match authorize(&req.grant.grant.channel, &req.grant.grant.holder) {
+    let operator = match authorize(req.grant.grant.channel, req.grant.grant.holder).await {
         Some(op) => op,
         None => {
             let _ = send.write_all(b"NO").await;
@@ -238,13 +239,14 @@ where
 /// wired to the control-plane channel registry — see [`accept_and_read_join`]),
 /// reply `OK`/`NO`, and return the request on success. This is the edge admission
 /// gate for a *single* participant; [`broker_channel_rendezvous`] pairs two.
-pub async fn resolve_channel_join<F>(
+pub async fn resolve_channel_join<F, Fut>(
     endpoint: &Endpoint,
     now: UnixSeconds,
     authorize: F,
 ) -> Result<ChannelJoinRequest, BoxError>
 where
-    F: Fn(&ChannelId, &[u8; 32]) -> Option<[u8; 32]>,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<[u8; 32]>>,
 {
     let (conn, mut send, req, _op) = accept_and_read_join(endpoint, now, &authorize).await?;
     send.write_all(b"OK").await?;
@@ -259,13 +261,14 @@ where
 /// so the two can connect directly — the edge is only the rendezvous broker and
 /// never sees their payload. An unpairable pair (channel mismatch / incompatible
 /// directions / same holder) gets `NO` on both sides. Returns the decided pairing.
-pub async fn broker_channel_rendezvous<F>(
+pub async fn broker_channel_rendezvous<F, Fut>(
     endpoint: &Endpoint,
     now: UnixSeconds,
     authorize: F,
 ) -> Result<ChannelPairing, BoxError>
 where
-    F: Fn(&ChannelId, &[u8; 32]) -> Option<[u8; 32]>,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<[u8; 32]>>,
 {
     let (conn_a, mut send_a, req_a, operator) =
         accept_and_read_join(endpoint, now, &authorize).await?;
@@ -520,7 +523,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
                 .await
                 .map(|r| r.endpoint)
                 .map_err(|e| e.to_string())
@@ -544,7 +547,11 @@ mod tests {
         let addr = server.local_addr().expect("addr");
         let server_task =
             tokio::spawn(
-                async move { resolve_channel_join(&server, 500, |_c, _h| None).await.map(|_| ()) },
+                async move {
+                    resolve_channel_join(&server, 500, |_c, _h| async move { None::<[u8; 32]> })
+                        .await
+                        .map(|_| ())
+                },
             );
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
@@ -559,7 +566,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let server2_task = tokio::spawn(async move {
-            resolve_channel_join(&server2, 2_000, move |c, _h| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server2, 2_000, move |c, _h| async move { (c.0 == channel).then_some(pk) })
                 .await
                 .map(|_| ())
         });
@@ -580,7 +587,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            broker_channel_rendezvous(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
+            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
                 .await
                 .map(|p| (p.initiator_holder[0], p.acceptor_holder[0]))
                 .map_err(|e| e.to_string())
@@ -638,8 +645,8 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, h| {
-                (c.0 == channel && h == &member).then_some(pk)
+            resolve_channel_join(&server, 500, move |c, h| async move {
+                (c.0 == channel && h == member).then_some(pk)
             })
             .await
             .map(|_| ())
@@ -661,7 +668,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
                 .await
                 .map(|_| ())
         });
@@ -690,7 +697,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -707,7 +714,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let task2 = tokio::spawn(async move {
-            resolve_channel_join(&server2, 500, move |c, _h| (c.0 == channel).then_some(pk))
+            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
                 .await
                 .map(|_| ())
         });
