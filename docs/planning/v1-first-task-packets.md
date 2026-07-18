@@ -2014,5 +2014,12 @@ Out-of-Scope getrackt — #59, ADR-0002/0017, fazit). Drei echte Restlücken, de
   weiterleiten", und explizit eingeräumt, dass payload-blindes Relaying *verbreitete Praxis* ist → der Beitrag
   ist die Vier-Bausteine-Kombination, nicht Nutzlast-Blindheit allein (Verweis §3.5). Bibliografie 20 → 24.
   Thesis baut grün (0 undefined, 64 S.).
-- **T70.3** ⏳ **Abgrenzungstabelle** (`relatedwork.tex` §3.5) um die **Passthrough-/Raw-TCP-Modi** der bereits
-  zitierten Tools (Cloudflare Tunnel/ngrok/Tailscale Funnel) ergänzen — diese wären ebenfalls payload-blind.
+- **T70.3** ✅ **Passthrough-/Raw-TCP-Modi eingeordnet** (`relatedwork.tex` §3.5): neuer Absatz nach der
+  Abgrenzungstabelle — die Tabelle vergleicht die Standard-Betriebsart (Anbieter-TLS-Terminierung);
+  Cloudflare Tunnel/ngrok/Tailscale Funnel bieten zusätzlich Passthrough-/Raw-TCP-Modi, in denen der
+  Vermittler ebenfalls nutzlast-blind ist. Ehrlich eingeräumt + gezeigt, dass die Abgrenzung trotzdem hält:
+  auch im Passthrough adressiert der Anbieter per bekanntem Hostnamen (kein opakes Token, das das Ziel
+  verbirgt), ohne KYC-freies PoW-Rendezvous und ohne kundenverankerte Schlüssel ohne zentrale PKI → der
+  Passthrough schließt nur den Payload-, nicht die übrigen drei der vier Bausteine. Thesis baut grün (65 S.).
+  **#70 fix-ready** (alle drei echten Lücken adressiert: PQC benannt, nächste Vergleichsprojekte zitiert,
+  Passthrough-Modi eingeordnet).

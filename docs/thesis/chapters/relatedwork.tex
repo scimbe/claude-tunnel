@@ -153,6 +153,19 @@ Wer kann kappen & Server-Peer & Anbieter & jedes Relay (Pfad) \\
 \end{tabular}
 \end{table}
 
+Die Tabelle vergleicht die Reverse-Tunnel-Dienste in ihrer Standard-Betriebsart mit
+anbieterseitiger TLS-Terminierung. Cloudflare Tunnel, ngrok und Tailscale Funnel
+bieten darüber hinaus \emph{Passthrough}- bzw.\ Raw-TCP-Modi, in denen der Anbieter
+den Datenstrom weiterreicht, ohne die TLS-Sitzung zu terminieren; in diesen Modi ist
+der Vermittler auf der Leitung ebenfalls nutzlast-blind. Die Abgrenzung dieser Arbeit
+verengt sich damit nicht auf die Nutzlast-Blindheit allein: Auch im Passthrough
+adressiert der Anbieter den Tunnel über einen ihm bekannten Hostnamen -- es gibt kein
+opakes Routing-Token, das zusätzlich das Vermittlungsziel verbirgt --, er kennt und
+kontrolliert die Zuordnung, und er stellt weder ein KYC-freies
+Proof-of-Work-Rendezvous noch kundenverankerte Schlüssel ohne zentrale PKI bereit. Der
+Passthrough-Modus schließt mithin nur den Payload-, nicht die übrigen drei der vier
+unterscheidenden Bausteine.
+
 Die konzeptionell nächsten Vorläufer sind nicht die klassischen Tunnel, sondern
 jüngere Ansätze, die das \emph{Wissen} über eine Verbindung bewusst auf mehrere
 Parteien aufteilen. Oblivious HTTP~\cite{rfc9458} trennt den Anfrageinhalt von
