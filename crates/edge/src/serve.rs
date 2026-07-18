@@ -1107,7 +1107,14 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     now,
                                     move |c, h| {
                                         let a = az.clone();
-                                        async move { a.authorize(&c, &h).await }
+                                        // Resolve both the operator key (grant check)
+                                        // and the member's attested Noise key, which the
+                                        // broker relays to the paired peer (#72/#100).
+                                        async move {
+                                            a.resolve(&c, &h)
+                                                .await
+                                                .map(|m| (m.operator_pubkey, m.noise_pubkey))
+                                        }
                                     },
                                 )
                                 .await

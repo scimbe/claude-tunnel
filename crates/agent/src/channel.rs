@@ -19,7 +19,12 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub enum ChannelJoinOutcome {
     /// Admitted. `peer_endpoint` is the paired peer's advertised address when the
     /// edge ran a two-party rendezvous, or empty for a single-participant admission.
-    Admitted { peer_endpoint: String },
+    /// `peer_noise_pubkey` is the peer's attested Noise key when the edge relayed it
+    /// (#72 AF4 / #100) — so an initiator can pin it with no operator-conveyed value.
+    Admitted {
+        peer_endpoint: String,
+        peer_noise_pubkey: Option<[u8; 32]>,
+    },
     /// Refused: a bad/expired grant, a non-member holder, an unsafe advertised
     /// endpoint, or a failed possession proof.
     Refused,
@@ -55,13 +60,35 @@ pub async fn present_channel_join(
     }
     send.finish()?;
 
-    let ack = recv.read_to_end(128).await.unwrap_or_default();
-    match String::from_utf8_lossy(&ack).strip_prefix("OK") {
-        Some(rest) => Ok(ChannelJoinOutcome::Admitted {
-            peer_endpoint: rest.trim().to_string(),
-        }),
+    let ack = recv.read_to_end(256).await.unwrap_or_default();
+    let ack = String::from_utf8_lossy(&ack);
+    match ack.strip_prefix("OK") {
+        // `OK[ <endpoint>[ <peer_noise_hex>]]` — the broker appends the peer's
+        // attested Noise key when the registry has one.
+        Some(rest) => {
+            let mut parts = rest.split_whitespace();
+            let peer_endpoint = parts.next().unwrap_or_default().to_string();
+            let peer_noise_pubkey = parts.next().and_then(decode_hex_32);
+            Ok(ChannelJoinOutcome::Admitted {
+                peer_endpoint,
+                peer_noise_pubkey,
+            })
+        }
         None => Ok(ChannelJoinOutcome::Refused),
     }
+}
+
+/// Decode 64 lowercase-hex chars into 32 bytes (the peer Noise key the broker
+/// relays), or `None` if malformed.
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -107,7 +134,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(op_pub) })
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None)) })
                 .await
                 .map(|_| ())
         });
@@ -116,7 +143,7 @@ mod tests {
         let outcome = present_channel_join(&conn, &request, &holder).await.expect("join drives");
         assert_eq!(
             outcome,
-            ChannelJoinOutcome::Admitted { peer_endpoint: String::new() },
+            ChannelJoinOutcome::Admitted { peer_endpoint: String::new(), peer_noise_pubkey: None },
             "the genuine holder proves possession and is admitted"
         );
         conn.close(0u32.into(), b"done");
@@ -127,7 +154,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let srv2 = tokio::spawn(async move {
-            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some(op_pub) })
+            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None)) })
                 .await
                 .map(|_| ())
         });
@@ -159,7 +186,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
-            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(op_pub) })
+            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None)) })
                 .await
                 .map(|_| ())
         });
@@ -184,13 +211,83 @@ mod tests {
         let _ = srv.await;
         assert_eq!(
             out_a,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string() },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string(), peer_noise_pubkey: None },
             "agent A learns B's endpoint"
         );
         assert_eq!(
             out_b,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string() },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string(), peer_noise_pubkey: None },
             "agent B learns A's endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn rendezvous_relays_each_peers_attested_noise_key() {
+        // #72 AF4 / #100 (hands-off): when the registry has each member's Noise key,
+        // the broker relays the PEER's key in the ack, so each agent learns the peer's
+        // Noise pubkey to pin — no operator-conveyed value. The authorize closure
+        // returns (operator, this-holder's-noise), keyed on the holder.
+        let op_pub = operator().verifying_key().to_bytes();
+        let channel = [0xC0u8; 32];
+        let holder_a = SigningKey::from_bytes(&[0x31u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x32u8; 32]);
+        let hkey_a = holder_a.verifying_key().to_bytes();
+        let noise_a = [0xAAu8; 32];
+        let noise_b = [0xBBu8; 32];
+        let req_a = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder_a, Direction::Initiate),
+            endpoint: "203.0.113.1:7001".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder_b, Direction::Accept),
+            endpoint: "203.0.113.2:7002".to_string(),
+        };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            broker_channel_rendezvous(&server, 500, move |c, h| async move {
+                // Each member resolves to (operator, its own attested Noise key).
+                let noise = if h == hkey_a { noise_a } else { noise_b };
+                (c.0 == channel).then_some((op_pub, Some(noise)))
+            })
+            .await
+            .map(|_| ())
+        });
+        let cert_b = cert.clone();
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let out = present_channel_join(&conn, &req_a, &holder_a).await.expect("a joins");
+            conn.close(0u32.into(), b"done");
+            out
+        });
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let out = present_channel_join(&conn, &req_b, &holder_b).await.expect("b joins");
+            conn.close(0u32.into(), b"done");
+            out
+        });
+
+        let out_a = a.await.expect("a");
+        let out_b = b.await.expect("b");
+        let _ = srv.await;
+        assert_eq!(
+            out_a,
+            ChannelJoinOutcome::Admitted {
+                peer_endpoint: "203.0.113.2:7002".to_string(),
+                peer_noise_pubkey: Some(noise_b),
+            },
+            "agent A learns B's endpoint AND B's attested Noise key"
+        );
+        assert_eq!(
+            out_b,
+            ChannelJoinOutcome::Admitted {
+                peer_endpoint: "203.0.113.1:7001".to_string(),
+                peer_noise_pubkey: Some(noise_a),
+            },
+            "agent B learns A's endpoint AND A's attested Noise key"
         );
     }
 

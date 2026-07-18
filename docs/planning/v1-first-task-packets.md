@@ -1777,10 +1777,18 @@ Decomposed:
     `installer_router`. So the operator can hand out one URL:
     `curl -fsSL <portal>/channel.sh | CT_CHANNEL_ROLE=… CT_CHANNEL_ADDR=… CT_CHANNEL_NOISE_KEY=… CT_CHANNEL_PEER_NOISE_KEY=… sh`.
     Frozen test `channel_scripts_are_served_and_exec_ct_agent_channel` (content + both routes 200).
-  - **AF4-session-wire** ⏳ last mile: (a) the broker calls `resolve` for each paired member and **relays the
-    peer's `noise_pubkey`** in the `OK` response (swap), with `present_channel_join` returning it in
-    `Admitted`; (b) a `ct-agent channel-join` that drives present→session with the learned key+endpoint;
-    (c) **edge-relay fallback** when the direct dial fails, with a test.
+  - **AF4-session-swap** ✅ **The broker relays the peer's attested Noise key in the rendezvous ack.** The
+    `authorize` closure now returns `(operator, member_noise)`; `broker_channel_rendezvous` appends the peer's
+    Noise key to each `OK <endpoint> <noise_hex>`; `present_channel_join` parses it into
+    `Admitted { peer_endpoint, peer_noise_pubkey }`. The live edge closure sources it via
+    `ChannelAuthorizer::resolve` (the CP-attested `member_noise_key`). So an agent learns **both** the peer
+    endpoint AND the peer Noise key from rendezvous alone — no operator-conveyed key. Combined with the
+    accept-any dialer (no cert), the A2A session can form fully hands-off. Frozen test
+    `rendezvous_relays_each_peers_attested_noise_key` (each agent learns the peer's key). Gate green.
+  - **AF4-session-wire** ⏳ last mile: (a) a `ct-agent channel-join` subcommand that dials the edge broker,
+    presents the grant, and drives present→(dial peer, accept-any)→`run_channel_session` with the
+    rendezvous-learned endpoint+key — the fully hands-off runner; (b) **edge-relay fallback** when the direct
+    dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

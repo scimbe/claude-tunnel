@@ -161,10 +161,10 @@ pub async fn read_join_on_connection<F, Fut>(
     conn: &quinn::Connection,
     now: UnixSeconds,
     authorize: &F,
-) -> Result<(quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
+) -> Result<(quinn::SendStream, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>), BoxError>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Option<[u8; 32]>>,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>)>>,
 {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -197,14 +197,15 @@ where
     }
     // #81 gap 2: the holder must be a current member; `authorize` yields the
     // operator key only then, so a revoked member is refused here.
-    let operator = match authorize(req.grant.grant.channel, req.grant.grant.holder).await {
-        Some(op) => op,
-        None => {
-            let _ = send.write_all(b"NO").await;
-            let _ = send.finish();
-            return Err("unknown channel or holder not a member".into());
-        }
-    };
+    let (operator, member_noise) =
+        match authorize(req.grant.grant.channel, req.grant.grant.holder).await {
+            Some(t) => t,
+            None => {
+                let _ = send.write_all(b"NO").await;
+                let _ = send.finish();
+                return Err("unknown channel or holder not a member".into());
+            }
+        };
     if let Err(e) = verify(&operator, &req.grant, now) {
         let _ = send.write_all(b"NO").await;
         let _ = send.finish();
@@ -226,7 +227,7 @@ where
         let _ = send.finish();
         return Err("holder possession proof failed".into());
     }
-    Ok((send, req, operator))
+    Ok((send, req, operator, member_noise))
 }
 
 /// Accept one QUIC connection from `endpoint` and read its channel-join via
@@ -237,18 +238,21 @@ async fn accept_and_read_join<F, Fut>(
     endpoint: &Endpoint,
     now: UnixSeconds,
     authorize: &F,
-) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
+) -> Result<
+    (quinn::Connection, quinn::SendStream, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>),
+    BoxError,
+>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Option<[u8; 32]>>,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>)>>,
 {
     let incoming = endpoint
         .accept()
         .await
         .ok_or("endpoint closed with no incoming")?;
     let conn = incoming.await?;
-    let (send, req, operator) = read_join_on_connection(&conn, now, authorize).await?;
-    Ok((conn, send, req, operator))
+    let (send, req, operator, noise) = read_join_on_connection(&conn, now, authorize).await?;
+    Ok((conn, send, req, operator, noise))
 }
 
 /// Accept one channel-join over QUIC (AF2d-transport-a): read the presented
@@ -263,13 +267,29 @@ pub async fn resolve_channel_join<F, Fut>(
 ) -> Result<ChannelJoinRequest, BoxError>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Option<[u8; 32]>>,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>)>>,
 {
-    let (conn, mut send, req, _op) = accept_and_read_join(endpoint, now, &authorize).await?;
+    let (conn, mut send, req, _op, _noise) = accept_and_read_join(endpoint, now, &authorize).await?;
     send.write_all(b"OK").await?;
     send.finish()?;
     conn.closed().await; // hold the connection so the peer reads the ack
     Ok(req)
+}
+
+/// The ` <hex>` suffix appended to an `OK <endpoint>` ack carrying the peer's
+/// attested Noise public key (#72 AF4 / #100), or empty when the registry has none.
+/// It lets the paired agent pin the peer's key with no operator-conveyed value.
+fn noise_ack_suffix(noise: Option<[u8; 32]>) -> String {
+    noise
+        .map(|n| {
+            let mut s = String::with_capacity(65);
+            s.push(' ');
+            for b in n {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        })
+        .unwrap_or_default()
 }
 
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
@@ -285,23 +305,25 @@ pub async fn broker_channel_rendezvous<F, Fut>(
 ) -> Result<ChannelPairing, BoxError>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Option<[u8; 32]>>,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>)>>,
 {
-    let (conn_a, mut send_a, req_a, operator) =
+    let (conn_a, mut send_a, req_a, operator, noise_a) =
         accept_and_read_join(endpoint, now, &authorize).await?;
-    let (conn_b, mut send_b, req_b, _op_b) =
+    let (conn_b, mut send_b, req_b, _op_b, noise_b) =
         accept_and_read_join(endpoint, now, &authorize).await?;
 
     // Both holders are authorized members with verified grants; pair using channel
     // A's operator key (authorize_channel_pair rejects a cross-channel pair).
     match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
         Ok(pairing) => {
-            // Each agent learns the OTHER's advertised endpoint to dial directly.
+            // Each agent learns the OTHER's advertised endpoint to dial directly, plus
+            // (when the registry has it) the peer's attested Noise key to pin — so an
+            // A2A session forms with no operator-conveyed key (#72 AF4 / #100).
             send_a
-                .write_all(format!("OK {}", req_b.endpoint).as_bytes())
+                .write_all(format!("OK {}{}", req_b.endpoint, noise_ack_suffix(noise_b)).as_bytes())
                 .await?;
             send_b
-                .write_all(format!("OK {}", req_a.endpoint).as_bytes())
+                .write_all(format!("OK {}{}", req_a.endpoint, noise_ack_suffix(noise_a)).as_bytes())
                 .await?;
             send_a.finish()?;
             send_b.finish()?;
@@ -540,7 +562,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None)) })
                 .await
                 .map(|r| r.endpoint)
                 .map_err(|e| e.to_string())
@@ -572,8 +594,8 @@ mod tests {
         let server_task = tokio::spawn(async move {
             // Accept the connection first (as the live edge loop does), then read the join.
             let conn = server.accept().await.expect("incoming").await.expect("conn");
-            let (mut send, req, _op) = read_join_on_connection(&conn, 500, &move |c, _h| async move {
-                (c.0 == channel).then_some(pk)
+            let (mut send, req, _op, _noise) = read_join_on_connection(&conn, 500, &move |c, _h| async move {
+                (c.0 == channel).then_some((pk, None))
             })
             .await
             .expect("admitted");
@@ -599,7 +621,7 @@ mod tests {
         let server_task =
             tokio::spawn(
                 async move {
-                    resolve_channel_join(&server, 500, |_c, _h| async move { None::<[u8; 32]> })
+                    resolve_channel_join(&server, 500, |_c, _h| async move { None::<([u8; 32], Option<[u8; 32]>)> })
                         .await
                         .map(|_| ())
                 },
@@ -617,7 +639,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let server2_task = tokio::spawn(async move {
-            resolve_channel_join(&server2, 2_000, move |c, _h| async move { (c.0 == channel).then_some(pk) })
+            resolve_channel_join(&server2, 2_000, move |c, _h| async move { (c.0 == channel).then_some((pk, None)) })
                 .await
                 .map(|_| ())
         });
@@ -638,7 +660,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
+            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None)) })
                 .await
                 .map(|p| (p.initiator_holder[0], p.acceptor_holder[0]))
                 .map_err(|e| e.to_string())
@@ -697,7 +719,7 @@ mod tests {
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
             resolve_channel_join(&server, 500, move |c, h| async move {
-                (c.0 == channel && h == member).then_some(pk)
+                (c.0 == channel && h == member).then_some((pk, None))
             })
             .await
             .map(|_| ())
@@ -719,7 +741,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let server_task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None)) })
                 .await
                 .map(|_| ())
         });
@@ -748,7 +770,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let task = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None)) })
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -765,7 +787,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let task2 = tokio::spawn(async move {
-            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some(pk) })
+            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None)) })
                 .await
                 .map(|_| ())
         });
@@ -830,7 +852,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             resolve_channel_join(&server, 500, move |c, h| {
                 let a = az.clone();
-                async move { a.authorize(&c, &h).await }
+                async move { a.resolve(&c, &h).await.map(|m| (m.operator_pubkey, m.noise_pubkey)) }
             })
             .await
             .map(|_| ())
