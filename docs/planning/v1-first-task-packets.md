@@ -2253,8 +2253,23 @@ Two secret-exposure observations. Decomposed:
   context and short hex preserved). Gate green.
 - **SEC90b** ⏳ **Install one-liner embeds tokens in the command string** (`installer.rs::install_one_liner`):
   the join/routing tokens appear in the shown one-liner (`CT_JOIN_TOKEN=<hex> … sh`), so they land in shell
-  history and `ps`. Removing them from the command string needs a bootstrap-token exchange (server-side
-  hand-off), which is tied to the #75 install-flow redesign (install scripts aren't live yet). Track with #75.
+  history and `ps`. Fix (maintainer decision, scimbe 2026-07-18): a **bootstrap-token exchange** — the
+  one-liner carries only a short-lived, single-use opaque token the agent exchanges **server-side over TLS**
+  for the real secrets, so the real secret never touches the command line. Shared with #97. Landing bottom-up:
+  - **SEC90b-core** ✅ **Bootstrap-token store primitive** (`storage::SqliteBootstrap` + `BootstrapError`):
+    durable `mint(secret, ttl_secs, now) -> [u8;32]` / `redeem(token, now) -> String` / `prune(now)`. Redeem
+    hands off the opaque secret **exactly once** within a short TTL: single-use is persisted (survives
+    restart), an expired token is **consumed** so it can't be retried (`Expired`), a second redemption is
+    `AlreadyUsed`, an unknown token is `UnknownToken`. Caller-supplied `now` (deterministic, mirrors
+    `ReplayCache`/rate limiters); the `secret` payload is opaque to the store (shape decided by the wire
+    packet). This is the core that makes a leaked one-liner useless once redeemed/expired. Frozen test
+    `bootstrap_token_redeems_once_within_ttl_then_is_dead`. Gate green (full `cargo test --workspace -D warnings`).
+  - **SEC90b-wire** ⏳ next: CP route to **mint** a bootstrap token (portal/authed) + **redeem** it
+    (`POST /bootstrap/redeem {token}` → the real `{join_token, routing_token}` bundle in the TLS response body),
+    with the bundle JSON as the `secret` payload.
+  - **SEC90b-installer** ⏳ then: rewrite `install_one_liner` (+ the channel one-liner, #97/#100) to carry only
+    `CT_BOOTSTRAP=<short-token>` and have `install.sh`/`.ps1` redeem it server-side; tied to the #75 live
+    install-flow. After that the secret-in-argv exposure is gone and #90/#97 can close.
 
 ## #95 Rendezvous rate-limit + connection cap are opt-in / off by default (security-review)
 

@@ -201,6 +201,138 @@ impl SqliteEnrollment {
     }
 }
 
+/// Why a bootstrap-token redemption failed (#90/#97 SEC90b).
+#[derive(Debug)]
+pub enum BootstrapError {
+    /// No such bootstrap token (never minted, or already pruned).
+    UnknownToken,
+    /// The token was already redeemed (single-use).
+    AlreadyUsed,
+    /// The token's TTL has elapsed (`now` is past `expires_at`).
+    Expired,
+    /// A database error.
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootstrapError::UnknownToken => write!(f, "unknown bootstrap token"),
+            BootstrapError::AlreadyUsed => write!(f, "bootstrap token already used"),
+            BootstrapError::Expired => write!(f, "bootstrap token expired"),
+            BootstrapError::Db(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {}
+
+impl From<rusqlite::Error> for BootstrapError {
+    fn from(e: rusqlite::Error) -> Self {
+        BootstrapError::Db(e)
+    }
+}
+
+/// SQLite-backed **bootstrap-token** store (#90/#97 SEC90b): the durable core of the
+/// bootstrap-token exchange that lets the install/channel one-liners carry only a
+/// **short-lived, single-use** opaque token instead of the real secrets (join /
+/// routing tokens), which today are embedded in the shown command string and so land
+/// in shell history and `ps`.
+///
+/// The flow this primitive underpins (HTTP route + installer rewrite are follow
+/// packets): the CP [`mint`](Self::mint)s a bootstrap token bound to the real secret
+/// bundle with a short TTL; the one-liner carries only that token; the agent redeems
+/// it **server-side over TLS** ([`redeem`](Self::redeem)) to receive the real secret
+/// in the response body. Because redemption is single-use and the TTL is short, a
+/// bootstrap token leaked via shell history / `ps` is useless once redeemed or
+/// expired — closing the secret-in-argv exposure without putting the real secret on
+/// the command line.
+///
+/// Time is caller-supplied (`now`, unix seconds) for deterministic tests, mirroring
+/// [`ct_common::replay::ReplayCache`] and the rate limiters. The `secret` payload is
+/// opaque to the store (the follow packet decides its shape, e.g. a JSON bundle).
+pub struct SqliteBootstrap {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteBootstrap {
+    /// Open (creating if needed) a durable store at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory store (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+                 token      BLOB PRIMARY KEY,
+                 secret     TEXT NOT NULL,
+                 expires_at INTEGER NOT NULL,
+                 redeemed   INTEGER NOT NULL DEFAULT 0
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Mint a fresh single-use bootstrap token that hands off `secret`, valid for
+    /// `ttl_secs` from `now`. Returns the 32-byte token to embed in the one-liner.
+    pub fn mint(&self, secret: &str, ttl_secs: u64, now: u64) -> rusqlite::Result<[u8; 32]> {
+        let mut token = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut token);
+        let expires_at = now.saturating_add(ttl_secs);
+        self.conn.lock_safe().execute(
+            "INSERT INTO bootstrap_tokens (token, secret, expires_at, redeemed) VALUES (?1, ?2, ?3, 0)",
+            params![&token[..], secret, expires_at as i64],
+        )?;
+        Ok(token)
+    }
+
+    /// Redeem a bootstrap token, returning its secret **exactly once**. Fails with
+    /// [`BootstrapError::UnknownToken`] if never minted, [`BootstrapError::Expired`]
+    /// if `now` is past its TTL (an expired token is consumed so it can't be retried),
+    /// or [`BootstrapError::AlreadyUsed`] on a second redemption. The consumption is
+    /// persisted, so single-use survives a restart.
+    pub fn redeem(&self, token: &[u8; 32], now: u64) -> Result<String, BootstrapError> {
+        let conn = self.conn.lock_safe();
+        let row: Option<(String, i64, i64)> = conn
+            .query_row(
+                "SELECT secret, expires_at, redeemed FROM bootstrap_tokens WHERE token = ?1",
+                params![&token[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (secret, expires_at, redeemed) = row.ok_or(BootstrapError::UnknownToken)?;
+        if redeemed != 0 {
+            return Err(BootstrapError::AlreadyUsed);
+        }
+        // Consume the token regardless of freshness, so an expired token can't be
+        // retried and a redeemed one is single-use.
+        conn.execute(
+            "UPDATE bootstrap_tokens SET redeemed = 1 WHERE token = ?1",
+            params![&token[..]],
+        )?;
+        if (now as i64) > expires_at {
+            return Err(BootstrapError::Expired);
+        }
+        Ok(secret)
+    }
+
+    /// Delete already-redeemed or expired rows (housekeeping); returns the count
+    /// removed. Safe to call periodically — live, unredeemed, unexpired tokens stay.
+    pub fn prune(&self, now: u64) -> rusqlite::Result<usize> {
+        self.conn.lock_safe().execute(
+            "DELETE FROM bootstrap_tokens WHERE redeemed != 0 OR expires_at < ?1",
+            params![now as i64],
+        )
+    }
+}
+
 /// SQLite-backed tunnel registry (durable equivalent of
 /// [`crate::registry::TunnelRegistry`]). Can share the same database file as
 /// [`SqliteEnrollment`] — each store owns its tables and its own connection.
@@ -1168,6 +1300,49 @@ mod tests {
 
     fn tenant() -> TenantId {
         TenantId("tenant-1".into())
+    }
+
+    #[test]
+    fn bootstrap_token_redeems_once_within_ttl_then_is_dead() {
+        // #90/#97 SEC90b: a bootstrap token hands off the real secret exactly once,
+        // within a short TTL — so a copy left in shell history / `ps` is useless once
+        // redeemed or expired. Time is caller-supplied for determinism.
+        let store = SqliteBootstrap::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let ttl = 300u64; // 5 minutes
+
+        // Mint → redeem within the TTL returns the exact secret.
+        let tok = store.mint("join=aa;routing=bb", ttl, now).unwrap();
+        assert_eq!(store.redeem(&tok, now + 10).unwrap(), "join=aa;routing=bb");
+
+        // Single-use: a second redemption fails (and does not re-hand-off the secret).
+        assert!(
+            matches!(store.redeem(&tok, now + 11), Err(BootstrapError::AlreadyUsed)),
+            "second redemption must fail single-use"
+        );
+
+        // A never-minted token is unknown.
+        assert!(matches!(
+            store.redeem(&[0x42u8; 32], now),
+            Err(BootstrapError::UnknownToken)
+        ));
+
+        // Expiry: a token redeemed past its TTL fails Expired and is consumed, so it
+        // can't be retried (a later in-window `now` still fails — here AlreadyUsed).
+        let expiring = store.mint("secret", ttl, now).unwrap();
+        assert!(matches!(
+            store.redeem(&expiring, now + ttl + 1),
+            Err(BootstrapError::Expired)
+        ));
+        assert!(matches!(
+            store.redeem(&expiring, now + 1),
+            Err(BootstrapError::AlreadyUsed)
+        ));
+
+        // Prune drops the consumed rows; a fresh live token survives.
+        let live = store.mint("still-good", ttl, now).unwrap();
+        assert!(store.prune(now + 1).unwrap() >= 1, "consumed/expired rows pruned");
+        assert_eq!(store.redeem(&live, now + 2).unwrap(), "still-good", "live token survives prune");
     }
 
     /// A unique temp DB path (no wall-clock / process helpers needed).
