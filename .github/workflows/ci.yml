@@ -1,0 +1,40 @@
+name: ci
+
+# #78 SEC78b — a read-only server-side gate on `main`, independent of the autonomous
+# developer loop. Mirrors the loop's hermetic gate: workspace build + test under
+# `-D warnings`, the committed-secret guard, and a dependency audit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (workspace, -D warnings)
+        run: cargo build --workspace --locked
+
+      - name: Test (workspace, -D warnings)
+        run: cargo test --workspace --locked
+
+      - name: Committed-secret guard
+        run: bash scripts/check-no-secrets.sh
+
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
