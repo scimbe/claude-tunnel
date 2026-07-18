@@ -775,4 +775,77 @@ mod tests {
         assert_ne!(ack2, b"OK", "a stolen grant without holder possession is refused");
         let _ = task2.await;
     }
+
+    #[tokio::test]
+    async fn channel_authorizer_as_the_gate_closure_admits_a_member() {
+        // #81 SEC81c-c c-iii-3a: the live wiring — the c-ii resolver (ChannelAuthorizer)
+        // plugged in as the broker's async authorize closure, sourcing membership from a
+        // (mock) control plane. A member is admitted; a non-member is refused. Proves the
+        // c-ii resolver + c-iii-1 async gate compose before c-iii-3 mounts them in run_edge.
+        use crate::channel_authorize::ChannelAuthorizer;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use serde_json::Value;
+
+        fn hx(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        let op = operator_pubkey();
+        let channel = [0xE7u8; 32];
+        let member = holder_sk(0x0a);
+        let member_hex = hx(&member.verifying_key().to_bytes());
+        let op_hex = hx(&op);
+        let admin_hex = hx(&[0x7au8; 32]);
+
+        // Mock CP c-i endpoint: operator key iff the right admin token + the known member.
+        let app = Router::new().route(
+            "/internal/channel/authorize",
+            post(move |headers: axum::http::HeaderMap, Json(b): Json<Value>| {
+                let (op_hex, member_hex, admin_hex) =
+                    (op_hex.clone(), member_hex.clone(), admin_hex.clone());
+                async move {
+                    if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok())
+                        != Some(admin_hex.as_str())
+                    {
+                        return Err(axum::http::StatusCode::UNAUTHORIZED);
+                    }
+                    if b.get("holder").and_then(|v| v.as_str()) == Some(member_hex.as_str()) {
+                        Ok(Json(serde_json::json!({ "operator_pubkey": op_hex })))
+                    } else {
+                        Err(axum::http::StatusCode::NOT_FOUND)
+                    }
+                }
+            }),
+        );
+        let cp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cp_addr = cp.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(cp, app).await.unwrap() });
+        let authorizer = ChannelAuthorizer::new(&format!("http://{cp_addr}"), &[0x7au8; 32]);
+
+        // Broker on a QUIC endpoint, authorize sourced from the CP via the resolver.
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let az = authorizer.clone();
+        let server_task = tokio::spawn(async move {
+            resolve_channel_join(&server, 500, move |c, h| {
+                let a = az.clone();
+                async move { a.authorize(&c, &h).await }
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        });
+
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &member, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6100".to_string(),
+        };
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode(), &member).await;
+        assert_eq!(ack, b"OK", "a member (per the mock CP) is admitted via ChannelAuthorizer");
+        conn.close(0u32.into(), b"done");
+        server_task.await.expect("join").expect("admitted");
+    }
 }

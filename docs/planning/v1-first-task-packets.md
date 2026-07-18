@@ -1874,9 +1874,14 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
       channel-join `quinn::Connection` (from its accept loop, via a new role byte) straight into the gate rather
       than needing a dedicated endpoint. Frozen test `read_join_on_connection_admits_a_valid_join` (accept the
       connection, then read → admit). Gate green (15 broker tests).
-    - **c-iii-3** ⏳ mount it in `run_edge`: a channel-join role byte → `read_join_on_connection` with
-      `ChannelAuthorizer` (CT_CP_URL + admin token) as the async closure; single-participant `OK` now, two-party
-      pairing (park+match by ChannelId in `EdgeState`) as c-iii-3b. → **broker live**.
+    - **c-iii-3a** ✅ **Full authorize-path composition proven** (`ct-edge::channel_broker` test): the c-ii
+      `ChannelAuthorizer` plugged in as the broker's async `authorize` closure, sourcing membership from a mock
+      control plane, admits a member end-to-end (agent join → gate → resolver → CP → operator key → grant verify
+      → possession → OK). Frozen test `channel_authorizer_as_the_gate_closure_admits_a_member`. Gate green — the
+      live wiring is validated before the run_edge glue.
+    - **c-iii-3b** ⏳ mount it in `run_edge`: bind a dedicated channel-rendezvous QUIC endpoint (from the same
+      CA leaf), spawn a loop running the broker with the `ChannelAuthorizer` closure (CT_CP_URL + admin token),
+      gated by a channel-listen addr. → **broker live**. Then #72 AF4-session.
     Then #72 AF4-session (dial peer + Noise_IK using the peer's `member_noise_key` + relay fallback) makes it a
     usable end-to-end tunnel.
 
