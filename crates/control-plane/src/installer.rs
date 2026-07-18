@@ -192,18 +192,61 @@ pub fn channel_one_liner(p: &ChannelOneLiner, os: InstallOs) -> String {
     }
 }
 
+/// Encode a channel member's `CT_CHANNEL_*` config as the opaque `secret` payload a
+/// bootstrap token carries (#100 / #97 SEC90b) — the A2A analog of
+/// [`install_bundle_secret`]. The member's **Noise private key** is a real secret, so
+/// carrying it inline in the one-liner (as `channel_one_liner` does) exposes it to
+/// shell history / `ps`. Instead the operator mints a bootstrap token over this bundle
+/// and the channel one-liner carries only that; `channel.sh` redeems it server-side.
+/// Flat, shell-tractable `K=V;K=V` (values are hex / `host:port` / `accept|initiate` —
+/// no quotes/`;`/`=` collisions), so the script lifts each field with one `sed`.
+pub fn channel_bundle_secret(p: &ChannelOneLiner) -> String {
+    let role = match p.side {
+        ChannelSide::Responder => "accept",
+        ChannelSide::Initiator => "initiate",
+    };
+    let mut s = format!(
+        "CT_CHANNEL_ROLE={role};CT_CHANNEL_ADDR={addr};CT_CHANNEL_NOISE_KEY={own};CT_CHANNEL_PEER_NOISE_KEY={peer}",
+        addr = p.addr,
+        own = p.own_noise_private_hex,
+        peer = p.peer_noise_public_hex,
+    );
+    if let Some(cert) = p.peer_cert_hex {
+        s.push_str(&format!(";CT_CHANNEL_PEER_CERT={cert}"));
+    }
+    s
+}
+
+/// Render the channel one-liner in its **bootstrap-token** form (#100 / #97 SEC90b):
+/// the command carries only a short-lived, single-use `bootstrap_token` — never the
+/// member's Noise private key — so nothing secret lands in shell history / `ps`.
+/// `channel.sh` redeems `CT_BOOTSTRAP` server-side (`POST {portal}/bootstrap/redeem`)
+/// for the [`channel_bundle_secret`] config. The secret-hygiene upgrade over
+/// [`channel_one_liner`], whose inline-secret form remains for the manual path.
+pub fn channel_one_liner_bootstrap(portal_base: &str, bootstrap_token: &str, os: InstallOs) -> String {
+    let base = portal_base.trim_end_matches('/');
+    match os {
+        InstallOs::Unix => {
+            format!("curl -fsSL {base}/channel.sh | CT_BOOTSTRAP={bootstrap_token} sh")
+        }
+        InstallOs::Windows => {
+            format!("$env:CT_BOOTSTRAP='{bootstrap_token}'; irm {base}/channel.ps1 | iex")
+        }
+    }
+}
+
 /// Render the POSIX `/channel.sh` script the A2A one-liner pipes into `sh` (#100).
 /// It detects OS+arch, downloads the matching prebuilt `ct-agent` from `release_base`,
 /// and execs `ct-agent channel` — which reads the `CT_CHANNEL_*` config (role, addr,
 /// Noise keys) from the environment the one-liner set, so no key is ever a script
 /// argument. Mirrors [`render_install_sh`]; the served route is in [`installer_router`].
-pub fn render_channel_sh(release_base: &str) -> String {
+pub fn render_channel_sh(portal_base: &str, release_base: &str) -> String {
     let base = release_base.trim_end_matches('/');
+    let portal = portal_base.trim_end_matches('/');
     format!(
         r#"#!/bin/sh
 # claude-tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
-#   curl -fsSL <portal>/channel.sh | CT_CHANNEL_ROLE=... CT_CHANNEL_ADDR=... \
-#     CT_CHANNEL_NOISE_KEY=... CT_CHANNEL_PEER_NOISE_KEY=... sh
+#   curl -fsSL <portal>/channel.sh | CT_BOOTSTRAP=... sh
 # Brings this machine up as a channel member and pipes stdin/stdout over the
 # encrypted agent-to-agent tunnel.
 set -eu
@@ -220,10 +263,25 @@ case "$os" in
   *) echo "ct-agent channel: unsupported OS '$os'" >&2; exit 1 ;;
 esac
 
-: "${{CT_CHANNEL_ROLE:?set CT_CHANNEL_ROLE (accept|initiate)}}"
-: "${{CT_CHANNEL_ADDR:?set CT_CHANNEL_ADDR (bind host:port for accept, peer host:port for initiate)}}"
-: "${{CT_CHANNEL_NOISE_KEY:?set CT_CHANNEL_NOISE_KEY (this member's Noise private key, hex)}}"
-: "${{CT_CHANNEL_PEER_NOISE_KEY:?set CT_CHANNEL_PEER_NOISE_KEY (the peer's Noise public key, hex)}}"
+# #100 / #97 SEC90b: if a short-lived bootstrap token is set, redeem it server-side
+# over TLS for the channel config (keeps the Noise private key off the command line /
+# shell history / ps); otherwise fall back to CT_CHANNEL_* set directly (manual path).
+if [ -n "${{CT_BOOTSTRAP:-}}" ]; then
+  resp=$(curl -fsSL -X POST -H 'content-type: application/json' \
+    --data "{{\"token\":\"$CT_BOOTSTRAP\"}}" "{portal}/bootstrap/redeem")
+  bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')
+  CT_CHANNEL_ROLE=$(printf '%s' "$bundle" | sed -n 's/.*CT_CHANNEL_ROLE=\([^;"]*\).*/\1/p')
+  CT_CHANNEL_ADDR=$(printf '%s' "$bundle" | sed -n 's/.*CT_CHANNEL_ADDR=\([^;"]*\).*/\1/p')
+  CT_CHANNEL_NOISE_KEY=$(printf '%s' "$bundle" | sed -n 's/.*CT_CHANNEL_NOISE_KEY=\([^;"]*\).*/\1/p')
+  CT_CHANNEL_PEER_NOISE_KEY=$(printf '%s' "$bundle" | sed -n 's/.*CT_CHANNEL_PEER_NOISE_KEY=\([^;"]*\).*/\1/p')
+  export CT_CHANNEL_ROLE CT_CHANNEL_ADDR CT_CHANNEL_NOISE_KEY CT_CHANNEL_PEER_NOISE_KEY
+  cert=$(printf '%s' "$bundle" | sed -n 's/.*CT_CHANNEL_PEER_CERT=\([^;"]*\).*/\1/p')
+  [ -n "$cert" ] && export CT_CHANNEL_PEER_CERT="$cert"
+fi
+: "${{CT_CHANNEL_ROLE:?set CT_BOOTSTRAP (or CT_CHANNEL_ROLE: accept|initiate)}}"
+: "${{CT_CHANNEL_ADDR:?set CT_BOOTSTRAP (or CT_CHANNEL_ADDR: bind host:port for accept, peer host:port for initiate)}}"
+: "${{CT_CHANNEL_NOISE_KEY:?set CT_BOOTSTRAP (or CT_CHANNEL_NOISE_KEY: this member's Noise private key, hex)}}"
+: "${{CT_CHANNEL_PEER_NOISE_KEY:?set CT_BOOTSTRAP (or CT_CHANNEL_PEER_NOISE_KEY: the peer's Noise public key, hex)}}"
 
 asset="ct-agent-${{os}}-${{arch}}"
 url="{base}/${{asset}}"
@@ -236,6 +294,7 @@ chmod +x "$tmp/ct-agent"
 exec "$tmp/ct-agent" channel
 "#,
         base = base,
+        portal = portal,
     )
 }
 
@@ -243,18 +302,32 @@ exec "$tmp/ct-agent" channel
 /// [`render_channel_sh`]). Detects the arch, downloads `ct-agent-windows-<arch>.exe`
 /// from `release_base`, and runs `ct-agent channel` reading `CT_CHANNEL_*` from the
 /// environment. Placeholder + replace so PowerShell's `{}` need no brace-escaping.
-pub fn render_channel_ps1(release_base: &str) -> String {
-    CHANNEL_PS1_TEMPLATE.replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
+pub fn render_channel_ps1(portal_base: &str, release_base: &str) -> String {
+    CHANNEL_PS1_TEMPLATE
+        .replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
+        .replace("__PORTAL_BASE__", portal_base.trim_end_matches('/'))
 }
 
 const CHANNEL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
 # claude-tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
-#   $env:CT_CHANNEL_ROLE='...'; ...; irm <portal>/channel.ps1 | iex
+#   $env:CT_BOOTSTRAP='...'; irm <portal>/channel.ps1 | iex
 $ErrorActionPreference = 'Stop'
-if (-not $env:CT_CHANNEL_ROLE)            { Write-Error 'ct-agent channel: set CT_CHANNEL_ROLE (accept|initiate)'; exit 1 }
-if (-not $env:CT_CHANNEL_ADDR)            { Write-Error 'ct-agent channel: set CT_CHANNEL_ADDR'; exit 1 }
-if (-not $env:CT_CHANNEL_NOISE_KEY)       { Write-Error 'ct-agent channel: set CT_CHANNEL_NOISE_KEY'; exit 1 }
-if (-not $env:CT_CHANNEL_PEER_NOISE_KEY)  { Write-Error 'ct-agent channel: set CT_CHANNEL_PEER_NOISE_KEY'; exit 1 }
+# #100 / #97 SEC90b: redeem a short-lived bootstrap token server-side over TLS for the
+# channel config (keeps the Noise private key off the command line); else fall back to
+# CT_CHANNEL_* set directly (manual path).
+if ($env:CT_BOOTSTRAP) {
+  $resp = Invoke-RestMethod -Method Post -Uri '__PORTAL_BASE__/bootstrap/redeem' -ContentType 'application/json' -Body (ConvertTo-Json @{ token = $env:CT_BOOTSTRAP })
+  $bundle = $resp.secret
+  if ($bundle -match 'CT_CHANNEL_ROLE=([^;]*)')           { $env:CT_CHANNEL_ROLE = $Matches[1] }
+  if ($bundle -match 'CT_CHANNEL_ADDR=([^;]*)')           { $env:CT_CHANNEL_ADDR = $Matches[1] }
+  if ($bundle -match 'CT_CHANNEL_NOISE_KEY=([^;]*)')      { $env:CT_CHANNEL_NOISE_KEY = $Matches[1] }
+  if ($bundle -match 'CT_CHANNEL_PEER_NOISE_KEY=([^;]*)') { $env:CT_CHANNEL_PEER_NOISE_KEY = $Matches[1] }
+  if ($bundle -match 'CT_CHANNEL_PEER_CERT=([^;]*)')      { $env:CT_CHANNEL_PEER_CERT = $Matches[1] }
+}
+if (-not $env:CT_CHANNEL_ROLE)            { Write-Error 'ct-agent channel: set CT_BOOTSTRAP (or CT_CHANNEL_ROLE: accept|initiate)'; exit 1 }
+if (-not $env:CT_CHANNEL_ADDR)            { Write-Error 'ct-agent channel: set CT_BOOTSTRAP (or CT_CHANNEL_ADDR)'; exit 1 }
+if (-not $env:CT_CHANNEL_NOISE_KEY)       { Write-Error 'ct-agent channel: set CT_BOOTSTRAP (or CT_CHANNEL_NOISE_KEY)'; exit 1 }
+if (-not $env:CT_CHANNEL_PEER_NOISE_KEY)  { Write-Error 'ct-agent channel: set CT_BOOTSTRAP (or CT_CHANNEL_PEER_NOISE_KEY)'; exit 1 }
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
   'AMD64' { 'x86_64' }
   'ARM64' { 'aarch64' }
@@ -429,7 +502,7 @@ async fn serve_install_ps1(State(st): State<InstallerState>) -> Response {
 async fn serve_channel_sh(State(st): State<InstallerState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        render_channel_sh(&st.release_base),
+        render_channel_sh(&st.portal_base, &st.release_base),
     )
         .into_response()
 }
@@ -437,7 +510,7 @@ async fn serve_channel_sh(State(st): State<InstallerState>) -> Response {
 async fn serve_channel_ps1(State(st): State<InstallerState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        render_channel_ps1(&st.release_base),
+        render_channel_ps1(&st.portal_base, &st.release_base),
     )
         .into_response()
 }
@@ -515,21 +588,26 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
+        let portal = "https://portal.example";
         let base = "https://github.com/scimbe/claude-tunnel/releases/latest/download";
 
         // Content: POSIX script requires the channel env, execs the subcommand.
-        let sh = render_channel_sh(base);
+        let sh = render_channel_sh(portal, base);
         assert!(sh.starts_with("#!/bin/sh") && sh.contains("set -eu"), "POSIX + fail-fast");
         assert!(sh.contains("CT_CHANNEL_ROLE:?") && sh.contains("CT_CHANNEL_NOISE_KEY:?"), "requires channel env");
         assert!(sh.contains(r#"exec "$tmp/ct-agent" channel"#), "execs ct-agent channel");
         assert!(sh.contains(&format!("{base}/${{asset}}")), "downloads from the release base");
         assert!(!sh.contains("channel $CT_CHANNEL_NOISE_KEY"), "keys stay in the env, not argv");
-        let ps = render_channel_ps1(base);
+        // #100/#97 SEC90b: the channel script also redeems CT_BOOTSTRAP against the portal.
+        assert!(sh.contains(r#"if [ -n "${CT_BOOTSTRAP:-}" ]; then"#), "has the bootstrap-redeem branch");
+        assert!(sh.contains("https://portal.example/bootstrap/redeem"), "redeems against the portal");
+        let ps = render_channel_ps1(portal, base);
         assert!(ps.contains("#Requires -Version 5") && ps.contains("& $exe channel"), "ps runs channel");
         assert!(ps.contains("$env:CT_CHANNEL_ROLE"), "ps requires the channel env");
+        assert!(ps.contains("if ($env:CT_BOOTSTRAP)"), "ps has the bootstrap-redeem branch");
 
         // Route: GET /channel.sh -> 200 serving exactly the rendered script.
-        let app = installer_router("https://portal.example".to_string(), base.to_string());
+        let app = installer_router(portal.to_string(), base.to_string());
         let resp = app
             .clone()
             .oneshot(Request::get("/channel.sh").body(Body::empty()).unwrap())
@@ -537,7 +615,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "/channel.sh is served");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), render_channel_sh(base), "serves the rendered script");
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), render_channel_sh(portal, base), "serves the rendered script");
         let resp2 = app
             .oneshot(Request::get("/channel.ps1").body(Body::empty()).unwrap())
             .await
@@ -587,6 +665,47 @@ mod tests {
         let ps = channel_one_liner(&initiator, InstallOs::Windows);
         assert!(ps.contains("$env:CT_CHANNEL_ROLE='initiate';"), "ps role");
         assert!(ps.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
+    }
+
+    #[test]
+    fn channel_bootstrap_one_liner_carries_no_noise_private_key() {
+        // #100/#97 SEC90b: the bootstrap form of the channel one-liner carries only
+        // CT_BOOTSTRAP — never the member's Noise private key (which the inline form
+        // exposes in shell history / ps). The config is recovered from the bundle the
+        // channel script redeems.
+        let p = ChannelOneLiner {
+            side: ChannelSide::Initiator,
+            addr: "peer.example:4500",
+            own_noise_private_hex: "aa11deadbeefsecretprivatekey00",
+            peer_noise_public_hex: "bb22peerpublickey00",
+            peer_cert_hex: None,
+        };
+        let bundle = channel_bundle_secret(&p);
+        assert_eq!(
+            bundle,
+            "CT_CHANNEL_ROLE=initiate;CT_CHANNEL_ADDR=peer.example:4500;\
+             CT_CHANNEL_NOISE_KEY=aa11deadbeefsecretprivatekey00;CT_CHANNEL_PEER_NOISE_KEY=bb22peerpublickey00"
+        );
+        // The optional cert is appended when pinned.
+        let pinned = channel_bundle_secret(&ChannelOneLiner { peer_cert_hex: Some("deadbeef"), ..p });
+        assert!(pinned.ends_with(";CT_CHANNEL_PEER_CERT=deadbeef"), "cert appended when pinned");
+
+        let boot = "dummy-bootstrap-token-cccc";
+        let unix = channel_one_liner_bootstrap("https://portal.example/", boot, InstallOs::Unix);
+        assert_eq!(
+            unix,
+            "curl -fsSL https://portal.example/channel.sh | CT_BOOTSTRAP=dummy-bootstrap-token-cccc sh"
+        );
+        let win = channel_one_liner_bootstrap("https://portal.example/", boot, InstallOs::Windows);
+        assert_eq!(
+            win,
+            "$env:CT_BOOTSTRAP='dummy-bootstrap-token-cccc'; irm https://portal.example/channel.ps1 | iex"
+        );
+        // The critical property: the Noise private key never appears in the one-liner.
+        for cmd in [&unix, &win] {
+            assert!(!cmd.contains("aa11deadbeefsecretprivatekey00"), "noise private key must not appear");
+            assert_eq!(cmd.matches(boot).count(), 1, "bootstrap token carried exactly once");
+        }
     }
 
     #[test]

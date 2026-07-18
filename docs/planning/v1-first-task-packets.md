@@ -1777,6 +1777,19 @@ Decomposed:
     `installer_router`. So the operator can hand out one URL:
     `curl -fsSL <portal>/channel.sh | CT_CHANNEL_ROLE=… CT_CHANNEL_ADDR=… CT_CHANNEL_NOISE_KEY=… CT_CHANNEL_PEER_NOISE_KEY=… sh`.
     Frozen test `channel_scripts_are_served_and_exec_ct_agent_channel` (content + both routes 200).
+  - **#100 channel-bootstrap** ✅ **Channel one-liner carries only `CT_BOOTSTRAP` — the member's Noise private
+    key is no longer in argv.** Applies the bootstrap-token exchange (#90/#97 SEC90b) to the A2A one-liner,
+    closing the "inline-secret residual (#97)" the one-liner-gen slice flagged. New
+    `channel_bundle_secret(&ChannelOneLiner)` (flat shell-tractable `CT_CHANNEL_ROLE=…;CT_CHANNEL_ADDR=…;
+    CT_CHANNEL_NOISE_KEY=…;CT_CHANNEL_PEER_NOISE_KEY=…[;CT_CHANNEL_PEER_CERT=…]`) is the bundle an operator mints
+    a bootstrap token over; `channel_one_liner_bootstrap(portal, token, os)` renders
+    `curl … /channel.sh | CT_BOOTSTRAP=<token> sh` (+ PowerShell). `render_channel_sh`/`render_channel_ps1`
+    gained a `portal_base` param and a redeem branch (with `CT_BOOTSTRAP` set they `POST /bootstrap/redeem`,
+    lift each `CT_CHANNEL_*` field with one `sed`/regex, and export them; else fall back to the env directly).
+    `installer_router` already carries `portal_base` (SEC90b-installer-wire), so the channel routes serve the
+    redeem-capable scripts. Frozen test `channel_bootstrap_one_liner_carries_no_noise_private_key` (bundle
+    round-trips incl. the optional cert; the Noise private key never appears in either OS one-liner). Gate
+    green. The manual inline form (`channel_one_liner`) stays for the direct/back-compat path.
   - **AF4-session-swap** ✅ **The broker relays the peer's attested Noise key in the rendezvous ack.** The
     `authorize` closure now returns `(operator, member_noise)`; `broker_channel_rendezvous` appends the peer's
     Noise key to each `OK <endpoint> <noise_hex>`; `present_channel_join` parses it into
