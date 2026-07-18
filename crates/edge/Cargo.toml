@@ -17,9 +17,13 @@ rcgen = "0.13"
 rustls-pki-types = { version = "1", features = ["std", "alloc"] }
 rand = "0.8"
 axum = "0.7"
+# #81 SEC81c-c c-ii: the edge queries the control plane's channel-authorize endpoint.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 ct-control-plane = { path = "../control-plane" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 ed25519-dalek = "2"
+serde_json = "1"

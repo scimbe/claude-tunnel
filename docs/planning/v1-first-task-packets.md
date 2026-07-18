@@ -1858,7 +1858,11 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
       `404` non-member. This is the exact `authorize(channel, holder) -> Option<operator_pubkey>` the live broker
       needs, sourced from `authorize_holder` (membership+revocation folded in). Mounted only when the admin token is
       set. Frozen test `internal_channel_authorize_requires_admin_token_and_membership`. Gate green.
-    - **c-ii** ⏳ an edge-side resolver that queries c-i (HTTP client) to form the `authorize` closure.
+    - **c-ii** ✅ **Edge-side authorize resolver** (`ct-edge::channel_authorize::ChannelAuthorizer`): queries c-i
+      (`reqwest` POST + the shared admin token) and maps the response to `Option<[u8;32]>` — **fail-closed** (any
+      non-member/401/transport error → `None`, so an unresolvable authorization denies admission). Frozen test
+      `resolver_returns_operator_key_only_for_a_member_with_the_admin_token` against a mock CP (member → key; non-
+      member, bad token, unreachable CP → None). Gate green. c-iii wraps this as the broker's `authorize` closure.
     - **c-iii** ⏳ mount `broker_channel_rendezvous` into `run_edge`'s accept path with that closure.
     Then #72 AF4-session (dial peer + Noise_IK using the peer's `member_noise_key` + relay fallback) makes it a
     usable end-to-end tunnel.
