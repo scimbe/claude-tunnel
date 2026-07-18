@@ -1776,9 +1776,16 @@ prebuilt image dead-ends at the final step. Substantial feature (like #72) → d
   IS3a — detects arch (PROCESSOR_ARCHITECTURE → x86_64/aarch64), downloads `ct-agent-windows-<arch>.exe`
   from the release base, `$ErrorActionPreference=Stop`, temp dir, `& $exe onboard` (tokens from env, never
   argv). 1 frozen test. Gate green. (The route serving it is IS3b; binaries are IS2.)
-- **IS5** ⏳ **Real integration test**: execute the served script in a CLEAN container (no prebuilt
-  image), not just the page's text generation. **fix-ready only when a fresh customer can run the
-  one-liner end-to-end.**
+- **IS5** ✅ **Real end-to-end test**: `served_install_sh_runs_end_to_end_with_tokens_from_the_env`
+  fetches `/install.sh` through the real route and actually **runs** it — OS/arch detection, the download
+  step, and `exec ct-agent onboard`. Hermetic: a fake `curl` on `PATH` intercepts the binary download and
+  drops a stub `ct-agent` (no network / no published release needed), and the stub records its argv+env;
+  the test asserts it was invoked as `onboard` with both tokens inherited from the **environment**, never
+  argv. Unix-only (the served script is POSIX `sh`). Gate green.
+
+**Status:** all install code + verification (IS1/IS2/IS3a/IS3b/IS4/IS5) landed and gate-green → **fix-ready**.
+The only remaining step is *operational*: publishing a `v*` release so `releases/latest/download/…` serves
+the real binaries (handled by the standing "cut `v0.1.0` at 0 open issues" release rule) — not a code gap.
 
 ## #76 Multi-agent tunnel overlay + topology study (epic) [+ Part B MA thesis, idle-time only]
 

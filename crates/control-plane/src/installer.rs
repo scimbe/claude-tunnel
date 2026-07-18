@@ -241,6 +241,76 @@ mod tests {
         assert_eq!(InstallOs::parse("plan9"), None);
     }
 
+    /// #75 IS5 — end-to-end: fetch `/install.sh` from the real route, then actually
+    /// *run* it and prove the whole path works — OS/arch detection, the download
+    /// step, and `exec ct-agent onboard` with the tokens inherited from the
+    /// environment (never argv). Hermetic: a fake `curl` on `PATH` intercepts the
+    /// binary download and drops a stub `ct-agent` (so no network / no published
+    /// release is needed), and the stub records how it was invoked. Unix-only —
+    /// the served script is POSIX `sh`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn served_install_sh_runs_end_to_end_with_tokens_from_the_env() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tower::ServiceExt;
+
+        // The served script — fetched through the real route, not rendered inline.
+        let app = installer_router("http://release.invalid/base".to_string());
+        let resp = app
+            .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let script = String::from_utf8(body.to_vec()).unwrap();
+
+        // A private working dir (pid-scoped so parallel test runs don't collide).
+        let dir = std::env::temp_dir().join(format!("ct-is5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let write_exec = |path: &std::path::Path, body: &str| {
+            fs::write(path, body).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // Stub ct-agent: records "<argv1>|<join>|<agent>" so we can assert the
+        // subcommand and that the secrets arrived via the environment.
+        let stub = dir.join("ct-agent-stub");
+        write_exec(&stub, "#!/bin/sh\necho \"$1|$CT_JOIN_TOKEN|$CT_AGENT_TOKEN\" > \"$CT_IS5_OUT\"\n");
+        // Fake curl: ignore everything except `-o <target>`, into which it copies the
+        // stub — standing in for downloading the release binary.
+        write_exec(
+            &dir.join("bin/curl"),
+            "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift 2;; *) shift;; esac; done\ncp \"$CT_IS5_STUB\" \"$out\"\n",
+        );
+        let script_path = dir.join("install.sh");
+        fs::write(&script_path, &script).unwrap();
+        let out = dir.join("out.txt");
+
+        let status = Command::new("sh")
+            .arg(&script_path)
+            .env("PATH", format!("{}/bin:{}", dir.display(), std::env::var("PATH").unwrap_or_default()))
+            .env("CT_JOIN_TOKEN", "join-XYZ")
+            .env("CT_AGENT_TOKEN", "agent-XYZ")
+            .env("CT_IS5_STUB", &stub)
+            .env("CT_IS5_OUT", &out)
+            .status()
+            .expect("run served install.sh");
+        assert!(status.success(), "the served installer runs to completion");
+
+        let recorded = fs::read_to_string(&out).expect("stub ct-agent ran");
+        assert_eq!(
+            recorded.trim(),
+            "onboard|join-XYZ|agent-XYZ",
+            "ct-agent is exec'd with `onboard` and both tokens inherited from the env (not argv)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn installer_routes_serve_the_scripts_that_were_404ing() {
         // #75 IS3b (the reported bug): the portal one-liners curl/irm these two
