@@ -18,16 +18,25 @@ advisory matches, so it can gate CI.
 
 | Field | Value |
 |-------|-------|
-| Date | 2026-07-12 |
+| Date | 2026-07-18 |
 | Tool | cargo-audit 0.22.2 |
-| Advisories loaded | 1160 |
-| Dependencies scanned | 206 |
-| **Vulnerabilities** | **0** |
-| **Warnings** (unmaintained / yanked) | **0** |
-| Exit code | 0 (clean) |
+| Dependencies scanned | ~219 |
+| **Vulnerabilities** | **0** (1 documented-accepted advisory ignored — see below) |
+| **Warnings** (unmaintained / yanked) | **1** (`rustls-pemfile` unmaintained — see below) |
+| Exit code | 0 (clean, with the `.cargo/audit.toml` ignore) |
 
-No known-vulnerable, yanked, or unmaintained crates are present in the
-dependency tree.
+**Accepted advisory (#80):** `RUSTSEC-2023-0071` — `rsa` "Marvin Attack" timing
+side-channel (no fixed upgrade available) — is ignored in `.cargo/audit.toml` with a
+documented rationale: `rsa` is a **dev-dependency only** (runtime RSA key generation
++ RS256 signing in the OIDC/portal JWKS tests), is not in any shipped service binary,
+and the timing side-channel is not reachable via test key generation. Revisit if a
+fix lands or if `rsa` ever enters a runtime path.
+
+**Open warning (#80 SEC80b):** `RUSTSEC-2025-0134` — `rustls-pemfile 2.2.0`
+unmaintained. This one **is** a runtime dependency of `ct-edge` (PEM cert parsing for
+the `:443` front door), so it is a real supply-chain-hygiene follow-up: replace it
+(e.g. with `rustls-pki-types` PEM parsing). Tracked as a non-failing `unmaintained`
+warning meanwhile.
 
 ## Pinning policy
 

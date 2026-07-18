@@ -1,0 +1,9 @@
+# cargo-audit configuration (#80). Read by `cargo audit` (scripts/security-audit.sh).
+[advisories]
+# RUSTSEC-2023-0071 — rsa "Marvin Attack" timing side-channel (no fixed upgrade
+# available). The `rsa` crate is a **dev-dependency only** (ct-control-plane tests:
+# runtime RSA key generation + RS256 signing for the OIDC/portal JWKS tests). It is
+# NOT linked into any shipped service binary, and the decryption timing side-channel
+# is not reachable via test key generation. Accepted as a documented, non-production
+# risk. Revisit if `rsa` ships a fix, or if it ever enters a runtime dependency path.
+ignore = ["RUSTSEC-2023-0071"]

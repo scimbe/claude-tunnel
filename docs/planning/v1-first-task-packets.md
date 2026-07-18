@@ -1832,3 +1832,18 @@ GLM-5.2 review: 3 OIDC weaknesses. Decomposed:
   (`oidc.rs OidcVerifier`) still has `validate_aud=false` because Keycloak access-token audiences vary by
   client — enabling it needs the realm's actual access-token `aud` shape confirmed against live Keycloak
   (central), so it's deliberately not flipped blind. Needs a field-checked audience value.
+
+## #80 cargo-audit exit 1 vs doc "0 vulnerabilities" (security-review)
+
+`cargo audit` exits 1 on RUSTSEC-2023-0071 (rsa Marvin, dev-only) + warns on rustls-pemfile unmaintained
+(runtime edge); the doc claimed exit 0. Decomposed:
+
+- **SEC80a** ✅ **Restore the green audit gate + align the doc**: `rsa` is a DEV-dependency only (test RSA
+  key-gen / RS256 signing), not in any shipped binary and the timing side-channel is not reachable via
+  key generation with no fix available → accepted+ignored in `.cargo/audit.toml` (RUSTSEC-2023-0071) with a
+  documented rationale. `docs/security/dependency-audit.md` updated to the real state (0 vulns with the
+  documented ignore, 1 unmaintained warning, exit 0). Verified live: `scripts/security-audit.sh` now exits
+  0 (only the non-failing rustls-pemfile warning remains).
+- **SEC80b** ⏳ **Replace the runtime unmaintained `rustls-pemfile`** (RUSTSEC-2025-0134): it's a real
+  runtime dep of `ct-edge` (PEM cert parsing for the front door). Replace with `rustls-pki-types` PEM
+  parsing (or equivalent) so no unmaintained crate ships. Then the warning clears too.
