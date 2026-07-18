@@ -1194,7 +1194,7 @@ pub fn persistent_control_plane_router(
         .merge(billing_writers_gated(ledger.clone(), admin_token))
         // #90/#97 SEC90b-wire: bootstrap-token exchange — /bootstrap/mint (admin-gated)
         // + /bootstrap/redeem (public, single-use short-TTL token handed off over TLS).
-        .merge(bootstrap_router(bootstrap, admin_token))
+        .merge(bootstrap_router(bootstrap.clone(), admin_token))
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
@@ -1207,6 +1207,7 @@ pub fn persistent_control_plane_router(
             ledger.clone(),
             tunnels.clone(),
             enrollment.clone(),
+            bootstrap.clone(),
             &std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
             // #27 RB4b: propagate tunnel revokes to the edge when both the admin
             // URL and shared secret are configured.

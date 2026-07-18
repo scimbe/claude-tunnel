@@ -14,10 +14,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::accounts::AccountId;
-use crate::installer::{install_one_liner, InstallOs};
+use crate::installer::{install_bundle_secret, install_one_liner_bootstrap, InstallOs};
 use crate::portal::{escape, session_subject_for};
-use crate::storage::{GrantError, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
+use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
@@ -43,6 +45,9 @@ struct ApiState {
     ledger: Arc<SqliteLedger>,
     tunnels: Arc<SqliteTunnelStore>,
     enrollment: Arc<SqliteEnrollment>,
+    /// Bootstrap-token store (#90/#97 SEC90b): the install page mints a short-lived
+    /// token over the `{join, routing}` bundle so the shown one-liner carries no secret.
+    bootstrap: Arc<SqliteBootstrap>,
     /// Public portal origin (e.g. `https://portal.example`) baked into installers.
     portal_base: Arc<str>,
     /// Edge admin revoke endpoint (#27 RB4b); `None` disables edge propagation.
@@ -58,6 +63,7 @@ pub fn portal_api_router(
     ledger: Arc<SqliteLedger>,
     tunnels: Arc<SqliteTunnelStore>,
     enrollment: Arc<SqliteEnrollment>,
+    bootstrap: Arc<SqliteBootstrap>,
     portal_base: &str,
     edge_admin: Option<(String, String)>,
     dns: Option<(DesecClient, String)>,
@@ -67,6 +73,7 @@ pub fn portal_api_router(
         ledger,
         tunnels,
         enrollment,
+        bootstrap,
         portal_base: Arc::from(portal_base),
         edge_admin: edge_admin.map(|(url, token)| EdgeAdmin {
             url: Arc::from(url),
@@ -296,6 +303,10 @@ struct InstallQuery {
     os: Option<String>,
 }
 
+/// TTL (seconds) for the bootstrap token minted for an install one-liner (#90/#97
+/// SEC90b): short — it exists only to be redeemed once, promptly, by the installer.
+const INSTALL_BOOTSTRAP_TTL_SECS: u64 = 600;
+
 /// `GET /portal/tunnels/:id/install` (#28): render the copy-paste one-liner(s)
 /// that install + onboard an agent for one of the caller's own tunnels. A fresh,
 /// single-use join token is minted per request and embedded via an env var.
@@ -323,6 +334,17 @@ async fn install_page(
         Ok(t) => hex(&t.0),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // #90/#97 SEC90b: mint a short-lived, single-use bootstrap token over the
+    // {join, routing} bundle and carry only *that* in the copy-paste one-liner, so
+    // no real secret lands in shell history / `ps`. The install script redeems it
+    // server-side (`POST /bootstrap/redeem`). The raw tokens are still shown once,
+    // separately, for the manual onboarding path below.
+    let bundle = install_bundle_secret(&token, &routing_token);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let boot = match st.bootstrap.mint(&bundle, INSTALL_BOOTSTRAP_TTL_SECS, now) {
+        Ok(b) => hex(&b),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     let oses = match q.os.as_deref().and_then(InstallOs::parse) {
         Some(os) => vec![os],
         None => vec![InstallOs::Unix, InstallOs::Windows],
@@ -334,7 +356,7 @@ async fn install_page(
                 InstallOs::Unix => "Linux / macOS",
                 InstallOs::Windows => "Windows (PowerShell)",
             };
-            let cmd = install_one_liner(&st.portal_base, &token, &routing_token, *os);
+            let cmd = install_one_liner_bootstrap(&st.portal_base, &boot, *os);
             format!("<h2>{label}</h2><pre><code>{}</code></pre>", escape(&cmd))
         })
         .collect::<String>();
@@ -659,7 +681,56 @@ mod tests {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
-        portal_api_router(KEY, ledger, tunnels, enrollment, "https://portal.example", None, None)
+        let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
+        portal_api_router(KEY, ledger, tunnels, enrollment, bootstrap, "https://portal.example", None, None)
+    }
+
+    #[tokio::test]
+    async fn install_page_shows_a_bootstrap_one_liner_carrying_no_real_token() {
+        // #90/#97 SEC90b: the copy-paste one-liner must carry only CT_BOOTSTRAP, never
+        // the raw join/routing tokens (those appear only in the separate manual block).
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
+        // Own a tunnel so the install page authorizes and has a routing token.
+        let tunnel = tunnels.create("kc-user-1", "t", None).unwrap();
+        let routing = tunnel.routing_token.clone();
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels,
+            enrollment,
+            bootstrap,
+            "https://portal.example",
+            None,
+            None,
+        );
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/install?os=linux", tunnel.id))
+                    .header("cookie", session_header("kc-user-1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // The one-liner carries CT_BOOTSTRAP and pipes to the installer.
+        assert!(html.contains("CT_BOOTSTRAP="), "one-liner carries the bootstrap token");
+        assert!(html.contains("/install.sh"), "pipes the installer script");
+        // The routing token must NOT appear inside a shown `curl … | … sh` command.
+        for line in html.lines().filter(|l| l.contains("CT_BOOTSTRAP=")) {
+            assert!(
+                !line.contains(&routing),
+                "the routing token must not be embedded in the one-liner command"
+            );
+        }
+        // The manual block still exists (raw tokens shown once, separately).
+        assert!(html.contains("CT_JOIN_TOKEN=") && html.contains("manual onboarding"), "manual path retained");
     }
 
     #[tokio::test]
@@ -888,6 +959,7 @@ mod tests {
             ledger,
             tunnels.clone(),
             enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
@@ -941,6 +1013,7 @@ mod tests {
             ledger,
             tunnels.clone(),
             enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
@@ -997,6 +1070,7 @@ mod tests {
             ledger,
             tunnels.clone(),
             enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
             "https://portal.example",
             None,
             Some((desec, "45.133.9.145".to_string())),

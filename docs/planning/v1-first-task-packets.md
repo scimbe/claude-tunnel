@@ -2293,11 +2293,21 @@ Two secret-exposure observations. Decomposed:
     `served_install_sh_redeems_a_bootstrap_token_for_the_real_tokens` (only `CT_BOOTSTRAP` set → a fake curl
     serves the redeem JSON → the stub agent onboards with the two real tokens, proving the extraction works in
     a real POSIX `sh`); the pre-existing embedded-token end-to-end test still passes (back-compat). Gate green.
-  - **SEC90b-installer-portal** ⏳ last: the portal install page mints a bootstrap token over
-    `install_bundle_secret(join, routing)` (`SqliteBootstrap` threaded into `PortalApiState`) and shows
-    `install_one_liner_bootstrap(...)` instead of the embedded-token `install_one_liner`. Small glue; after it
-    the shown one-liner carries no real secret and #90/#97 can close. (Both paths already interoperate, so
-    nothing is broken meanwhile.)
+  - **SEC90b-installer-portal** ✅ **The portal install page now shows the bootstrap one-liner.** `SqliteBootstrap`
+    is threaded into `ApiState`/`portal_api_router`; `install_page` mints a short-lived (600 s) single-use
+    bootstrap token over `install_bundle_secret(join, routing)` and renders `install_one_liner_bootstrap(...)`,
+    so the **copy-paste command carries only `CT_BOOTSTRAP=<token>`** — no real secret in shell history / `ps`.
+    The raw tokens are still shown once, separately, for the manual-onboarding block (an authenticated,
+    shown-once display, not a shell exposure). Frozen test
+    `install_page_shows_a_bootstrap_one_liner_carrying_no_real_token` (one-liner carries `CT_BOOTSTRAP`, the
+    routing token never appears inside the shown command; the manual block is retained). Gate green.
+
+  **Net for #90/#97 (SEC90b):** the bootstrap-token exchange is complete end-to-end — durable store (core) →
+  admin-gated mint + public redeem routes (wire) → bootstrap one-liner + shell-tractable bundle codec (render)
+  → served scripts redeem `CT_BOOTSTRAP` (installer-wire) → the portal shows the bootstrap one-liner
+  (installer-portal). Combined with **SEC90a** (routing-token redaction in edge-revoke logs), both
+  secret-exposure observations in #90 — and the #97 follow-up (one-liner still embeds tokens) — are resolved:
+  no real join/routing token is ever on the command line or in logs. #90 and #97 → fix-ready.
 
 ## #95 Rendezvous rate-limit + connection cap are opt-in / off by default (security-review)
 
