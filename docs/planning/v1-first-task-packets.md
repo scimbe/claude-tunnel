@@ -2273,9 +2273,20 @@ Two secret-exposure observations. Decomposed:
     wall-clock `now_secs()` over the deterministic store core. Merged into `persistent_control_plane_router`.
     Frozen test `bootstrap_mint_is_admin_gated_and_redeem_hands_off_once` (mint 401 without admin / 200 with;
     redeem hands off the exact secret once, 409 on reuse, 404 unknown; open when unset). Gate green.
-  - **SEC90b-installer** ⏳ then: rewrite `install_one_liner` (+ the channel one-liner, #97/#100) to carry only
-    `CT_BOOTSTRAP=<short-token>` and have `install.sh`/`.ps1` redeem it server-side; tied to the #75 live
-    install-flow. After that the secret-in-argv exposure is gone and #90/#97 can close.
+  - **SEC90b-installer-render** ✅ **Bootstrap one-liner renderer + install-bundle codec** (`installer.rs`,
+    pure): `install_one_liner_bootstrap(portal_base, bootstrap_token, os)` renders the copy-paste command
+    carrying **only** `CT_BOOTSTRAP=<token>` (Unix `curl … | CT_BOOTSTRAP=… sh`; Windows `$env:CT_BOOTSTRAP=…;
+    irm … | iex`) — the real join/routing tokens never appear in it. `install_bundle_secret(join, routing)` /
+    `parse_install_bundle` are the JSON `{join_token, routing_token}` bundle the portal mints a bootstrap token
+    over (`SqliteBootstrap::mint`) and the agent recovers after `POST /bootstrap/redeem`. Frozen test
+    `bootstrap_one_liner_carries_only_the_bootstrap_token_not_the_real_secrets` (bundle round-trips + rejects
+    malformed; neither real token appears in either OS one-liner; bootstrap token carried exactly once). Gate
+    green. The embedded-token `install_one_liner` stays for the manual/back-compat path.
+  - **SEC90b-installer-wire** ⏳ last: portal mints the bootstrap token over `install_bundle_secret(...)` and
+    shows `install_one_liner_bootstrap(...)`; `render_install_sh`/`.ps1` redeem `CT_BOOTSTRAP` server-side
+    (`POST {portal}/bootstrap/redeem`) → parse the bundle → `onboard`. Tied to the #75 live install-flow (needs
+    the portal_base threaded into the install scripts + shell JSON extraction). After that the secret-in-argv
+    exposure is gone and #90/#97 can close.
 
 ## #95 Rendezvous rate-limit + connection cap are opt-in / off by default (security-review)
 

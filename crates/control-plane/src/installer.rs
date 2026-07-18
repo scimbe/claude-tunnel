@@ -73,6 +73,51 @@ pub fn install_one_liner(
     }
 }
 
+/// Encode the real install secrets — the single-use `join_token` and the tunnel's
+/// persistent `routing_token` — as the opaque `secret` payload a bootstrap token
+/// carries (#90/#97 SEC90b). The portal mints a bootstrap token over this bundle
+/// (`SqliteBootstrap::mint`); the agent redeems the bootstrap token server-side
+/// (`POST /bootstrap/redeem`) and [`parse_install_bundle`]s the result back into the
+/// two tokens — so the real secrets travel in the TLS response body, never in the
+/// one-liner's command string. JSON so the redeem response is self-describing and
+/// forward-compatible.
+pub fn install_bundle_secret(join_token: &str, routing_token: &str) -> String {
+    serde_json::json!({
+        "join_token": join_token,
+        "routing_token": routing_token,
+    })
+    .to_string()
+}
+
+/// Parse the bundle produced by [`install_bundle_secret`] back into
+/// `(join_token, routing_token)`. Returns `None` if the JSON is malformed or either
+/// field is missing/non-string.
+pub fn parse_install_bundle(secret: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(secret).ok()?;
+    let join = v.get("join_token")?.as_str()?.to_string();
+    let routing = v.get("routing_token")?.as_str()?.to_string();
+    Some((join, routing))
+}
+
+/// Render the copy-paste one-liner in its **bootstrap-token** form (#90/#97 SEC90b):
+/// the command carries only a short-lived, single-use `bootstrap_token` — never the
+/// real join/routing tokens — so nothing secret lands in shell history or `ps`. The
+/// install script redeems `CT_BOOTSTRAP` server-side (`POST {portal}/bootstrap/redeem`)
+/// for the real [`install_bundle_secret`] bundle. This is the secret-hygiene upgrade
+/// over [`install_one_liner`], whose embedded-token form remains for the manual path
+/// and back-compat until the live install flow (#75) adopts this.
+pub fn install_one_liner_bootstrap(portal_base: &str, bootstrap_token: &str, os: InstallOs) -> String {
+    let base = portal_base.trim_end_matches('/');
+    match os {
+        InstallOs::Unix => {
+            format!("curl -fsSL {base}/install.sh | CT_BOOTSTRAP={bootstrap_token} sh")
+        }
+        InstallOs::Windows => {
+            format!("$env:CT_BOOTSTRAP='{bootstrap_token}'; irm {base}/install.ps1 | iex")
+        }
+    }
+}
+
 /// Which side of an Agent-Fabric channel a one-liner brings the machine up as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelSide {
@@ -630,6 +675,42 @@ mod tests {
         for cmd in [&unix, &win] {
             assert_eq!(cmd.matches(jt).count(), 1);
             assert_eq!(cmd.matches(rt).count(), 1);
+        }
+    }
+
+    #[test]
+    fn bootstrap_one_liner_carries_only_the_bootstrap_token_not_the_real_secrets() {
+        // #90/#97 SEC90b: the bootstrap form of the one-liner must NOT contain the
+        // real join/routing tokens — only the short-lived bootstrap token. The real
+        // secrets ride in the TLS redeem response, recovered via the bundle codec.
+        let jt = "dummy-join-token-xyz";
+        let rt = "dummy-routing-token-abc";
+        let boot = "dummy-bootstrap-token-0123456789";
+        let base = "https://portal.example/"; // trailing slash trimmed
+
+        // The bundle the portal mints a bootstrap token over round-trips exactly.
+        let bundle = install_bundle_secret(jt, rt);
+        assert_eq!(parse_install_bundle(&bundle), Some((jt.to_string(), rt.to_string())));
+        assert_eq!(parse_install_bundle("not json"), None);
+        assert_eq!(parse_install_bundle(r#"{"join_token":"x"}"#), None, "missing routing_token -> None");
+
+        let unix = install_one_liner_bootstrap(base, boot, InstallOs::Unix);
+        assert_eq!(
+            unix,
+            "curl -fsSL https://portal.example/install.sh | CT_BOOTSTRAP=dummy-bootstrap-token-0123456789 sh"
+        );
+        let win = install_one_liner_bootstrap(base, boot, InstallOs::Windows);
+        assert_eq!(
+            win,
+            "$env:CT_BOOTSTRAP='dummy-bootstrap-token-0123456789'; irm https://portal.example/install.ps1 | iex"
+        );
+
+        // The critical property: neither the real join nor routing token appears in
+        // the shown command — only the bootstrap token does.
+        for cmd in [&unix, &win] {
+            assert!(!cmd.contains(jt), "join token must not appear in the one-liner");
+            assert!(!cmd.contains(rt), "routing token must not appear in the one-liner");
+            assert_eq!(cmd.matches(boot).count(), 1, "bootstrap token carried exactly once");
         }
     }
 }
