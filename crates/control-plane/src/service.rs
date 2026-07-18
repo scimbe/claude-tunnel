@@ -904,6 +904,16 @@ pub fn persistent_control_plane_router(
             },
         ))
         .merge(pki);
+    // #81 SEC81c-c (c-i): the live edge queries this to authorize channel-joins (the
+    // broker's `authorize` closure). Gated by the shared edge↔CP admin token; mounted
+    // only when CT_CP_EDGE_ADMIN_TOKEN is a valid 64-hex value.
+    if let Some(admin_tok) = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| hex_decode_32(&s))
+    {
+        app = app.merge(internal_channel_authorize_router(channels.clone(), admin_tok));
+    }
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
     if let Some(oidc) = oidc {
@@ -918,6 +928,79 @@ pub fn persistent_control_plane_router(
             .merge(authed_channel_router(channels, oidc));
     }
     Ok(app.merge(health_router(ledger)))
+}
+
+/// Shared state for the edge-facing channel-authorize endpoint (#81 SEC81c-c c-i):
+/// the channel registry + the shared edge↔CP admin token the edge presents.
+#[derive(Clone)]
+pub struct AdminChannelState {
+    channels: Arc<SqliteChannelStore>,
+    admin_token: [u8; 32],
+}
+
+/// Constant-time 32-byte token comparison (avoid leaking the admin token via timing).
+fn ct_token_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Build the **edge-facing** channel-authorize router (#81 SEC81c-c c-i): the live edge
+/// broker's admission gate needs `authorize(channel, holder) -> Option<operator_pubkey>`
+/// (the operator key iff the holder is a current member — folding gap-2 membership/
+/// revocation into the key source). The registry lives in the control plane, so the edge
+/// queries this endpoint, presenting the shared edge↔CP admin token. Read-only; mounted
+/// only when the admin token is configured.
+///
+/// * `POST /internal/channel/authorize` `{channel, holder}` + header `x-ct-admin-token`
+///   → `200 {operator_pubkey}` iff member; `401` bad/missing token; `404` non-member.
+fn internal_channel_authorize_router(
+    channels: Arc<SqliteChannelStore>,
+    admin_token: [u8; 32],
+) -> Router {
+    Router::new()
+        .route("/internal/channel/authorize", post(channel_authorize))
+        .with_state(AdminChannelState {
+            channels,
+            admin_token,
+        })
+}
+
+#[derive(Deserialize)]
+struct AuthorizeReq {
+    channel: String,
+    holder: String,
+}
+#[derive(Serialize, Deserialize)]
+struct AuthorizeResp {
+    operator_pubkey: String,
+}
+
+async fn channel_authorize(
+    State(state): State<AdminChannelState>,
+    headers: HeaderMap,
+    Json(req): Json<AuthorizeReq>,
+) -> Result<Json<AuthorizeResp>, StatusCode> {
+    // Verify the shared edge↔CP admin token (constant time) before any lookup.
+    let ok = headers
+        .get("x-ct-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .and_then(hex_decode_32)
+        .map(|t| ct_token_eq(&t, &state.admin_token))
+        .unwrap_or(false);
+    if !ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let channel = hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST)?;
+    let holder = hex_decode_32(&req.holder).ok_or(StatusCode::BAD_REQUEST)?;
+    match state
+        .channels
+        .authorize_holder(&ChannelId(channel), &holder)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        Some(op) => Ok(Json(AuthorizeResp {
+            operator_pubkey: hex_encode(&op),
+        })),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1438,6 +1521,54 @@ mod tests {
             probe.authorize_holder(&chan, &hbytes).unwrap(),
             None,
             "a revoked member is no longer authorized"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_channel_authorize_requires_admin_token_and_membership() {
+        // #81 SEC81c-c c-i: the edge queries this (with the shared admin token) to
+        // source the broker's `authorize` closure — operator key iff the holder is a
+        // current member; bad/missing token -> 401; non-member -> 404.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0xC5u8; 32]);
+        let op = [0xEEu8; 32];
+        let member = [0x33u8; 32];
+        assert!(channels.register_channel(&ch, &op, "alice").unwrap());
+        assert!(channels.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap());
+
+        let app = internal_channel_authorize_router(channels, admin);
+        let admin_hex = hex_encode(&admin);
+        let wrong_hex = hex_encode(&[0u8; 32]);
+        let ch_hex = hex_encode(&ch.0);
+        let post = |tok: Option<String>, holder: [u8; 32]| {
+            let mut req =
+                Request::post("/internal/channel/authorize").header("content-type", "application/json");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            let body = format!(r#"{{"channel":"{ch_hex}","holder":"{}"}}"#, hex_encode(&holder));
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        // Correct token + member -> 200 + the operator key.
+        let r = post(Some(admin_hex.clone()), member).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let resp: AuthorizeResp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.operator_pubkey, hex_encode(&op), "member resolves the operator key");
+
+        // Wrong / missing token -> 401 (before any lookup).
+        assert_eq!(post(Some(wrong_hex), member).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post(None, member).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // Valid token, non-member holder -> 404.
+        assert_eq!(
+            post(Some(admin_hex), [0x44u8; 32]).await.unwrap().status(),
+            StatusCode::NOT_FOUND
         );
     }
 

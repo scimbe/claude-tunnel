@@ -1851,11 +1851,17 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
     cloud metadata IP (`169.254.169.254`). Now only globally-routable unicast passes (v4: `is_private` +
     `is_link_local` + `100.64/10`; v6: `fc00::/7` + `fe80::/10`). Frozen test
     `safe_endpoint_rejects_private_and_internal_ranges`; broker/agent tests moved to `203.0.113.x`. Gate green.
-  - **SEC81c-c** ⏳ **Mount the broker in the live edge** — the roadmap "many things wait for" (scimbe). Steps:
-    (c-i) a CP internal endpoint exposing `authorize_holder` (operator key iff member), gated by the shared
-    edge-admin token; (c-ii) an edge-side resolver that queries it as the `authorize` closure; (c-iii) mount
-    `broker_channel_rendezvous` into `run_edge`'s accept path. Then #72 AF4-session (dial peer + Noise_IK using
-    the peer's `member_noise_key` + relay fallback) makes it a usable end-to-end tunnel.
+  - **SEC81c-c** ⏳ **Mount the broker in the live edge** — the roadmap "many things wait for" (scimbe):
+    - **c-i** ✅ **CP edge-facing authorize endpoint** (`ct-control-plane::service`): `POST /internal/channel/authorize`
+      `{channel, holder}` + header `x-ct-admin-token` → `200 {operator_pubkey}` iff the holder is a current member,
+      `401` bad/missing token (constant-time compare of the shared edge↔CP admin token, `CT_CP_EDGE_ADMIN_TOKEN`),
+      `404` non-member. This is the exact `authorize(channel, holder) -> Option<operator_pubkey>` the live broker
+      needs, sourced from `authorize_holder` (membership+revocation folded in). Mounted only when the admin token is
+      set. Frozen test `internal_channel_authorize_requires_admin_token_and_membership`. Gate green.
+    - **c-ii** ⏳ an edge-side resolver that queries c-i (HTTP client) to form the `authorize` closure.
+    - **c-iii** ⏳ mount `broker_channel_rendezvous` into `run_edge`'s accept path with that closure.
+    Then #72 AF4-session (dial peer + Noise_IK using the peer's `member_noise_key` + relay fallback) makes it a
+    usable end-to-end tunnel.
 
 ## #78 CI gate / build-isolation security review (security-review)
 
