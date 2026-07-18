@@ -1754,8 +1754,14 @@ prebuilt image dead-ends at the final step. Substantial feature (like #72) → d
   via the binary/`ct-testbed` image, + onboarding-guide link); the one-liner is demoted under a
   "coming soon (not functional yet)" heading. Frozen test asserts the honesty banner + manual path.
   Gate: cargo build+test, 0 warnings. Stops misleading real customers immediately.
-- **IS2** ⏳ **Binary distribution**: GitHub Releases (or equivalent) with prebuilt `ct-agent` binaries
-  for Linux x86_64/arm64, macOS, Windows — without this `install.sh` has nothing to download.
+- **IS2** ✅ **Binary distribution via GitHub Releases** (scimbe decision 2026-07-18; `workflow` scope now
+  granted): `.github/workflows/release.yml` — on a `v*` tag, builds `ct-agent` per OS/arch and uploads to the
+  Release the six assets the IS3a/IS4 renderers download (`ct-agent-{linux,darwin}-{x86_64,aarch64}`,
+  `ct-agent-windows-{x86_64,aarch64}.exe`). First-party actions + `gh` CLI only (no third-party actions);
+  `fail-fast: false` so one target failing still ships the rest; linux-aarch64 via the gcc cross-linker.
+  Gate: valid YAML, the six asset names match the renderer patterns, and a hermetic `cargo build -p ct-agent
+  --release --locked` produces the `ct-agent` binary. Binaries populate when a release tag is cut (the tag
+  itself is gated on the 0-open-issues release condition); the workflow itself is in place.
 - **IS3a** ✅ **`/install.sh` script renderer** (`installer::render_install_sh`): pure function producing the
   POSIX installer — detects OS (uname) + arch (x86_64/aarch64 normalised), downloads `ct-agent-<os>-<arch>`
   from the release base, `set -eu` + temp-dir + `exec ct-agent onboard` (tokens from env, never argv).
