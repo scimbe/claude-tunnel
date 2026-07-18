@@ -82,6 +82,25 @@ impl OidcVerifier {
         Self::build(DecodingKey::from_secret(secret), Algorithm::HS256, issuer)
     }
 
+    /// Require the token's `aud` to contain `audience` (#82 SEC82b). Keycloak
+    /// access-token audiences vary by client, so audience is **not** validated by
+    /// default (see [`Self::build`]); an operator who knows their realm's
+    /// access-token `aud` shape opts in with a field-checked value (env
+    /// `CT_OIDC_ACCESS_AUD`). Once required, a token whose `aud` omits `audience`
+    /// — or carries no `aud` at all — is rejected, closing the "bearer-token
+    /// audience not validated" gap without a blind flip that would break realms
+    /// whose access tokens don't carry the portal's audience.
+    #[must_use]
+    pub fn require_audience(mut self, audience: &str) -> Self {
+        self.validation.set_audience(&[audience]);
+        self.validation.validate_aud = true;
+        // `validate_aud` alone only rejects a *mismatched* `aud`; a token carrying
+        // no `aud` at all still passes. Requiring the claim's presence closes that
+        // hole so an audience-less bearer token can't slip through enforcement.
+        self.validation.set_required_spec_claims(&["exp", "aud"]);
+        self
+    }
+
     /// Verify `token` and return its subject (`sub`). Fails on a bad signature,
     /// an expired token, or a mismatched issuer.
     pub fn subject(&self, token: &str) -> Result<String, OidcError> {
@@ -190,6 +209,37 @@ mod tests {
             &EncodingKey::from_secret(secret),
         )
         .unwrap()
+    }
+
+    fn make_token_with_aud(secret: &[u8], sub: &str, iss: &str, exp: u64, aud: &str) -> String {
+        let claims = serde_json::json!({ "sub": sub, "iss": iss, "exp": exp, "aud": aud });
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn required_audience_gates_bearer_tokens() {
+        // #82 SEC82b: with an audience required, only a token whose `aud` contains
+        // it is accepted; a mismatched or absent `aud` is rejected — while the
+        // default verifier (no audience required) still ignores `aud` entirely, so
+        // enabling enforcement never silently breaks the pre-#82b behavior.
+        let matching = make_token_with_aud(SECRET, "user-42", ISSUER, now() + 3600, "ct-portal");
+        let wrong = make_token_with_aud(SECRET, "user-42", ISSUER, now() + 3600, "some-other-client");
+        let no_aud = make_token(SECRET, "user-42", ISSUER, now() + 3600);
+
+        let enforced = OidcVerifier::from_hs_secret(SECRET, ISSUER).require_audience("ct-portal");
+        assert_eq!(enforced.subject(&matching).unwrap(), "user-42", "matching aud accepted");
+        assert!(enforced.subject(&wrong).is_err(), "mismatched aud rejected");
+        assert!(enforced.subject(&no_aud).is_err(), "missing aud rejected when required");
+
+        // Default (audience not required) — pre-#82b behavior is preserved.
+        let default = OidcVerifier::from_hs_secret(SECRET, ISSUER);
+        assert_eq!(default.subject(&wrong).unwrap(), "user-42", "aud ignored by default");
+        assert_eq!(default.subject(&no_aud).unwrap(), "user-42", "no aud is fine by default");
     }
 
     #[test]

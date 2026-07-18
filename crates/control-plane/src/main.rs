@@ -65,12 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let verifier = OidcVerifier::from_rsa_pem(&pem, &issuer)
                     .map_err(|e| format!("invalid OIDC realm key at {path}: {e}"))?;
                 eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=PEM {path})");
-                Some(Arc::new(verifier))
+                Some(verifier)
             }
             _ => match verifier_from_jwks(&issuer, fetch_jwks).await {
                 Some(v) => {
                     eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=JWKS)");
-                    Some(Arc::new(v))
+                    Some(v)
                 }
                 None => {
                     eprintln!(
@@ -85,6 +85,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             None
         }
     };
+    // #82 SEC82b: opt-in bearer-token audience enforcement for /me/*. Keycloak
+    // access-token audiences vary by client, so this stays off unless the operator
+    // supplies their realm's field-checked access-token `aud` via CT_OIDC_ACCESS_AUD.
+    let oidc = oidc.map(|v| match std::env::var("CT_OIDC_ACCESS_AUD") {
+        Ok(aud) if !aud.is_empty() => {
+            eprintln!("ct-control-plane: /me/* access-token audience enforced (aud={aud})");
+            Arc::new(v.require_audience(&aud))
+        }
+        _ => Arc::new(v),
+    });
 
     // #68: the customer-facing install one-liner (/portal/tunnels/{id}/install)
     // embeds this base URL. If it's unset it silently falls back to

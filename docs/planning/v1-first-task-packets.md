@@ -1923,10 +1923,13 @@ GLM-5.2 review: 3 OIDC weaknesses. Decomposed:
   token-endpoint response can no longer inject an arbitrary subject/email. Frozen tests: hermetic runtime-RSA
   id_token verified (valid → sub+email; forged-key/wrong-issuer/wrong-audience rejected; sub required) +
   kid selection among multiple JWKS keys. Gate green.
-- **SEC82b** ⏳ **Bearer-token audience (issue #2 for /me/*)**: the access-token verifier
-  (`oidc.rs OidcVerifier`) still has `validate_aud=false` because Keycloak access-token audiences vary by
-  client — enabling it needs the realm's actual access-token `aud` shape confirmed against live Keycloak
-  (central), so it's deliberately not flipped blind. Needs a field-checked audience value.
+- **SEC82b** ✅ **Bearer-token audience (issue #2 for /me/*)** — **opt-in enforcement landed.**
+  `OidcVerifier::require_audience(aud)` sets `validate_aud=true`, pins the expected audience, and marks
+  `aud` a required spec claim (so an *absent* `aud` is also rejected, not just a mismatched one). Wired in
+  `main.rs`: when `CT_OIDC_ACCESS_AUD` is set the `/me/*` verifier enforces it; unset preserves the prior
+  no-aud-check behavior (no blind flip — Keycloak access-token audiences vary by client, so the operator
+  supplies their realm's field-checked value). Frozen test `required_audience_gates_bearer_tokens`:
+  matching aud accepted; mismatched + missing aud rejected under enforcement; both accepted by default.
 
 ## #80 cargo-audit exit 1 vs doc "0 vulnerabilities" (security-review)
 
