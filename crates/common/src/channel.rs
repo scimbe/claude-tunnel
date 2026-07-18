@@ -339,6 +339,47 @@ pub fn verify_holder_possession(holder: &[u8; 32], challenge: &[u8], signature: 
     }
 }
 
+/// The domain-separated message a member signs with its **holder** key to attest that
+/// it authorized `noise_pubkey` as its Noise static key on `channel` (#72 AF4-keydist /
+/// #101). Binding the Noise key to `(channel, holder)` means a DB-controlling operator
+/// can't substitute a key to MITM the A2A direct path — a substituted key carries no
+/// valid holder signature. The agent signs this with its holder `SigningKey`; peers
+/// verify with [`verify_member_noise_attestation`] before pinning the key.
+pub fn member_noise_attest_bytes(
+    channel: &ChannelId,
+    holder: &[u8; 32],
+    noise_pubkey: &[u8; 32],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(22 + 32 + 32 + 32);
+    m.extend_from_slice(b"ct-a2a-noise-attest-v1");
+    m.extend_from_slice(&channel.0);
+    m.extend_from_slice(holder);
+    m.extend_from_slice(noise_pubkey);
+    m
+}
+
+/// Verify a member Noise-key attestation (#101): `signature` must be `holder`'s
+/// ed25519 signature over [`member_noise_attest_bytes`]. Returns `false` on a bad key,
+/// a wrong `(channel, holder, noise_pubkey)` binding, or a bad signature — so an
+/// un-attested or operator-substituted Noise key is rejected before an initiator pins
+/// it for the direct-path `Noise_IK` handshake.
+pub fn verify_member_noise_attestation(
+    channel: &ChannelId,
+    holder: &[u8; 32],
+    noise_pubkey: &[u8; 32],
+    signature: &[u8; 64],
+) -> bool {
+    match VerifyingKey::from_bytes(holder) {
+        Ok(vk) => vk
+            .verify(
+                &member_noise_attest_bytes(channel, holder, noise_pubkey),
+                &Signature::from_bytes(signature),
+            )
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Lowercase-hex a 32-byte value for the canonical signing bytes.
 fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -521,6 +562,33 @@ mod tests {
         let mut tampered = sig;
         tampered[0] ^= 0xff;
         assert!(!verify_holder_possession(&holder, challenge, &tampered), "tampered signature rejected");
+    }
+
+    #[test]
+    fn member_noise_attestation_binds_the_key_to_holder_and_channel() {
+        // #101: the member signs its Noise key with its HOLDER key, binding it to
+        // (channel, holder). A DB-controlling operator who substitutes the key can't
+        // forge this signature, so the initiator rejects the substituted key.
+        let holder_sk = SigningKey::from_bytes(&[0x33u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let channel = ChannelId([0xC1u8; 32]);
+        let noise = [0xAAu8; 32];
+        let sig = holder_sk.sign(&member_noise_attest_bytes(&channel, &holder, &noise)).to_bytes();
+
+        assert!(verify_member_noise_attestation(&channel, &holder, &noise, &sig), "genuine attestation verifies");
+        assert!(
+            !verify_member_noise_attestation(&channel, &holder, &[0xBBu8; 32], &sig),
+            "an operator-substituted Noise key is rejected"
+        );
+        assert!(
+            !verify_member_noise_attestation(&ChannelId([0xC2u8; 32]), &holder, &noise, &sig),
+            "the attestation is bound to its channel"
+        );
+        let other = SigningKey::from_bytes(&[0x99u8; 32]).verifying_key().to_bytes();
+        assert!(
+            !verify_member_noise_attestation(&channel, &other, &noise, &sig),
+            "only the real holder can attest (a DB operator can't sign as the holder)"
+        );
     }
 
     #[test]

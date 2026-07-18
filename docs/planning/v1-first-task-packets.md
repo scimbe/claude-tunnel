@@ -2228,6 +2228,25 @@ gated on an env var and did nothing when unset (the default), so a public edge s
   `cargo test --workspace -D warnings`). The per-token/per-connection semantics (from #86) are unchanged;
   only the default flipped from off→on with an explicit opt-out.
 
+## #101 AF4-keydist: member Noise key stored un-attested in the CP registry (security-review)
+
+The registry stores each member's X25519 Noise key as an un-attested BLOB with no binding to the holder
+identity, so a DB-controlling operator could substitute a key to MITM the A2A direct-path `Noise_IK`
+handshake. Fix: **attest** the Noise key with the member's holder key and verify end-to-end. Decomposed:
+
+- **SEC101a** ✅ **Attestation primitive** (`ct_common::channel`): `member_noise_attest_bytes(channel, holder,
+  noise_pubkey)` is the domain-separated (`ct-a2a-noise-attest-v1`) message the member signs with its **holder**
+  key; `verify_member_noise_attestation(...)` checks it. Binds the Noise key to `(channel, holder)`, so a
+  substituted key carries no valid holder signature. Frozen test
+  `member_noise_attestation_binds_the_key_to_holder_and_channel` (genuine verifies; substituted key / wrong
+  channel / wrong holder all rejected). Gate green.
+- **SEC101b** ⏳ **Store + verify the attestation at the CP**: `channel_members` gains a `noise_attestation`
+  column; `POST /me/channels/:channel/members` requires the signature and the CP verifies it before storing
+  (reject un-attested/forged); `/internal/channel/authorize` returns it alongside the key.
+- **SEC101c** ⏳ **Relay + verify end-to-end**: the broker relays the attestation with the peer's Noise key;
+  the initiator calls `verify_member_noise_attestation` before pinning (`a2a_initiate`) — so even a tampered
+  DB can't make an initiator pin an unattested key.
+
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
 Gutachten: Tabelle 7.1 „80,8 ± 91,9 ms" impliziert negative Latenz (symmetrisches Normal-KI auf
