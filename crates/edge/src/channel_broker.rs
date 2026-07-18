@@ -157,20 +157,15 @@ fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
 /// presenter must answer with a 64-byte ed25519 signature over it under `holder`
 /// before the edge acks. (A plain `read_to_end` would force the presenter to finish
 /// its send stream, leaving no room for the possession round-trip.)
-async fn accept_and_read_join<F, Fut>(
-    endpoint: &Endpoint,
+pub async fn read_join_on_connection<F, Fut>(
+    conn: &quinn::Connection,
     now: UnixSeconds,
     authorize: &F,
-) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
+) -> Result<(quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<[u8; 32]>>,
 {
-    let incoming = endpoint
-        .accept()
-        .await
-        .ok_or("endpoint closed with no incoming")?;
-    let conn = incoming.await?;
     let (mut send, mut recv) = conn.accept_bi().await?;
 
     // Length-framed request so the presenter's send stream stays open for the
@@ -231,6 +226,28 @@ where
         let _ = send.finish();
         return Err("holder possession proof failed".into());
     }
+    Ok((send, req, operator))
+}
+
+/// Accept one QUIC connection from `endpoint` and read its channel-join via
+/// [`read_join_on_connection`]. The standalone entrypoint used by the broker's own
+/// tests and by any dedicated channel-rendezvous endpoint; the live edge instead calls
+/// `read_join_on_connection` directly on a connection dispatched by its accept loop.
+async fn accept_and_read_join<F, Fut>(
+    endpoint: &Endpoint,
+    now: UnixSeconds,
+    authorize: &F,
+) -> Result<(quinn::Connection, quinn::SendStream, ChannelJoinRequest, [u8; 32]), BoxError>
+where
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<[u8; 32]>>,
+{
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or("endpoint closed with no incoming")?;
+    let conn = incoming.await?;
+    let (send, req, operator) = read_join_on_connection(&conn, now, authorize).await?;
     Ok((conn, send, req, operator))
 }
 
@@ -537,6 +554,40 @@ mod tests {
 
         let endpoint = server_task.await.expect("join").expect("admitted");
         assert_eq!(endpoint, "203.0.113.9:6001", "handler returns the advertised endpoint");
+    }
+
+    #[tokio::test]
+    async fn read_join_on_connection_admits_a_valid_join() {
+        // #81 SEC81c-c c-iii-2: the connection-level entry point — what the live edge's
+        // accept loop dispatches to once it has accepted the QUIC connection itself.
+        let pk = operator_pubkey();
+        let channel = [0xD7u8; 32];
+        let holder = holder_sk(0x0a);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6011".to_string(),
+        };
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            // Accept the connection first (as the live edge loop does), then read the join.
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let (mut send, req, _op) = read_join_on_connection(&conn, 500, &move |c, _h| async move {
+                (c.0 == channel).then_some(pk)
+            })
+            .await
+            .expect("admitted");
+            send.write_all(b"OK").await.expect("ack");
+            send.finish().expect("finish");
+            conn.closed().await;
+            req.endpoint
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode(), &holder).await;
+        assert_eq!(ack, b"OK", "connection-level gate admits a valid join");
+        conn.close(0u32.into(), b"done");
+        assert_eq!(server_task.await.expect("join"), "203.0.113.9:6011");
     }
 
     #[tokio::test]
