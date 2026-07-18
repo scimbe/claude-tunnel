@@ -1623,10 +1623,15 @@ jedes diskutierte System zitiert, 3.5 gegen OHTTP + iCloud Private Relay abgegre
   und in `chapters/relatedwork.tex` an **jedem bereits im Text genannten System** `\cite{}` verdrahtet (§3.1
   WireGuard, §3.2 Reverse-Tunnel-Produkte, §3.3 Tor+obfs4+Shadowsocks+Sybil, §3.4 MASQUE). Gate: Thesis baut grün
   (`latexmk` exit 0), `grep -ci undefined thesis.log == 0`; gedruckte Bibliografie 4 → 14. Frozen = der Build-Gate.
-- **T50.2** ⏳ **3.5 Abgrenzung + Zensur-Quellen**: OHTTP (RFC 9458), Apple iCloud Private Relay (Zwei-Hop,
-  Ingress/Egress-Trennung), TLS 1.3 (RFC 8446), Domain Fronting (Fifield PoPETs'15), Telex/Decoy-Routing
-  (Wustrow USENIX'11) als konzeptionelle Vorläufer aufnehmen; §3.5 explizit dagegen abgrenzen (Alleinstellung der
-  Vier-Bausteine-Kombination). Zensurresistenz mit Mess-/Umgehungsforschung belegen (OONI, Snowflake/meek).
+- **T50.2** ✅ **3.5 Abgrenzung + Zensur-Quellen**: 6 verifizierte Quellen in `references.bib` (OHTTP RFC 9458,
+  TLS 1.3 RFC 8446, Domain Fronting Fifield PoPETs'15, Telex Wustrow USENIX'11, OONI Filastò/Appelbaum FOCI'12,
+  Apple iCloud Private Relay Overview). §3.5 um einen Absatz erweitert, der OHTTP und iCloud Private Relay als
+  die **konzeptionell nächsten Vorläufer** benennt und explizit abgrenzt (OHTTP: Gateway sieht Ziel+Klartext,
+  request-scoped; Private Relay: Zwei-Betreiber-Trennung, reguläre Ziel-TLS — beide ohne Nutzlast-Blindheit
+  gegenüber einem *einzelnen* Vermittler) → stützt die Vier-Bausteine-Alleinstellung. §3.3 Zensurumgehung mit
+  Domain Fronting + Telex + OONI belegt; §3.4 TLS 1.3 zitiert. Gate: Thesis baut grün (`latexmk` exit 0,
+  **0 undefined citations**, 62 S.); gedruckte Bibliografie **14 → 20** — Akzeptanz (≥20, jedes System zitiert,
+  3.5 abgegrenzt) **erfüllt**.
 - **T50.3** ⏳ **Noise peer-reviewed + Zielzahl**: Noise über die Webseite hinaus mit peer-reviewter Analyse
   untermauern (Kobeissi et al.; Dowling & Paterson, WireGuard/Noise), Privacy Pass (Davidson PoPETs'18) für
   tokenbasierten anonymen Zugang; auf ≥20 gedruckte Quellen auffüllen + finaler Zitations-Audit. **fix-ready erst

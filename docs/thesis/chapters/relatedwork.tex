@@ -65,8 +65,13 @@ mehrstufige, geschichtete Verschlüsselung über mehrere unabhängige Relays, so
 kein einzelner Knoten Sender und Empfänger zugleich kennt. \emph{Pluggable
 transports} wie obfs4~\cite{obfs4} oder Shadowsocks~\cite{shadowsocks} ergänzen dies um Verschleierung des
 Verkehrsmusters, um Deep-Packet-Inspection und Protokollfilter zu unterlaufen.
-Diese Systeme schützen also primär die \emph{Identität} und die
-\emph{Beobachtbarkeit} der Kommunikation gegenüber Netzbeobachtern.
+Weitere Umgehungsansätze verlagern die Resistenz in die Netzinfrastruktur ---
+etwa Domain Fronting~\cite{fifield2015domainfronting}, das Sperren durch
+Mitnutzung großer, nicht blockierbarer Fronting-Domains unterläuft, oder
+Refraction-/Decoy-Routing wie Telex~\cite{wustrow2011telex}; Messplattformen wie
+OONI~\cite{filasto2012ooni} dokumentieren Verbreitung und Methodik solcher
+Blockaden empirisch. Diese Systeme schützen also primär die \emph{Identität} und
+die \emph{Beobachtbarkeit} der Kommunikation gegenüber Netzbeobachtern.
 
 \texttt{claude-tunnel} zielt demgegenüber nicht auf Anonymität, sondern auf
 \emph{Providerblindheit}: Der Betreiber darf durchaus wissen, \emph{dass} ein
@@ -86,7 +91,9 @@ als primären Sybil-~\cite{douceur2002sybil} und Flutungs-Schutz.
 Auf der Transportebene ist \texttt{claude-tunnel} den QUIC-basierten
 Relay-Ansätzen verwandt. QUIC~\cite{rfc9000} bündelt Verbindungsaufbau,
 Verschlüsselung und Multiplexing über UDP und eignet sich damit für den
-schnellen Aufbau vieler kurzlebiger Tunnel. Das MASQUE-Framework~\cite{rfc9298,rfc9484} baut auf QUIC
+schnellen Aufbau vieler kurzlebiger Tunnel; die Vertraulichkeit ruht dabei auf
+TLS~1.3~\cite{rfc8446}, das QUIC in seinen Handshake integriert. Das
+MASQUE-Framework~\cite{rfc9298,rfc9484} baut auf QUIC
 und HTTP/3 auf, um Proxy- und Tunneldienste über eine QUIC-Verbindung zu
 transportieren --- konzeptionell ein Relay, das UDP- oder IP-Verkehr für einen
 Client weiterreicht. Die Datenebene dieser Arbeit teilt diese Transportbasis:
@@ -128,9 +135,27 @@ Wer kann kappen & Server-Peer & Anbieter & jedes Relay (Pfad) \\
 \end{tabular}
 \end{table}
 
+Die konzeptionell nächsten Vorläufer sind nicht die klassischen Tunnel, sondern
+jüngere Ansätze, die das \emph{Wissen} über eine Verbindung bewusst auf mehrere
+Parteien aufteilen. Oblivious HTTP~\cite{rfc9458} trennt den Anfrageinhalt von
+der Absenderidentität: Ein Relay verbirgt die Client-Adresse, während ein Gateway
+die Anfrage entschlüsselt und an das Ziel weiterreicht. Damit sieht der Gateway
+sehr wohl Ziel und Klartext, und das Modell ist auf einzelne, zustandslose
+HTTP-Anfragen zugeschnitten statt auf einen langlebigen, protokollagnostischen
+Tunnel. Apples iCloud Private Relay~\cite{appleprivaterelay} nutzt zwei Hops mit
+Ingress-/Egress-Trennung, sodass kein einzelner Betreiber zugleich Client-IP und
+Zieladresse kennt; die Trennung ruht jedoch auf \emph{zwei getrennten
+Betreiberrollen}, und die Sitzung zum Ziel terminiert regulär --- eine
+kundenseitig verankerte Nutzlast-Blindheit gegenüber einem \emph{einzelnen}
+Vermittler ist damit nicht gegeben. \texttt{claude-tunnel} grenzt sich gegen
+beide dadurch ab, dass ein \emph{einzelner} Betreiber weder Nutzlast noch
+Vermittlungsziel erfährt --- Chiffretext statt Klartext, opakes Routing-Token
+statt Hostname --- und die Terminierung unabhängig von einer
+Zwei-Parteien-Aufteilung am kundeneigenen Origin verankert bleibt.
+
 Die Alleinstellung von \texttt{claude-tunnel} ergibt sich aus der Kombination
 vierer Bausteine, die in dieser Zusammenstellung bei keinem der verglichenen
-Systeme auftritt:
+Systeme --- auch nicht bei diesen nächsten Vorläufern --- auftritt:
 
 \begin{itemize}
   \item ein \emph{nutzlast-blindes Relay}, das ausschließlich Chiffretext
