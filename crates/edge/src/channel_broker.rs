@@ -160,6 +160,7 @@ fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
 pub async fn read_join_on_connection<F, Fut>(
     conn: &quinn::Connection,
     now: UnixSeconds,
+    join_timeout: std::time::Duration,
     authorize: &F,
 ) -> Result<
     (quinn::SendStream, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>),
@@ -169,6 +170,10 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
+    // #105: bound the whole join read (accept_bi + framed request + possession
+    // round-trip) so a connection that completes the QUIC handshake but never submits
+    // a valid join can't wedge the broker's serial round loop for every other channel.
+    let read = async {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
     // Length-framed request so the presenter's send stream stays open for the
@@ -231,7 +236,20 @@ where
         return Err("holder possession proof failed".into());
     }
     Ok((send, req, operator, member_noise, member_attest))
+    };
+    match tokio::time::timeout(join_timeout, read).await {
+        Ok(r) => r,
+        Err(_) => {
+            Err("channel join not submitted within the timeout — dropping stalled connection (#105)".into())
+        }
+    }
 }
+
+/// The bound on a single connection's join read (#105). A legitimate join completes
+/// in one CP `authorize` HTTP round-trip plus a local possession exchange; anything
+/// slower is a slow/broken/hostile client whose stalled connection would otherwise
+/// wedge the broker's serial round loop, so it is dropped and the loop moves on.
+const JOIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Accept one QUIC connection from `endpoint` and read its channel-join via
 /// [`read_join_on_connection`]. The standalone entrypoint used by the broker's own
@@ -261,7 +279,8 @@ where
         .await
         .ok_or("endpoint closed with no incoming")?;
     let conn = incoming.await?;
-    let (send, req, operator, noise, attest) = read_join_on_connection(&conn, now, authorize).await?;
+    let (send, req, operator, noise, attest) =
+        read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await?;
     Ok((conn, send, req, operator, noise, attest))
 }
 
@@ -678,7 +697,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             // Accept the connection first (as the live edge loop does), then read the join.
             let conn = server.accept().await.expect("incoming").await.expect("conn");
-            let (mut send, req, _op, _noise, _attest) = read_join_on_connection(&conn, 500, &move |c, _h| async move {
+            let (mut send, req, _op, _noise, _attest) = read_join_on_connection(&conn, 500, std::time::Duration::from_secs(5), &move |c, _h| async move {
                 (c.0 == channel).then_some((pk, None, None))
             })
             .await
@@ -694,6 +713,33 @@ mod tests {
         assert_eq!(ack, b"OK", "connection-level gate admits a valid join");
         conn.close(0u32.into(), b"done");
         assert_eq!(server_task.await.expect("join"), "203.0.113.9:6011");
+    }
+
+    #[tokio::test]
+    async fn read_join_on_connection_times_out_a_stalled_connection() {
+        // #105: a client that completes the QUIC handshake but never opens a bi-stream
+        // (never submits a join) must NOT wedge the broker — read_join_on_connection
+        // abandons it within the timeout instead of blocking the serial round forever.
+        use std::time::{Duration, Instant};
+        let pk = operator_pubkey();
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let start = Instant::now();
+            let r = read_join_on_connection(&conn, 500, Duration::from_millis(400), &move |c, _h| async move {
+                (c.0 == [0u8; 32]).then_some((pk, None, None))
+            })
+            .await;
+            (r.is_err(), start.elapsed())
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        // Connect but NEVER open a bi-stream — the stalled/silent case. Hold the
+        // connection so accept_bi genuinely waits (and hits the timeout).
+        let _conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let (errored, elapsed) = server_task.await.expect("task");
+        assert!(errored, "a stalled connection is abandoned with an error, not hung");
+        assert!(elapsed < Duration::from_secs(2), "it timed out fast ({elapsed:?}), not forever");
     }
 
     #[tokio::test]

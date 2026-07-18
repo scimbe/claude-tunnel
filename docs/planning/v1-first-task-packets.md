@@ -2266,6 +2266,20 @@ handshake. Fix: **attest** the Noise key with the member's holder key and verify
 (SEC101b), and relayed + **verified by the initiator before pinning** (SEC101c) — closing the DB-operator
 MITM vector on the A2A direct path end-to-end.
 
+## #105 broker_channel_rendezvous: no per-round timeout — a stalled connection wedges the broker (bug)
+
+A connection that completes the QUIC handshake but never submits a join blocked `read_join_on_connection`'s
+`accept_bi` **forever**, wedging the broker's serial round loop for every channel (a trivial low-effort DoS).
+
+- **Fix ✅** `read_join_on_connection` gained a `join_timeout` param and wraps the whole join read (accept_bi +
+  framed request + possession round-trip) in `tokio::time::timeout`; on elapse it drops the stalled connection
+  with an error and the round moves on. `accept_and_read_join` passes `JOIN_READ_TIMEOUT` (15 s — well above
+  the single CP `authorize` round-trip). Frozen test `read_join_on_connection_times_out_a_stalled_connection`
+  (a silent connection → error in <2 s, not a hang). Gate green.
+- **Follow ⏳** the serial `run_edge` loop still processes rounds one at a time, so a stalled connection can
+  delay others for up to the timeout; running rounds concurrently (`spawn` per round) + correlating the two
+  connections of a pairing is a separate robustness redesign (the reporter's second suggestion).
+
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
 Gutachten: Tabelle 7.1 „80,8 ± 91,9 ms" impliziert negative Latenz (symmetrisches Normal-KI auf
