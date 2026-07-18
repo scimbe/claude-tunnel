@@ -24,8 +24,8 @@ use crate::payment::{PaymentError, PaymentId};
 use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
-    LedgerOpError, PaymentOpError, RedeemError, SqliteChannelStore, SqliteEnrollment, SqliteLedger,
-    SqliteRegistry,
+    BootstrapError, LedgerOpError, PaymentOpError, RedeemError, SqliteBootstrap, SqliteChannelStore,
+    SqliteEnrollment, SqliteLedger, SqliteRegistry,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -173,6 +173,105 @@ pub fn registry_router_sqlite_gated(store: Arc<SqliteRegistry>, admin_token: Opt
         None => register,
     };
     resolve.merge(register)
+}
+
+/// Default TTL (seconds) for a minted bootstrap token (#90/#97 SEC90b-wire): short,
+/// because it exists only to be redeemed once, promptly, by the install one-liner.
+const BOOTSTRAP_TTL_SECS: u64 = 600;
+
+/// Shared state for the bootstrap-token exchange routes.
+#[derive(Clone)]
+struct BootstrapState {
+    store: Arc<SqliteBootstrap>,
+}
+
+/// Build the **bootstrap-token exchange** router (#90/#97 SEC90b-wire): the wire
+/// half of the exchange whose durable core is [`SqliteBootstrap`]. It lets the
+/// install/channel one-liner carry only a short-lived, single-use opaque token
+/// instead of the real secrets (which today are embedded in the shown command and so
+/// land in shell history / `ps`).
+///
+/// * `POST /bootstrap/mint` `{secret, ttl_secs?}` → `{token}` — **admin-gated** (minting
+///   hands off control of a secret bundle; same `CT_CP_EDGE_ADMIN_TOKEN` as the other
+///   operator writers). The operator/portal mints when generating an install one-liner.
+/// * `POST /bootstrap/redeem` `{token}` → `{secret}` — **public**: possession of the
+///   short-lived single-use token is the authorization, and it is handed off over TLS
+///   in the response body (never on the command line). `404` unknown, `409` already
+///   used, `410` expired.
+pub fn bootstrap_router(store: Arc<SqliteBootstrap>, admin_token: Option<[u8; 32]>) -> Router {
+    let redeem = Router::new()
+        .route("/bootstrap/redeem", post(bootstrap_redeem))
+        .with_state(BootstrapState { store: store.clone() });
+    let mint = Router::new()
+        .route("/bootstrap/mint", post(bootstrap_mint))
+        .with_state(BootstrapState { store });
+    let mint = match admin_token {
+        Some(token) => mint.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
+        None => mint,
+    };
+    redeem.merge(mint)
+}
+
+/// Seconds since the Unix epoch (wall clock), for the bootstrap-token TTL.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Deserialize)]
+struct BootstrapMintReq {
+    secret: String,
+    ttl_secs: Option<u64>,
+}
+#[derive(Serialize, Deserialize)]
+struct BootstrapMintResp {
+    token: String,
+}
+
+async fn bootstrap_mint(
+    State(st): State<BootstrapState>,
+    Json(req): Json<BootstrapMintReq>,
+) -> Result<Json<BootstrapMintResp>, (StatusCode, String)> {
+    let ttl = req.ttl_secs.unwrap_or(BOOTSTRAP_TTL_SECS);
+    let token = st
+        .store
+        .mint(&req.secret, ttl, now_secs())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(BootstrapMintResp {
+        token: hex_encode(&token),
+    }))
+}
+
+#[derive(Deserialize)]
+struct BootstrapRedeemReq {
+    token: String,
+}
+#[derive(Serialize, Deserialize)]
+struct BootstrapRedeemResp {
+    secret: String,
+}
+
+async fn bootstrap_redeem(
+    State(st): State<BootstrapState>,
+    Json(req): Json<BootstrapRedeemReq>,
+) -> Result<Json<BootstrapRedeemResp>, (StatusCode, String)> {
+    let token = hex_decode_32(&req.token)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed token".to_string()))?;
+    match st.store.redeem(&token, now_secs()) {
+        Ok(secret) => Ok(Json(BootstrapRedeemResp { secret })),
+        Err(BootstrapError::UnknownToken) => {
+            Err((StatusCode::NOT_FOUND, "unknown bootstrap token".to_string()))
+        }
+        Err(BootstrapError::AlreadyUsed) => {
+            Err((StatusCode::CONFLICT, "bootstrap token already used".to_string()))
+        }
+        Err(BootstrapError::Expired) => {
+            Err((StatusCode::GONE, "bootstrap token expired".to_string()))
+        }
+        Err(BootstrapError::Db(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1049,6 +1148,7 @@ pub fn persistent_control_plane_router(
     let ledger = Arc::new(SqliteLedger::open(db_path)?);
     let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open(db_path)?);
     let channels = Arc::new(SqliteChannelStore::open(db_path)?);
+    let bootstrap = Arc::new(SqliteBootstrap::open(db_path)?);
     let verifier = Arc::new(WebhookVerifier::new(
         webhook_secret.to_vec(),
         WEBHOOK_TOLERANCE_SECS,
@@ -1092,6 +1192,9 @@ pub fn persistent_control_plane_router(
     let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), admin_token)
         .merge(registry_router_sqlite_gated(registry, admin_token))
         .merge(billing_writers_gated(ledger.clone(), admin_token))
+        // #90/#97 SEC90b-wire: bootstrap-token exchange — /bootstrap/mint (admin-gated)
+        // + /bootstrap/redeem (public, single-use short-TTL token handed off over TLS).
+        .merge(bootstrap_router(bootstrap, admin_token))
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
@@ -1472,6 +1575,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "register open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_mint_is_admin_gated_and_redeem_hands_off_once() {
+        // #90/#97 SEC90b-wire: /bootstrap/mint is admin-gated (minting hands off a
+        // secret bundle); /bootstrap/redeem is public (possession of the short-lived
+        // single-use token is the auth) and returns the secret in the TLS body exactly
+        // once — 409 on reuse, 404 on unknown.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x9au8; 32];
+        let store = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
+        let app = bootstrap_router(store, Some(admin));
+
+        // Mint requires the admin token.
+        let mint_no = app
+            .clone()
+            .oneshot(
+                Request::post("/bootstrap/mint")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"secret":"join=aa;routing=bb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mint_no.status(), StatusCode::UNAUTHORIZED, "mint needs the admin token");
+
+        // Mint with the admin token returns a bootstrap token.
+        let mint = app
+            .clone()
+            .oneshot(
+                Request::post("/bootstrap/mint")
+                    .header("content-type", "application/json")
+                    .header("x-ct-admin-token", hex_encode(&admin))
+                    .body(Body::from(r#"{"secret":"join=aa;routing=bb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mint.status(), StatusCode::OK);
+        let mb = to_bytes(mint.into_body(), 1 << 16).await.unwrap();
+        let minted: BootstrapMintResp = serde_json::from_slice(&mb).unwrap();
+
+        let redeem = |tok: String| {
+            app.clone().oneshot(
+                Request::post("/bootstrap/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{tok}"}}"#)))
+                    .unwrap(),
+            )
+        };
+
+        // Redeem is public and hands off the exact secret once.
+        let r1 = redeem(minted.token.clone()).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK, "redeem is public");
+        let b1 = to_bytes(r1.into_body(), 1 << 16).await.unwrap();
+        let got: BootstrapRedeemResp = serde_json::from_slice(&b1).unwrap();
+        assert_eq!(got.secret, "join=aa;routing=bb", "hands off the exact minted secret");
+
+        // Second redemption -> 409 (single-use), unknown token -> 404.
+        assert_eq!(
+            redeem(minted.token.clone()).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "single-use: second redeem is 409"
+        );
+        assert_eq!(
+            redeem(hex_encode(&[0u8; 32])).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "unknown token -> 404"
+        );
+
+        // With no admin token configured, mint is open (dev/back-compat).
+        let open = bootstrap_router(Arc::new(SqliteBootstrap::open_in_memory().unwrap()), None);
+        let r = open
+            .oneshot(
+                Request::post("/bootstrap/mint")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"secret":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "mint open when no admin token is configured");
     }
 
     #[tokio::test]

@@ -2264,9 +2264,15 @@ Two secret-exposure observations. Decomposed:
     `ReplayCache`/rate limiters); the `secret` payload is opaque to the store (shape decided by the wire
     packet). This is the core that makes a leaked one-liner useless once redeemed/expired. Frozen test
     `bootstrap_token_redeems_once_within_ttl_then_is_dead`. Gate green (full `cargo test --workspace -D warnings`).
-  - **SEC90b-wire** ⏳ next: CP route to **mint** a bootstrap token (portal/authed) + **redeem** it
-    (`POST /bootstrap/redeem {token}` → the real `{join_token, routing_token}` bundle in the TLS response body),
-    with the bundle JSON as the `secret` payload.
+  - **SEC90b-wire** ✅ **Bootstrap-token exchange routes** (`service::bootstrap_router`, backed by
+    `SqliteBootstrap` opened on the shared `db_path`): `POST /bootstrap/mint {secret, ttl_secs?}` → `{token}`,
+    **admin-gated** (minting hands off a secret bundle — same `AdminGate` / `CT_CP_EDGE_ADMIN_TOKEN` as the
+    other operator writers; open in dev when unset); `POST /bootstrap/redeem {token}` → `{secret}`, **public**
+    (possession of the short-lived single-use token is the auth, handed off in the TLS response body, never on
+    the command line): `404` unknown, `409` already used, `410` expired. Default mint TTL 600 s; handlers use
+    wall-clock `now_secs()` over the deterministic store core. Merged into `persistent_control_plane_router`.
+    Frozen test `bootstrap_mint_is_admin_gated_and_redeem_hands_off_once` (mint 401 without admin / 200 with;
+    redeem hands off the exact secret once, 409 on reuse, 404 unknown; open when unset). Gate green.
   - **SEC90b-installer** ⏳ then: rewrite `install_one_liner` (+ the channel one-liner, #97/#100) to carry only
     `CT_BOOTSTRAP=<short-token>` and have `install.sh`/`.ps1` redeem it server-side; tied to the #75 live
     install-flow. After that the secret-in-argv exposure is gone and #90/#97 can close.
