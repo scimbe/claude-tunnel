@@ -1818,10 +1818,19 @@ Decomposed:
       the raw-bytes test had hidden. **Capstone frozen test** `agents_tunnel_a_noise_session_over_the_edge_relay`:
       two agents fall back to the relay, run a REAL Noise session over it, and application data flows through
       the edge (ciphertext; Noise E2E). Gate green.
-    - **AF4-relay-orchestrate** ⏳ the thin final wire: `run_channel_join`, on `Unreachable`, auto-invokes
-      `join_via_relay` (direct-then-relay) instead of erroring; both members need the relay endpoint address +
-      a listen-timeout so the acceptor also falls back. Test: induce a blocked direct path and assert the
-      tunnel auto-recovers via the relay with no caller intervention.
+    - **AF4-relay-orchestrate** ✅ **Automatic direct-then-relay recovery.** `run_channel_join` now takes a
+      `relay_conn` + `dial_timeout`/`accept_timeout`: the initiator dials direct and on `Unreachable`
+      auto-invokes `join_via_relay`; the acceptor waits on its listener with a timeout and, if the direct
+      connection never arrives, also falls back to the relay — so a blocked direct path recovers with no
+      caller intervention. **Frozen test** `run_channel_join_auto_falls_back_to_the_relay_when_direct_is_blocked`
+      *induces* the failure (the rendezvous hands a bound-but-silent blackhole endpoint; the 400 ms direct dial
+      times out) and asserts the tunnel auto-recovers via the edge relay and carries data. Gate green.
+
+  **AF4-session-resilience is complete** (scimbe's connection-difficulty focus): fast **classified** dial
+  (`Unreachable`) → role-aware edge relay-forward → relay-mode admission handler → agent relay path with a
+  real Noise session over the relay → **automatic direct-then-relay recovery**, each with an induced-failure
+  test. The remaining #72 work is non-resilience: AF3 operator-signed invitations, and closing out #100's
+  self-contained one-liner polish.
     - Also: refused-join and unresolvable-peer error surfacing; retry/backoff.
   - **AF4-session-cli-join** ⏳ a thin `ct-agent channel-join` subcommand wiring env → `run_channel_join`.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**

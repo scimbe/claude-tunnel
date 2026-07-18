@@ -98,21 +98,27 @@ where
     noise_pump(session, BiStream { send, recv }, local).await
 }
 
-/// Hands-off A2A join (#72 AF4 / #100): present `request` to the edge broker over
-/// `broker_conn`, and on admission use the endpoint **and Noise key the rendezvous
-/// relays** (no operator-conveyed value) to establish the encrypted session, piping
-/// `local` over it. `role` (from the grant `Direction`) selects the side: an
-/// `Initiate` peer dials the learned `peer_endpoint` with the accept-any channel
-/// dialer; an `Accept` peer takes the next connection on its own `listener` (bound at
-/// the endpoint it advertised in `request`). Fails if the broker refuses or relays no
-/// peer Noise key (the registry must carry it — AF4-keydist).
+/// Hands-off A2A join with automatic **direct-then-relay** recovery (#72 AF4 /
+/// AF4-session-resilience): present `request` to the edge broker over `broker_conn`,
+/// learn the peer endpoint + Noise key the rendezvous relays, then try the **direct**
+/// path and, if it can't connect, transparently fall back to the edge **relay**
+/// (`relay_conn`) — so a blocked direct path (NAT/firewall) recovers with no caller
+/// intervention. `role` (from the grant `Direction`) selects the side: an `Initiate`
+/// peer dials `peer_endpoint` (bounded by `dial_timeout`; `Unreachable` → relay); an
+/// `Accept` peer waits on its `listener` (bounded by `accept_timeout`; timeout →
+/// relay, since the initiator that can't reach it directly went to the relay too). The
+/// relay carries ciphertext only — the Noise_IK session stays end-to-end either way.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join<P>(
     broker_conn: &Connection,
+    relay_conn: &Connection,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
     role: ChannelRole,
     own_noise_private: &[u8; 32],
     listener: Option<Endpoint>,
+    dial_timeout: std::time::Duration,
+    accept_timeout: std::time::Duration,
     local: P,
 ) -> Result<(), BoxError>
 where
@@ -131,27 +137,30 @@ where
             let addr = peer_endpoint
                 .parse()
                 .map_err(|_| format!("broker returned an unparseable peer endpoint: {peer_endpoint:?}"))?;
-            let conn = match dial_peer_direct(addr, DIRECT_DIAL_TIMEOUT).await {
-                Ok(conn) => conn,
-                // #72 AF4-session-resilience: the direct path is blocked
-                // (NAT/firewall/down). Edge-relay fallback is the next packet; until
-                // it's wired, surface a clear, actionable error instead of hanging.
+            match dial_peer_direct(addr, dial_timeout).await {
+                Ok(conn) => {
+                    run_channel_session(&conn, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+                }
                 Err(ChannelDialError::Unreachable) => {
-                    return Err(format!(
-                        "direct A2A dial to {addr} timed out — peer unreachable on the direct \
-                         path (NAT/firewall/down); edge-relay fallback not yet wired \
-                         (#72 AF4-session-resilience)"
-                    )
-                    .into());
+                    eprintln!("ct-agent channel: direct dial to {addr} unreachable — falling back to the edge relay (#72)");
+                    join_via_relay(relay_conn, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
                 }
                 Err(ChannelDialError::Failed(e)) => return Err(e),
-            };
-            run_channel_session(&conn, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+            }
         }
         ChannelRole::Accept => {
             let ep = listener.ok_or("responder role requires a bound listener")?;
-            let conn = ep.accept().await.ok_or("channel listener closed with no incoming")?.await?;
-            run_channel_session(&conn, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+            match tokio::time::timeout(accept_timeout, ep.accept()).await {
+                Ok(Some(incoming)) => {
+                    let conn = incoming.await?;
+                    run_channel_session(&conn, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+                }
+                Ok(None) => return Err("channel listener closed with no incoming".into()),
+                Err(_timeout) => {
+                    eprintln!("ct-agent channel: no direct connection within {accept_timeout:?} — falling back to the edge relay (#72)");
+                    join_via_relay(relay_conn, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+                }
+            }
         }
     }
     Ok(())
@@ -542,7 +551,21 @@ mod tests {
         let a_task = tokio::spawn(async move {
             let c = build_client_endpoint(broker_cert).expect("client");
             let conn = c.connect(broker_addr, "localhost").expect("cfg").await.expect("conn");
-            run_channel_join(&conn, &req, &holder, ChannelRole::Initiate, &inp, None, a_local_run).await
+            // Direct dial succeeds here (the stub broker gives a real responder addr),
+            // so relay_conn is unused — reuse the broker conn; timeouts don't fire.
+            run_channel_join(
+                &conn,
+                &conn,
+                &req,
+                &holder,
+                ChannelRole::Initiate,
+                &inp,
+                None,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                a_local_run,
+            )
+            .await
         });
 
         // Data flows initiator -> responder with zero out-of-band key/cert exchange.
@@ -630,6 +653,110 @@ mod tests {
         a.abort();
         b.abort();
         relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_channel_join_auto_falls_back_to_the_relay_when_direct_is_blocked() {
+        // #72 AF4-relay-orchestrate: the auto-recovery. The rendezvous hands the
+        // initiator a peer endpoint that BLACKHOLES (bound-but-silent), so the direct
+        // dial times out (Unreachable) and run_channel_join transparently falls back to
+        // the edge relay where the responder waits — the tunnel carries data with NO
+        // caller intervention.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::broker_channel_relay;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x21u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x22u8; 32]);
+        let channel = [0xE2u8; 32];
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        let req_a = ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: "203.0.113.1:7001".to_string() };
+        let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".to_string() };
+
+        // A bound-but-silent UDP socket: the direct dial to it blackholes -> times out.
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").expect("blackhole");
+        let blackhole_addr = blackhole.local_addr().expect("bh addr");
+
+        // Stub rendezvous: hands the initiator the blackhole addr + B's Noise key.
+        let (rdv_ep, rdv_cert) = build_server_endpoint_with_cert().expect("rdv");
+        let rdv_addr = rdv_ep.local_addr().expect("rdv addr");
+        let nb_pub = noise_b.public;
+        let rdv_task = tokio::spawn(async move { stub_broker_admit(&rdv_ep, blackhole_addr, nb_pub).await });
+
+        // Real relay endpoint.
+        let (relay_ep, relay_cert) = build_server_endpoint_with_cert().expect("relay");
+        let relay_addr = relay_ep.local_addr().expect("relay addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
+                (c.0 == channel).then_some((op_pub, None))
+            })
+            .await
+            .map(|_| ())
+        });
+
+        // Initiator via run_channel_join: direct -> blackhole -> Unreachable -> relay.
+        let (mut a_local_test, a_local_run) = tokio::io::duplex(8192);
+        let na = noise_a.private;
+        let relay_cert_a = relay_cert.clone();
+        let a = tokio::spawn(async move {
+            let bc = build_client_endpoint(rdv_cert).expect("bc");
+            let broker_conn = bc.connect(rdv_addr, "localhost").expect("cfg").await.expect("bconn");
+            let rc = build_client_endpoint(relay_cert_a).expect("rc");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn");
+            run_channel_join(
+                &broker_conn,
+                &relay_conn,
+                &req_a,
+                &holder_a,
+                ChannelRole::Initiate,
+                &na,
+                None,
+                std::time::Duration::from_millis(400), // short dial timeout -> fast fallback
+                std::time::Duration::from_secs(2),
+                a_local_run,
+            )
+            .await
+        });
+
+        // Responder joins the relay directly (its own listen-timeout fallback is covered
+        // by run_channel_join's Accept branch; here it goes straight to the relay).
+        let (mut b_local_test, b_local_run) = tokio::io::duplex(8192);
+        let nb = noise_b.private;
+        let nap = noise_a.public;
+        let b = tokio::spawn(async move {
+            let rc = build_client_endpoint(relay_cert).expect("rc b");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
+            join_via_relay(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &nap, b_local_run).await
+        });
+
+        let payload = b"auto-recovered onto the relay after the direct path was blocked";
+        a_local_test.write_all(payload).await.expect("write");
+        a_local_test.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        b_local_test.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, payload, "the tunnel auto-recovered via the relay with no caller intervention");
+
+        a.abort();
+        b.abort();
+        rdv_task.abort();
+        relay_task.abort();
+        drop(blackhole);
     }
 
     #[tokio::test]
