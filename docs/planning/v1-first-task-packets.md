@@ -1788,13 +1788,18 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
   check — `signature` must be the holder's ed25519 signature over the edge-issued `challenge`, verified
   against the grant's `holder` pubkey. Closes replay of an old proof against a fresh nonce. 1 frozen test
   (real holder verifies; wrong key / stale challenge / tampered sig rejected). Gate green.
-- **SEC81b-b** ⏳ **Wire the challenge-response into the QUIC gate**: the gate issues a single-use nonce
-  after grant+membership pass, reads the holder's signature, calls `verify_holder_possession`. Needs
-  length-prefixed request framing (or a second stream) + the test client to sign; lands with the agent-side
-  join dial. MUST precede SEC81c (broker-live).
+- **SEC81b-b** ✅ **Wire the challenge-response into the QUIC gate** (`ct-edge::channel_broker`): after
+  grant+membership+endpoint pass, `accept_and_read_join` fills a fresh 32-byte `OsRng` challenge, writes it,
+  reads a 64-byte holder signature, and calls `verify_holder_possession` before acking — so a stolen grant
+  (exfiltrated wire bytes) can no longer join, and an old proof can't be replayed against a new nonce. The
+  request read moved to a `u16`-BE length prefix so the presenter's send stream stays open for the round-trip
+  (a `read_to_end` would force an early finish). Frozen test `edge_requires_holder_possession_of_the_grant`:
+  the genuine holder signs the challenge and is admitted; a thief who replays the identical grant but signs
+  with another key is refused. Broker still NOT live (SEC81c) — this only hardens the gate it will mount.
+  Gate green (13 broker tests).
 - **SEC81c** ⏳ **Wire the broker into the live edge** (gap 4): mount `broker_channel_rendezvous` in
-  serve.rs + a control-plane channel-registry API, ONLY after SEC81b. Endpoint should additionally be
-  constrained to match the agent's advertised direct endpoint where possible.
+  serve.rs + a control-plane channel-registry API, ONLY after SEC81b (now unblocked). Endpoint should
+  additionally be constrained to match the agent's advertised direct endpoint where possible.
 
 ## #78 CI gate / build-isolation security review (security-review)
 

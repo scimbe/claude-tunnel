@@ -10,9 +10,11 @@
 //! two agents) and where the operator key comes from are later sub-packets.
 
 use ct_common::channel::{
-    verify, ChannelId, ChannelJoinRequest, Direction, GrantError, SignedChannelGrant, UnixSeconds,
+    verify, verify_holder_possession, ChannelId, ChannelJoinRequest, Direction, GrantError,
+    SignedChannelGrant, UnixSeconds,
 };
 use quinn::Endpoint;
+use rand::RngCore;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -121,8 +123,15 @@ fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
 /// #81 gap-2 membership/revocation check into the operator-key source (removing a
 /// member from the registry now denies admission at the gate, no key rotation or
 /// expiry-shortening needed). Rejects (with a `NO`) a malformed request, an
-/// #81 gap-3 unsafe advertised endpoint, an unknown-channel/non-member holder, and
-/// a bad/expired grant. Returns the request and the resolved operator key.
+/// #81 gap-3 unsafe advertised endpoint, an unknown-channel/non-member holder, a
+/// bad/expired grant, and (#81 gap 1) a presenter that cannot prove it holds the
+/// grant's `holder` private key. Returns the request and the resolved operator key.
+///
+/// Wire framing: the presenter sends a `u16`-BE length prefix + the encoded request,
+/// then keeps its stream open. The edge replies with a fresh 32-byte challenge; the
+/// presenter must answer with a 64-byte ed25519 signature over it under `holder`
+/// before the edge acks. (A plain `read_to_end` would force the presenter to finish
+/// its send stream, leaving no room for the possession round-trip.)
 async fn accept_and_read_join<F>(
     endpoint: &Endpoint,
     now: UnixSeconds,
@@ -137,7 +146,19 @@ where
         .ok_or("endpoint closed with no incoming")?;
     let conn = incoming.await?;
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let bytes = recv.read_to_end(1024).await?;
+
+    // Length-framed request so the presenter's send stream stays open for the
+    // possession challenge-response below.
+    let mut len_buf = [0u8; 2];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > 1024 {
+        let _ = send.write_all(b"NO").await;
+        let _ = send.finish();
+        return Err("channel join request length out of range".into());
+    }
+    let mut bytes = vec![0u8; len];
+    recv.read_exact(&mut bytes).await?;
 
     let req = match ChannelJoinRequest::decode(&bytes) {
         Ok(r) => r,
@@ -167,6 +188,22 @@ where
         let _ = send.write_all(b"NO").await;
         let _ = send.finish();
         return Err(format!("channel grant rejected: {e}").into());
+    }
+    // #81 gap 1: a signed grant is bearer bytes until the presenter proves it holds
+    // the `holder` private key. The edge picks a fresh single-use challenge; the
+    // presenter must return an ed25519 signature over it under `holder`. A stolen
+    // grant (exfiltrated wire bytes) cannot answer, and a captured old signature
+    // can't be replayed against a new challenge.
+    let mut challenge = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut challenge);
+    send.write_all(&challenge).await?;
+    let mut sig = [0u8; 64];
+    if recv.read_exact(&mut sig).await.is_err()
+        || !verify_holder_possession(&req.grant.grant.holder, &challenge, &sig)
+    {
+        let _ = send.write_all(b"NO").await;
+        let _ = send.finish();
+        return Err("holder possession proof failed".into());
     }
     Ok((conn, send, req, operator))
 }
@@ -357,10 +394,53 @@ mod tests {
 
     // --- AF2d-transport: the QUIC channel-join admission gate ---
 
-    async fn present_join(conn: &quinn::Connection, req_bytes: &[u8]) -> Vec<u8> {
+    /// A holder keypair with a real ed25519 public key (unlike the `[byte; 32]`
+    /// fake pubkeys used in the pure-authz tests) so the possession round-trip works.
+    fn holder_sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// A grant bound to a real holder pubkey, signed by the channel operator.
+    fn grant_h(
+        channel: [u8; 32],
+        holder: &SigningKey,
+        direction: Direction,
+        expires_at: UnixSeconds,
+    ) -> SignedChannelGrant {
+        let sk = SigningKey::from_bytes(&OP_SEED);
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: holder.verifying_key().to_bytes(),
+            direction,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at,
+        };
+        let signature = sk.sign(&g.signing_bytes()).to_bytes();
+        SignedChannelGrant { grant: g, signature }
+    }
+
+    /// Drive the client side of the admission handshake: send the length-framed
+    /// request, then (if the edge challenges) sign it under `holder` to prove
+    /// possession. Returns the edge's final ack (empty if refused pre-possession).
+    async fn present_join(
+        conn: &quinn::Connection,
+        req_bytes: &[u8],
+        holder: &SigningKey,
+    ) -> Vec<u8> {
         let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+        send.write_all(&(req_bytes.len() as u16).to_be_bytes())
+            .await
+            .expect("write length");
         send.write_all(req_bytes).await.expect("write request");
-        send.finish().expect("finish");
+        // Answer the edge's possession challenge; if the join was refused before
+        // that point the stream finishes early and read_exact fails — return the ack.
+        let mut challenge = [0u8; 32];
+        if recv.read_exact(&mut challenge).await.is_ok() {
+            let sig = holder.sign(&challenge).to_bytes();
+            let _ = send.write_all(&sig).await;
+        }
+        let _ = send.finish();
         recv.read_to_end(128).await.unwrap_or_default()
     }
 
@@ -375,7 +455,11 @@ mod tests {
     async fn edge_admits_a_valid_channel_join() {
         let pk = operator_pubkey();
         let channel = [0xC1u8; 32];
-        let req = join_request(channel, 0x0a, "203.0.113.9:6001");
+        let holder = holder_sk(0x0a);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6001".to_string(),
+        };
 
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
@@ -388,7 +472,7 @@ mod tests {
 
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
-        let ack = present_join(&conn, &req.encode()).await;
+        let ack = present_join(&conn, &req.encode(), &holder).await;
         assert_eq!(ack, b"OK");
         conn.close(0u32.into(), b"done");
 
@@ -408,7 +492,7 @@ mod tests {
             );
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
-        let ack = present_join(&conn, &unknown.encode()).await;
+        let ack = present_join(&conn, &unknown.encode(), &holder_sk(0x0b)).await;
         assert_ne!(ack, b"OK", "an unknown channel must be refused");
         let _ = server_task.await;
 
@@ -425,7 +509,7 @@ mod tests {
         });
         let client2 = build_client_endpoint(cert2).expect("client");
         let conn2 = client2.connect(addr2, "localhost").expect("cfg").await.expect("conn");
-        let ack2 = present_join(&conn2, &expired.encode()).await;
+        let ack2 = present_join(&conn2, &expired.encode(), &holder_sk(0x0c)).await;
         assert_ne!(ack2, b"OK", "an expired grant must be refused");
         let _ = server2_task.await;
     }
@@ -446,26 +530,31 @@ mod tests {
                 .map_err(|e| e.to_string())
         });
 
+        let holder_a = holder_sk(0xa1);
+        let holder_b = holder_sk(0xb2);
+        // First pubkey byte identifies each holder in the returned pairing.
+        let ia = holder_a.verifying_key().to_bytes()[0];
+        let ib = holder_b.verifying_key().to_bytes()[0];
         let req_a = ChannelJoinRequest {
-            grant: grant(channel, 0xa1, Direction::Initiate, 1_000),
+            grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
             endpoint: "10.0.0.1:7001".to_string(),
         };
         let req_b = ChannelJoinRequest {
-            grant: grant(channel, 0xb2, Direction::Accept, 1_000),
+            grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
             endpoint: "10.0.0.2:7002".to_string(),
         };
         let cert_b = cert.clone();
         let a = tokio::spawn(async move {
             let c = build_client_endpoint(cert).expect("client");
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
-            let ack = present_join(&conn, &req_a.encode()).await;
+            let ack = present_join(&conn, &req_a.encode(), &holder_a).await;
             conn.close(0u32.into(), b"done");
             String::from_utf8(ack).unwrap_or_default()
         });
         let b = tokio::spawn(async move {
             let c = build_client_endpoint(cert_b).expect("client");
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
-            let ack = present_join(&conn, &req_b.encode()).await;
+            let ack = present_join(&conn, &req_b.encode(), &holder_b).await;
             conn.close(0u32.into(), b"done");
             String::from_utf8(ack).unwrap_or_default()
         });
@@ -477,8 +566,8 @@ mod tests {
         // Each agent learned the PEER's endpoint (independent of edge accept order).
         assert!(ack_a.contains("10.0.0.2:7002"), "agent A learns B's endpoint, got {ack_a:?}");
         assert!(ack_b.contains("10.0.0.1:7001"), "agent B learns A's endpoint, got {ack_b:?}");
-        // The initiator is the Initiate-holder (0xa1), the acceptor the Accept-holder (0xb2).
-        assert_eq!(paired, (0xa1, 0xb2), "roles follow the grants' directions");
+        // The initiator is the Initiate-holder, the acceptor the Accept-holder.
+        assert_eq!(paired, (ia, ib), "roles follow the grants' directions");
     }
 
     #[tokio::test]
@@ -501,7 +590,7 @@ mod tests {
         });
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
-        let ack = present_join(&conn, &req.encode()).await;
+        let ack = present_join(&conn, &req.encode(), &holder_sk(0x0b)).await;
         assert_ne!(ack, b"OK", "a non-member holder must be refused");
         let _ = server_task.await;
     }
@@ -522,8 +611,54 @@ mod tests {
         });
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
-        let ack = present_join(&conn, &req.encode()).await;
+        let ack = present_join(&conn, &req.encode(), &holder_sk(0x0c)).await;
         assert_ne!(ack, b"OK", "a loopback advertised endpoint must be refused");
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn edge_requires_holder_possession_of_the_grant() {
+        // #81 gap 1: a valid, signed, unexpired grant for a current member is still
+        // bearer bytes until the presenter proves it holds the holder private key.
+        // The genuine holder signs the edge challenge and is admitted; a thief who
+        // replays the SAME ~139-byte grant but signs with a different key is refused.
+        let pk = operator_pubkey();
+        let channel = [0xF1u8; 32];
+        let holder = holder_sk(0x33);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6200".to_string(),
+        };
+
+        // (1) genuine holder proves possession -> admitted.
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let task = tokio::spawn(async move {
+            resolve_channel_join(&server, 500, move |c, _h| (c.0 == channel).then_some(pk))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode(), &holder).await;
+        assert_eq!(ack, b"OK", "the genuine holder proves possession and is admitted");
+        conn.close(0u32.into(), b"done");
+        task.await.expect("join").expect("admitted");
+
+        // (2) a thief replays the identical grant bytes but signs with another key.
+        let thief = holder_sk(0x99);
+        let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
+        let addr2 = server2.local_addr().expect("addr");
+        let task2 = tokio::spawn(async move {
+            resolve_channel_join(&server2, 500, move |c, _h| (c.0 == channel).then_some(pk))
+                .await
+                .map(|_| ())
+        });
+        let client2 = build_client_endpoint(cert2).expect("client");
+        let conn2 = client2.connect(addr2, "localhost").expect("cfg").await.expect("conn");
+        let ack2 = present_join(&conn2, &req.encode(), &thief).await;
+        assert_ne!(ack2, b"OK", "a stolen grant without holder possession is refused");
+        let _ = task2.await;
     }
 }
