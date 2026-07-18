@@ -73,14 +73,19 @@ pub fn build_portal_acceptor(
     key_pem: impl AsRef<Path>,
 ) -> Result<TlsAcceptor, BoxError> {
     install_crypto_provider();
-    let mut cr = std::io::BufReader::new(std::fs::File::open(cert_pem)?);
-    let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cr).collect::<Result<_, _>>()?;
+    // PEM parsing via the maintained rustls-pki-types PemObject decoders (#80 SEC80b —
+    // replaces the unmaintained rustls-pemfile).
+    use rustls::pki_types::pem::PemObject;
+    let cert_bytes = std::fs::read(cert_pem)?;
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("portal cert PEM parse failed: {e}"))?;
     if chain.is_empty() {
         return Err("portal cert file had no certificates".into());
     }
-    let mut kr = std::io::BufReader::new(std::fs::File::open(key_pem)?);
-    let key = rustls_pemfile::private_key(&mut kr)?.ok_or("portal key file had no private key")?;
+    let key_bytes = std::fs::read(key_pem)?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+        .map_err(|e| format!("portal key file had no usable private key: {e}"))?;
     let cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain, key)?;
@@ -179,6 +184,31 @@ pub async fn build_dual_edge(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn build_portal_acceptor_parses_pem_via_pki_types() {
+        // #80 SEC80b: the rustls-pki-types PEM decoders (replacing the unmaintained
+        // rustls-pemfile) must accept a real PEM cert + PKCS#8 key and reject junk.
+        let certified = rcgen::generate_simple_self_signed(vec!["portal.example".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("ct-portal-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+
+        assert!(
+            build_portal_acceptor(&cert_path, &key_path).is_ok(),
+            "a real PEM cert + key parse into a TLS acceptor"
+        );
+        // A key file with no PEM key material is rejected (not silently accepted).
+        std::fs::write(&key_path, b"-----BEGIN NONSENSE-----\nnope\n-----END NONSENSE-----\n").unwrap();
+        assert!(
+            build_portal_acceptor(&cert_path, &key_path).is_err(),
+            "a file with no usable private key is rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn tcp_tls_stream_echoes() {

@@ -1844,6 +1844,8 @@ GLM-5.2 review: 3 OIDC weaknesses. Decomposed:
   documented rationale. `docs/security/dependency-audit.md` updated to the real state (0 vulns with the
   documented ignore, 1 unmaintained warning, exit 0). Verified live: `scripts/security-audit.sh` now exits
   0 (only the non-failing rustls-pemfile warning remains).
-- **SEC80b** ⏳ **Replace the runtime unmaintained `rustls-pemfile`** (RUSTSEC-2025-0134): it's a real
-  runtime dep of `ct-edge` (PEM cert parsing for the front door). Replace with `rustls-pki-types` PEM
-  parsing (or equivalent) so no unmaintained crate ships. Then the warning clears too.
+- **SEC80b** ✅ **Replaced the runtime unmaintained `rustls-pemfile`** (RUSTSEC-2025-0134) with the
+  maintained `rustls-pki-types` PemObject decoders in `ct-edge::transport::build_portal_acceptor`.
+  `rustls-pemfile` is gone from Cargo.lock (218 deps, was 219). Frozen test
+  `build_portal_acceptor_parses_pem_via_pki_types` (real self-signed PEM cert+key parse; junk rejected).
+  cargo audit now fully clean: exit 0, 0 vulns (rsa ignored), 0 warnings. **#80 fix-ready.**
