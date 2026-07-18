@@ -958,6 +958,9 @@ impl SqliteChannelStore {
         // which the peer pins for the direct-path Noise_IK handshake. Additive,
         // nullable migration so an already-deployed channel_members upgrades in place (#44).
         ensure_column(&conn, "channel_members", "noise_pubkey", "BLOB")?;
+        // #101 SEC101b: the member's attestation over its Noise key (holder-signed),
+        // stored so the edge can relay it and the peer can verify the key is genuine.
+        ensure_column(&conn, "channel_members", "noise_attestation", "BLOB")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1052,6 +1055,7 @@ impl SqliteChannelStore {
         owner: &str,
         holder: &[u8; 32],
         noise_pubkey: &[u8; 32],
+        noise_attestation: &[u8; 64],
     ) -> rusqlite::Result<bool> {
         let conn = self.conn.lock_safe();
         let is_owner: bool = conn
@@ -1066,10 +1070,32 @@ impl SqliteChannelStore {
             return Ok(false);
         }
         conn.execute(
-            "INSERT OR REPLACE INTO channel_members (channel, holder, noise_pubkey) VALUES (?1, ?2, ?3)",
-            params![&channel.0[..], &holder[..], &noise_pubkey[..]],
+            "INSERT OR REPLACE INTO channel_members (channel, holder, noise_pubkey, noise_attestation) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&channel.0[..], &holder[..], &noise_pubkey[..], &noise_attestation[..]],
         )?;
         Ok(true)
+    }
+
+    /// The holder-signed attestation over `holder`'s Noise key on `channel` (#101), if
+    /// recorded. The edge relays this to the peer, who verifies the Noise key is bound
+    /// to the holder (`ct_common::channel::verify_member_noise_attestation`) before
+    /// pinning it — so a DB-substituted key is rejected.
+    pub fn member_noise_attestation(
+        &self,
+        channel: &ChannelId,
+        holder: &[u8; 32],
+    ) -> rusqlite::Result<Option<[u8; 64]>> {
+        let raw: Option<Option<Vec<u8>>> = self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT noise_attestation FROM channel_members WHERE channel = ?1 AND holder = ?2",
+                params![&channel.0[..], &holder[..]],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?;
+        Ok(raw.flatten().and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok()))
     }
 
     /// The X25519 Noise static key `holder` pinned for `channel` (#72 AF4), if the
@@ -1630,12 +1656,12 @@ mod tests {
         // Non-owner cannot re-key the channel or manage its members.
         assert!(!s.register_channel(&ch, &[0xAAu8; 32], "mallory").unwrap());
         assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op), "operator key unchanged");
-        assert!(!s.add_member(&ch, "mallory", &member, &[0xd4u8; 32]).unwrap());
+        assert!(!s.add_member(&ch, "mallory", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
         assert!(!s.is_member(&ch, &member).unwrap());
 
         // Owner adds a member (idempotent), then removes it (idempotent).
-        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap());
-        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap(), "add is idempotent");
+        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
+        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap(), "add is idempotent");
         assert!(s.is_member(&ch, &member).unwrap());
         assert!(s.remove_member(&ch, "alice", &member).unwrap());
         assert!(s.remove_member(&ch, "alice", &member).unwrap(), "remove is idempotent");
@@ -1666,7 +1692,7 @@ mod tests {
         assert_eq!(s.authorize_holder(&ch, &member).unwrap(), None, "non-member gets no key");
 
         // Member -> the operator key; a different holder still gets None.
-        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap());
+        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
         assert_eq!(s.authorize_holder(&ch, &member).unwrap(), Some(op), "member resolves the key");
         assert_eq!(s.authorize_holder(&ch, &stranger).unwrap(), None);
 
@@ -1675,7 +1701,7 @@ mod tests {
         assert_eq!(s.authorize_holder(&ch, &member).unwrap(), None, "revoked member refused");
 
         // Re-key tracks through: a re-added member resolves the NEW operator key.
-        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap());
+        assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
         assert!(s.register_channel(&ch, &[0x55u8; 32], "alice").unwrap());
         assert_eq!(s.authorize_holder(&ch, &member).unwrap(), Some([0x55u8; 32]));
     }
@@ -1693,10 +1719,10 @@ mod tests {
 
         assert!(s.register_channel(&ch, &[0xEEu8; 32], "alice").unwrap());
         assert_eq!(s.member_noise_key(&ch, &member).unwrap(), None, "non-member has no key");
-        assert!(s.add_member(&ch, "alice", &member, &k1).unwrap());
+        assert!(s.add_member(&ch, "alice", &member, &k1, &[0u8; 64]).unwrap());
         assert_eq!(s.member_noise_key(&ch, &member).unwrap(), Some(k1), "key round-trips");
         // Re-adding the same member updates the pinned key.
-        assert!(s.add_member(&ch, "alice", &member, &k2).unwrap());
+        assert!(s.add_member(&ch, "alice", &member, &k2, &[0u8; 64]).unwrap());
         assert_eq!(s.member_noise_key(&ch, &member).unwrap(), Some(k2), "re-add updates the key");
         // Revocation removes the member and its key.
         assert!(s.remove_member(&ch, "alice", &member).unwrap());
@@ -1713,7 +1739,7 @@ mod tests {
         {
             let s = SqliteChannelStore::open(&path).unwrap();
             assert!(s.register_channel(&ch, &op, "alice").unwrap());
-            assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap());
+            assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
         }
         let reopened = SqliteChannelStore::open(&path).unwrap();
         assert_eq!(reopened.operator_pubkey(&ch).unwrap(), Some(op), "operator key persists");

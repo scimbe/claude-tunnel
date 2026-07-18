@@ -473,6 +473,10 @@ struct MemberReq {
     /// The member's X25519 Noise static key (#72 AF4) — the peer pins this for the
     /// direct-path Noise_IK handshake.
     noise_pubkey: String,
+    /// The member's attestation over `noise_pubkey` (#101): the holder's ed25519
+    /// signature over `member_noise_attest_bytes(channel, holder, noise_pubkey)`,
+    /// hex. The CP verifies it, so an un-attested / operator-forged key is rejected.
+    noise_attestation: String,
 }
 
 async fn channel_add_member(
@@ -488,9 +492,25 @@ async fn channel_add_member(
         .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
     let noise_pubkey = hex_decode_32(&req.noise_pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
+    let noise_attestation = hex_decode_64(&req.noise_attestation)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_attestation".to_string()))?;
+    // #101 SEC101b: the Noise key must be attested by the holder — a signature over
+    // (channel, holder, noise_pubkey) under the holder key. Reject an un-attested or
+    // forged key so a DB-controlling operator can't seed a MITM key.
+    if !ct_common::channel::verify_member_noise_attestation(
+        &ChannelId(channel),
+        &holder,
+        &noise_pubkey,
+        &noise_attestation,
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "noise_attestation does not verify against the holder key".to_string(),
+        ));
+    }
     let ok = state
         .channels
-        .add_member(&ChannelId(channel), &owner, &holder, &noise_pubkey)
+        .add_member(&ChannelId(channel), &owner, &holder, &noise_pubkey, &noise_attestation)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // false → not the owner (or unknown channel): only the owner manages members.
     if ok {
@@ -1065,6 +1085,12 @@ struct AuthorizeResp {
     /// enrolled before AF4-keydist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     noise_pubkey: Option<String>,
+    /// The member's holder-signed attestation over `noise_pubkey` (#101, hex): the
+    /// broker relays it so the peer can verify the Noise key is genuinely the holder's
+    /// before pinning it (rejecting a DB-substituted key). Absent for members enrolled
+    /// before attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    noise_attestation: Option<String>,
 }
 
 async fn channel_authorize(
@@ -1098,9 +1124,16 @@ async fn channel_authorize(
                 .ok()
                 .flatten()
                 .map(|n| hex_encode(&n));
+            let attestation = state
+                .channels
+                .member_noise_attestation(&ChannelId(channel), &holder)
+                .ok()
+                .flatten()
+                .map(|a| hex_encode(&a));
             Ok(Json(AuthorizeResp {
                 operator_pubkey: hex_encode(&op),
                 noise_pubkey: noise,
+                noise_attestation: attestation,
             }))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -1615,11 +1648,19 @@ mod tests {
             app.clone().oneshot(req.body(Body::from(body)).unwrap())
         };
 
+        use ed25519_dalek::{Signer, SigningKey};
         let ch = "a1".repeat(32);
         let op = "b2".repeat(32);
-        let holder = "c3".repeat(32);
         let chan = ChannelId(hex_decode_32(&ch).unwrap());
-        let hbytes = hex_decode_32(&holder).unwrap();
+        // #101: the member attests its Noise key with its holder key, so the holder
+        // must be a real keypair and the POST must carry a valid attestation.
+        let holder_sk = SigningKey::from_bytes(&[0xc3u8; 32]);
+        let hbytes = holder_sk.verifying_key().to_bytes();
+        let holder = hex_encode(&hbytes);
+        let nk_bytes = [0xd4u8; 32];
+        let attest = |sk: &SigningKey, hb: &[u8; 32]| {
+            hex_encode(&sk.sign(&ct_common::channel::member_noise_attest_bytes(&chan, hb, &nk_bytes)).to_bytes())
+        };
 
         // Unauthenticated registration is rejected.
         let s = post(
@@ -1642,11 +1683,12 @@ mod tests {
         .unwrap()
         .status();
         assert_eq!(s, StatusCode::OK, "owner registers");
-        let nk = "d4".repeat(32);
+        let nk = hex_encode(&nk_bytes);
+        let att = attest(&holder_sk, &hbytes);
         let s = post(
             format!("/me/channels/{ch}/members"),
             Some(alice.clone()),
-            format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}"}}"#),
+            format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}","noise_attestation":"{att}"}}"#),
         )
         .await
         .unwrap()
@@ -1663,11 +1705,27 @@ mod tests {
             "the member's pinned X25519 Noise key round-trips (AF4 key distribution)"
         );
 
-        // Mallory cannot manage or re-key alice's channel.
+        // #101 SEC101b: a member POST whose attestation doesn't verify (here all-zero)
+        // is rejected — the CP won't store an un-attested / operator-forged Noise key.
+        let s = post(
+            format!("/me/channels/{ch}/members"),
+            Some(alice.clone()),
+            format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}","noise_attestation":"{}"}}"#, "00".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::BAD_REQUEST, "an unattested Noise key is rejected (#101)");
+
+        // Mallory cannot manage or re-key alice's channel (valid attestation, so the
+        // rejection is on ownership at 403, not the attestation check).
+        let m_sk = SigningKey::from_bytes(&[0xeeu8; 32]);
+        let m_h = hex_encode(&m_sk.verifying_key().to_bytes());
+        let m_att = attest(&m_sk, &m_sk.verifying_key().to_bytes());
         let s = post(
             format!("/me/channels/{ch}/members"),
             Some(mallory.clone()),
-            format!(r#"{{"holder":"{}","noise_pubkey":"{}"}}"#, "ee".repeat(32), "d4".repeat(32)),
+            format!(r#"{{"holder":"{m_h}","noise_pubkey":"{nk}","noise_attestation":"{m_att}"}}"#),
         )
         .await
         .unwrap()
@@ -1720,7 +1778,7 @@ mod tests {
         let op = [0xEEu8; 32];
         let member = [0x33u8; 32];
         assert!(channels.register_channel(&ch, &op, "alice").unwrap());
-        assert!(channels.add_member(&ch, "alice", &member, &[0xd4u8; 32]).unwrap());
+        assert!(channels.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
 
         let app = internal_channel_authorize_router(channels, admin);
         let admin_hex = hex_encode(&admin);

@@ -2240,9 +2240,13 @@ handshake. Fix: **attest** the Noise key with the member's holder key and verify
   substituted key carries no valid holder signature. Frozen test
   `member_noise_attestation_binds_the_key_to_holder_and_channel` (genuine verifies; substituted key / wrong
   channel / wrong holder all rejected). Gate green.
-- **SEC101b** ⏳ **Store + verify the attestation at the CP**: `channel_members` gains a `noise_attestation`
-  column; `POST /me/channels/:channel/members` requires the signature and the CP verifies it before storing
-  (reject un-attested/forged); `/internal/channel/authorize` returns it alongside the key.
+- **SEC101b** ✅ **CP stores + verifies the attestation.** `channel_members` gained a `noise_attestation`
+  column (`ensure_column`); `add_member` persists it + a `member_noise_attestation` getter. `POST
+  /me/channels/:channel/members` now requires `noise_attestation` (hex) and **verifies**
+  `verify_member_noise_attestation(channel, holder, noise_pubkey, sig)` before storing — an un-attested /
+  operator-forged key is rejected `400`. `/internal/channel/authorize` returns the attestation alongside the
+  key. Frozen coverage in `authed_channel_registry_is_owner_scoped` (valid attestation → stored; all-zero →
+  `400`). Gate green.
 - **SEC101c** ⏳ **Relay + verify end-to-end**: the broker relays the attestation with the peer's Noise key;
   the initiator calls `verify_member_noise_attestation` before pinning (`a2a_initiate`) — so even a tampered
   DB can't make an initiator pin an unattested key.
