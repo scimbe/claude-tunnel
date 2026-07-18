@@ -68,7 +68,7 @@
       "alias": "github",
       "providerId": "github",
       "enabled": true,
-      "trustEmail": false,
+      "trustEmail": true,
       "storeToken": false,
       "linkOnly": false,
       "config": {
@@ -81,7 +81,7 @@
       "alias": "gitlab",
       "providerId": "gitlab",
       "enabled": true,
-      "trustEmail": false,
+      "trustEmail": true,
       "storeToken": false,
       "linkOnly": false,
       "config": {
