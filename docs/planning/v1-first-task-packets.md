@@ -1868,10 +1868,10 @@ unverified. Mostly architectural (needs scimbe decisions); one clean fix landed.
   — a cross-user-write / non-portable footgun on any host without user `becke`. Parameterized to
   `$HOME/.cache/ct-cargo` (matching `security-audit.sh`). Gate: `git grep '/home/becke/.cache/ct-cargo'`
   in tracked files == 0.
-- **SEC78b** ⏳ **NEEDS SCIMBE DECISION** — independent server-side CI. Blocked: `.gitignore:40-42`
-  untracks `.github/workflows/ci.yml` because pushing it needs the `workflow` token scope (`gh auth refresh
-  -s workflow`). Decision: grant the scope + add a read-only CI (cargo test + check-no-secrets + cargo
-  audit) that gates main independently of the autonomous agent? This also blocks #75 IS2 (release workflow).
+- **SEC78b** ✅ **Independent server-side CI** (scimbe decision 2026-07-18; `workflow` scope now granted):
+  `.github/workflows/ci.yml` is tracked and gates `main` (and pull requests) independently of the autonomous
+  agent — a read-only gate mirroring the loop's hermetic gate: workspace build + test under `-D warnings`,
+  the committed-secret guard (`check-no-secrets`), and `cargo audit`. This also unblocked #75 IS2 (release workflow).
 - **SEC78c** ⏳ **NEEDS DECISION** — build isolation: drop the host-cache bind-mount / run as a non-host
   uid so a dep `build.rs` can't write the repo or poison the shared cache; pin+verify `cargo-audit`
   instead of cached-reuse (evidence #4). Relates to #77 (skill trust model).
@@ -2059,10 +2059,7 @@ Decomposed:
   mandate `scripts/verify-issue-author.sh <n>` (exit 0 iff pinned) instead of a login string compare. Gate:
   `bash -n` + `--selftest` (pinned id passes; foreign id, login string, empty all rejected) + live check
   (#77 → OK; a foreign account → rejected).
-- **SEC77b** ⏳ **Commit `.claude/settings.json` + PreToolUse hook**: a permissions denylist (field roles
-  agent/central: no `Edit`/`Write`; and `Bash` write-guard so `> file`/`tee`/`sed -i` can't bypass it) enforced
-  by a committed PreToolUse hook, so the "field roles cannot modify the codebase" guarantee is shim-enforced,
-  not prose (#77 gaps 1,8). Node/Claude-Code tooling with a self-test.
+- **SEC77b** ✅ **PreToolUse role-enforcement guard** (`scripts/role-guard.sh`; scimbe decision: CT_ROLE env var): a Claude Code PreToolUse hook that, when the launching role sets `CT_ROLE=agent|central`, denies `Edit`/`Write`/`MultiEdit`/`NotebookEdit` and Bash file-writes (`> file`, `tee`, `sed -i`, `git` mutations) — so "field roles cannot modify the codebase" is shim-enforced, not prose (#77 gaps 1,8). The developer role may edit. The hook is committed + self-tested; its wiring into the LOCAL, untracked `.claude/settings.json` is documented in the script header + all three role SKILLs (the local settings.json is machine-specific, per #91). Gate: `bash -n` + `--selftest` (agent Edit/Write/MultiEdit + Bash write/git-mutate blocked; agent Read + read-only Bash allowed; developer Edit/write allowed).
 - **SEC77c** ✅ **Treat non-scimbe issue *comments* as untrusted** (#77 gaps 4,9, `scripts/verify-comment-authors.sh`):
   the real injection vector on a public repo is a comment (from any account) on a scimbe-authored issue. The
   guard lists an issue's comment authors and flags every one not from the pinned scimbe account, exit 3 iff any
