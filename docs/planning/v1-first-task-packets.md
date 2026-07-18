@@ -1765,11 +1765,16 @@ Decomposed:
     auth — a transport MITM can't complete the handshake without the peer's Noise private key. Frozen test
     `initiator_dials_without_a_pre_shared_cert_noise_authenticates` (responder self-signs a cert the initiator
     never sees; data flows). Gate green. **So the one-liner now needs only the peer's Noise key, not a cert.**
-  - **AF4-session-wire** ⏳ last mile to a *fully hands-off* one-liner: (a) a broker-mediated `ct-agent
-    channel-join` that presents the grant and **auto-fetches the peer's `member_noise_key`** from the
-    rendezvous (broker swap / CP fetch — #101 attestation applies), so even the Noise key isn't pasted;
-    (b) a served `channel.sh`/`channel.ps1` + `/channel.sh` route so the operator emits one URL;
-    (c) **edge-relay fallback** when the direct dial fails, with a test.
+  - **AF4-session-keydeliver-cp** ✅ **The CP now serves the member's attested Noise key to the edge.** The
+    `/internal/channel/authorize` response gained `noise_pubkey` (from the registry `member_noise_key`), and
+    `ChannelAuthorizer::resolve` returns `MemberResolution { operator_pubkey, noise_pubkey }` (the existing
+    `authorize` delegates to it, unchanged for the broker). So the edge can look up the peer's **attested**
+    Noise key (not agent-advertised — addresses #101) during rendezvous. Frozen tests: CP
+    `internal_channel_authorize_…` asserts the key is served; edge `resolve_carries_the_members_attested_noise_key`.
+  - **AF4-session-wire** ⏳ last mile: (a) the broker calls `resolve` for each paired member and **relays the
+    peer's `noise_pubkey`** in the `OK` response (swap), with `present_channel_join` returning it in
+    `Admitted`; (b) a `ct-agent channel-join` that drives present→session with the learned key+endpoint;
+    (c) a served `/channel.sh` route; (d) **edge-relay fallback** when the direct dial fails, with a test.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

@@ -1059,6 +1059,12 @@ struct AuthorizeReq {
 #[derive(Serialize, Deserialize)]
 struct AuthorizeResp {
     operator_pubkey: String,
+    /// The member's attested Noise static key (hex), when the registry has one
+    /// (#72 AF4 / #100): the edge broker relays it to the paired peer so an A2A
+    /// initiator can pin it without the operator pasting it. Absent for members
+    /// enrolled before AF4-keydist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    noise_pubkey: Option<String>,
 }
 
 async fn channel_authorize(
@@ -1083,9 +1089,20 @@ async fn channel_authorize(
         .authorize_holder(&ChannelId(channel), &holder)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        Some(op) => Ok(Json(AuthorizeResp {
-            operator_pubkey: hex_encode(&op),
-        })),
+        Some(op) => {
+            // Also hand back the member's attested Noise key (if registered) so the
+            // broker can deliver it to the paired peer (#72 AF4 / #100).
+            let noise = state
+                .channels
+                .member_noise_key(&ChannelId(channel), &holder)
+                .ok()
+                .flatten()
+                .map(|n| hex_encode(&n));
+            Ok(Json(AuthorizeResp {
+                operator_pubkey: hex_encode(&op),
+                noise_pubkey: noise,
+            }))
+        }
         None => Err(StatusCode::NOT_FOUND),
     }
 }
@@ -1725,6 +1742,11 @@ mod tests {
         let bytes = to_bytes(r.into_body(), 1 << 16).await.unwrap();
         let resp: AuthorizeResp = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(resp.operator_pubkey, hex_encode(&op), "member resolves the operator key");
+        assert_eq!(
+            resp.noise_pubkey.as_deref(),
+            Some(hex_encode(&[0xd4u8; 32]).as_str()),
+            "the member's attested Noise key is served for A2A key delivery (#72/#100)"
+        );
 
         // Wrong / missing token -> 401 (before any lookup).
         assert_eq!(post(Some(wrong_hex), member).await.unwrap().status(), StatusCode::UNAUTHORIZED);

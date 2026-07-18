@@ -39,6 +39,16 @@ struct AuthorizeReq {
 #[derive(Deserialize)]
 struct AuthorizeResp {
     operator_pubkey: String,
+    #[serde(default)]
+    noise_pubkey: Option<String>,
+}
+
+/// A resolved channel membership: the operator key (verifies the grant) and, when
+/// the registry has one, the member's attested Noise static key (#72 AF4 / #100) —
+/// which the broker relays to the paired peer so an A2A initiator can pin it.
+pub struct MemberResolution {
+    pub operator_pubkey: [u8; 32],
+    pub noise_pubkey: Option<[u8; 32]>,
 }
 
 /// Resolves channel-join authorization by querying the control plane's c-i endpoint.
@@ -64,8 +74,17 @@ impl ChannelAuthorizer {
     }
 
     /// The operator public key iff `holder` is a current member of `channel`, else
-    /// `None` (fail-closed on non-member / bad token / transport error).
+    /// `None` (fail-closed on non-member / bad token / transport error). This is the
+    /// broker's grant-verification gate; [`Self::resolve`] additionally carries the
+    /// member's Noise key.
     pub async fn authorize(&self, channel: &ChannelId, holder: &[u8; 32]) -> Option<[u8; 32]> {
+        self.resolve(channel, holder).await.map(|m| m.operator_pubkey)
+    }
+
+    /// Resolve the full membership — operator key plus the member's attested Noise
+    /// key (when the registry has one) — iff `holder` is a current member (#72 AF4 /
+    /// #100). Same fail-closed contract as [`Self::authorize`].
+    pub async fn resolve(&self, channel: &ChannelId, holder: &[u8; 32]) -> Option<MemberResolution> {
         let resp = self
             .client
             .post(&self.url)
@@ -81,7 +100,10 @@ impl ChannelAuthorizer {
             return None;
         }
         let body: AuthorizeResp = resp.json().await.ok()?;
-        hex_decode_32(&body.operator_pubkey)
+        Some(MemberResolution {
+            operator_pubkey: hex_decode_32(&body.operator_pubkey)?,
+            noise_pubkey: body.noise_pubkey.as_deref().and_then(hex_decode_32),
+        })
     }
 }
 
@@ -104,7 +126,10 @@ mod tests {
         }
         let holder = body.get("holder").and_then(|v| v.as_str()).unwrap_or("");
         if holder == hex(&[0x33u8; 32]) {
-            Ok(Json(serde_json::json!({ "operator_pubkey": hex(&[0xEEu8; 32]) })))
+            Ok(Json(serde_json::json!({
+                "operator_pubkey": hex(&[0xEEu8; 32]),
+                "noise_pubkey": hex(&[0x55u8; 32]),
+            })))
         } else {
             Err(axum::http::StatusCode::NOT_FOUND)
         }
@@ -140,5 +165,20 @@ mod tests {
         // Unreachable CP -> None (fail-closed on transport error).
         let down = ChannelAuthorizer::new("http://127.0.0.1:1", &[0x7au8; 32]);
         assert_eq!(down.authorize(&channel, &[0x33u8; 32]).await, None, "unreachable CP denied");
+    }
+
+    #[tokio::test]
+    async fn resolve_carries_the_members_attested_noise_key() {
+        // #72 AF4 / #100: resolve() returns the operator key AND the member's Noise
+        // key, so the broker can relay the peer key without the operator pasting it.
+        let base = spawn_mock_cp().await;
+        let channel = ChannelId([0xC5u8; 32]);
+        let good = ChannelAuthorizer::new(&base, &[0x7au8; 32]);
+
+        let m = good.resolve(&channel, &[0x33u8; 32]).await.expect("member resolves");
+        assert_eq!(m.operator_pubkey, [0xEEu8; 32], "operator key");
+        assert_eq!(m.noise_pubkey, Some([0x55u8; 32]), "attested Noise key delivered");
+        // A non-member still resolves to None (fail-closed).
+        assert!(good.resolve(&channel, &[0x44u8; 32]).await.is_none(), "non-member denied");
     }
 }
