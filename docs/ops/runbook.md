@@ -69,6 +69,8 @@ probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
 | `CT_PORTAL_BASE_URL` | control plane | public base URL embedded in the customer install one-liner (`/portal/tunnels/{id}/install`), e.g. `https://<zone>`; **unset ⇒ silently defaults to `https://localhost`** (warned at startup, #68). The front-door overlay wires it from `PORTAL_PUBLIC_HOST` |
 | `CT_EDGE_LISTEN` | edge | bind address (default `0.0.0.0:4433`) |
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
+| `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` | edge | per-token rendezvous rate limit (rendezvous attempts per routing token per minute); unset ⇒ off (opt-in abuse gate, #86) |
+| `CT_EDGE_MAX_CONNECTIONS` | edge | cap on concurrent connections, shared globally across the QUIC + TCP accept loops; unset (or `0`) ⇒ off (opt-in abuse gate, #86) |
 | `CT_EDGE_CERT_OUT` | edge | path the edge writes its CA root to |
 | `CT_EDGE_METRICS_LISTEN` | edge | bind address for `GET /metrics` (unset ⇒ off, issue #10) |
 | `CT_FRONT_DOOR` | edge | bind address for the unified :443 front door (SNI/ALPN-multiplexed relay + Portal + browser tunnels); unset ⇒ off, additive to `:4433`/`:8090` (#31) |
