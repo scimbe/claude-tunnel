@@ -1879,9 +1879,15 @@ gaps BEFORE wiring the broker into the live edge binary. Decomposed:
       control plane, admits a member end-to-end (agent join → gate → resolver → CP → operator key → grant verify
       → possession → OK). Frozen test `channel_authorizer_as_the_gate_closure_admits_a_member`. Gate green — the
       live wiring is validated before the run_edge glue.
-    - **c-iii-3b** ⏳ mount it in `run_edge`: bind a dedicated channel-rendezvous QUIC endpoint (from the same
-      CA leaf), spawn a loop running the broker with the `ChannelAuthorizer` closure (CT_CP_URL + admin token),
-      gated by a channel-listen addr. → **broker live**. Then #72 AF4-session.
+    - **c-iii-3b** ✅ **Broker mounted in the live edge** (`run_edge`): when `CT_EDGE_CHANNEL_LISTEN` +
+      `CT_EDGE_CP_URL` + `CT_EDGE_ADMIN_TOKEN` are all set, `run_edge` binds a dedicated channel-rendezvous QUIC
+      endpoint (a fresh leaf under the same CA, so agents already trust it) and spawns a loop running
+      `broker_channel_rendezvous` with the `ChannelAuthorizer` closure — membership resolved via the control
+      plane (c-i/c-ii, fail-closed). Opt-in; absent config → no channel endpoint. Gate: build `-D warnings` + all
+      95 ct-edge tests (the mount is integration glue over the unit-tested broker/resolver/composition). **The
+      broker is now live.** Remaining for a *usable A2A tunnel*: #72 AF4-session (agents dial the peer endpoint +
+      run Noise_IK using `member_noise_key` + relay fallback); a live edge+CP+2-agent smoke is the final
+      end-to-end confirmation.
     Then #72 AF4-session (dial peer + Noise_IK using the peer's `member_noise_key` + relay fallback) makes it a
     usable end-to-end tunnel.
 

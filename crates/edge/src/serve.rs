@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::config::EdgeConfig;
 use crate::relay::{relay, relay_quic};
 use crate::state::{ConnectionCap, EdgeState};
-use crate::pki::{build_dual_edge_from_ca, Ca};
+use crate::pki::{build_dual_edge_from_ca, build_server_endpoint_from_ca, Ca};
 use crate::transport::save_cert;
 use ct_common::pow::{check_request, Challenge};
 use ct_common::RoutingToken;
@@ -1040,6 +1040,59 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
             });
         }
     });
+
+    // #81 SEC81c-c c-iii-3b: mount the Agent-Fabric broker on a DEDICATED channel-
+    // rendezvous QUIC endpoint (a fresh leaf under the same CA, so agents already trust
+    // it). Opt-in: only when the channel listen addr + control-plane URL + shared admin
+    // token are all set. The broker's `authorize` closure resolves channel membership via
+    // the control plane (c-i/c-ii, fail-closed); each rendezvous pairs two members and
+    // hands each the other's advertised endpoint for a direct A2A connection.
+    if let (Some(listen), Some(cp_url), Some(admin_tok)) = (
+        std::env::var("CT_EDGE_CHANNEL_LISTEN").ok().filter(|s| !s.is_empty()),
+        std::env::var("CT_EDGE_CP_URL").ok().filter(|s| !s.is_empty()),
+        std::env::var("CT_EDGE_ADMIN_TOKEN")
+            .ok()
+            .and_then(|s| parse_admin_token_hex(&s)),
+    ) {
+        match listen.parse::<std::net::SocketAddr>() {
+            Ok(chan_addr) => {
+                match build_server_endpoint_from_ca(&ca, chan_addr, vec!["localhost".to_string()]) {
+                    Ok((chan_ep, _root)) => {
+                        let authorizer =
+                            crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                        eprintln!(
+                            "ct-edge: Agent-Fabric channel broker on {chan_addr} \
+                             (authorize via {cp_url}, #81 SEC81c-c)"
+                        );
+                        tokio::spawn(async move {
+                            loop {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let az = authorizer.clone();
+                                match crate::channel_broker::broker_channel_rendezvous(
+                                    &chan_ep,
+                                    now,
+                                    move |c, h| {
+                                        let a = az.clone();
+                                        async move { a.authorize(&c, &h).await }
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(_) => eprintln!("ct-edge: channel rendezvous paired two agents"),
+                                    Err(e) => eprintln!("ct-edge: channel rendezvous ended: {e}"),
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_CHANNEL_LISTEN {chan_addr}: {e}"),
+                }
+            }
+            Err(e) => eprintln!("ct-edge: invalid CT_EDGE_CHANNEL_LISTEN '{listen}': {e}"),
+        }
+    }
 
     // QUIC accept loop (primary).
     while let Some(incoming) = endpoint.accept().await {
