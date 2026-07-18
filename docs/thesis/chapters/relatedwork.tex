@@ -31,6 +31,24 @@ dieser Arbeit bildet. \texttt{claude-tunnel} übernimmt die Idee moderner,
 schlanker Handshakes --- die Datenebene nutzt Noise~\cite{noiseprotocol} ---,
 verschiebt die Terminierung jedoch vom Vermittler an das kundeneigene Ziel.
 
+Näher am hier verfolgten Ansatz als das klassische VPN liegen jüngere Overlay-
+und Secure-Channel-Systeme, deren Vermittler den Nutzlast-Schlüssel bewusst nicht
+halten. Nebula~\cite{nebula} spannt ein Noise-basiertes Mesh zwischen
+authentifizierten Hosts auf, in dem koordinierende \emph{Lighthouses} die Peers
+zusammenführen, ohne die Ende-zu-Ende-Sitzung zu terminieren. Tailscale reicht
+Verkehr, wenn kein direkter Pfad zustande kommt, über verschlüsselte
+\emph{DERP}-Relays weiter, die die WireGuard-Pakete lediglich
+durchreichen~\cite{tailscalederp}; die zugehörige Steuerebene lässt sich mit
+Headscale~\cite{headscale} selbst betreiben. Ockam~\cite{ockam} wiederum baut
+mehrsprüngige, gegenseitig authentifizierte Ende-zu-Ende-Kanäle, deren Relays
+als Architektur-Eigenschaft ausschließlich Chiffretext weiterleiten. Diese
+Systeme zeigen, dass \emph{payload-blindes Relaying} für sich genommen kein
+Alleinstellungsmerkmal ist, sondern verbreitete Praxis. Der Beitrag dieser Arbeit
+liegt daher nicht in der Nutzlast-Blindheit allein, sondern in ihrer Kombination
+mit einem opaken Routing-Token (das zusätzlich das Vermittlungsziel verbirgt),
+einem KYC-freien Proof-of-Work-Rendezvous und kundenverankerten Noise-Schlüsseln
+ohne zentrale PKI (Abschnitt~\ref{sec:rw-abgrenzung}).
+
 \section{Reverse-Tunnel-Dienste}
 \label{sec:rw-reverse}
 

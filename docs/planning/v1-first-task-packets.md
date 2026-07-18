@@ -2006,8 +2006,13 @@ Out-of-Scope getrackt — #59, ADR-0002/0017, fazit). Drei echte Restlücken, de
   NIST-standardisiertem ML-KEM (FIPS 203, 2024) als bewusst zurückgestellter nächster Schritt. Neue
   Bib-Quelle `nistfips203`. Thesis baut grün (0 undefined, 64 S.). Analog zum bestehenden
   Metadaten-/Dezentralitäts-Disclaimer — schließt die „PQC fehlt auch als Erwähnung"-Lücke.
-- **T70.2** ⏳ **Ockam, Nebula, Headscale/Tailscale-DERP** in `relatedwork.tex` + `references.bib` aufnehmen
-  (architektonisch nächste Vergleichsprojekte), sauber referenziert, kein Overclaim (die „mathematisch
-  beweisbar blind"-Formulierung des Einwands auf die belegbare Architektur-Property abschwächen).
+- **T70.2** ✅ **Ockam, Nebula, Headscale/Tailscale-DERP** aufgenommen (`relatedwork.tex` §3.1 + 4 Bib-Quellen
+  `nebula`/`tailscalederp`/`headscale`/`ockam`): neuer Absatz benennt sie als die architektonisch nächsten
+  payload-blinden Relay-/Overlay-Systeme (Nebula Noise-Mesh mit Lighthouses; Tailscale-DERP reicht
+  verschlüsselte WireGuard-Pakete durch, Headscale = selbst-hostbare Steuerebene; Ockam mehrsprüngige E2E-
+  Kanäle). **Kein Overclaim** (Gegenkorrektur beachtet): „deren Relays *als Architektur-Eigenschaft* Chiffretext
+  weiterleiten", und explizit eingeräumt, dass payload-blindes Relaying *verbreitete Praxis* ist → der Beitrag
+  ist die Vier-Bausteine-Kombination, nicht Nutzlast-Blindheit allein (Verweis §3.5). Bibliografie 20 → 24.
+  Thesis baut grün (0 undefined, 64 S.).
 - **T70.3** ⏳ **Abgrenzungstabelle** (`relatedwork.tex` §3.5) um die **Passthrough-/Raw-TCP-Modi** der bereits
   zitierten Tools (Cloudflare Tunnel/ngrok/Tailscale Funnel) ergänzen — diese wären ebenfalls payload-blind.
