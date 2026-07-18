@@ -2005,10 +2005,18 @@ took a **client-supplied `price`** so `price:0` minted a routing token for free.
   the token price. Frozen test `issuance_rejects_price_below_the_token_price` (price:0 → 402, balance
   unchanged; price:TOKEN_PRICE → 200, debited). Gate green. (The parallel `http.rs`/`issue_token_for_payment`
   surface is **not** wired into `main` — no live vuln — but must adopt the same floor if ever mounted.)
-- **SEC87b** ⏳ **Auth + rate limits on the unauthenticated DB-writers** (`/enroll/issue`, `/accounts/open`,
-  `/registry/register`, `/payment/intent`): flood → SQLite growth (DoS/disk). Needs the control-plane auth
-  model decision (overlaps #77/#78); sybil account creation is acknowledged by-design (`accounts.rs`). Blocks
-  the #81 SEC81c-b channel-registry HTTP API (same auth question). Maintainer call.
+- **SEC87b-rl** ✅ **Per-IP flood cap on the unauthenticated DB-writers** (`/enroll/issue`, `/accounts/open`,
+  `/registry/register`, `/payment/intent`) — the *disk-DoS* half, landable without the auth decision.
+  `with_unauth_write_limit` wraps the app in a `from_fn` layer that meters exactly those `POST` paths per
+  client IP (from `ConnectInfo`, reusing `KeyedRateLimiter`, fixed 60 s window) → `429` past the cap; reads,
+  authed `/me/*`, and health pass through, and a missing peer IP fails **open**. Off by default (no behavior
+  change — a default-on policy is the maintainer's call); enable with `CT_CP_UNAUTH_WRITE_PER_MIN=<n>`.
+  `main.rs` now serves with `into_make_service_with_connect_info`. Frozen test
+  `unauthenticated_writers_are_rate_limited_per_ip` (3rd metered POST from one IP → 429; other IP
+  independent; non-listed path + reads unmetered). Gate green.
+- **SEC87b-auth** ⏳ **Authentication on those writers**: still the control-plane auth-model decision
+  (overlaps #77/#78); sybil account creation is acknowledged by-design (`accounts.rs`). Blocks the #81
+  SEC81c-b channel-registry HTTP API (same auth question). Maintainer call — not code-blocked here.
 
 ## #90 Secret-handling: token in install one-liner + routing token in revoke logs (security-review, low)
 

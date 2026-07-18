@@ -109,6 +109,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("ct-control-plane: listening on {listen}, db={db}");
-    axum::serve(listener, app).await?;
+    // Serve with connection info so the per-IP unauthenticated-writer rate limit
+    // (#87 SEC87b-rl) can key on the client address.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

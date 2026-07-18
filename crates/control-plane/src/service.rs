@@ -3,13 +3,16 @@
 //! restart preserves enrollment / registry / billing. This module grows one
 //! router per store; M18.4a wires enrollment.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -829,6 +832,63 @@ async fn ca_handler(State(path): State<Arc<String>>) -> axum::response::Response
 /// billing + health, all backed by durable SQLite stores opened on **one**
 /// database file (`db_path`). The three stores share the file via separate
 /// connections; each owns its own tables. This is what a real deployment serves.
+/// Fixed window (seconds) for the unauthenticated-writer rate limit (#87 SEC87b-rl).
+const UNAUTH_WRITE_WINDOW_SECS: u64 = 60;
+
+/// The unauthenticated, DB-writing endpoints a flood could grow the durable SQLite
+/// store with (#87). They take no bearer token, so the only stable caller key is the
+/// client IP — the per-IP limiter is applied to exactly these `POST` paths.
+const UNAUTH_WRITE_PATHS: &[&str] = &[
+    "/enroll/issue",
+    "/accounts/open",
+    "/registry/register",
+    "/payment/intent",
+];
+
+/// Per-client-IP fixed-window limiter state for the unauthenticated DB-writers.
+#[derive(Clone)]
+struct UnauthWriteLimit {
+    limiter: Arc<Mutex<KeyedRateLimiter<IpAddr>>>,
+}
+
+/// Wrap `app` so that each unauthenticated DB-writing `POST` (see
+/// [`UNAUTH_WRITE_PATHS`]) is capped at `per_window` requests per client IP per
+/// fixed window (#87 SEC87b-rl) — a flood from one source gets `429` before it can
+/// grow the durable store, bounding the disk-DoS. Only those paths are metered;
+/// every other request (reads, authed `/me/*`, health) passes straight through. The
+/// client IP comes from the connection (`ConnectInfo`); if it can't be determined
+/// the request fails **open** (passes through) rather than erroring.
+pub(crate) fn with_unauth_write_limit(app: Router, per_window: u32) -> Router {
+    let state = UnauthWriteLimit {
+        limiter: Arc::new(Mutex::new(KeyedRateLimiter::new(per_window))),
+    };
+    app.layer(from_fn_with_state(state, limit_unauth_writes))
+}
+
+async fn limit_unauth_writes(
+    State(state): State<UnauthWriteLimit>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let metered =
+        req.method() == Method::POST && UNAUTH_WRITE_PATHS.contains(&req.uri().path());
+    if let (true, Some(ConnectInfo(addr))) = (metered, peer) {
+        let window = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / UNAUTH_WRITE_WINDOW_SECS)
+            .unwrap_or(0);
+        if !state.limiter.lock_safe().allow(&addr.ip(), window) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit: too many unauthenticated requests from your address\n",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 pub fn persistent_control_plane_router(
     db_path: &str,
     webhook_secret: &[u8],
@@ -936,7 +996,20 @@ pub fn persistent_control_plane_router(
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc));
     }
-    Ok(app.merge(health_router(ledger)))
+    let app = app.merge(health_router(ledger));
+    // #87 SEC87b-rl: optional per-IP flood cap on the unauthenticated DB-writers.
+    // Off by default (no behavior change — the auth model + a default-on policy are
+    // the maintainer decision this doesn't presume); set CT_CP_UNAUTH_WRITE_PER_MIN
+    // to a positive integer to bound the disk-DoS from a single address.
+    let app = match std::env::var("CT_CP_UNAUTH_WRITE_PER_MIN")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+    {
+        Some(per_min) => with_unauth_write_limit(app, per_min),
+        None => app,
+    };
+    Ok(app)
 }
 
 /// Shared state for the edge-facing channel-authorize endpoint (#81 SEC81c-c c-i):
@@ -1035,6 +1108,62 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use crate::client::ControlPlaneClient;
+
+    #[tokio::test]
+    async fn unauthenticated_writers_are_rate_limited_per_ip() {
+        // #87 SEC87b-rl: a per-IP fixed-window cap on the unauthenticated
+        // DB-writers. One address that floods a metered POST is `429`'d past the
+        // limit; a different address has its own budget; a non-listed path and a
+        // read are never metered.
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = with_unauth_write_limit(
+            Router::new()
+                .route("/accounts/open", post(|| async { StatusCode::OK }))
+                .route("/other", post(|| async { StatusCode::OK }))
+                .route("/registry/resolve/x", get(|| async { StatusCode::OK })),
+            2,
+        );
+
+        let a: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.6:5000".parse().unwrap();
+        async fn call(app: &Router, method: Method, path: &str, peer: SocketAddr) -> StatusCode {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            app.clone().oneshot(req).await.unwrap().status()
+        }
+
+        // A: first two metered POSTs pass, the third is throttled.
+        assert_eq!(call(&app, Method::POST, "/accounts/open", a).await, StatusCode::OK);
+        assert_eq!(call(&app, Method::POST, "/accounts/open", a).await, StatusCode::OK);
+        assert_eq!(
+            call(&app, Method::POST, "/accounts/open", a).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 3rd metered POST from the same IP is rate limited"
+        );
+        // B: a different address keeps its own budget.
+        assert_eq!(
+            call(&app, Method::POST, "/accounts/open", b).await,
+            StatusCode::OK,
+            "a different client IP is not affected"
+        );
+        // A non-listed POST and a read are never metered, even for the throttled IP.
+        assert_eq!(
+            call(&app, Method::POST, "/other", a).await,
+            StatusCode::OK,
+            "a path outside the unauth-writer set is not metered"
+        );
+        assert_eq!(
+            call(&app, Method::GET, "/registry/resolve/x", a).await,
+            StatusCode::OK,
+            "reads are not metered"
+        );
+    }
 
     fn temp_db_path() -> String {
         let mut b = [0u8; 8];
