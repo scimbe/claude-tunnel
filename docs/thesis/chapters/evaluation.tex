@@ -279,6 +279,73 @@ bleibt bewusst dünn und selbst hostbar (ADR-0017): Sie hält weder Schlüssel n
 Nutzlast, verifiziert OIDC/Keycloak-gestützte \texttt{/me/*}-Endpunkte und führt
 das Konto-/Kredit-Ledger.
 
+\paragraph{Semi-formales Bedrohungsmodell.} Tabelle~\ref{tab:threat} fasst
+zusammen, was die vier relevanten Akteure beobachten können und welche Garantie
+ihnen jeweils gegenübersteht.
+
+\begin{table}[t]
+\centering
+\caption{Was die einzelnen Akteure sehen und welche Garantie bzw.\ Grenze ihnen
+gegenübersteht.}
+\label{tab:threat}
+\begin{tabular}{p{2.9cm}p{4.4cm}p{4.4cm}}
+\toprule
+Akteur & Sieht & Garantie / Grenze \\
+\midrule
+Edge (Betreiber) & Chiffretext, Tunnel-Existenz, grobe Zeit-/Volumen\-zähler,
+Rendezvous-Ereignisse & Keine Nutzlast, kein Origin-Schlüssel, kein Zielname
+(opakes Token); \emph{nicht} gegen Timing-/Volumen-Korrelation geschützt \\
+Passiver Netzbeobachter & Verschlüsselte QUIC-/TLS-Flüsse, Paketgrößen und Timing
+& Kein Klartext; Existenz und grobe Muster eines Tunnels bleiben sichtbar (kein
+Padding) \\
+Kompromittierte Control-Plane & Konto-/Kredit-Metadaten, ausgestellte Tokens &
+Weder Schlüssel noch Nutzlast (dünn, ADR-0017); kann Tunnel autorisieren oder
+entwerten, aber keinen Klartext lesen \\
+Kompromittierter Agent & Klartext \emph{seines} Origins (er terminiert die
+Noise-Sitzung) & Isolation auf das eigene Origin; keine Fremd-Origins, kein Edge-
+oder CA-Schlüsselmaterial \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Verkehrsanalyse (nicht geleistet).} Die Provider-Blindheit schützt die
+\emph{Nutzlast}, nicht das \emph{Kommunikationsmuster}. Byte- und Paketzähler, die
+Existenz eines Tunnels und dessen Timing erlauben einem Beobachter mit Sicht auf
+beide Enden Bestätigungs- und Korrelationsangriffe; das System fügt weder Padding
+noch Cover-Traffic hinzu. Verkehrsanalyse-Resistenz ist damit ausdrücklich
+\emph{kein} Schutzziel dieser Arbeit (vgl. Abschnitt~\ref{sec:zensur-scope}).
+
+\paragraph{Grenzen des Proof-of-Work-Reglers.} Der eingesetzte statische
+SHA-2-PoW ist ein grober Regler: Er ist GPU-/ASIC-freundlich und
+client-heterogen -- ein ressourcenstarker Angreifer überwindet die Schranke
+trivial, während ein schwacher oder mobiler Client dieselbe Schwierigkeit um
+Größenordnungen langsamer löst (die in Abschnitt~\ref{sec:eval-pow} berichteten
+Kosten wurden auf einem i9 gemessen und sind daher eine untere Schranke für
+leistungsschwache Geräte). Zusätzlich bindet der Edge bei \emph{jeder} gültigen
+Lösung Zustand in seiner Token-Liste, was einen asymmetrischen architektonischen
+Flaschenhals schafft. Ein speicherharter PoW (Argon2, Equihash) wäre der fairere
+Regler, weil er die Hardware-Heterogenität einebnet -- er bleibt eine
+Entwurfsalternative für künftige Arbeit. Das Fundament -- dass ohne Identitäten
+allein ein Kostenmechanismus die Sybil-Flutung begrenzt -- ist seit
+\cite{douceur2002sybil} bekannt.
+
+\paragraph{Garantien des \texttt{Noise\_IK}-Musters.} Das IK-Muster liefert
+Vorwärtsgeheimnis über ephemere Diffie-Hellman-Anteile (ein späteres
+Kompromittieren statischer Schlüssel entschlüsselt vergangene Sitzungen nicht),
+bindet die Sitzung an die \emph{vorab gepinnte} statische Origin-Identität (womit
+ein Man-in-the-Middle vor der ersten Nachricht ausgeschlossen ist) und ist gegen
+Wiedereinspielung durch die je Handschlag frischen Ephemeral-Anteile geschützt.
+Bekannte Restschärfe -- etwa Key-Compromise-Impersonation bei kompromittiertem
+statischem Schlüssel -- folgt der etablierten Analyse des
+Noise-Rahmens~\cite{noiseprotocol}.
+
+\paragraph{Token-an-Agent-Bindung (Anti-Missbrauch).} Ein Routing-Token vermittelt
+nicht zu einem beliebigen Ziel, sondern ausschließlich zu der \emph{registrierten}
+Agent-Verbindung, unter der es aufgelöst wird. Der Edge ist damit kein offener
+Proxy: Er lässt sich nicht dazu bringen, Verkehr an einen vom Angreifer gewählten
+Fremd-Host zu relayen. Das ist eine eigenständige Sicherheitseigenschaft gegen
+Relay-Missbrauch, die über die reine Nutzlast-Blindheit hinausgeht.
+
 \section{Limitierungen und Validitätsbedrohungen}
 \label{sec:limitierungen}
 
