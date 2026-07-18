@@ -1785,10 +1785,17 @@ Decomposed:
     endpoint AND the peer Noise key from rendezvous alone — no operator-conveyed key. Combined with the
     accept-any dialer (no cert), the A2A session can form fully hands-off. Frozen test
     `rendezvous_relays_each_peers_attested_noise_key` (each agent learns the peer's key). Gate green.
-  - **AF4-session-wire** ⏳ last mile: (a) a `ct-agent channel-join` subcommand that dials the edge broker,
-    presents the grant, and drives present→(dial peer, accept-any)→`run_channel_session` with the
-    rendezvous-learned endpoint+key — the fully hands-off runner; (b) **edge-relay fallback** when the direct
-    dial fails, with a test.
+  - **AF4-session-join** ✅ **`run_channel_join` — the hands-off join orchestration.** Presents `request` to
+    the broker over `broker_conn`, takes the peer endpoint AND Noise key from the rendezvous ack (no
+    out-of-band value), then (by role) dials the peer accept-any / accepts on its listener and runs
+    `run_channel_session`. Frozen test `channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data`
+    (initiator learns peer addr+key from the ack, dials, data flows; a stub broker supplies the loopback peer
+    since the real `safe_endpoint` rejects loopback). Gate green.
+  - **AF4-session-resilience** ⏳ **THE interesting part (scimbe steer): the *connection-difficulty* paths, not
+    happy-path data exchange.** When the direct A2A dial **fails** (peer unreachable / NAT / firewall / dial
+    timeout), fall back to the **edge relay**; surface clear errors; retry/backoff. Tests must target the
+    hard-to-connect cases (dial timeout → relay, refusal, unresolvable peer), not just "bytes flow".
+  - **AF4-session-cli-join** ⏳ a thin `ct-agent channel-join` subcommand wiring env → `run_channel_join`.
   **#72 fix-ready when direct A2A data exchange + trust chains + tested fallback are all met.**
 - **AF3** ⏳ **Cross-user invitation model**: operator issues an invitation, another user's agent redeems it
   into a scoped member grant; trust-fail (deny/expiry/revoke) rules enforced + tested.

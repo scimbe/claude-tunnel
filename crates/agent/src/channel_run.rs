@@ -12,10 +12,13 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use quinn::{Connection, RecvStream, SendStream};
+use ct_common::channel::ChannelJoinRequest;
+use ed25519_dalek::SigningKey;
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::channel::{present_channel_join, ChannelJoinOutcome};
 use ct_common::a2a::{a2a_initiate, a2a_respond};
 use ct_common::noise::noise_pump;
 
@@ -93,6 +96,52 @@ where
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     noise_pump(session, BiStream { send, recv }, local).await
+}
+
+/// Hands-off A2A join (#72 AF4 / #100): present `request` to the edge broker over
+/// `broker_conn`, and on admission use the endpoint **and Noise key the rendezvous
+/// relays** (no operator-conveyed value) to establish the encrypted session, piping
+/// `local` over it. `role` (from the grant `Direction`) selects the side: an
+/// `Initiate` peer dials the learned `peer_endpoint` with the accept-any channel
+/// dialer; an `Accept` peer takes the next connection on its own `listener` (bound at
+/// the endpoint it advertised in `request`). Fails if the broker refuses or relays no
+/// peer Noise key (the registry must carry it — AF4-keydist).
+pub async fn run_channel_join<P>(
+    broker_conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    listener: Option<Endpoint>,
+    local: P,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    let (peer_endpoint, peer_noise) = match present_channel_join(broker_conn, request, holder).await? {
+        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey } => {
+            let noise = peer_noise_pubkey
+                .ok_or("broker admitted the join but relayed no peer Noise key (registry has none)")?;
+            (peer_endpoint, noise)
+        }
+        ChannelJoinOutcome::Refused => return Err("edge broker refused the channel join".into()),
+    };
+    match role {
+        ChannelRole::Initiate => {
+            let addr = peer_endpoint
+                .parse()
+                .map_err(|_| format!("broker returned an unparseable peer endpoint: {peer_endpoint:?}"))?;
+            let dialer = crate::transport::build_channel_dialer()?;
+            let conn = dialer.connect(addr, "localhost")?.await?;
+            run_channel_session(&conn, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+        }
+        ChannelRole::Accept => {
+            let ep = listener.ok_or("responder role requires a bound listener")?;
+            let conn = ep.accept().await.ok_or("channel listener closed with no incoming")?.await?;
+            run_channel_session(&conn, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+        }
+    }
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -331,6 +380,92 @@ mod tests {
 
         init_task.abort();
         resp_task.abort();
+    }
+
+    // A minimal edge-broker stand-in that admits one join and acks a fixed peer
+    // endpoint + Noise key. It replicates the broker wire protocol (length-framed
+    // request, possession challenge, `OK <endpoint> <noise_hex>`) but omits the
+    // `safe_endpoint` SSRF gate — which is tested in `ct_edge::channel_broker` and
+    // would (correctly) reject the loopback address a hermetic test must use.
+    async fn stub_broker_admit(server: &Endpoint, peer_addr: std::net::SocketAddr, peer_noise: [u8; 32]) {
+        let conn = server.accept().await.expect("incoming").await.expect("conn");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+        let mut len = [0u8; 2];
+        recv.read_exact(&mut len).await.expect("len");
+        let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+        recv.read_exact(&mut buf).await.expect("req");
+        send.write_all(&[0u8; 32]).await.expect("challenge"); // possession challenge
+        let mut sig = [0u8; 64];
+        let _ = recv.read_exact(&mut sig).await; // (signature not checked by the stub)
+        let ack = format!("OK {} {}", peer_addr, hex_encode(&peer_noise));
+        send.write_all(ack.as_bytes()).await.expect("ack");
+        send.finish().expect("finish");
+        conn.closed().await;
+    }
+
+    #[tokio::test]
+    async fn channel_join_initiator_uses_the_rendezvous_peer_and_pipes_data() {
+        // #72 AF4 / #100 hands-off capstone: run_channel_join presents to the broker,
+        // takes the peer endpoint AND Noise key from the ack (no out-of-band value),
+        // dials the peer (accept-any), and pipes data. Here the peer is a real
+        // responder listener; the stub broker supplies its addr+key.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        // Responder: a real direct listener running the Accept side of the session.
+        let responder_noise = generate_static_keypair();
+        let (resp_listener, _c) = crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+        let resp_addr = resp_listener.local_addr().expect("resp addr");
+        let (mut resp_local_test, resp_local_run) = tokio::io::duplex(8192);
+        let rnp = responder_noise.private;
+        let resp_task = tokio::spawn(async move {
+            let conn = resp_listener.accept().await.expect("incoming").await.expect("conn");
+            run_channel_session(&conn, ChannelRole::Accept, &rnp, &[0u8; 32], resp_local_run)
+                .await
+                .expect("responder session");
+        });
+
+        // Stub broker: admits the initiator and relays the responder's addr + key.
+        let (broker_ep, broker_cert) = build_server_endpoint_with_cert().expect("broker");
+        let broker_addr = broker_ep.local_addr().expect("broker addr");
+        let rnpub = responder_noise.public;
+        let broker_task = tokio::spawn(async move { stub_broker_admit(&broker_ep, resp_addr, rnpub).await });
+
+        // Initiator: run_channel_join over a connection to the (stub) broker.
+        let initiator_noise = generate_static_keypair();
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let holder = SigningKey::from_bytes(&[0x11u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId([0xD0u8; 32]),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+        let req = ChannelJoinRequest { grant, endpoint: "203.0.113.1:7001".to_string() };
+        let (mut a_local_test, a_local_run) = tokio::io::duplex(8192);
+        let inp = initiator_noise.private;
+        let a_task = tokio::spawn(async move {
+            let c = build_client_endpoint(broker_cert).expect("client");
+            let conn = c.connect(broker_addr, "localhost").expect("cfg").await.expect("conn");
+            run_channel_join(&conn, &req, &holder, ChannelRole::Initiate, &inp, None, a_local_run).await
+        });
+
+        // Data flows initiator -> responder with zero out-of-band key/cert exchange.
+        let payload = b"hands-off: peer addr + Noise key came from the rendezvous ack";
+        a_local_test.write_all(payload).await.expect("write");
+        a_local_test.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        resp_local_test.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, payload, "the responder receives the initiator's data, keyed only via rendezvous");
+
+        a_task.abort();
+        resp_task.abort();
+        broker_task.abort();
     }
 
     #[tokio::test]
