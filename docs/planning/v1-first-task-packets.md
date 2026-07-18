@@ -2018,6 +2018,27 @@ took a **client-supplied `price`** so `price:0` minted a routing token for free.
   (overlaps #77/#78); sybil account creation is acknowledged by-design (`accounts.rs`). Blocks the #81
   SEC81c-b channel-registry HTTP API (same auth question). Maintainer call — not code-blocked here.
 
+## #88 Replay cache + enrollment proof-of-possession (security-review, medium)
+
+Three trust-primitive gaps: (1) `SignedCredential` and (2) `ChannelGrant` are signature+expiry only, so a
+captured token is replayable until expiry; (3) enrollment `redeem` binds a join token to an agent pubkey
+with **no** proof-of-possession, so an intercepted token can bind an attacker's key. Decomposed:
+
+- **SEC88a** ✅ **Replay-cache primitive** (`ct_common::replay::ReplayCache`) — the named missing mechanism.
+  `check_and_record(id, expires_at, now) -> bool`: fresh the first time an unexpired `id` is seen, `false` on
+  a replay; already-expired ids are never fresh/stored; expired entries are evicted on access so the map only
+  holds currently-valid ids. Caller-supplied time (deterministic, mirrors `ratelimit`). The `id` is opaque —
+  a token's 64-byte signature works (a replay carries the identical signature) as does an explicit nonce, so
+  it wires into both credential and grant paths without a format change. 4 frozen tests. Gate green.
+- **SEC88b** ⏳ **Consult the cache in `SignedCredential`/`ChannelGrant` verify** — key on the signature bytes
+  (no nonce/format change needed) at the edge admission + broker paths, threading a shared `ReplayCache`.
+- **SEC88c** ⏳ **Enrollment proof-of-possession**: `redeem` must verify a signature over the join token by
+  the pubkey being bound (agent already holds an ed25519 identity). Cross-crate wire change (agent onboard +
+  `ControlPlaneClient::redeem` + both `redeem` handlers + `SqliteEnrollment`/`Enrollment` + call sites) — its
+  own packet.
+- **SEC88d** ⏳ **Clock-skew hardening**: `verify` trusts a caller-supplied `now`; a backwards-skewed edge
+  clock extends validity. (ChannelGrant *revocation* is already covered via #81's membership check.)
+
 ## #90 Secret-handling: token in install one-liner + routing token in revoke logs (security-review, low)
 
 Two secret-exposure observations. Decomposed:
