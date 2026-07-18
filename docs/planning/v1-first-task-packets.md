@@ -2105,6 +2105,21 @@ Two secret-exposure observations. Decomposed:
   history and `ps`. Removing them from the command string needs a bootstrap-token exchange (server-side
   hand-off), which is tied to the #75 install-flow redesign (install scripts aren't live yet). Track with #75.
 
+## #95 Rendezvous rate-limit + connection cap are opt-in / off by default (security-review)
+
+Follow-up to #86: both edge flood controls (per-token rendezvous rate limit, concurrent-connection cap) were
+gated on an env var and did nothing when unset (the default), so a public edge shipped flood-exposed.
+
+- **SEC95a** ✅ **Both controls on by default, tunable + disable-able**: `resolve_flood_limit(raw, default)` —
+  unset → the safe `default` (ON); a positive value overrides; explicit `0`/`off`/`false`/`none` disables; an
+  unparseable value fails safe to the default (a typo never opens the flood gate). Wired at both `run_edge`
+  sites with generous defaults — `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` default **600/min per token** (≈10/s; a
+  solver-farm flood is orders of magnitude higher, so normal use + the testbed are unaffected) and
+  `CT_EDGE_MAX_CONNECTIONS` default **8192** concurrent (well above any real/testbed footprint, bounds FD/mem
+  exhaustion). Frozen test `flood_limits_are_on_by_default_but_tunable_and_disable_able`. Gate green (full
+  `cargo test --workspace -D warnings`). The per-token/per-connection semantics (from #86) are unchanged;
+  only the default flipped from off→on with an explicit opt-out.
+
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
 Gutachten: Tabelle 7.1 „80,8 ± 91,9 ms" impliziert negative Latenz (symmetrisches Normal-KI auf

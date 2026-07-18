@@ -789,6 +789,36 @@ fn host_auth_required(require_env: Option<&str>, front_door_set: bool) -> bool {
     }
 }
 
+/// Default per-token rendezvous rate limit (#95): 600/min ≈ 10/s per routing token.
+/// Generous — a legitimate tunnel rendezvouses a handful of times per session, while
+/// a solver-farm flood is orders of magnitude higher — so it protects a public edge
+/// by default without throttling normal use or the testbed.
+const DEFAULT_RENDEZVOUS_MAX_PER_MIN: u32 = 600;
+/// Default cap on concurrently-handled connections (#95): well above any real
+/// deployment or testbed footprint, but bounds an FD/memory-exhaustion flood.
+const DEFAULT_MAX_CONNECTIONS: u32 = 8192;
+
+/// Resolve an opt-out flood-control limit (#95). A public edge must be protected
+/// **by default**, so an *unset* env var yields the safe `default` (on), not `None`.
+/// The value is still fully tunable: a positive integer overrides the default, and an
+/// explicit `0` / `off` / `false` / `none` disables the control. An unparseable value
+/// falls back to `default` rather than silently disabling protection (fail-safe — a
+/// typo never opens the flood gate). Returns `None` only for an explicit opt-out.
+fn resolve_flood_limit(raw: Option<&str>, default: u32) -> Option<u32> {
+    match raw.map(str::trim) {
+        None => Some(default),
+        Some(v)
+            if v == "0"
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("none") =>
+        {
+            None
+        }
+        Some(v) => Some(v.parse::<u32>().ok().filter(|&n| n > 0).unwrap_or(default)),
+    }
+}
+
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
     // Issue the Edge's leaf from an internal CA (M20.3b) and listen on both QUIC
     // (primary) and TLS-TCP (fallback) with that one shared leaf. Persist the CA
@@ -805,29 +835,30 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     save_cert(cert_out, &ca_root)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
-    // #86 (ADR-0018): opt-in per-token rendezvous rate limit — at most N rendezvous
-    // per routing token per minute. Off unless CT_EDGE_RENDEZVOUS_MAX_PER_MIN is set,
-    // so it never surprises a benign deployment; enable it on a public edge to cap a
-    // token-specific rendezvous flood that the PoW gate alone can't (a solver farm).
-    if let Some(n) = std::env::var("CT_EDGE_RENDEZVOUS_MAX_PER_MIN")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-    {
+    // #86/#95 (ADR-0018): per-token rendezvous rate limit — at most N rendezvous per
+    // routing token per minute. On by DEFAULT now (#95: a public edge must not ship
+    // flood-exposed); CT_EDGE_RENDEZVOUS_MAX_PER_MIN tunes it, and `0`/`off` disables
+    // it. Caps a token-specific rendezvous flood the PoW gate alone can't (solver farm).
+    if let Some(n) = resolve_flood_limit(
+        std::env::var("CT_EDGE_RENDEZVOUS_MAX_PER_MIN").ok().as_deref(),
+        DEFAULT_RENDEZVOUS_MAX_PER_MIN,
+    ) {
         state.set_rendezvous_limit(n);
-        eprintln!("ct-edge: per-token rendezvous rate limit {n}/min (CT_EDGE_RENDEZVOUS_MAX_PER_MIN, #86)");
+        eprintln!("ct-edge: per-token rendezvous rate limit {n}/min (CT_EDGE_RENDEZVOUS_MAX_PER_MIN, #86/#95)");
+    } else {
+        eprintln!("ct-edge: per-token rendezvous rate limit DISABLED (CT_EDGE_RENDEZVOUS_MAX_PER_MIN=off, #95)");
     }
-    // #86 SEC86b (ADR-0018): opt-in cap on concurrently-handled QUIC connections.
-    // Off unless CT_EDGE_MAX_CONNECTIONS is set (>0); on a public edge it bounds a
-    // connection flood so memory / FDs can't be exhausted before the PoW gate runs.
-    let conn_cap = std::env::var("CT_EDGE_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .map(|n| {
-            eprintln!("ct-edge: max {n} concurrent connections (CT_EDGE_MAX_CONNECTIONS, #86)");
-            ConnectionCap::new(n)
-        });
+    // #86 SEC86b/#95 (ADR-0018): cap on concurrently-handled QUIC connections, on by
+    // DEFAULT now (#95). CT_EDGE_MAX_CONNECTIONS tunes it, `0`/`off` disables it. Bounds
+    // a connection flood so memory / FDs can't be exhausted before the PoW gate runs.
+    let conn_cap = resolve_flood_limit(
+        std::env::var("CT_EDGE_MAX_CONNECTIONS").ok().as_deref(),
+        DEFAULT_MAX_CONNECTIONS,
+    )
+    .map(|n| {
+        eprintln!("ct-edge: max {n} concurrent connections (CT_EDGE_MAX_CONNECTIONS, #86/#95)");
+        ConnectionCap::new(n as usize)
+    });
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
@@ -1155,6 +1186,21 @@ mod tests {
             !host_auth_required(None, false),
             "unset + mesh-only (:4433, no front door) -> OFF (zero-config unaffected)"
         );
+    }
+
+    #[test]
+    fn flood_limits_are_on_by_default_but_tunable_and_disable_able() {
+        // #95: a public edge must ship protected. Unset -> the safe default (ON);
+        // a positive value overrides; an explicit 0/off/false/none disables; an
+        // unparseable value fails safe to the default (a typo never opens the gate).
+        assert_eq!(resolve_flood_limit(None, 600), Some(600), "unset -> on by default");
+        assert_eq!(resolve_flood_limit(Some("250"), 600), Some(250), "positive value overrides");
+        assert_eq!(resolve_flood_limit(Some("  0 "), 600), None, "0 disables");
+        assert_eq!(resolve_flood_limit(Some("off"), 600), None, "off disables");
+        assert_eq!(resolve_flood_limit(Some("False"), 600), None, "false disables (case-insensitive)");
+        assert_eq!(resolve_flood_limit(Some("none"), 600), None, "none disables");
+        assert_eq!(resolve_flood_limit(Some("garbage"), 600), Some(600), "unparseable -> safe default, not off");
+        assert_eq!(resolve_flood_limit(Some("-5"), 600), Some(600), "negative -> safe default, not off");
     }
 
     #[tokio::test]
