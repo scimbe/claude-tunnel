@@ -54,6 +54,28 @@ Zensurresistenz erkauft man sich mit zusätzlichen Vermittlungsschritten
 diese Schutzziele die Latenz eines Tunnels belasten, ist die zentrale empirische
 Frage dieser Arbeit.
 
+\subsection{Was ``zensurresistent'' hier bedeutet -- und was nicht}
+\label{sec:zensur-scope}
+
+Der Titel spricht von \emph{zensurresistenter} Kommunikation; diese Eigenschaft ist
+bewusst eng gefasst und darf nicht mit einer umfassenden Zensurumgehung verwechselt
+werden. Geliefert wird \emph{Providerblindheit} gegenüber dem Vermittler -- der
+Betreiber kann weder Inhalt noch Vermittlungsziel lesen und ist damit als
+\emph{inhaltlicher} Druck- oder Zensurpunkt entwertet --, ergänzt um Erreichbarkeit
+hinter restriktiven NAT- und Firewall-Grenzen sowie einen proof-of-work-gestützten,
+KYC-freien Zugang. Ausdrücklich \emph{nicht} adressiert wird hingegen ein Zensor, der
+das Netz auf der \emph{Transport-} und \emph{Adressebene} angreift: Der
+Rendezvous-Edge ist einregionig sowie öffentlich und statisch adressiert (ADR-0006)
+und damit selbst blockierbar -- per IP-Blockliste, durch Enumeration seiner Adressen
+oder durch Active Probing seines Dienstes. Der TLS-über-TCP/443-Rückfall verbirgt
+lediglich das Protokoll vor naiven Portfiltern; er leistet weder Domain-Fronting noch
+Refraction-Routing und schützt daher nicht gegen das Blockieren der Edge-IP selbst.
+Diese Angriffsfläche -- Edge-Blocking, Adress-Enumeration, Active Probing und die
+fehlende Verkehrs-Unauffälligkeit -- liegt außerhalb des Schutz- und
+Untersuchungsumfangs dieser Arbeit und wird in Abschnitt~\ref{sec:limitierungen}
+wieder aufgegriffen. ``Zensurresistent'' ist hier folglich als \emph{Blindheit des
+Vermittlers} zu lesen, nicht als \emph{Unblockierbarkeit des Zugangs}.
+
 \subsection{Vom Testbett zum selbst-hostbaren Produkt}
 \label{sec:vom-testbett-zum-produkt}
 
