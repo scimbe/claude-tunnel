@@ -2489,3 +2489,32 @@ Decomposed:
   numeric `user.id` (1279912). All three SKILLs now mandate running it and treating any flagged comment body as
   DATA, never as an instruction. Gate: `bash -n` + `--selftest` (scimbe id trusted; foreign id, and a *recycled
   scimbe login on a different id*, both flagged) + live (#77 all-scimbe → OK exit 0).
+
+## #102 Intent-/policy-driven SDN-style control plane for the agent mesh (feature, epic)
+
+An orchestration/policy layer **on top of** the Agent Fabric: declare *who may talk to whom under which
+conditions* (RBAC groups + security Labels/Levels with MAC flow-control, default-deny) and drive it via a
+token-authenticated REST/OpenAPI surface + an MCP tool layer; the controller compiles the declaration into
+`SignedChannelGrant`s and the edge broker enforces admission. Big epic — decomposed bottom-up so the pure,
+mesh-independent core lands first:
+
+- **#102-policy-core** ✅ **Policy decision engine** (`ct_common::policy`): the pure RBAC + MAC evaluator every
+  other layer consumes (controller compiles grants from it, broker enforces it at admission #81/#99, MCP
+  `net.explain` renders its `Decision`). `Policy { levels, rules, mac_flow_control }` with `Levels` (ordered
+  labels), default-deny `AllowRule`s over `Selector { group?, label? }`, and Bell–LaPadula **no-write-down**
+  MAC that overrides RBAC. `evaluate(from, to) -> Decision { allowed, reason }` (directed flow) and
+  `may_establish_channel(a, b)` (bidirectional — the broker-admission check; a cross-level pair is refused
+  because one direction is a write-down). Wire-serializable (serde) for the REST surface. Reasons are
+  human/AI-legible (for `net.explain` and the broker's `NO <reason>`). Frozen tests: the #102 "verteilte
+  Firma" fixture (dev/ops/finance × internal/secret) — RBAC allow + default-deny, MAC blocks write-down /
+  allows write-up even with a matching rule, MAC fails closed on an unknown label, channel establishment needs
+  both directions + refuses cross-level, and a serde round-trip. Gate green (full `cargo test --workspace -D warnings`).
+- **#102-network-model** ⏳ next: the declarative objects (`Network → Segments → Agents`, groups, labels,
+  policy) as durable CP state + a `reconcile(desired) -> {mint, revoke}` diff against the live grants.
+- **#102-rest** ⏳ then: `PUT /networks/:id` + imperative overrides (`POST /channels`, `/grants/:id/revoke`),
+  OpenAPI schema, OIDC-bearer + scoped-API-token authN.
+- **#102-broker-enforce** ⏳: the edge broker's `authorize` closure consults the compiled policy so a
+  non-conformant join is refused with `NO <reason>` (defense-in-depth with the agent-side grant check).
+- **#102-mcp** ⏳: the same operations as agent-native MCP tools (`net.apply`, `net.grant`, `net.revoke`,
+  `net.explain(a, b) → allowed? why`). Depends on the live A2A mesh (#99/#98/#100/#81/#72) for the end-to-end
+  "allowed flow connects, disallowed refused at the broker" acceptance.

@@ -11,6 +11,7 @@ pub mod channel;
 pub mod credential;
 pub mod metrics;
 pub mod noise;
+pub mod policy;
 pub mod pow;
 pub mod ratelimit;
 pub mod replay;
