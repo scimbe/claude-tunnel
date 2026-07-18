@@ -1113,7 +1113,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         async move {
                                             a.resolve(&c, &h)
                                                 .await
-                                                .map(|m| (m.operator_pubkey, m.noise_pubkey))
+                                                .map(|m| (m.operator_pubkey, m.noise_pubkey, m.noise_attestation))
                                         }
                                     },
                                 )

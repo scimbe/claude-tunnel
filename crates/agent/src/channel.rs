@@ -24,6 +24,12 @@ pub enum ChannelJoinOutcome {
     Admitted {
         peer_endpoint: String,
         peer_noise_pubkey: Option<[u8; 32]>,
+        /// The peer's grant-authenticated holder pubkey, when the edge relayed the
+        /// attested-key triple (#101) — the key to verify `peer_attestation` against.
+        peer_holder: Option<[u8; 32]>,
+        /// The peer's holder-signed attestation over `peer_noise_pubkey` (#101), which
+        /// the initiator verifies before pinning the key.
+        peer_attestation: Option<[u8; 64]>,
     },
     /// Refused: a bad/expired grant, a non-member holder, an unsafe advertised
     /// endpoint, or a failed possession proof.
@@ -60,31 +66,50 @@ pub async fn present_channel_join(
     }
     send.finish()?;
 
-    let ack = recv.read_to_end(256).await.unwrap_or_default();
+    // The ack can carry endpoint + noise(64) + holder(64) + attestation(128) hex plus
+    // separators — well over 256 bytes; allow room so the attestation isn't truncated.
+    let ack = recv.read_to_end(512).await.unwrap_or_default();
     let ack = String::from_utf8_lossy(&ack);
     match ack.strip_prefix("OK") {
-        // `OK[ <endpoint>[ <peer_noise_hex>]]` — the broker appends the peer's
-        // attested Noise key when the registry has one.
+        // `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]]` — the broker
+        // appends the peer's attested Noise key, its holder, and the holder-signed
+        // attestation (#101) when the registry has them (all-or-nothing).
         Some(rest) => {
             let mut parts = rest.split_whitespace();
             let peer_endpoint = parts.next().unwrap_or_default().to_string();
             let peer_noise_pubkey = parts.next().and_then(decode_hex_32);
+            let peer_holder = parts.next().and_then(decode_hex_32);
+            let peer_attestation = parts.next().and_then(decode_hex_64);
             Ok(ChannelJoinOutcome::Admitted {
                 peer_endpoint,
                 peer_noise_pubkey,
+                peer_holder,
+                peer_attestation,
             })
         }
         None => Ok(ChannelJoinOutcome::Refused),
     }
 }
 
-/// Decode 64 lowercase-hex chars into 32 bytes (the peer Noise key the broker
-/// relays), or `None` if malformed.
+/// Decode 64 lowercase-hex chars into 32 bytes (the peer Noise key / holder the
+/// broker relays), or `None` if malformed.
 fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Decode 128 lowercase-hex chars into the 64-byte attestation, or `None`.
+fn decode_hex_64(s: &str) -> Option<[u8; 64]> {
+    if s.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
     for (i, b) in out.iter_mut().enumerate() {
         *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
     }
@@ -134,7 +159,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
-            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None)) })
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None, None)) })
                 .await
                 .map(|_| ())
         });
@@ -143,7 +168,7 @@ mod tests {
         let outcome = present_channel_join(&conn, &request, &holder).await.expect("join drives");
         assert_eq!(
             outcome,
-            ChannelJoinOutcome::Admitted { peer_endpoint: String::new(), peer_noise_pubkey: None },
+            ChannelJoinOutcome::Admitted { peer_endpoint: String::new(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None },
             "the genuine holder proves possession and is admitted"
         );
         conn.close(0u32.into(), b"done");
@@ -154,7 +179,7 @@ mod tests {
         let (server2, cert2) = build_server_endpoint_with_cert().expect("server");
         let addr2 = server2.local_addr().expect("addr");
         let srv2 = tokio::spawn(async move {
-            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None)) })
+            resolve_channel_join(&server2, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None, None)) })
                 .await
                 .map(|_| ())
         });
@@ -186,7 +211,7 @@ mod tests {
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
-            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None)) })
+            broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((op_pub, None, None)) })
                 .await
                 .map(|_| ())
         });
@@ -211,12 +236,12 @@ mod tests {
         let _ = srv.await;
         assert_eq!(
             out_a,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string(), peer_noise_pubkey: None },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None },
             "agent A learns B's endpoint"
         );
         assert_eq!(
             out_b,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string(), peer_noise_pubkey: None },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None },
             "agent B learns A's endpoint"
         );
     }
@@ -232,8 +257,16 @@ mod tests {
         let holder_a = SigningKey::from_bytes(&[0x31u8; 32]);
         let holder_b = SigningKey::from_bytes(&[0x32u8; 32]);
         let hkey_a = holder_a.verifying_key().to_bytes();
+        let hkey_b = holder_b.verifying_key().to_bytes();
         let noise_a = [0xAAu8; 32];
         let noise_b = [0xBBu8; 32];
+        // Each member attests its own Noise key with its holder key (#101).
+        let attest_a = holder_a
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &hkey_a, &noise_a))
+            .to_bytes();
+        let attest_b = holder_b
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &hkey_b, &noise_b))
+            .to_bytes();
         let req_a = ChannelJoinRequest {
             grant: signed_grant(channel, &holder_a, Direction::Initiate),
             endpoint: "203.0.113.1:7001".to_string(),
@@ -247,9 +280,9 @@ mod tests {
         let addr = server.local_addr().expect("addr");
         let srv = tokio::spawn(async move {
             broker_channel_rendezvous(&server, 500, move |c, h| async move {
-                // Each member resolves to (operator, its own attested Noise key).
-                let noise = if h == hkey_a { noise_a } else { noise_b };
-                (c.0 == channel).then_some((op_pub, Some(noise)))
+                // Each member resolves to (operator, its Noise key, its attestation).
+                let (noise, attest) = if h == hkey_a { (noise_a, attest_a) } else { (noise_b, attest_b) };
+                (c.0 == channel).then_some((op_pub, Some(noise), Some(attest)))
             })
             .await
             .map(|_| ())
@@ -278,16 +311,20 @@ mod tests {
             ChannelJoinOutcome::Admitted {
                 peer_endpoint: "203.0.113.2:7002".to_string(),
                 peer_noise_pubkey: Some(noise_b),
+                peer_holder: Some(hkey_b),
+                peer_attestation: Some(attest_b),
             },
-            "agent A learns B's endpoint AND B's attested Noise key"
+            "agent A learns B's endpoint, Noise key, holder, AND attestation"
         );
         assert_eq!(
             out_b,
             ChannelJoinOutcome::Admitted {
                 peer_endpoint: "203.0.113.1:7001".to_string(),
                 peer_noise_pubkey: Some(noise_a),
+                peer_holder: Some(hkey_a),
+                peer_attestation: Some(attest_a),
             },
-            "agent B learns A's endpoint AND A's attested Noise key"
+            "agent B learns A's endpoint, Noise key, holder, AND attestation"
         );
     }
 

@@ -2251,11 +2251,20 @@ handshake. Fix: **attest** the Noise key with the member's holder key and verify
   `noise_attestation`; `ChannelAuthorizer::resolve` parses the CP-served attestation (hex→`[u8;64]`). Frozen
   test `resolve_carries_the_members_attested_noise_key` asserts it. Gate green — the edge now has the
   attestation ready to relay.
-- **SEC101c-ii** ⏳ **Relay + verify end-to-end**: the broker's authorize closure returns the attestation too,
-  `broker_channel_rendezvous` appends it (+ the peer holder) to the ack, `present_channel_join` parses it into
-  `Admitted`, and `run_channel_join`/`join_via_relay` call `verify_member_noise_attestation` before
-  `a2a_initiate` pins — so even a tampered DB can't make an initiator pin an unattested key. (Same
-  closure-signature ripple as the noise-key swap.)
+- **SEC101c-ii** ✅ **Relay + verify end-to-end.** The broker's authorize closure now returns the attestation
+  (`(operator, noise, attestation)`); `broker_channel_rendezvous` appends the peer's **grant-authenticated**
+  holder + Noise key + attestation to the ack (`member_ack_suffix`, all-or-nothing); `present_channel_join`
+  parses them into `Admitted { peer_holder, peer_attestation, … }`; and `run_channel_join`
+  **`verify_member_noise_attestation` before pinning** — refusing a key whose attestation doesn't verify
+  against the grant-holder. Because the holder comes from the operator-signed grant (not the mutable
+  registry), a DB-substituted key can't produce a matching attestation. Frozen tests:
+  `run_channel_join_rejects_a_peer_key_with_a_bad_attestation` (substituted key → error, no session) +
+  `rendezvous_relays_each_peers_attested_noise_key`/`auto_falls_back` reworked to relay+verify real
+  attestations. Closure-signature ripple handled across the broker/agent. Gate green.
+
+**#101 complete:** the member Noise key is attested by its holder (SEC101a), verified + stored at the CP
+(SEC101b), and relayed + **verified by the initiator before pinning** (SEC101c) — closing the DB-operator
+MITM vector on the A2A direct path end-to-end.
 
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 

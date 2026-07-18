@@ -125,9 +125,24 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let (peer_endpoint, peer_noise) = match present_channel_join(broker_conn, request, holder).await? {
-        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey } => {
+        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation } => {
             let noise = peer_noise_pubkey
                 .ok_or("broker admitted the join but relayed no peer Noise key (registry has none)")?;
+            // #101 SEC101c-ii: verify the peer's Noise key is attested by its
+            // grant-authenticated holder before pinning it — so even a tampered DB
+            // can't make us pin a substituted key (the attestation wouldn't verify).
+            let holder = peer_holder
+                .ok_or("broker relayed a Noise key without the peer holder — cannot verify (#101)")?;
+            let attestation = peer_attestation
+                .ok_or("broker relayed a Noise key without an attestation (#101)")?;
+            if !ct_common::channel::verify_member_noise_attestation(
+                &request.grant.grant.channel,
+                &holder,
+                &noise,
+                &attestation,
+            ) {
+                return Err("peer Noise-key attestation failed — refusing to pin a possibly-substituted key (#101)".into());
+            }
             (peer_endpoint, noise)
         }
         ChannelJoinOutcome::Refused => return Err("edge broker refused the channel join".into()),
@@ -639,7 +654,13 @@ mod tests {
     // request, possession challenge, `OK <endpoint> <noise_hex>`) but omits the
     // `safe_endpoint` SSRF gate — which is tested in `ct_edge::channel_broker` and
     // would (correctly) reject the loopback address a hermetic test must use.
-    async fn stub_broker_admit(server: &Endpoint, peer_addr: std::net::SocketAddr, peer_noise: [u8; 32]) {
+    async fn stub_broker_admit(
+        server: &Endpoint,
+        peer_addr: std::net::SocketAddr,
+        peer_noise: [u8; 32],
+        peer_holder: [u8; 32],
+        peer_attestation: [u8; 64],
+    ) {
         let conn = server.accept().await.expect("incoming").await.expect("conn");
         let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
         let mut len = [0u8; 2];
@@ -649,7 +670,14 @@ mod tests {
         send.write_all(&[0u8; 32]).await.expect("challenge"); // possession challenge
         let mut sig = [0u8; 64];
         let _ = recv.read_exact(&mut sig).await; // (signature not checked by the stub)
-        let ack = format!("OK {} {}", peer_addr, hex_encode(&peer_noise));
+        // Ack the attested-key triple the real broker relays (#101).
+        let ack = format!(
+            "OK {} {} {} {}",
+            peer_addr,
+            hex_encode(&peer_noise),
+            hex_encode(&peer_holder),
+            hex_encode(&peer_attestation)
+        );
         send.write_all(ack.as_bytes()).await.expect("ack");
         send.finish().expect("finish");
         conn.closed().await;
@@ -683,7 +711,16 @@ mod tests {
         let (broker_ep, broker_cert) = build_server_endpoint_with_cert().expect("broker");
         let broker_addr = broker_ep.local_addr().expect("broker addr");
         let rnpub = responder_noise.public;
-        let broker_task = tokio::spawn(async move { stub_broker_admit(&broker_ep, resp_addr, rnpub).await });
+        // The stub relays the responder's attested-key triple (#101): a holder that
+        // signs the responder's Noise key for the initiator's channel.
+        let resp_holder = SigningKey::from_bytes(&[0x44u8; 32]);
+        let resp_hpub = resp_holder.verifying_key().to_bytes();
+        let resp_att = resp_holder
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId([0xD0u8; 32]), &resp_hpub, &rnpub))
+            .to_bytes();
+        let broker_task = tokio::spawn(async move {
+            stub_broker_admit(&broker_ep, resp_addr, rnpub, resp_hpub, resp_att).await
+        });
 
         // Initiator: run_channel_join over a connection to the (stub) broker.
         let initiator_noise = generate_static_keypair();
@@ -772,7 +809,7 @@ mod tests {
         let relay_addr = relay_ep.local_addr().expect("addr");
         let relay_task = tokio::spawn(async move {
             broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
-                (c.0 == channel).then_some((op_pub, None))
+                (c.0 == channel).then_some((op_pub, None, None))
             })
             .await
             .map(|_| ())
@@ -850,14 +887,21 @@ mod tests {
         let (rdv_ep, rdv_cert) = build_server_endpoint_with_cert().expect("rdv");
         let rdv_addr = rdv_ep.local_addr().expect("rdv addr");
         let nb_pub = noise_b.public;
-        let rdv_task = tokio::spawn(async move { stub_broker_admit(&rdv_ep, blackhole_addr, nb_pub).await });
+        // B's attested-key triple, verified by run_channel_join before it falls back.
+        let hb_pub = holder_b.verifying_key().to_bytes();
+        let b_att = holder_b
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &hb_pub, &nb_pub))
+            .to_bytes();
+        let rdv_task = tokio::spawn(async move {
+            stub_broker_admit(&rdv_ep, blackhole_addr, nb_pub, hb_pub, b_att).await
+        });
 
         // Real relay endpoint.
         let (relay_ep, relay_cert) = build_server_endpoint_with_cert().expect("relay");
         let relay_addr = relay_ep.local_addr().expect("relay addr");
         let relay_task = tokio::spawn(async move {
             broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
-                (c.0 == channel).then_some((op_pub, None))
+                (c.0 == channel).then_some((op_pub, None, None))
             })
             .await
             .map(|_| ())
@@ -910,6 +954,68 @@ mod tests {
         rdv_task.abort();
         relay_task.abort();
         drop(blackhole);
+    }
+
+    #[tokio::test]
+    async fn run_channel_join_rejects_a_peer_key_with_a_bad_attestation() {
+        // #101 SEC101c-ii: if the relayed peer Noise key's attestation doesn't verify
+        // against the peer's holder (a DB-substituted key), run_channel_join REFUSES to
+        // pin it — it errors before establishing any session.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let holder_a = SigningKey::from_bytes(&[0x21u8; 32]);
+        let channel = [0xE3u8; 32];
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: holder_a.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let req_a = ChannelJoinRequest {
+            grant: SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() },
+            endpoint: "203.0.113.1:7001".to_string(),
+        };
+
+        // The stub relays a peer key + holder, but an attestation over a DIFFERENT key
+        // (as a tampered DB would produce) — it must not verify.
+        let peer_holder = SigningKey::from_bytes(&[0x55u8; 32]);
+        let peer_hpub = peer_holder.verifying_key().to_bytes();
+        let peer_noise = generate_static_keypair().public;
+        let bad_attest = peer_holder
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &peer_hpub, &[0u8; 32]))
+            .to_bytes();
+
+        let (rdv_ep, rdv_cert) = build_server_endpoint_with_cert().expect("rdv");
+        let rdv_addr = rdv_ep.local_addr().expect("addr");
+        let rdv_task = tokio::spawn(async move {
+            stub_broker_admit(&rdv_ep, "203.0.113.9:9000".parse().unwrap(), peer_noise, peer_hpub, bad_attest).await
+        });
+
+        let bc = build_client_endpoint(rdv_cert).expect("bc");
+        let broker_conn = bc.connect(rdv_addr, "localhost").expect("cfg").await.expect("conn");
+        let noise_a = generate_static_keypair();
+        let (_t, local) = tokio::io::duplex(64);
+        let result = run_channel_join(
+            &broker_conn,
+            &broker_conn,
+            &req_a,
+            &holder_a,
+            ChannelRole::Initiate,
+            &noise_a.private,
+            None,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(1),
+            local,
+        )
+        .await;
+        assert!(result.is_err(), "a peer key with a bad attestation is rejected before pinning (#101)");
+        rdv_task.abort();
     }
 
     #[tokio::test]
