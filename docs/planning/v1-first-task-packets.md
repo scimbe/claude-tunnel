@@ -1849,3 +1849,19 @@ GLM-5.2 review: 3 OIDC weaknesses. Decomposed:
   `rustls-pemfile` is gone from Cargo.lock (218 deps, was 219). Frozen test
   `build_portal_acceptor_parses_pem_via_pki_types` (real self-signed PEM cert+key parse; junk rejected).
   cargo audit now fully clean: exit 0, 0 vulns (rsa ignored), 0 warnings. **#80 fix-ready.**
+
+## #86 Edge DoS defense — ADR-0018 half-deployed (security-review)
+
+Two availability gaps: no connection cap on the accept loops, and the per-token RateLimiter unwired.
+Decomposed:
+
+- **SEC86a** ✅ **Wire the per-token rendezvous rate limit** (ADR-0018's second half): `EdgeState` gains an
+  opt-in `rendezvous_limiter` (`set_rendezvous_limit` / `rendezvous_allowed(token, window)`), enabled by
+  `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` (off by default). Both `'C'` rendezvous handlers (QUIC + TCP-fallback)
+  now reject a token over its per-minute budget AFTER PoW — PoW raises per-attempt cost, this caps
+  per-token volume a solver farm could still push. Frozen test on the state method (off by default; caps
+  N per window; per-token independent; new window resets). Gate green.
+- **SEC86b** ⏳ **Connection cap on the accept loops**: bound concurrent connection-handling tasks (a
+  `tokio::sync::Semaphore` permit per accepted connection, and/or a quinn endpoint concurrency cap) so a
+  connection flood can't exhaust memory/FDs — the first availability gap. Optionally PoW-gate `'A'`
+  registration. Doc: reconcile the whitepaper's "rate limit shipped" claim (now opt-in + wired).

@@ -495,6 +495,12 @@ pub async fn serve_connection(
             recv.read_exact(&mut req).await?;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
+            // #86 (ADR-0018): per-token rendezvous rate limit — PoW raises per-attempt
+            // cost, this caps how many rendezvous a single token drives per window.
+            if !state.rendezvous_allowed(&token, rendezvous_window()) {
+                return Err("rendezvous rate limit exceeded".into());
+            }
+
             // A QUIC client must also reach a TCP-fallback agent (#13): the TCP
             // path prefers a parked TCP agent, and the QUIC path must mirror it or
             // a QUIC-client → TCP-agent tunnel is invisible and dies with
@@ -721,6 +727,11 @@ where
             stream.read_exact(&mut req).await?;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
+            // #86 (ADR-0018): per-token rendezvous rate limit (same as the QUIC path).
+            if !state.rendezvous_allowed(&token, rendezvous_window()) {
+                return Err("rendezvous rate limit exceeded".into());
+            }
+
             // Prefer a parked TCP-fallback agent; else relay to a QUIC agent.
             match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
@@ -759,6 +770,17 @@ fn ca_key_path_for(cert_out: &str) -> String {
 /// with unauthenticated hostname binds lets any routing-token holder squat an
 /// unbound name. A mesh-only edge (no front door) stays off, so zero-config `:4433`
 /// deployments are unaffected.
+/// Current fixed-window index for the per-token rendezvous rate limit (#86): unix
+/// seconds / the window length (a per-minute window). Wall-clock, but only used in
+/// the live edge accept path; the limiter's own logic is tested deterministically.
+fn rendezvous_window() -> u64 {
+    const WINDOW_SECS: u64 = 60;
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / WINDOW_SECS)
+        .unwrap_or(0)
+}
+
 fn host_auth_required(require_env: Option<&str>, front_door_set: bool) -> bool {
     match require_env {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.trim().is_empty() => false,
@@ -783,6 +805,18 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     save_cert(cert_out, &ca_root)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
+    // #86 (ADR-0018): opt-in per-token rendezvous rate limit — at most N rendezvous
+    // per routing token per minute. Off unless CT_EDGE_RENDEZVOUS_MAX_PER_MIN is set,
+    // so it never surprises a benign deployment; enable it on a public edge to cap a
+    // token-specific rendezvous flood that the PoW gate alone can't (a solver farm).
+    if let Some(n) = std::env::var("CT_EDGE_RENDEZVOUS_MAX_PER_MIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+    {
+        state.set_rendezvous_limit(n);
+        eprintln!("ct-edge: per-token rendezvous rate limit {n}/min (CT_EDGE_RENDEZVOUS_MAX_PER_MIN, #86)");
+    }
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.

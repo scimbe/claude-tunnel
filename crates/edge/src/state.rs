@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ct_common::metrics::Counter;
+use ct_common::ratelimit::RateLimiter;
 use ct_common::RoutingToken;
 use ct_common::sync::MutexExt;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -58,6 +59,11 @@ pub struct EdgeState<H> {
     /// a hostname may only be bound by the token the control plane authorized for
     /// it — so an anonymous `'H'` bind on a public `:443` can't claim a name.
     host_auth: Mutex<Option<HashMap<String, RoutingToken>>>,
+    /// Per-token fixed-window rendezvous rate limit (#86, ADR-0018). `None` = off
+    /// (no cap). `Some(limiter)` caps how many rendezvous a single routing token may
+    /// drive per window — the second half of the layered rendezvous-flood defense
+    /// (PoW raises per-attempt cost; this caps per-token volume even for a solver).
+    rendezvous_limiter: Mutex<Option<RateLimiter>>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -77,6 +83,7 @@ impl<H: Clone> EdgeState<H> {
             revoked: Mutex::new(HashSet::new()),
             admin_token: Mutex::new(None),
             host_auth: Mutex::new(None),
+            rendezvous_limiter: Mutex::new(None),
             registrations: Counter::default(),
             relays: Counter::default(),
             relay_bytes: Counter::default(),
@@ -142,6 +149,23 @@ impl<H: Clone> EdgeState<H> {
         match self.host_auth.lock_safe().as_ref() {
             None => true,
             Some(map) => map.get(&key) == Some(token),
+        }
+    }
+
+    /// Enable the per-token rendezvous rate limit (#86, ADR-0018): at most
+    /// `max_per_window` rendezvous per routing token per window. Off until called.
+    pub fn set_rendezvous_limit(&self, max_per_window: u32) {
+        *self.rendezvous_limiter.lock_safe() = Some(RateLimiter::new(max_per_window));
+    }
+
+    /// Whether `token` may drive another rendezvous in `window` (#86): always true
+    /// when the limit is off; otherwise consults the fixed-window counter. `window`
+    /// is a caller-supplied window index (e.g. `unix_secs / window_secs`), so this
+    /// stays deterministic and unit-testable.
+    pub fn rendezvous_allowed(&self, token: &RoutingToken, window: u64) -> bool {
+        match self.rendezvous_limiter.lock_safe().as_mut() {
+            None => true,
+            Some(rl) => rl.allow(token, window),
         }
     }
 
@@ -385,6 +409,24 @@ mod tests {
         state.register(token(1), 42u32);
         assert_eq!(state.route(&token(1)), Some(42));
         assert!(state.is_known(&token(1)));
+    }
+
+    #[test]
+    fn rendezvous_rate_limit_off_by_default_then_caps_per_token_per_window() {
+        let state: EdgeState<u32> = EdgeState::new();
+        // Off by default: any number of rendezvous is allowed.
+        for _ in 0..100 {
+            assert!(state.rendezvous_allowed(&token(1), 0), "no cap until enabled (#86)");
+        }
+        // Enable a cap of 2 per window.
+        state.set_rendezvous_limit(2);
+        assert!(state.rendezvous_allowed(&token(1), 0), "1st allowed");
+        assert!(state.rendezvous_allowed(&token(1), 0), "2nd allowed");
+        assert!(!state.rendezvous_allowed(&token(1), 0), "3rd in the window rejected");
+        // A different token has its own budget.
+        assert!(state.rendezvous_allowed(&token(2), 0), "per-token budget is independent");
+        // A new window resets the budget.
+        assert!(state.rendezvous_allowed(&token(1), 1), "next window resets the cap");
     }
 
     #[test]
