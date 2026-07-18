@@ -25,12 +25,12 @@ kann, kann ihn auch unter Zwang nicht herausgeben; ein Betreiber, der die
 Schlüssel nicht hält, ist kein lohnendes Ziel für ihre Erpressung.
 
 Diese Arbeit verfolgt den entgegengesetzten Entwurf: einen
-\emph{providerblinden} (zero-knowledge) Tunnel, bei dem der Betreiber
+\emph{providerblinden} Tunnel, bei dem der Betreiber
 bewusst aus drei Dingen herausgehalten wird -- dem \emph{Inhalt} (die
 Nutzlast-Verschlüsselung terminiert erst am kundeneigenen Origin, nie beim
 Betreiber), dem \emph{Vertrauen} (die Schlüssel sind kundenverankert, es gibt
 keine betreiberseitige PKI) und, soweit möglich, dem \emph{Datenpfad} selbst.
-Die Zero-Knowledge-Eigenschaft ist dabei bewusst auf die \emph{Nutzlast}
+Die Providerblindheit ist dabei bewusst auf die \emph{Nutzlast}
 begrenzt: Strukturelle Metadaten wie die Existenz eines Tunnels oder -- im
 Relay-Fall -- grobe Zeit- und Volumenzähler bleiben sichtbar. Durchsetzung
 reduziert sich auf einen einzigen, groben Hebel (Terminierung eines Tokens),

@@ -31,7 +31,7 @@
 \usepackage[hidelinks]{hyperref}
 
 % --- Metadaten (Platzhalter, vor Abgabe ausfüllen) ---
-\newcommand{\arbeittitel}{Zero-Knowledge-Netzwerktunnel für zensurresistente Kommunikation}
+\newcommand{\arbeittitel}{Providerblinder Netzwerktunnel für zensurresistente Kommunikation}
 \newcommand{\arbeituntertitel}{Entwurf, Implementierung und emulationsbasierte Evaluation}
 \newcommand{\autorname}{Vorname Nachname}
 \newcommand{\matrikelnr}{0000000}
@@ -81,10 +81,12 @@ hat in gleicher oder ähnlicher Form noch keiner Prüfungsbehörde vorgelegen.
 
 % ===================== Kurzfassung / Abstract =====================
 \chapter*{Kurzfassung}
-Diese Arbeit entwirft und implementiert einen \emph{Zero-Knowledge-Netzwerktunnel}
-für zensurresistente Kommunikation: ein providerblindes Relay, das nur
+Diese Arbeit entwirft und implementiert einen \emph{providerblinden Netzwerktunnel}
+für zensurresistente Kommunikation: ein Relay, das nur
 Chiffretext weiterleitet, während die Ende-zu-Ende-Verschlüsselung zwischen
-Client und Ursprung über das Noise-Protokoll erfolgt. Der Zugang zum Relay wird
+Client und Ursprung über das Noise-Protokoll erfolgt. Der Begriff
+\emph{providerblind} bezeichnet die strukturelle Nutzlast-Blindheit des Betreibers
+und ist nicht mit kryptographischen Zero-Knowledge-Beweissystemen zu verwechseln. Der Zugang zum Relay wird
 über ein Proof-of-Work-gestütztes Rendezvous und tokenbasierte Ratenbegrenzung
 geschützt. Der Prototyp ist in Rust auf Basis von QUIC umgesetzt und wird in
 einem Docker-basierten Testbett unter emulierten Netzbedingungen
@@ -92,10 +94,12 @@ einem Docker-basierten Testbett unter emulierten Netzbedingungen
 
 \begin{otherlanguage}{english}
 \chapter*{Abstract}
-This thesis designs and implements a \emph{zero-knowledge network tunnel} for
-censorship-resistant communication: a provider-blind relay that forwards only
+This thesis designs and implements a \emph{provider-blind network tunnel} for
+censorship-resistant communication: a relay that forwards only
 ciphertext, while end-to-end encryption between client and origin is provided by
-the Noise protocol. Access to the relay is guarded by a proof-of-work
+the Noise protocol. The term \emph{provider-blind} denotes structural payload
+blindness of the operator and is not to be confused with cryptographic
+zero-knowledge proof systems. Access to the relay is guarded by a proof-of-work
 rendezvous and per-token rate limiting. The prototype is implemented in Rust on
 top of QUIC and evaluated for round-trip latency in a Docker-based testbed under
 emulated network conditions (\texttt{tc netem}).

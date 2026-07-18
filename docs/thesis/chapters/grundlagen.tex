@@ -28,7 +28,14 @@ Relay kehrt diese Eigenschaft um: Es leitet ausschließlich Chiffretext weiter u
 besitzt keinen Schlüssel, mit dem sich die Nutzlast entschlüsseln ließe. Die
 Verschlüsselung terminiert erst am kundeneigenen Ziel (\emph{Origin}).
 
-Die Zero-Knowledge-Eigenschaft ist dabei präzise auf die \emph{Nutzlast}
+Der Begriff \emph{Zero-Knowledge} bezeichnet in dieser Arbeit ausschließlich diese
+strukturelle Nutzlast-Blindheit des Betreibers und ist \emph{nicht} im Sinne
+kryptographischer Zero-Knowledge-Beweissysteme (ZK-Proofs) zu verstehen. Als
+Primärbegriff wird deshalb durchgehend \emph{Providerblindheit} verwendet, während
+\emph{Zero-Knowledge-Grenze} (ADR-0002) allein als fest definierter Eigenname für
+die so gezogene Vertrauensgrenze beibehalten wird.
+
+Die Providerblindheit ist dabei präzise auf die \emph{Nutzlast}
 begrenzt. Der Betreiber kann weder Inhalt lesen oder verändern noch das
 Origin-Schlüsselmaterial erlangen; sichtbar bleiben ihm hingegen strukturelle
 \emph{Metadaten}: dass ein Tunnel existiert, die Koordinationsereignisse des
