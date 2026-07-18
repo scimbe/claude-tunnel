@@ -70,3 +70,16 @@ rotate the edge CA by restart (clients trust the CA root, so no re-pinning).
    `verify_fresh` primitive (#88 SEC88a/b) is available for any future live
    `SignedCredential` path, and enrollment now requires proof-of-possession (#88
    SEC88c). accepted residual.
+5. **Unverified-email / open-registration accounts (#89 SEC89b)** — the Keycloak
+   realm runs with `verifyEmail=false` + `registrationAllowed=true` (and
+   `trustEmail=true` for social IDPs), so an account can be created without a
+   verified email address. This is **accepted as residual**: the deployment has
+   **no SMTP** to send verification mail, so email verification cannot be enforced
+   operationally, and — critically — **email is not the billing identity**. Billing
+   and all per-subject authorization key off the Keycloak `sub` (#82/#92 sub
+   mapper), never the email claim, and free token issuance is closed (#87 SEC87a:
+   a routing token costs ≥ `TOKEN_PRICE`; #87 SEC87b-auth: the durable-writer
+   surface is gated). So an unverified-email account still cannot mint value for
+   free; the exposure it adds over a verified-email realm is bounded to **funded
+   sybil abuse**, which is already residual #1 above. If SMTP is added later,
+   flip `verifyEmail=true` to raise the bar; until then, accepted residual.
