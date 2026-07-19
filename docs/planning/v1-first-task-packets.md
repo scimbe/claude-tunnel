@@ -2563,9 +2563,18 @@ mesh-independent core lands first:
     erroring the caller. Frozen test `network_store_is_owner_scoped_and_round_trips` (round-trips the full
     Network for its owner; invisible to another subject; owner-scoped list; in-place replace; scoped delete).
     Gate green.
-  - **#102-rest** ⏳ next: `PUT /me/networks/:id` (persist via the store) + `GET` (load) + a
-    `GET /me/networks/:id/plan` that returns `reconcile(desired_channels, live)` — following the `/me/*`
-    OIDC-bearer, subject-scoped conventions (the store's `owner` = the verified subject).
+  - **#102-rest** ✅ **The authenticated declarative-network REST surface** (`service::authed_network_router`,
+    `/me/networks/*`): `PUT /me/networks/:id {Network}` persists the caller's desired state (idempotent),
+    `GET /me/networks/:id` loads it (404 if none), and `GET /me/networks/:id/plan` returns
+    `{desired: [[a,b],…]}` — the policy-compiled connectivity (`Network::desired_channels`). Follows the
+    `/me/*` OIDC-bearer, subject-scoped convention: the `owner` is always the verified subject
+    (`subject_of`), never a request field, so it carries **no unauthenticated write surface** (cf. #87) and is
+    owner-isolated. Mounted in the `oidc`-gated block of `persistent_control_plane_router`. Frozen test
+    `authed_network_api_is_owner_scoped_and_plans_from_the_policy` (no bearer→401; owner PUT→GET round-trips the
+    Network; another subject→404; `/plan` compiles exactly the permitted pair from the policy). Gate green.
+  - **#102-broker-enforce** ⏳ next: the edge broker's `authorize` closure consults the compiled policy so a
+    non-conformant join is refused with `NO <reason>` (defense-in-depth with the agent-side grant check).
+    Exercises the live A2A mesh (#99/#98/#100). Then the MCP layer.
 - **#102-rest** ⏳ then: `PUT /networks/:id` + imperative overrides (`POST /channels`, `/grants/:id/revoke`),
   OpenAPI schema, OIDC-bearer + scoped-API-token authN.
 - **#102-broker-enforce** ⏳: the edge broker's `authorize` closure consults the compiled policy so a

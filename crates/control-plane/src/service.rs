@@ -13,7 +13,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
     BootstrapError, LedgerOpError, PaymentOpError, RedeemError, SqliteBootstrap, SqliteChannelStore,
-    SqliteEnrollment, SqliteLedger, SqliteRegistry,
+    SqliteEnrollment, SqliteLedger, SqliteNetworkStore, SqliteRegistry,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -660,6 +660,84 @@ pub fn authed_channel_router(
             post(channel_remove_member),
         )
         .with_state(AuthedChannelState { channels, verifier })
+}
+
+/// Shared state for the authenticated declarative **network** API (#102-rest): the
+/// durable [`SqliteNetworkStore`] + the OIDC verifier. Networks are keyed by the
+/// verified subject, so a caller only ever reads/writes its own (owner isolation).
+#[derive(Clone)]
+pub struct AuthedNetworkState {
+    networks: Arc<SqliteNetworkStore>,
+    verifier: Arc<OidcVerifier>,
+}
+
+/// Build the **authenticated** declarative-network router (#102-rest): the REST surface
+/// the SDN-style control plane exposes to a network owner, following the `/me/*`
+/// OIDC-bearer, subject-scoped conventions (the `owner` is always the verified subject,
+/// never a request field — no unauthenticated write surface, cf. #87).
+///
+/// * `PUT /me/networks/:id` `{Network}` → persist the caller's declared network (desired
+///   state); idempotent.
+/// * `GET /me/networks/:id` → the caller's network, or `404`.
+/// * `GET /me/networks/:id/plan` → `{desired: [[a,b],…]}`, the channel set the policy
+///   compiles to ([`Network::desired_channels`]) — what the controller would establish.
+pub fn authed_network_router(
+    networks: Arc<SqliteNetworkStore>,
+    verifier: Arc<OidcVerifier>,
+) -> Router {
+    Router::new()
+        .route("/me/networks/:id", put(network_put).get(network_get))
+        .route("/me/networks/:id/plan", get(network_plan))
+        .with_state(AuthedNetworkState { networks, verifier })
+}
+
+async fn network_put(
+    State(state): State<AuthedNetworkState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(network): Json<ct_common::policy::Network>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    state
+        .networks
+        .put(&owner, &id, &network)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+async fn network_get(
+    State(state): State<AuthedNetworkState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ct_common::policy::Network>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let network = state
+        .networks
+        .get(&owner, &id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "no such network".to_string()))?;
+    Ok(Json(network))
+}
+
+#[derive(Serialize, Deserialize)]
+struct NetworkPlanResp {
+    /// The agent-pairs the policy permits a channel between — the desired connectivity.
+    desired: Vec<ct_common::policy::Pair>,
+}
+
+async fn network_plan(
+    State(state): State<AuthedNetworkState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<NetworkPlanResp>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let network = state
+        .networks
+        .get(&owner, &id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "no such network".to_string()))?;
+    let desired = network.desired_channels().into_iter().collect();
+    Ok(Json(NetworkPlanResp { desired }))
 }
 
 #[derive(Deserialize)]
@@ -1352,12 +1430,15 @@ pub fn persistent_control_plane_router(
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
     if let Some(oidc) = oidc {
+        // #102-rest: the declarative-network REST surface (owner = verified subject).
+        let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
                 oidc.clone(),
                 AUTHED_ISSUES_PER_WINDOW,
             ))
+            .merge(authed_network_router(networks, oidc.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc));
@@ -2213,6 +2294,118 @@ mod tests {
             4,
             "the subject's account was debited"
         );
+    }
+
+    #[tokio::test]
+    async fn authed_network_api_is_owner_scoped_and_plans_from_the_policy() {
+        // #102-rest: PUT/GET /me/networks/:id is subject-scoped; /plan returns the
+        // policy-compiled desired connectivity.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ct_common::policy::{Agent, AllowRule, Levels, Network, Pair, Policy, Selector};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let networks = Arc::new(SqliteNetworkStore::open_in_memory().unwrap());
+        let app = authed_network_router(networks, verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+            ],
+            policy: Policy {
+                levels: Levels::new(["public", "internal", "secret"]),
+                rules: vec![
+                    AllowRule { from: Selector::group("dev"), to: Selector::group("ops") },
+                    AllowRule { from: Selector::group("ops"), to: Selector::group("dev") },
+                ],
+                mac_flow_control: true,
+            },
+        };
+        let net_json = serde_json::to_string(&net).unwrap();
+
+        // A bearer is required.
+        let no_auth = app
+            .clone()
+            .oneshot(
+                Request::put("/me/networks/corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(net_json.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED, "no bearer -> 401");
+
+        // Alice stores her network, then reads it back.
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/me/networks/corp")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(net_json.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK, "owner stores the network");
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::get("/me/networks/corp")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = to_bytes(get.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Network>(&body).unwrap(), net, "round-trips the network");
+
+        // Owner isolation: mallory can't see alice's network.
+        let cross = app
+            .clone()
+            .oneshot(
+                Request::get("/me/networks/corp")
+                    .header("authorization", format!("Bearer {mallory}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross.status(), StatusCode::NOT_FOUND, "another subject sees nothing");
+
+        // The plan compiles the desired connectivity from the policy.
+        let plan = app
+            .clone()
+            .oneshot(
+                Request::get("/me/networks/corp/plan")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.status(), StatusCode::OK);
+        let body = to_bytes(plan.into_body(), 1 << 16).await.unwrap();
+        let resp: NetworkPlanResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.desired, vec![Pair::new("dev-1", "ops-1")], "dev<->ops is the one permitted channel");
     }
 
     #[tokio::test]
