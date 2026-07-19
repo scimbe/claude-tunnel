@@ -2508,9 +2508,34 @@ for one cycle — decomposed so the pure correlator (the substrate for all three
     is paired and its relay HELD OPEN, then Y races in and pairs (its bytes cross both ways) while X is held —
     which would hang under the old serial loop; asserts channel-keyed correlation (no X↔Y cross-pair). Verified
     non-flaky (5/5 runs). Gate green, 0 warnings.
-  - **#109-concurrent-rendezvous** ⏳ (optional follow): apply the same pairer-driven loop to the RENDEZVOUS
-    endpoint (rendezvous is a short endpoint-swap, not a long splice, so its single-slot exposure is far smaller —
-    lower priority than the relay fix above).
+  - **#109-concurrent-rendezvous** ✅ **pairer-driven concurrent RENDEZVOUS** (done as **#120** — see below). The
+    earlier "single-slot exposure is far smaller / lower priority" note was **wrong**: the code contradicted it —
+    `finish_rendezvous_pair` awaits `a.conn.closed().await; b.conn.closed().await` unbounded, so a single held-open
+    paired member wedged the ENTIRE serial rendezvous endpoint (every channel's pairing blocked), the same
+    single-slot wedge as the relay. Now fixed identically.
+
+## #120 security: rendezvous endpoint still serial — single held-open member wedges all rendezvous pairing (review, priority:high)
+
+Security-review follow-up to #109: the RELAY endpoint was made pairer-driven/concurrent (#109-concurrent-b) but the
+RENDEZVOUS endpoint was left on the serial `tokio::spawn(async move { loop { broker_channel_rendezvous(..).await } })`.
+Because `finish_rendezvous_pair` acks `OK <peer_endpoint>` then awaits `a.conn.closed().await; b.conn.closed().await`
+with **no timeout**, a single paired member that holds its rendezvous connection open blocks the accept loop forever —
+so every other channel's rendezvous pairing is wedged (the exact single-slot failure #109 fixed for the relay).
+
+- **#120** ✅ **Generalized pairer-driven concurrent broker loop for BOTH endpoints** (`ct_edge::channel_broker`,
+  wired in `serve.rs`): `run_relay_broker_loop` was generalized into `run_channel_broker_loop<..., C, CFut>` which
+  takes the pairing **completer** as a closure `C: Fn(AdmittedMember, AdmittedMember, UnixSeconds) -> CFut` (spawned
+  on `Paired`, `Send + 'static`). The RELAY call site + its frozen test pass `|a,b,now| finish_relay_pair(a,b,now)`;
+  the RENDEZVOUS spawn now passes `|a,b,now| finish_rendezvous_pair(a,b,now)`, replacing the serial
+  `loop { broker_channel_rendezvous(..) }`. Park-TTL / `drain_expired` / `Superseded` / `Parked` behaviour is
+  identical to the relay loop, so a held-open rendezvous member's `conn.closed()` wait now runs on its **own spawned
+  task** and the accept loop stays free (**fixes #1**); channel-keying means two channels can never cross-pair
+  (**fixes #2**). `broker_channel_rendezvous` is kept for its existing pairing tests. Frozen test
+  `rendezvous_broker_loop_pairs_two_channels_concurrently_without_wedging`: two channels over real QUIC — channel X is
+  paired and its two rendezvous connections HELD OPEN (so X's spawned finisher blocks in `conn.closed()`), then Y
+  races in and both Y members receive their `OK <peer_endpoint>` ack while X is held — which would hang under the old
+  serial loop; asserts channel-keyed correlation (Y never learns an X endpoint). Verified non-flaky. Gate green,
+  0 warnings.
 
 ## #114 Efficiency: per-frame heap allocs on the Noise bulk data path + backoff jitter (report, priority:high)
 

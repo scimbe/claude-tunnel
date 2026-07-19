@@ -1351,11 +1351,14 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                                 })
                                             }
                                         };
-                                    crate::channel_broker::run_relay_broker_loop(
+                                    crate::channel_broker::run_channel_broker_loop(
                                         &relay_ep,
                                         now_fn,
                                         authorize,
                                         CHANNEL_PARK_TTL_SECS,
+                                        |a, b, now| {
+                                            crate::channel_broker::finish_relay_pair(a, b, now)
+                                        },
                                     )
                                     .await;
                                 });
@@ -1365,36 +1368,42 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
 
                         eprintln!(
                             "ct-edge: Agent-Fabric channel broker on {chan_addr} \
-                             (authorize via {cp_url}, #81 SEC81c-c)"
+                             (authorize via {cp_url}, #81 SEC81c-c, #120 concurrent)"
                         );
                         tokio::spawn(async move {
-                            loop {
-                                let now = std::time::SystemTime::now()
+                            // #120: drive the RENDEZVOUS endpoint with the same channel-keyed
+                            // pairer that spawns each pair-completion on its own task, so a
+                            // single member that holds its rendezvous connection open can't
+                            // wedge the single global accept slot and two channels can never
+                            // cross-pair. Replaces the old serial `loop { broker_channel_
+                            // rendezvous(..).await }` that awaited both `conn.closed()` inline.
+                            let now_fn = || {
+                                std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                let az = authorizer.clone();
-                                match crate::channel_broker::broker_channel_rendezvous(
-                                    &chan_ep,
-                                    now,
-                                    move |c, h| {
-                                        let a = az.clone();
-                                        // Resolve both the operator key (grant check)
-                                        // and the member's attested Noise key, which the
-                                        // broker relays to the paired peer (#72/#100).
-                                        async move {
-                                            a.resolve(&c, &h)
-                                                .await
-                                                .map(|m| (m.operator_pubkey, m.noise_pubkey, m.noise_attestation))
-                                        }
-                                    },
-                                )
-                                .await
-                                {
-                                    Ok(_) => eprintln!("ct-edge: channel rendezvous paired two agents"),
-                                    Err(e) => eprintln!("ct-edge: channel rendezvous ended: {e}"),
+                                    .unwrap_or(0)
+                            };
+                            let authorize = move |c: ct_common::channel::ChannelId, h: [u8; 32]| {
+                                let a = authorizer.clone();
+                                // Resolve both the operator key (grant check) and the
+                                // member's attested Noise key, which the broker relays to
+                                // the paired peer (#72/#100).
+                                async move {
+                                    a.resolve(&c, &h)
+                                        .await
+                                        .map(|m| (m.operator_pubkey, m.noise_pubkey, m.noise_attestation))
                                 }
-                            }
+                            };
+                            crate::channel_broker::run_channel_broker_loop(
+                                &chan_ep,
+                                now_fn,
+                                authorize,
+                                CHANNEL_PARK_TTL_SECS,
+                                |a, b, now| {
+                                    crate::channel_broker::finish_rendezvous_pair(a, b, now)
+                                },
+                            )
+                            .await;
                         });
                     }
                     Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_CHANNEL_LISTEN {chan_addr}: {e}"),
