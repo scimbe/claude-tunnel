@@ -654,22 +654,39 @@ pub(crate) async fn finish_relay_pair(
 /// verified request + the operator key its grant verified under. `pub` like the rest of
 /// the transport-generic seam ([`admit_channel_join_on_duplex`]); the `:443` front-door
 /// wiring (#106-complete-wire443) constructs it from an admitted stream + its keys.
+///
+/// `noise`/`attest` are the member's registered Noise key + its holder-signed attestation
+/// (#101), captured at admission so the relay finisher can relay each side the PEER's
+/// attested key in the ack (#122) — exactly as the rendezvous path does. Without them a
+/// `:443`-only pair (both members forced onto the relay) could never learn each other's
+/// Noise key and the join failed at the pin step; carrying them here closes that gap.
 pub struct AdmittedStreamMember<S> {
     stream: S,
     req: ChannelJoinRequest,
     operator: [u8; 32],
+    noise: Option<[u8; 32]>,
+    attest: Option<[u8; 64]>,
 }
 
 /// Complete a **relay** pairing for two members admitted over generic byte streams
 /// (#106 relay-splice-generic) — the transport-agnostic sibling of [`finish_relay_pair`].
-/// Authorize the pair under member A's operator key, ack `OK` on each stream, then splice
-/// the two duplexes through the edge via [`crate::relay::relay_streams`] so the Noise_IK
-/// tunnel flows end-to-end as ciphertext (the edge sees only opaque bytes). Because each
-/// member's data path is the **same** stream it joined on (no separate bi-stream to
-/// open/accept, unlike the quinn path), the splice is a plain symmetric bidirectional
-/// pump — no initiator/acceptor stream-role dance. This is what lets two `:443`/TLS-TCP
-/// members (which cannot be dialed, so rendezvous is useless to them) be relay-paired.
-/// Returns the decided pairing when either side closes; an unpairable pair gets `NO`.
+/// Authorize the pair under member A's operator key, ack each side the RICH
+/// `OK <peer_endpoint> <peer_noise> <peer_holder> <peer_attest>\n` line (#122 — mirroring
+/// the rendezvous path via [`member_ack_suffix`]), then splice the two duplexes through the
+/// edge via [`crate::relay::relay_streams`] so the Noise_IK tunnel flows end-to-end as
+/// ciphertext (the edge sees only opaque bytes). Conveying the peer's **attested** Noise key
+/// in the ack is what lets a fresh `:443`-only pair — both members forced onto the relay,
+/// neither dialable, with no pre-shared peer key — verify (#101) and pin each other's key and
+/// actually form the tunnel; before this the bare `OK` conveyed nothing and every such join
+/// failed at the pin step. The peer's `holder` is taken from its **grant** (`peer.req.grant`),
+/// not the mutable registry, so a DB-tampered attestation won't verify. The trailing `\n`
+/// delimits the ack from the Noise session that follows on the **same** spliced stream, so
+/// the relay client ([`ct_agent::channel::present_channel_relay_join_on_stream`]) can read the
+/// rich ack without over-reading into the session's first frame. Because each member's data
+/// path is the **same** stream it joined on (no separate bi-stream to open/accept, unlike the
+/// quinn path), the splice is a plain symmetric bidirectional pump — no initiator/acceptor
+/// stream-role dance. Returns the decided pairing when either side closes; an unpairable pair
+/// gets `NO`.
 pub async fn finish_relay_pair_over_streams<A, B>(
     mut a: AdmittedStreamMember<A>,
     mut b: AdmittedStreamMember<B>,
@@ -681,9 +698,33 @@ where
 {
     match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
         Ok(pairing) => {
-            a.stream.write_all(b"OK").await?;
+            // Each side learns the OTHER's advertised endpoint + attested Noise key + holder +
+            // attestation, exactly as `finish_rendezvous_pair` does — but with a trailing `\n`
+            // because the Noise session follows on this same stream (the rendezvous path
+            // `finish()`es the quinn stream instead, so it needs no delimiter). A relay-only
+            // member's `endpoint` is the relay-only sentinel: the peer won't dial it (it's
+            // relayed), it's just echoed through.
+            a.stream
+                .write_all(
+                    format!(
+                        "OK {}{}\n",
+                        b.req.endpoint,
+                        member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest)
+                    )
+                    .as_bytes(),
+                )
+                .await?;
             a.stream.flush().await?;
-            b.stream.write_all(b"OK").await?;
+            b.stream
+                .write_all(
+                    format!(
+                        "OK {}{}\n",
+                        a.req.endpoint,
+                        member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest)
+                    )
+                    .as_bytes(),
+                )
+                .await?;
             b.stream.flush().await?;
             crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443").await?;
             Ok(pairing)
@@ -731,11 +772,13 @@ where
     // the accepted `TcpStream`'s `peer_addr()`). It is captured through admission; carrying it
     // into the relay-pair ack for a `:443` member is the deferred B1 follow slice (a `:443`-only
     // member is behind symmetric/CGNAT NAT — `RelayOnly` — so it needs no reflexive to punch).
-    let (stream, req, operator, _noise, _attest, _observed) =
+    // #122: keep the member's attested Noise key + attestation (admission already read them);
+    // the relay finisher relays each side the PEER's, so a `:443`-only pair can pin each other.
+    let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let channel = req.grant.grant.channel;
     let holder = req.grant.grant.holder;
-    let member = AdmittedStreamMember { stream, req, operator };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest };
     let outcome = pairer
         .lock()
         .unwrap()
@@ -1176,6 +1219,22 @@ mod tests {
         }
     }
 
+    /// Read the relay's `OK <..>\n` ack line off a spliced stream, stopping at the newline
+    /// delimiter (#122) so the session/app bytes that follow on the SAME stream stay unread —
+    /// mirroring the client's `present_channel_relay_join_on_stream`. Returns the line without
+    /// the trailing newline (a bare `NO` refusal, which has no newline, comes back on EOF).
+    async fn read_relay_ack_line<R: AsyncRead + Unpin>(recv: &mut R) -> Vec<u8> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while recv.read_exact(&mut byte).await.is_ok() {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        line
+    }
+
     #[tokio::test]
     async fn edge_admits_a_valid_channel_join() {
         let pk = operator_pubkey();
@@ -1432,8 +1491,8 @@ mod tests {
                     .await
                     .expect("admit 2");
             finish_relay_pair_over_streams(
-                AdmittedStreamMember { stream: s1, req: r1, operator: op1 },
-                AdmittedStreamMember { stream: s2, req: r2, operator: op2 },
+                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None },
+                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None },
                 500,
             )
             .await
@@ -1453,9 +1512,8 @@ mod tests {
             let mut ch = [0u8; 32];
             c.read_exact(&mut ch).await.expect("challenge");
             c.write_all(&src.sign(&ch).to_bytes()).await.expect("sig");
-            let mut ok = [0u8; 2];
-            c.read_exact(&mut ok).await.expect("ok");
-            assert_eq!(&ok, b"OK", "relay acks OK once both :443 members are paired");
+            let ack = read_relay_ack_line(&mut c).await;
+            assert!(ack.starts_with(b"OK"), "relay acks OK once both :443 members are paired, got {:?}", String::from_utf8_lossy(&ack));
             c.write_all(&[0x11]).await.expect("app send");
             let mut got = [0u8; 1];
             c.read_exact(&mut got).await.expect("app recv");
@@ -1472,9 +1530,8 @@ mod tests {
             let mut ch = [0u8; 32];
             c.read_exact(&mut ch).await.expect("challenge");
             c.write_all(&snk.sign(&ch).to_bytes()).await.expect("sig");
-            let mut ok = [0u8; 2];
-            c.read_exact(&mut ok).await.expect("ok");
-            assert_eq!(&ok, b"OK", "relay acks OK once both :443 members are paired");
+            let ack = read_relay_ack_line(&mut c).await;
+            assert!(ack.starts_with(b"OK"), "relay acks OK once both :443 members are paired, got {:?}", String::from_utf8_lossy(&ack));
             c.write_all(&[0x22]).await.expect("app send");
             let mut got = [0u8; 1];
             c.read_exact(&mut got).await.expect("app recv");
@@ -1527,9 +1584,8 @@ mod tests {
             let mut ch = [0u8; 32];
             c.read_exact(&mut ch).await.expect("challenge");
             c.write_all(&src.sign(&ch).to_bytes()).await.expect("sig");
-            let mut ok = [0u8; 2];
-            c.read_exact(&mut ok).await.expect("ok");
-            assert_eq!(&ok, b"OK");
+            let ack = read_relay_ack_line(&mut c).await;
+            assert!(ack.starts_with(b"OK"), "got {:?}", String::from_utf8_lossy(&ack));
             c.write_all(&[0x11]).await.expect("send");
             let mut g = [0u8; 1];
             c.read_exact(&mut g).await.expect("recv");
@@ -1544,9 +1600,8 @@ mod tests {
             let mut ch = [0u8; 32];
             c.read_exact(&mut ch).await.expect("challenge");
             c.write_all(&snk.sign(&ch).to_bytes()).await.expect("sig");
-            let mut ok = [0u8; 2];
-            c.read_exact(&mut ok).await.expect("ok");
-            assert_eq!(&ok, b"OK");
+            let ack = read_relay_ack_line(&mut c).await;
+            assert!(ack.starts_with(b"OK"), "got {:?}", String::from_utf8_lossy(&ack));
             c.write_all(&[0x22]).await.expect("send");
             let mut g = [0u8; 1];
             c.read_exact(&mut g).await.expect("recv");
@@ -2115,6 +2170,8 @@ mod tests {
                 endpoint: "203.0.113.1:7051".to_string(),
             },
             operator: pk,
+            noise: None,
+            attest: None,
         };
         let b = AdmittedStreamMember {
             stream: broker_b,
@@ -2123,6 +2180,8 @@ mod tests {
                 endpoint: "203.0.113.2:7052".to_string(),
             },
             operator: pk,
+            noise: None,
+            attest: None,
         };
 
         let splice = tokio::spawn(async move {
@@ -2132,12 +2191,11 @@ mod tests {
                 .map_err(|e| e.to_string())
         });
 
-        // Each member reads its `OK` ack, then the relay carries bytes both ways.
-        let mut ok = [0u8; 2];
-        member_a.read_exact(&mut ok).await.expect("a ok");
-        assert_eq!(&ok, b"OK", "member A is acked OK over its plain stream");
-        member_b.read_exact(&mut ok).await.expect("b ok");
-        assert_eq!(&ok, b"OK", "member B is acked OK over its plain stream");
+        // Each member reads its `OK <..>\n` ack line, then the relay carries bytes both ways.
+        let ack_a = read_relay_ack_line(&mut member_a).await;
+        assert!(ack_a.starts_with(b"OK"), "member A is acked OK over its plain stream, got {:?}", String::from_utf8_lossy(&ack_a));
+        let ack_b = read_relay_ack_line(&mut member_b).await;
+        assert!(ack_b.starts_with(b"OK"), "member B is acked OK over its plain stream, got {:?}", String::from_utf8_lossy(&ack_b));
 
         // A -> B through the edge splice (A keeps its stream open, like a Noise msg1).
         member_a.write_all(b"noise-msg1-from-a").await.expect("a writes");

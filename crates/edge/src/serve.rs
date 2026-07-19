@@ -2817,9 +2817,23 @@ mod tests {
             let mut ch = [0u8; 32];
             tls.read_exact(&mut ch).await.unwrap();
             tls.write_all(&holder.sign(&ch).to_bytes()).await.unwrap();
-            let mut ok = [0u8; 2];
-            tls.read_exact(&mut ok).await.unwrap();
-            assert_eq!(&ok, b"OK", "the front door acks OK once both :443 members are paired");
+            // #122: the relay now acks the RICH `OK <endpoint> ...\n` line (the peer's attested
+            // Noise key etc.), terminated by a newline so the app/session bytes that follow on
+            // this same spliced stream stay unread — consume up to the newline, then the byte.
+            let mut ack = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                tls.read_exact(&mut byte).await.unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+                ack.push(byte[0]);
+            }
+            assert!(
+                ack.starts_with(b"OK"),
+                "the front door acks OK once both :443 members are paired, got {:?}",
+                String::from_utf8_lossy(&ack)
+            );
             tls.write_all(&[send_byte]).await.unwrap();
             let mut got = [0u8; 1];
             tls.read_exact(&mut got).await.unwrap();

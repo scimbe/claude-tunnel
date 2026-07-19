@@ -102,13 +102,19 @@ where
     let mut ack = Vec::new();
     let _ = recv.take(512).read_to_end(&mut ack).await;
     let ack = String::from_utf8_lossy(&ack);
+    Ok(parse_channel_ack(&ack))
+}
+
+/// Parse a broker/relay admission ack into a [`ChannelJoinOutcome`]. `ack` is the whole ack
+/// text (the relay leg strips its trailing `\n` delimiter first). An `OK`-prefixed ack is
+/// `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]][ r=<reflexive>]`: the broker
+/// appends the peer's attested Noise key, its holder, and the holder-signed attestation
+/// (#101) when the registry has them (all-or-nothing), plus (#121 Phase B1) the joining
+/// member's OWN edge-observed reflexive address as a tagged `r=<addr>` token. The `r=` token
+/// is pulled out first (it is self-addressed, not peer material, and order-independent); a
+/// missing field yields `None` — backward-additive. Anything else is a refusal.
+fn parse_channel_ack(ack: &str) -> ChannelJoinOutcome {
     match ack.strip_prefix("OK") {
-        // `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]][ r=<reflexive>]` — the
-        // broker appends the peer's attested Noise key, its holder, and the holder-signed
-        // attestation (#101) when the registry has them (all-or-nothing), plus (#121 Phase
-        // B1) the joining member's OWN edge-observed reflexive address as a tagged `r=<addr>`
-        // token. The `r=` token is pulled out first (it is self-addressed, not peer material,
-        // and order-independent); its absence on an older ack yields `None` — backward-additive.
         Some(rest) => {
             let mut observed_reflexive = None;
             let mut fields: Vec<&str> = Vec::new();
@@ -123,15 +129,15 @@ where
             let peer_noise_pubkey = parts.next().and_then(decode_hex_32);
             let peer_holder = parts.next().and_then(decode_hex_32);
             let peer_attestation = parts.next().and_then(decode_hex_64);
-            Ok(ChannelJoinOutcome::Admitted {
+            ChannelJoinOutcome::Admitted {
                 peer_endpoint,
                 peer_noise_pubkey,
                 peer_holder,
                 peer_attestation,
                 observed_reflexive,
-            })
+            }
         }
-        None => Ok(ChannelJoinOutcome::Refused),
+        None => ChannelJoinOutcome::Refused,
     }
 }
 
@@ -141,11 +147,15 @@ where
 /// join stream is throwaway (it reads the ack to EOF and closes its write half, and the
 /// data path is a *separate* connection) — in two ways the `:443` relay leg requires:
 /// it must **not** close the send half (the session writes over it next), and it must
-/// read **exactly** the 2-byte `OK`/`NO` ack, leaving every subsequent byte for
-/// [`crate::channel_run::run_channel_session_on_stream`]. The edge relay acks a bare
-/// `OK` (no peer endpoint/keys — the caller already holds the peer's attested Noise key)
-/// and then splices the two members' streams, so the relay ack carries no peer material.
-/// `send`/`recv` are borrowed, not consumed, so the caller reuses them for the session.
+/// read the ack **up to its `\n` delimiter and no further**, leaving every subsequent byte
+/// for [`crate::channel_run::run_channel_session_on_stream`]. The edge relay
+/// ([`ct_edge::channel_broker::finish_relay_pair_over_streams`]) now acks the RICH
+/// `OK <peer_endpoint> <peer_noise> <peer_holder> <peer_attest>\n` line — conveying the
+/// peer's attested Noise key (#122), so a fresh `:443`-only pair with no pre-shared peer key
+/// learns it here — then splices the two members' streams. The trailing newline is exactly
+/// where the ack ends and the Noise session's first frame begins, so reading up to it never
+/// over-reads. `send`/`recv` are borrowed, not consumed, so the caller reuses them for the
+/// session. A refusal is a bare `NO` (no newline), surfaced when the read hits EOF first.
 pub async fn present_channel_relay_join_on_stream<W, R>(
     send: &mut W,
     recv: &mut R,
@@ -170,24 +180,28 @@ where
     send.write_all(&sig).await?;
     send.flush().await?;
 
-    // Read EXACTLY the 2-byte `OK`/`NO` ack. Unlike the broker leg's `read_to_end`, we
-    // must not read past it: the Noise session ciphertext follows immediately on this same
-    // relay-spliced stream, and over-reading would swallow the session's first frame.
-    let mut ack = [0u8; 2];
-    recv.read_exact(&mut ack).await?;
-    match &ack {
-        b"OK" => Ok(ChannelJoinOutcome::Admitted {
-            peer_endpoint: String::new(),
-            peer_noise_pubkey: None,
-            peer_holder: None,
-            peer_attestation: None,
-            // The relay leg acks a bare 2-byte `OK` and the Noise session follows immediately
-            // on this same stream — there is no room for a reflexive token, and a relay-only
-            // member has no punchable reflexive anyway (#121 Phase B1).
-            observed_reflexive: None,
-        }),
-        _ => Ok(ChannelJoinOutcome::Refused),
+    // Read the ack LINE up to (and consuming) its `\n` delimiter — never past it: the Noise
+    // session ciphertext follows immediately on this same relay-spliced stream, so reading a
+    // fixed buffer could swallow the session's first frame. Reading byte-by-byte to the
+    // newline consumes exactly the ack; the transport buffers the session bytes internally.
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match recv.read_exact(&mut byte).await {
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                line.push(byte[0]);
+                if line.len() > 512 {
+                    return Err("relay ack exceeded 512 bytes without a newline delimiter".into());
+                }
+            }
+            // EOF before a newline — a bare `NO` refusal, or a dropped relay leg. Classify
+            // from whatever arrived (a bare `NO` becomes `Refused`).
+            Err(_) => break,
+        }
     }
+    let ack = String::from_utf8_lossy(&line);
+    Ok(parse_channel_ack(&ack))
 }
 
 /// Decode 64 lowercase-hex chars into 32 bytes (the peer Noise key / holder the

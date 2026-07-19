@@ -2313,6 +2313,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_443_only_members_learn_each_others_noise_key_and_form_the_tunnel() {
+        // #122 (frozen): the bug that broke EVERY `:443`-only two-party join. Two members
+        // FORCED onto the public `:443` front door (relay/broker ports unreachable), each with
+        // FRESHLY + independently generated channel keys and grants — NO pre-shared peer Noise
+        // key, no reliance on any prior broker-admission step. Each drives the join over the
+        // PRODUCTION relay-splice path (`admit_and_pair_on_stream` → `finish_relay_pair_over_
+        // streams`) and MUST learn the OTHER's attested Noise key FROM THE ACK itself
+        // (`Admitted.peer_noise_pubkey == Some(peer key)`), verify the #101 attestation, pin it,
+        // and form the Noise_IK tunnel — a real payload crossing BOTH directions. Before the
+        // fix the relay acked a bare `OK` conveying no key, so `peer_noise_pubkey` was `None`
+        // and the join failed at the pin step (channel_run.rs). So this test FAILS against the
+        // bare-`OK` code and PASSES once the ack carries the peer's attested key.
+        use ct_common::channel::{
+            member_noise_attest_bytes, verify_member_noise_attestation, ChannelGrant, ChannelId,
+            Direction, Rights, SignedChannelGrant, CHANNEL_ENDPOINT_RELAY_ONLY,
+        };
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::{
+            admit_and_pair_on_stream, finish_relay_pair_over_streams, ChannelPairer,
+        };
+        use ct_edge::transport::build_tcp_tls_listener_at;
+        use ed25519_dalek::Signer;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
+
+        let op = SigningKey::from_bytes(&[0x5Au8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let channel = [0xC2u8; 32];
+        // Fresh, independent identities per member — nothing pre-shared between them.
+        let holder_a = SigningKey::from_bytes(&[0x2au8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x2bu8; 32]);
+        let ha_pub = holder_a.verifying_key().to_bytes();
+        let hb_pub = holder_b.verifying_key().to_bytes();
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let (na, na_pub) = (noise_a.private, noise_a.public);
+        let (nb, nb_pub) = (noise_b.private, noise_b.public);
+        // Each member attests its OWN Noise key under its holder key (#101).
+        let attest_a = holder_a
+            .sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &na_pub))
+            .to_bytes();
+        let attest_b = holder_b
+            .sign(&member_noise_attest_bytes(&ChannelId(channel), &hb_pub, &nb_pub))
+            .to_bytes();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        // Both are `:443`-only — they advertise the relay-only sentinel (they can't be dialed).
+        let req_a = ChannelJoinRequest {
+            grant: signed(&holder_a, Direction::Initiate),
+            endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: signed(&holder_b, Direction::Accept),
+            endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+
+        // The PRODUCTION `:443` front door: admit two independently-arriving members, correlate
+        // them by channel, and relay-splice the two duplexes. The `authorize` closure resolves
+        // each member to its OWN (operator, Noise key, attestation) — exactly as the CP-backed
+        // registry does — so the relay finisher has the material to relay each side the OTHER's
+        // attested key.
+        let (listener, acceptor, edge_cert) =
+            build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("tls-tcp listener");
+        let fd_addr = listener.local_addr().expect("front-door addr");
+        let edge = tokio::spawn(async move {
+            let pairer: Mutex<ChannelPairer<_>> = Mutex::new(ChannelPairer::new());
+            let authorize = move |c: ChannelId, h: [u8; 32]| async move {
+                if c.0 != channel {
+                    return None;
+                }
+                let (noise, attest) =
+                    if h == ha_pub { (na_pub, attest_a) } else { (nb_pub, attest_b) };
+                Some((op_pub, Some(noise), Some(attest)))
+            };
+            let mut paired = None;
+            for _ in 0..2 {
+                let (tcp, peer) = listener.accept().await.expect("accept tcp");
+                let tls = acceptor.accept(tcp).await.expect("tls accept");
+                if let Some((x, y)) = admit_and_pair_on_stream(
+                    tls,
+                    peer,
+                    500u64,
+                    Duration::from_secs(5),
+                    &authorize,
+                    10_000u64,
+                    &pairer,
+                )
+                .await
+                .expect("admit + pair the :443 member")
+                {
+                    paired = Some((x, y));
+                }
+            }
+            let (x, y) = paired.expect("two same-channel members paired over :443");
+            finish_relay_pair_over_streams(x, y, 500u64)
+                .await
+                .expect("relay-splice the two :443 duplexes");
+        });
+
+        let (mut a_app, a_local) = duplex(16 * 1024);
+        let (mut b_app, b_local) = duplex(16 * 1024);
+        let cert_a = edge_cert.clone();
+        // A: connect over `:443`, present the join WITHOUT consuming the stream, LEARN B's
+        // attested Noise key from the ack, verify #101, pin it, run the session on the SAME
+        // relay-spliced stream.
+        let a = tokio::spawn(async move {
+            let stream = crate::transport::tcp_tls_connect_channel(fd_addr, cert_a)
+                .await
+                .expect("A tls-tcp connect");
+            let (mut recv, mut send) = split(stream);
+            let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req_a, &holder_a)
+                .await
+                .expect("A relay join");
+            let peer_noise = match outcome {
+                ChannelJoinOutcome::Admitted { peer_noise_pubkey, peer_holder, peer_attestation, .. } => {
+                    let n = peer_noise_pubkey.expect("A learns B's Noise key from the ack (#122)");
+                    assert_eq!(n, nb_pub, "A learns B's REAL Noise key from the ack");
+                    let ph = peer_holder.expect("A learns B's holder from the ack");
+                    let att = peer_attestation.expect("A learns B's attestation from the ack");
+                    assert!(
+                        verify_member_noise_attestation(&ChannelId(channel), &ph, &n, &att),
+                        "B's #101 attestation verifies against its grant-authenticated holder"
+                    );
+                    n
+                }
+                ChannelJoinOutcome::Refused => panic!("A's :443 join must be Admitted"),
+            };
+            run_channel_session_on_stream(send, recv, ChannelRole::Initiate, &na, &peer_noise, a_local).await
+        });
+        // B: the mirror (Accept role), learning A's key from its ack.
+        let b = tokio::spawn(async move {
+            let stream = crate::transport::tcp_tls_connect_channel(fd_addr, edge_cert)
+                .await
+                .expect("B tls-tcp connect");
+            let (mut recv, mut send) = split(stream);
+            let outcome = present_channel_relay_join_on_stream(&mut send, &mut recv, &req_b, &holder_b)
+                .await
+                .expect("B relay join");
+            let peer_noise = match outcome {
+                ChannelJoinOutcome::Admitted { peer_noise_pubkey, peer_holder, peer_attestation, .. } => {
+                    let n = peer_noise_pubkey.expect("B learns A's Noise key from the ack (#122)");
+                    assert_eq!(n, na_pub, "B learns A's REAL Noise key from the ack");
+                    let ph = peer_holder.expect("B learns A's holder from the ack");
+                    let att = peer_attestation.expect("B learns A's attestation from the ack");
+                    assert!(
+                        verify_member_noise_attestation(&ChannelId(channel), &ph, &n, &att),
+                        "A's #101 attestation verifies against its grant-authenticated holder"
+                    );
+                    n
+                }
+                ChannelJoinOutcome::Refused => panic!("B's :443 join must be Admitted"),
+            };
+            run_channel_session_on_stream(send, recv, ChannelRole::Accept, &nb, &peer_noise, b_local).await
+        });
+
+        // A -> B over the `:443`-relayed, encrypted A2A tunnel keyed on the ACK-LEARNED keys.
+        a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+        let mut got = [0u8; 11];
+        b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+        assert_eq!(&got, b"ping-A-to-B", "A's plaintext arrives decrypted at B (key learned from the ack)");
+
+        // B -> A (reverse direction proves the splice is full-duplex).
+        b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+        let mut got2 = [0u8; 11];
+        a_app.read_exact(&mut got2).await.expect("a reads B's bytes");
+        assert_eq!(&got2, b"pong-B-to-A", "B's plaintext arrives decrypted at A over the :443 relay");
+
+        drop(a_app);
+        drop(b_app);
+        a.await.expect("A task joins").expect("A session ok");
+        b.await.expect("B task joins").expect("B session ok");
+        edge.await.expect("edge relay task joins");
+    }
+
+    #[tokio::test]
     async fn run_channel_join_auto_falls_back_to_the_relay_when_direct_is_blocked() {
         // #72 AF4-relay-orchestrate: the auto-recovery. The rendezvous hands the
         // initiator a peer endpoint that BLACKHOLES (bound-but-silent), so the direct
