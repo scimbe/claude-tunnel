@@ -232,6 +232,33 @@ pub fn add_shortcuts(
     plan
 }
 
+/// Compile a [`Network`](crate::policy::Network) into the concrete overlay to wire (#107
+/// controller step): the candidate links are exactly the pairs the network's **policy
+/// permits** ([`crate::policy::Network::desired_channels`]), each weighted by its
+/// **measured latency** from `latency(a, b)`; the result is the two-phase optimizer's plan
+/// — the MST backbone plus up to `shortcut_budget` latency-reducing shortcuts. A pair with
+/// no measured latency is dropped (an unmeasured link can't be wired). Policy-forbidden
+/// pairs are never candidates, so the plan is always policy-conformant by construction.
+/// Pure given `latency`; the controller then compiles each returned link into an A2A
+/// channel grant (the per-link grant minting + live establishment is a follow).
+pub fn plan_network_overlay<F>(
+    network: &crate::policy::Network,
+    mut latency: F,
+    shortcut_budget: usize,
+) -> OverlayPlan
+where
+    F: FnMut(&str, &str) -> Option<u64>,
+{
+    let nodes: Vec<String> = network.agents.iter().map(|a| a.id.clone()).collect();
+    let links: Vec<WeightedLink> = network
+        .desired_channels()
+        .into_iter()
+        .filter_map(|p| latency(&p.0, &p.1).map(|c| WeightedLink::new(p.0, p.1, c)))
+        .collect();
+    let base = min_latency_overlay(&nodes, &links);
+    add_shortcuts(&nodes, &links, base, shortcut_budget)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +362,60 @@ mod tests {
         // Only candidate not chosen would be... none improving (no a-c candidate exists).
         let out = add_shortcuts(&ns, &links, base.clone(), 5);
         assert_eq!(out, base, "no improving candidate -> unchanged");
+    }
+
+    #[test]
+    fn plan_network_overlay_wires_only_policy_permitted_links_by_latency() {
+        use crate::policy::{Agent, AllowRule, Levels, Network, Policy, Selector};
+
+        // dev + ops may connect (both ways, same level); finance is isolated by policy.
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("dev-2", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+                Agent::new("fin-1", "finance", "internal"),
+            ],
+            policy: Policy {
+                levels: Levels::new(["public", "internal", "secret"]),
+                rules: vec![
+                    AllowRule { from: Selector::group("dev"), to: Selector::group("dev") },
+                    AllowRule { from: Selector::group("dev"), to: Selector::group("ops") },
+                    AllowRule { from: Selector::group("ops"), to: Selector::group("dev") },
+                ],
+                mac_flow_control: true,
+            },
+        };
+        // Measured latencies (symmetric); finance links are permitted by NO policy rule,
+        // so they never become candidates even though we'd "measure" them.
+        let lat = |a: &str, b: &str| -> Option<u64> {
+            let (x, y) = if a <= b { (a, b) } else { (b, a) };
+            match (x, y) {
+                ("dev-1", "dev-2") => Some(1),
+                ("dev-1", "ops-1") => Some(2),
+                ("dev-2", "ops-1") => Some(3),
+                _ => Some(9), // e.g. any finance pair — but policy excludes them upstream
+            }
+        };
+
+        // No shortcuts: the MST over the 3 permitted dev/ops links (1,2,3) = {dev1-dev2,
+        // dev1-ops1}, total 3, and fin-1 is left unconnected (policy isolates it).
+        let plan = plan_network_overlay(&net, lat, 0);
+        assert_eq!(
+            plan.links,
+            vec![("dev-1".into(), "dev-2".into()), ("dev-1".into(), "ops-1".into())]
+        );
+        assert_eq!(plan.total_cost, 3);
+        assert!(!plan.connected, "fin-1 is policy-isolated, so the overlay can't span it");
+        // No finance link ever appears — the plan is policy-conformant by construction.
+        assert!(!plan.links.iter().any(|(a, b)| a.starts_with("fin") || b.starts_with("fin")));
+
+        // Here the only unchosen candidate (dev2-ops1, cost 3) equals its current path
+        // latency (dev2-dev1-ops1 = 3), so no shortcut improves anything and a budget adds
+        // nothing — assert the plan never regresses (shortcuts only ever add links).
+        let with_budget = plan_network_overlay(&net, lat, 5);
+        assert!(with_budget.links.len() >= plan.links.len(), "shortcuts never drop links");
+        assert_eq!(with_budget.links.len(), 2, "no candidate improves a path -> no shortcut");
     }
 
     #[test]

@@ -2760,7 +2760,17 @@ with **no prior art** and **no dependency on those open questions** lands first:
   budget (path 3 → direct 2), budget 0 is a no-op, a huge budget stops once nothing improves, and no-improving-
   candidate → unchanged. Gate green. **The #107 optimizer is now a two-phase pipeline: MST backbone → greedy
   shortcuts**, both pure/deterministic for arbitrary N.
-- **#107-optimize-follow** ⏳: measure/supply per-link latencies (edge probes feed `WeightedLink.cost`); then
-  the controller compiles the plan's links into per-link channel grants (#107-nway). **#107-ui** ⏳
-  **(design-gated)**: greenfield node-graph editor — awaiting the framework-vs-vanilla call. **#107-testing** ⏳:
-  unit/API (done for the pure layers) + a real N-agent formation smoke once the mesh is live.
+- **#107-plan** ✅ **Policy→overlay controller compile** (`ct_common::overlay::plan_network_overlay`): ties #102
+  and #107 — compiles a `Network` (agents + policy) + measured per-link latencies into the concrete overlay to
+  wire. Candidates are exactly the **policy-permitted** pairs (`Network::desired_channels`) weighted by
+  `latency(a,b)` (a pair with no measurement is dropped), then the two-phase optimizer (MST + shortcuts). So the
+  plan is **policy-conformant by construction** — a forbidden pair is never a candidate. Pure given the latency
+  fn. Frozen test `plan_network_overlay_wires_only_policy_permitted_links_by_latency` (dev/ops MST by latency; a
+  policy-isolated finance agent leaves the overlay `connected=false` and never appears in a link; a shortcut
+  budget never regresses). Gate green. **This is the controller's core deliverable** — "given a declared
+  network + measured latencies, here are the exact A2A channels to establish."
+- **#107-optimize-follow** ⏳: edge latency probes feed `plan_network_overlay`'s `latency`; then the controller
+  mints a per-link channel grant for each planned link (grant signing is operator/client-side) and the broker
+  generalizes past two-connection (#107-nway) — the live-mesh e2e. **#107-ui** ⏳ **(design-gated)**: greenfield
+  node-graph editor — awaiting the framework-vs-vanilla call. **#107-testing** ⏳: unit/API (done for the pure
+  layers) + a real N-agent formation smoke once the mesh is live.
