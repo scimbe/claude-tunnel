@@ -15,10 +15,12 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# libp2p connectivity substrate (#121 B2-libp2p-seam). Minimal in-memory feature set:
-# tokio runtime, noise (connection security) + yamux (muxer), and the stream protocol
-# for raw substreams. MemoryTransport lives in libp2p-core (no feature gate).
-libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux"] }
+# libp2p connectivity substrate (#121 B2-libp2p-seam / B2-libp2p-tcp). Minimal feature
+# set: tokio runtime, noise (connection security) + yamux (muxer), the stream protocol
+# for raw substreams, and `tcp` for the real loopback-TCP transport (dial-by-multiaddr,
+# the prerequisite for the later DCUtR/Relay slices). MemoryTransport lives in
+# libp2p-core (no feature gate); no `dns` — we dial raw `/ip4/.../tcp/...` addresses.
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp"] }
 # Raw-substream protocol handler (the `stream::Behaviour`); a sibling crate, not an
 # umbrella feature. Gives us an `AsyncRead + AsyncWrite` stream out of the swarm.
 libp2p-stream = "0.4.0-alpha"
