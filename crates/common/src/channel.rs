@@ -380,6 +380,177 @@ pub fn verify_member_noise_attestation(
     }
 }
 
+/// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
+/// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
+/// the member (holder) key that agent will use. The invitee's agent redeems it — proving
+/// it holds the invitee identity key and choosing a holder key (see
+/// [`invitation_redeem_bytes`]) — after which the operator/CP issues the real per-holder
+/// [`SignedChannelGrant`]. Distinct from *sharing*: an invitation crosses users and is
+/// redeemed once into a scoped grant. Same claim shape as [`ChannelGrant`], but bound to
+/// the invitee's *identity* key rather than a member key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelInvitation {
+    /// The channel the invitee is invited to.
+    pub channel: ChannelId,
+    /// The invited user's agent **identity** public key — the invitee proves possession
+    /// of the matching private key at redemption, so only the intended user can accept.
+    pub invitee_identity: [u8; 32],
+    /// The direction(s) the resulting membership will confer.
+    pub direction: Direction,
+    /// The data-exchange rights the resulting membership will confer.
+    pub rights: Rights,
+    /// Whether the resulting membership may re-delegate.
+    pub delegable: bool,
+    /// Expiry (unix seconds); the invitation is invalid at and after this instant.
+    pub expires_at: UnixSeconds,
+}
+
+impl ChannelInvitation {
+    /// Canonical bytes the operator signs — domain-separated from a grant so an
+    /// invitation can never be mistaken for (or replayed as) a grant.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        format!(
+            "ct-chan-invite:v1|{}|{}|{}|{}|{}|{}",
+            hex32(&self.channel.0),
+            hex32(&self.invitee_identity),
+            self.direction.label(),
+            self.rights.label(),
+            self.delegable as u8,
+            self.expires_at,
+        )
+        .into_bytes()
+    }
+}
+
+/// A channel invitation together with the operator's signature over its claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedChannelInvitation {
+    pub invitation: ChannelInvitation,
+    pub signature: [u8; 64],
+}
+
+impl SignedChannelInvitation {
+    /// Fixed wire length — every field is fixed-size (mirrors [`SignedChannelGrant`]).
+    pub const WIRE_LEN: usize = 64 + 32 + 32 + 1 + 1 + 1 + 8; // 139
+
+    /// Encode to a fixed-layout binary wire form:
+    /// `signature(64) | channel(32) | invitee_identity(32) | direction(1) | rights(1) | delegable(1) | expires_at(u64 LE)`.
+    pub fn encode(&self) -> Vec<u8> {
+        let i = &self.invitation;
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&self.signature);
+        out.extend_from_slice(&i.channel.0);
+        out.extend_from_slice(&i.invitee_identity);
+        out.push(i.direction.as_byte());
+        out.push(i.rights.as_byte());
+        out.push(i.delegable as u8);
+        out.extend_from_slice(&i.expires_at.to_le_bytes());
+        out
+    }
+
+    /// Decode from [`SignedChannelInvitation::encode`]'s wire form.
+    pub fn decode(bytes: &[u8]) -> Result<Self, GrantError> {
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], GrantError> {
+            if cur.len() < n {
+                return Err(GrantError::Malformed);
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head)
+        }
+        let mut cur = bytes;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(take(&mut cur, 64)?);
+        let mut channel = [0u8; 32];
+        channel.copy_from_slice(take(&mut cur, 32)?);
+        let mut invitee_identity = [0u8; 32];
+        invitee_identity.copy_from_slice(take(&mut cur, 32)?);
+        let direction = Direction::from_byte(take(&mut cur, 1)?[0]).ok_or(GrantError::Malformed)?;
+        let rights = Rights::from_byte(take(&mut cur, 1)?[0]).ok_or(GrantError::Malformed)?;
+        let delegable = match take(&mut cur, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(GrantError::Malformed),
+        };
+        let expires_at = u64::from_le_bytes(take(&mut cur, 8)?.try_into().unwrap());
+        if !cur.is_empty() {
+            return Err(GrantError::Malformed);
+        }
+        Ok(SignedChannelInvitation {
+            invitation: ChannelInvitation {
+                channel: ChannelId(channel),
+                invitee_identity,
+                direction,
+                rights,
+                delegable,
+                expires_at,
+            },
+            signature,
+        })
+    }
+}
+
+/// Verify a signed invitation against the channel `operator_pubkey` at time `now`
+/// (mirrors [`verify`]): confirms the operator signature over the claims and that the
+/// invitation has not expired. Does NOT check the invitee's acceptance — that is the
+/// redemption proof ([`verify_invitation_redemption`]); this establishes the invitation
+/// is authentic and current.
+pub fn verify_invitation(
+    operator_pubkey: &[u8; 32],
+    signed: &SignedChannelInvitation,
+    now: UnixSeconds,
+) -> Result<(), GrantError> {
+    let vk = VerifyingKey::from_bytes(operator_pubkey).map_err(|_| GrantError::BadKey)?;
+    let sig = Signature::from_bytes(&signed.signature);
+    vk.verify(&signed.invitation.signing_bytes(), &sig)
+        .map_err(|_| GrantError::BadSignature)?;
+    if now >= signed.invitation.expires_at {
+        return Err(GrantError::Expired);
+    }
+    Ok(())
+}
+
+/// The domain-separated message the invitee signs with its **identity** key to redeem an
+/// invitation (#72 AF3), binding the member `holder` key it will use on the channel.
+/// Signing this proves two things at once: the intended invitee (only it holds the
+/// identity private key) accepted, and it chose `holder` — so the operator/CP can then
+/// issue a [`SignedChannelGrant`] for `holder` knowing the right user asked for it. The
+/// binding to `(channel, invitee_identity, holder)` stops a captured invitation from
+/// being redeemed to a different key or channel.
+pub fn invitation_redeem_bytes(
+    channel: &ChannelId,
+    invitee_identity: &[u8; 32],
+    holder: &[u8; 32],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(24 + 32 + 32 + 32);
+    m.extend_from_slice(b"ct-chan-invite-redeem-v1");
+    m.extend_from_slice(&channel.0);
+    m.extend_from_slice(invitee_identity);
+    m.extend_from_slice(holder);
+    m
+}
+
+/// Verify an invitation redemption (#72 AF3): `signature` must be `invitee_identity`'s
+/// ed25519 signature over [`invitation_redeem_bytes`]. Returns `false` on a bad key, a
+/// wrong `(channel, invitee_identity, holder)` binding, or a bad signature — so only the
+/// intended invitee can accept, and only into the holder key it actually chose.
+pub fn verify_invitation_redemption(
+    channel: &ChannelId,
+    invitee_identity: &[u8; 32],
+    holder: &[u8; 32],
+    signature: &[u8; 64],
+) -> bool {
+    match VerifyingKey::from_bytes(invitee_identity) {
+        Ok(vk) => vk
+            .verify(
+                &invitation_redeem_bytes(channel, invitee_identity, holder),
+                &Signature::from_bytes(signature),
+            )
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Lowercase-hex a 32-byte value for the canonical signing bytes.
 fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -600,5 +771,81 @@ mod tests {
         assert!(Rights::ReadWrite.can_read() && Rights::ReadWrite.can_write());
         assert!(Rights::Read.can_read() && !Rights::Read.can_write());
         assert!(!Rights::Write.can_read() && Rights::Write.can_write());
+    }
+
+    /// Operator-signed invitation for a deterministic invitee identity (no rng).
+    fn signed_invitation(expires_at: UnixSeconds) -> ([u8; 32], SignedChannelInvitation) {
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let invitee = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key().to_bytes();
+        let invitation = ChannelInvitation {
+            channel: ChannelId([0xabu8; 32]),
+            invitee_identity: invitee,
+            direction: Direction::Both,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at,
+        };
+        let signature = op.sign(&invitation.signing_bytes()).to_bytes();
+        (op.verifying_key().to_bytes(), SignedChannelInvitation { invitation, signature })
+    }
+
+    #[test]
+    fn verify_invitation_checks_operator_signature_and_expiry() {
+        let (op_pk, signed) = signed_invitation(1_000);
+        assert_eq!(verify_invitation(&op_pk, &signed, 999), Ok(()));
+        assert_eq!(verify_invitation(&op_pk, &signed, 1_000), Err(GrantError::Expired));
+        let other = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
+        assert_eq!(verify_invitation(&other, &signed, 500), Err(GrantError::BadSignature));
+    }
+
+    #[test]
+    fn signed_invitation_round_trips_through_the_wire_form() {
+        let (_op, signed) = signed_invitation(4_242);
+        let bytes = signed.encode();
+        assert_eq!(bytes.len(), SignedChannelInvitation::WIRE_LEN);
+        assert_eq!(SignedChannelInvitation::decode(&bytes), Ok(signed));
+        // A truncated buffer is Malformed, not a panic.
+        assert_eq!(
+            SignedChannelInvitation::decode(&bytes[..bytes.len() - 1]),
+            Err(GrantError::Malformed)
+        );
+    }
+
+    #[test]
+    fn only_the_intended_invitee_can_redeem_into_the_holder_it_chose() {
+        let channel = ChannelId([0xabu8; 32]);
+        let invitee_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder = [0xcdu8; 32]; // the member key the invitee chooses
+
+        // The invitee signs the redemption with its IDENTITY key, binding `holder`.
+        let sig = invitee_sk.sign(&invitation_redeem_bytes(&channel, &invitee, &holder)).to_bytes();
+        assert!(verify_invitation_redemption(&channel, &invitee, &holder, &sig));
+
+        // A different holder key -> the binding fails (can't redeem to another key).
+        assert!(!verify_invitation_redemption(&channel, &invitee, &[0xee; 32], &sig));
+        // A different channel -> fails (invitation can't be moved to another channel).
+        assert!(!verify_invitation_redemption(&ChannelId([0x01; 32]), &invitee, &holder, &sig));
+        // Someone else's signature over their own redeem bytes doesn't accept for the
+        // invitee -> only the intended invitee can accept.
+        let mallory = SigningKey::from_bytes(&[0x99u8; 32]);
+        let m_sig = mallory.sign(&invitation_redeem_bytes(&channel, &invitee, &holder)).to_bytes();
+        assert!(!verify_invitation_redemption(&channel, &invitee, &holder, &m_sig));
+    }
+
+    #[test]
+    fn an_invitation_is_domain_separated_from_a_grant() {
+        // Same fields, but the invitation and grant signing bytes differ, so an
+        // operator signature over one can never be replayed as the other.
+        let (_op, inv) = signed_invitation(1_000);
+        let grant = ChannelGrant {
+            channel: inv.invitation.channel,
+            holder: inv.invitation.invitee_identity,
+            direction: inv.invitation.direction,
+            rights: inv.invitation.rights,
+            delegable: inv.invitation.delegable,
+            expires_at: inv.invitation.expires_at,
+        };
+        assert_ne!(inv.invitation.signing_bytes(), grant.signing_bytes());
     }
 }

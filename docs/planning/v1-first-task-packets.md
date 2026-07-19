@@ -1714,7 +1714,23 @@ Decomposed:
   read step into `accept_and_read_join`. Real TWO-agent QUIC integration test (two clients pair + each
   learns the other's endpoint + roles follow directions). Gate green (channel_broker 10).
 - **AF3** ⏳ **Cross-user invitation**: operator issues an invitation → another user's agent redeems it into
-  a scoped member grant (agent-signed); trust-fail (deny/expiry/revoke) rules + tests.
+  a scoped member grant (agent-signed); trust-fail (deny/expiry/revoke) rules + tests. Split:
+  - **AF3-primitive** ✅ **Invitation trust primitive** (`ct_common::channel`): the cross-user handoff, pure
+    crypto. `ChannelInvitation { channel, invitee_identity, direction, rights, delegable, expires_at }` +
+    `SignedChannelInvitation` (operator-signed; fixed 139-byte wire `encode`/`decode` mirroring
+    `SignedChannelGrant`) + `verify_invitation(operator_pubkey, now)` (sig + expiry). Bound to the invitee's
+    **identity** key (not a member key), so the operator can invite *before* knowing the key the invitee will
+    use. Redemption: `invitation_redeem_bytes(channel, invitee_identity, holder)` — the domain-separated
+    message the invitee signs with its **identity** key to accept and bind the `holder` key it chose —
+    verified by `verify_invitation_redemption(...)`. So only the intended invitee can accept, only into the
+    key it chose, only for that channel. Signing bytes are domain-separated (`ct-chan-invite:v1` vs
+    `ct-grant:v1`), so an invitation can't be replayed as a grant. Frozen tests: verify sig+expiry+wrong-key;
+    wire round-trip + truncation→Malformed; redemption binding (wrong holder/channel/identity all rejected);
+    invitation≠grant domain separation. Gate green.
+  - **AF3-redeem-cp** ⏳ next: the CP flow — the invitee's agent presents `(SignedChannelInvitation,
+    redemption signature, chosen holder key)`; the CP verifies both and issues the real per-holder
+    `SignedChannelGrant` (+ registers membership + the member Noise key, reusing #101). This is the
+    server-side glue on top of the primitive; unblocks #100's brokered channel one-liner generator.
 - **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**. Split:
   - **AF4-join** ✅ **Agent-side channel-join client** (`ct-agent::channel::present_channel_join`): the client
     half of the broker handshake — sends the `u16`-framed `ChannelJoinRequest`, answers the edge's 32-byte
