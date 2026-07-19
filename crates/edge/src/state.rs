@@ -439,6 +439,26 @@ mod tests {
     }
 
     #[test]
+    fn connection_cap_admits_up_to_max_then_sheds_and_recovers_on_release() {
+        // #95/#119: the load-shedding cap admits at most `max` concurrent connections
+        // (each admitted connection holds its permit for its lifetime). Over the cap
+        // `try_admit` returns `None` so the accept loop sheds cheaply, and dropping a
+        // permit (a connection closed) frees a slot for the next admission. This is the
+        // mechanism every edge accept loop — QUIC, the TCP fallback, and the `:443` front
+        // door (#119) — relies on to bound a pre-auth connection flood.
+        let cap = ConnectionCap::new(2);
+        assert_eq!(cap.available(), 2);
+        let p1 = cap.try_admit().expect("1st admitted");
+        let _p2 = cap.try_admit().expect("2nd admitted");
+        assert_eq!(cap.available(), 0, "at the cap");
+        assert!(cap.try_admit().is_none(), "over the cap -> shed");
+        drop(p1); // a connection closed, releasing its slot
+        assert_eq!(cap.available(), 1);
+        let _p3 = cap.try_admit().expect("a freed slot admits the next");
+        assert!(cap.try_admit().is_none(), "full again after re-admitting");
+    }
+
+    #[test]
     fn register_then_route() {
         let state = EdgeState::new();
         state.register(token(1), 42u32);

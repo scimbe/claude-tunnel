@@ -1186,14 +1186,33 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         }
                         _ => None,
                     };
+                    // #119 SEC: apply the #95 connection cap to the `:443` front door too
+                    // — the most-exposed public port. Like the QUIC and TCP-fallback loops,
+                    // acquire a permit and SHED over the cap by dropping the socket, so an
+                    // unauthenticated `:443` connection flood can't exhaust tasks/FDs/memory
+                    // (each connection reaching the un-timed TLS handshake) before the PoW /
+                    // grant / membership gates run. Was missing here — the cap was cloned to
+                    // the TCP-fallback and QUIC loops but never to this one.
+                    let conn_cap_fd = conn_cap.clone();
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = fl.accept().await {
+                            let permit = match &conn_cap_fd {
+                                Some(cap) => match cap.try_admit() {
+                                    Some(p) => Some(p),
+                                    None => {
+                                        drop(tcp); // shed: over the cap, close cheaply
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
                             let proxies = proxies.clone();
                             let default_host = default_host.clone();
                             let channel_fd = channel_fd.clone();
                             tokio::spawn(async move {
+                                let _permit = permit; // held for the connection's lifetime
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                                 let challenge = Challenge { nonce, difficulty };

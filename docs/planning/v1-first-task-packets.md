@@ -2997,6 +2997,15 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
               client's trusted root and the channel acceptor, and after the handshake asserts
               `alpn_protocol() == Some(b"ct-edge-channel")` — plus the existing admit→pair→relay byte-crossing.
               Gate green, 0 warnings.
+            - **#119** ✅ (security-review) **`:443` front door now honours the #95 connection cap**: the front-door
+              TCP accept loop spawned a task per connection with **no** `ConnectionCap` — the `#95` cap was cloned to
+              the QUIC and TCP-fallback loops but never to the most-exposed public port, so an unauthenticated
+              `:443` connection flood could exhaust tasks/FDs (each parking at the un-timed TLS handshake) before any
+              PoW/grant/membership gate. Fix: the loop now `conn_cap.try_admit()`s a permit and **sheds over the
+              cap** (drops the socket), holding the permit for the connection's lifetime — mirroring the QUIC/
+              TCP-fallback loops exactly. Added the missing `ConnectionCap` unit test
+              (`connection_cap_admits_up_to_max_then_sheds_and_recovers_on_release`: admit up to max → shed → free a
+              slot on release → re-admit) since the primitive had none. Gate green, 0 warnings.
             - then **N4** ⏳ — local docker-compose A2A e2e over a real `:443` front door (the connection-difficulty proof).
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
