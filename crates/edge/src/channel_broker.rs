@@ -1178,6 +1178,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_pairs_two_admitted_tls_tcp_members_end_to_end() {
+        // #106 complete-wire443-e2e (frozen): the capstone `:443` relay path. Admit TWO
+        // real TLS-over-TCP members (a source + a `:443`-only sink, neither dialable) via
+        // `admit_channel_join_on_duplex`, then `finish_relay_pair_over_streams` them —
+        // proving a full source<->sink A2A relay forms end-to-end over `:443`, edge-
+        // brokered, with no quinn anywhere. The Noise_IK session would run over this
+        // spliced path; here each side pushes one app byte to prove the edge splices the
+        // two admitted duplexes together (and that roles come from the grants).
+        use crate::transport::{build_tcp_tls_listener_at, tcp_tls_connect};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let pk = operator_pubkey();
+        let channel = [0x7Eu8; 32];
+        let src = holder_sk(0xa1); // Initiate grant → initiator
+        let snk = holder_sk(0xb2); // Accept grant → acceptor
+        let src_pk = src.verifying_key().to_bytes();
+        let snk_pk = snk.verifying_key().to_bytes();
+        let req_src = ChannelJoinRequest {
+            grant: grant_h(channel, &src, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.1:7001".to_string(),
+        };
+        let req_snk = ChannelJoinRequest {
+            grant: grant_h(channel, &snk, Direction::Accept, 1_000),
+            endpoint: "203.0.113.2:7002".to_string(),
+        };
+
+        let (listener, acceptor, cert) = build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into())
+            .await
+            .expect("tls-tcp listener");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+
+        // Edge: accept two TLS-TCP connections, admit both over the front-door transport,
+        // then relay-splice the two admitted `:443` duplexes.
+        let server = tokio::spawn(async move {
+            let authorize =
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+            let (t1, _) = listener.accept().await.expect("accept 1");
+            let tls1 = acceptor.accept(t1).await.expect("tls 1");
+            let (s1, r1, op1, _n1, _a1) =
+                admit_channel_join_on_duplex(tls1, 500, std::time::Duration::from_secs(5), &authorize)
+                    .await
+                    .expect("admit 1");
+            let (t2, _) = listener.accept().await.expect("accept 2");
+            let tls2 = acceptor.accept(t2).await.expect("tls 2");
+            let (s2, r2, op2, _n2, _a2) =
+                admit_channel_join_on_duplex(tls2, 500, std::time::Duration::from_secs(5), &authorize)
+                    .await
+                    .expect("admit 2");
+            finish_relay_pair_over_streams(
+                AdmittedStreamMember { stream: s1, req: r1, operator: op1 },
+                AdmittedStreamMember { stream: s2, req: r2, operator: op2 },
+                500,
+            )
+            .await
+            .map(|p| (p.initiator_holder, p.acceptor_holder))
+            .map_err(|e| e.to_string())
+        });
+
+        // Each member: connect over TLS-TCP, run the admission handshake, wait for the
+        // relay's OK (written once both are paired), then push one app byte and read the
+        // peer's — the bytes cross only if the edge spliced the two duplexes.
+        let cert2 = cert.clone();
+        let src_task = tokio::spawn(async move {
+            let mut c = tcp_tls_connect(addr, cert).await.expect("connect src");
+            let rb = req_src.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&src.sign(&ch).to_bytes()).await.expect("sig");
+            let mut ok = [0u8; 2];
+            c.read_exact(&mut ok).await.expect("ok");
+            assert_eq!(&ok, b"OK", "relay acks OK once both :443 members are paired");
+            c.write_all(&[0x11]).await.expect("app send");
+            let mut got = [0u8; 1];
+            c.read_exact(&mut got).await.expect("app recv");
+            // Close gracefully (TLS close_notify) so the relay sees a clean EOF, not an
+            // abrupt drop — a real client shuts down; the test must too.
+            let _ = c.shutdown().await;
+            got[0]
+        });
+        let snk_task = tokio::spawn(async move {
+            let mut c = tcp_tls_connect(addr, cert2).await.expect("connect snk");
+            let rb = req_snk.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&snk.sign(&ch).to_bytes()).await.expect("sig");
+            let mut ok = [0u8; 2];
+            c.read_exact(&mut ok).await.expect("ok");
+            assert_eq!(&ok, b"OK", "relay acks OK once both :443 members are paired");
+            c.write_all(&[0x22]).await.expect("app send");
+            let mut got = [0u8; 1];
+            c.read_exact(&mut got).await.expect("app recv");
+            let _ = c.shutdown().await;
+            got[0]
+        });
+
+        let got_src = src_task.await.expect("src task");
+        let got_snk = snk_task.await.expect("snk task");
+        let (init_h, acc_h) = server.await.expect("server task").expect("relay paired");
+
+        assert_eq!(got_src, 0x22, "source received the sink's byte through the :443 relay");
+        assert_eq!(got_snk, 0x11, "sink received the source's byte through the :443 relay");
+        assert_eq!(init_h, src_pk, "the Initiate-grant holder is the initiator");
+        assert_eq!(acc_h, snk_pk, "the Accept-grant holder is the acceptor");
+    }
+
+    #[tokio::test]
     async fn read_join_on_connection_times_out_a_stalled_connection() {
         // #105: a client that completes the QUIC handshake but never opens a bi-stream
         // (never submits a join) must NOT wedge the broker — read_join_on_connection

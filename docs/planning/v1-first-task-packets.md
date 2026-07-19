@@ -2806,9 +2806,16 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
           `Connection`, not the join stream — behaviour unchanged). Frozen: the real TLS-TCP admission test now also
           reads a post-admission app byte off the reunited stream (proving the read half survived), and the
           plain-duplex admission test updated for the new arity. Gate green, 0 warnings.
-          - **#106-complete-wire443-e2e** ⏳ next: drive `finish_relay_pair_over_streams` over *two* genuinely
-            admitted TLS-TCP streams (admit both via `admit_channel_join_on_duplex`, then relay-splice) — the full
-            `:443` source↔sink relay path minus the front-door ALPN routing (`#106-dispatch-frontdoor`).
+          - **#106-complete-wire443-e2e** ✅: the capstone — a frozen end-to-end test admits **two** real
+            TLS-over-TCP members via `admit_channel_join_on_duplex` (a source + a `:443`-only sink, neither
+            dialable) and relay-splices them with `finish_relay_pair_over_streams`, then pushes one app byte each
+            way and asserts both cross (the edge spliced the two admitted duplexes) + roles come from the grants.
+            Proves the full `:443` source↔sink relay data path end-to-end (no quinn), with only the front-door
+            ALPN routing left. Test-only (all production pieces landed in the prior slices). Gate green, 0 warnings.
+          - **#106-dispatch-frontdoor** ⏳ next (the last mile): route the `ct-edge-channel` ALPN on `:443` in
+            `serve_front_door` — accept → `admit_channel_join_on_duplex` → pair by `ChannelId` (ChannelPairer) →
+            `finish_relay_pair_over_streams`. This is what makes a `:443`-only sink actually reach the broker in a
+            deployed edge; then the local docker-compose A2A e2e (N4) proves it over a real `:443` front door.
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
       what lets a `:443`-only host (the #103 sink) reach the broker/relay end-to-end.
