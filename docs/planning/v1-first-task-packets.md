@@ -2812,10 +2812,22 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
             way and asserts both cross (the edge spliced the two admitted duplexes) + roles come from the grants.
             Proves the full `:443` source↔sink relay data path end-to-end (no quinn), with only the front-door
             ALPN routing left. Test-only (all production pieces landed in the prior slices). Gate green, 0 warnings.
-          - **#106-dispatch-frontdoor** ⏳ next (the last mile): route the `ct-edge-channel` ALPN on `:443` in
-            `serve_front_door` — accept → `admit_channel_join_on_duplex` → pair by `ChannelId` (ChannelPairer) →
-            `finish_relay_pair_over_streams`. This is what makes a `:443`-only sink actually reach the broker in a
-            deployed edge; then the local docker-compose A2A e2e (N4) proves it over a real `:443` front door.
+          - **#106-dispatch-frontdoor** — the last mile; decomposed (front-door signature/plumbing is too big for
+            one cycle alongside the pairing core):
+            - **#106-frontdoor-handler** ✅: `admit_and_pair_on_stream(stream, …, pairer)` — the transport-generic
+              front-door core. Because `:443` members arrive **independently** (can't be dialed, so the front door
+              can't pair "the next two arrivals"), it admits the stream (`admit_channel_join_on_duplex`) and offers
+              it to a shared `ChannelPairer` keyed by `ChannelId`: first holder → `Ok(None)` (parked), second → 
+              `Ok(Some((a, b)))` (the caller relay-splices those two, typically on its own task). Same-holder retry
+              supersedes + closes the stale stream. Lock held only for the synchronous `offer`, never across await.
+              Frozen test parks-then-pairs two members over in-memory duplexes, relay-splices the returned pair, and
+              asserts the bytes cross + the pairer drains. Gate green, 0 warnings.
+            - **#106-frontdoor-wire** ⏳ next: wire `serve_front_door`'s `ChannelBroker` arm (currently returns an
+              error) to terminate TLS then call `admit_and_pair_on_stream` against a long-lived shared pairer +
+              channel authorizer (plumb `CT_EDGE_CP_URL`/`CT_EDGE_ADMIN_TOKEN` through the front-door serve path),
+              and `tokio::spawn(finish_relay_pair_over_streams)` on a pair. Then the deploy already routes the channel
+              ALPN on `:443` (classification landed), so a `:443`-only sink reaches the broker in a deployed edge.
+            - then **N4** — local docker-compose A2A e2e over a real `:443` front door (the connection-difficulty proof).
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
       what lets a `:443`-only host (the #103 sink) reach the broker/relay end-to-end.

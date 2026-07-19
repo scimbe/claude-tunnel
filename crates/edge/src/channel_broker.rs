@@ -667,6 +667,56 @@ where
     }
 }
 
+/// Admit one channel member arriving over a `:443` front-door stream and offer it to a
+/// shared [`ChannelPairer`] (#106 dispatch-frontdoor). Because a `:443` member cannot
+/// be dialed, front-door connections arrive **independently** (the two holders of a
+/// channel connect separately), so the front door can't pair "the next two arrivals" —
+/// it must correlate by `ChannelId`. This admits the stream
+/// ([`admit_channel_join_on_duplex`]), parks it in `pairer` keyed by channel, and:
+/// - returns `Ok(None)` when it is the first holder of its channel (now parked), or
+/// - returns `Ok(Some((a, b)))` when its partner was already waiting — the caller then
+///   relay-splices exactly those two with [`finish_relay_pair_over_streams`] (typically
+///   on its own task, so the accept loop stays free).
+///
+/// A same-holder retry supersedes the stale wait (its stream is closed) and the fresh
+/// offer stays parked (`Ok(None)`). The lock is held only for the synchronous `offer`,
+/// never across `.await`. This is the transport-generic core the front-door accept loop
+/// drives; wiring it into `serve_front_door` is the follow slice.
+pub async fn admit_and_pair_on_stream<S, F, Fut>(
+    stream: S,
+    now: UnixSeconds,
+    join_timeout: std::time::Duration,
+    authorize: &F,
+    deadline: UnixSeconds,
+    pairer: &std::sync::Mutex<ChannelPairer<AdmittedStreamMember<S>>>,
+) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    let (stream, req, operator, _noise, _attest) =
+        admit_channel_join_on_duplex(stream, now, join_timeout, authorize).await?;
+    let channel = req.grant.grant.channel;
+    let holder = req.grant.grant.holder;
+    let member = AdmittedStreamMember { stream, req, operator };
+    let outcome = pairer
+        .lock()
+        .unwrap()
+        .offer(WaitingMember { channel, holder, deadline, payload: member });
+    match outcome {
+        PairOutcome::Parked => Ok(None),
+        PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
+        PairOutcome::Superseded(stale) => {
+            // A retry from the same holder arrived before its partner; the fresh offer is
+            // now parked, so close the stale stream and report "parked" (nothing to pair).
+            let mut stale = stale.payload;
+            let _ = stale.stream.shutdown().await;
+            Ok(None)
+        }
+    }
+}
+
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
 /// channel-joins for the same channel, pair them via [`authorize_channel_pair`],
 /// and reply to each side with the *peer's* advertised endpoint (`OK <endpoint>`)
@@ -1285,6 +1335,94 @@ mod tests {
         assert_eq!(got_snk, 0x11, "sink received the source's byte through the :443 relay");
         assert_eq!(init_h, src_pk, "the Initiate-grant holder is the initiator");
         assert_eq!(acc_h, snk_pk, "the Accept-grant holder is the acceptor");
+    }
+
+    #[tokio::test]
+    async fn admit_and_pair_on_stream_parks_then_pairs_by_channel() {
+        // #106 dispatch-frontdoor (handler, frozen): the front door's `:443` members arrive
+        // independently, so admission must correlate by `ChannelId` via a shared
+        // `ChannelPairer`. The FIRST holder of a channel parks (Ok(None)); the SECOND
+        // returns Ok(Some((a, b))) — exactly the two same-channel members — which the
+        // caller relay-splices. Prove it end-to-end over two in-memory duplexes: park,
+        // pair, splice, bytes cross, pairer drained.
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x9Au8; 32];
+        let src = holder_sk(0xa1); // Initiate
+        let snk = holder_sk(0xb2); // Accept
+        let req_src = ChannelJoinRequest {
+            grant: grant_h(channel, &src, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.1:8001".to_string(),
+        };
+        let req_snk = ChannelJoinRequest {
+            grant: grant_h(channel, &snk, Direction::Accept, 1_000),
+            endpoint: "203.0.113.2:8002".to_string(),
+        };
+
+        let (c1, s1) = tokio::io::duplex(4096);
+        let (c2, s2) = tokio::io::duplex(4096);
+
+        // Two members drive the admission handshake independently, then exchange a byte
+        // once the relay's OK arrives.
+        let src_task = tokio::spawn(async move {
+            let mut c = c1;
+            let rb = req_src.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&src.sign(&ch).to_bytes()).await.expect("sig");
+            let mut ok = [0u8; 2];
+            c.read_exact(&mut ok).await.expect("ok");
+            assert_eq!(&ok, b"OK");
+            c.write_all(&[0x11]).await.expect("send");
+            let mut g = [0u8; 1];
+            c.read_exact(&mut g).await.expect("recv");
+            let _ = c.shutdown().await;
+            g[0]
+        });
+        let snk_task = tokio::spawn(async move {
+            let mut c = c2;
+            let rb = req_snk.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&snk.sign(&ch).to_bytes()).await.expect("sig");
+            let mut ok = [0u8; 2];
+            c.read_exact(&mut ok).await.expect("ok");
+            assert_eq!(&ok, b"OK");
+            c.write_all(&[0x22]).await.expect("send");
+            let mut g = [0u8; 1];
+            c.read_exact(&mut g).await.expect("recv");
+            let _ = c.shutdown().await;
+            g[0]
+        });
+
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<tokio::io::DuplexStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+
+        // First holder → parked (no partner yet).
+        let r1 = admit_and_pair_on_stream(s1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+            .await
+            .expect("admit 1");
+        assert!(r1.is_none(), "first holder of the channel parks in the pairer");
+        assert_eq!(pairer.lock().unwrap().len(), 1, "one member waiting");
+
+        // Second holder → paired with exactly the parked first.
+        let r2 = admit_and_pair_on_stream(s2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+            .await
+            .expect("admit 2");
+        let (a, b) = r2.expect("second holder pairs with the parked first");
+        assert!(pairer.lock().unwrap().is_empty(), "the pair was removed from the pairer");
+
+        // The caller relay-splices exactly those two.
+        finish_relay_pair_over_streams(a, b, 500).await.expect("relay spliced the paired members");
+
+        assert_eq!(src_task.await.expect("src"), 0x22, "source got the sink's byte via the paired relay");
+        assert_eq!(snk_task.await.expect("snk"), 0x11, "sink got the source's byte via the paired relay");
     }
 
     #[tokio::test]
