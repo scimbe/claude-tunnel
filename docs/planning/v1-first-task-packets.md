@@ -2688,8 +2688,16 @@ with **no prior art** and **no dependency on those open questions** lands first:
   agents + the canonical edge; mallory can neither see nor edit alice's topology, and her listing is empty).
   Gate green. **The Topology Editor is now usable at the API level** (create + compose + read). Follow: the
   `<net_uuid>.<zone>` live page (reuse #38 DL2), and the design-question-gated optimizer / N-way / UI slices.
-- **#107-subdomain** ⏳: `<net-uuid>.<zone>` live-status page reusing the #38 DL2 DNS + authorize-host pipeline
-  (keyed by topology-id), UUID-only access first (owner auth-gate deferred — its own tracked placeholder).
+- **#107-subdomain** ✅ (page + resolver) **The public live-status page** (`service::topology_status_router`,
+  `GET /net/:net_uuid`): resolves a topology by its `net_uuid` (`topology_by_uuid`) and renders a
+  self-contained (CSP-safe, no external assets) HTML view of the overlay — net-uuid, member agents, and links.
+  **UUID-only access** (unauthenticated, per the issue's "for now unauthenticated-by-UUID"); an owner auth-gate
+  is a tracked follow. Mounted **publicly** in `persistent_control_plane_router` (the store is opened once and
+  shared with the authed `/me/topologies*` editor). Frozen test
+  `topology_status_page_is_public_and_resolves_by_net_uuid` (known uuid → 200 HTML listing the agents + the
+  link, no bearer; unknown → 404). Gate green. **Follow:** the actual `<net_uuid>.<zone>` **subdomain** routing
+  (Host-header → this page) + auto DNS, reusing the Browser-Plane / #38 DL2 pipeline — deploy wiring on top of
+  this path-addressed page; and a richer live **diagram** (inline SVG) over the current list.
 - **#107-nway** ⏳ **(hard core, gated on open questions)**: generalize `authorize_channel_pair` + the broker's
   fixed two-connection loop to N-way — needs scimbe's answers on scale (≤8 vs arbitrary N) and "SDN" scope.
 - **#107-optimize** ⏳ **(blocked)**: the best-connectivity objective function — cannot start until scimbe

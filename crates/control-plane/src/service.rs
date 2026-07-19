@@ -920,6 +920,63 @@ async fn topology_add_edge(
     }
 }
 
+/// Render the public **live-status page** for a topology (#107-subdomain): a
+/// self-contained (CSP-safe, no external assets) HTML view of the overlay — its
+/// net-uuid, member agents, and links. Addressed by net-uuid (unauthenticated for now).
+fn render_topology_status(
+    t: &crate::topology::Topology,
+    agents: &[String],
+    edges: &[(String, String)],
+) -> String {
+    let esc = crate::portal::escape;
+    let agents_html: String = agents
+        .iter()
+        .map(|a| format!("<li><code>{}</code></li>", esc(a)))
+        .collect();
+    let edges_html: String = edges
+        .iter()
+        .map(|(a, b)| format!("<li><code>{}</code> &mdash; <code>{}</code></li>", esc(a), esc(b)))
+        .collect();
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>topology {uuid}</title></head><body>\
+         <h1>Overlay topology</h1>\
+         <p>net-uuid: <code>{uuid}</code></p>\
+         <h2>Agents ({na})</h2><ul>{agents_html}</ul>\
+         <h2>Links ({ne})</h2><ul>{edges_html}</ul>\
+         </body></html>",
+        uuid = esc(&t.net_uuid),
+        na = agents.len(),
+        ne = edges.len(),
+    )
+}
+
+/// Build the public **topology live-status** router (#107-subdomain): `GET /net/:net_uuid`
+/// resolves the topology by its net-uuid and renders [`render_topology_status`]. UUID-only
+/// access for now (an owner auth-gate is a tracked follow); the eventual
+/// `<net_uuid>.<zone>` subdomain routing reuses the Browser-Plane / #38 DL2 pipeline.
+pub fn topology_status_router(topologies: Arc<SqliteTopologyStore>) -> Router {
+    Router::new()
+        .route("/net/:net_uuid", get(topology_status_page))
+        .with_state(topologies)
+}
+
+async fn topology_status_page(
+    State(topologies): State<Arc<SqliteTopologyStore>>,
+    Path(net_uuid): Path<String>,
+) -> Response {
+    match topologies.topology_by_uuid(&net_uuid) {
+        Ok(Some(t)) => {
+            let agents = topologies.agents_in(&t.id).unwrap_or_default();
+            let edges = topologies.edges(&t.id).unwrap_or_default();
+            axum::response::Html(render_topology_status(&t, &agents, &edges)).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "no such topology").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct ChannelRegisterReq {
     channel: String,
@@ -1503,6 +1560,9 @@ pub fn persistent_control_plane_router(
     let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open(db_path)?);
     let channels = Arc::new(SqliteChannelStore::open(db_path)?);
     let bootstrap = Arc::new(SqliteBootstrap::open(db_path)?);
+    // #107: the Topology Editor store — its public live-status page is always mounted;
+    // the authed `/me/topologies*` editor mounts only with an OIDC verifier (below).
+    let topologies = Arc::new(SqliteTopologyStore::open(db_path)?);
     let verifier = Arc::new(WebhookVerifier::new(
         webhook_secret.to_vec(),
         WEBHOOK_TOLERANCE_SECS,
@@ -1552,6 +1612,8 @@ pub fn persistent_control_plane_router(
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
         // proof-gated (operator-signed invitation + invitee redemption + Noise attest).
         .merge(channel_invite_router(channels.clone()))
+        // #107-subdomain: the public UUID-only topology live-status page (/net/:net_uuid).
+        .merge(topology_status_router(topologies.clone()))
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
@@ -1612,8 +1674,6 @@ pub fn persistent_control_plane_router(
     if let Some(oidc) = oidc {
         // #102-rest: the declarative-network REST surface (owner = verified subject).
         let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
-        // #107-rest: the Topology Editor REST surface (owner = verified subject).
-        let topologies = Arc::new(SqliteTopologyStore::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -1621,7 +1681,7 @@ pub fn persistent_control_plane_router(
                 AUTHED_ISSUES_PER_WINDOW,
             ))
             .merge(authed_network_router(networks, oidc.clone()))
-            .merge(authed_topology_router(topologies, oidc.clone()))
+            .merge(authed_topology_router(topologies.clone(), oidc.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc));
@@ -2674,6 +2734,44 @@ mod tests {
         let list = send("GET", "/me/topologies".into(), Some(&mallory), String::new()).await.unwrap();
         let body = to_bytes(list.into_body(), 1 << 16).await.unwrap();
         assert_eq!(serde_json::from_slice::<Vec<TopologySummary>>(&body).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn topology_status_page_is_public_and_resolves_by_net_uuid() {
+        // #107-subdomain: the live-status page is addressed by net-uuid, no auth, and
+        // renders the overlay's agents + links; an unknown uuid is 404.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        topologies.create_topology("alice", "t1", "uuid-live").unwrap();
+        topologies.assign("alice", "agent-1", "t1").unwrap();
+        topologies.assign("alice", "agent-2", "t1").unwrap();
+        topologies.add_edge("alice", "t1", "agent-1", "agent-2").unwrap();
+        let app = topology_status_router(topologies);
+
+        // Known net-uuid -> 200 HTML showing the agents + the link (no bearer needed).
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/net/uuid-live").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "public UUID access");
+        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("text/html"), "html content-type: {ct}");
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("uuid-live"), "shows the net-uuid");
+        assert!(html.contains("agent-1") && html.contains("agent-2"), "lists the member agents");
+        assert!(html.contains("agent-1</code> &mdash; <code>agent-2"), "renders the link");
+
+        // Unknown net-uuid -> 404.
+        let miss = app
+            .oneshot(Request::get("/net/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND, "unknown uuid -> 404");
     }
 
     #[tokio::test]
