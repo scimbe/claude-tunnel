@@ -23,6 +23,24 @@ use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
+/// Shared HTTP client for the edge admin API calls (#112): a hung edge admin
+/// endpoint must not block the portal's authenticated request path (create /
+/// delete tunnel). Mirrors the timeout guard already on the OIDC client
+/// (`portal.rs`, #96) and the `/status` scrape (`service.rs`). Split so a test
+/// can inject a short timeout.
+fn edge_admin_http_client_with(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The edge admin client with the production timeout — a hung edge must not wedge
+/// the portal request.
+fn edge_admin_http_client() -> reqwest::Client {
+    edge_admin_http_client_with(std::time::Duration::from_secs(5))
+}
+
 /// Automatic DNS-record management for tunnel hostnames (#38 DL2): create the A
 /// record on hostname-set, delete it on revoke, pointing at the edge's public IP.
 #[derive(Clone)]
@@ -213,7 +231,7 @@ async fn create_tunnel(
                 tunnel.routing_token,
                 host
             );
-            match reqwest::Client::new()
+            match edge_admin_http_client()
                 .post(&endpoint)
                 .header("x-ct-admin-token", edge.token.as_ref())
                 .send()
@@ -277,7 +295,7 @@ async fn delete_tunnel(
             let endpoint = format!("{}/admin/revoke/{}", edge.url.trim_end_matches('/'), routing_token);
             // Best-effort: the DB row is already gone; log if the edge call fails
             // so an operator can see a tunnel that may still be serving.
-            match reqwest::Client::new()
+            match edge_admin_http_client()
                 .post(&endpoint)
                 .header("x-ct-admin-token", edge.token.as_ref())
                 .send()
@@ -651,6 +669,34 @@ mod tests {
     use tower::ServiceExt;
 
     const KEY: &[u8] = b"portal-api-test-key";
+
+    // #112 (frozen): a hung edge admin endpoint must NOT block the portal path.
+    // The tuned client returns a timeout error promptly instead of hanging — the
+    // exact failure mode `create_tunnel`/`delete_tunnel` now avoid.
+    #[tokio::test]
+    async fn edge_admin_client_times_out_against_a_hung_endpoint() {
+        // A listener that accepts the connection but never writes an HTTP response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _held = stream; // hold the socket open, send nothing
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+        let client = edge_admin_http_client_with(std::time::Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        let res = client
+            .post(format!("http://{addr}/admin/revoke/tok"))
+            .send()
+            .await;
+        let err = res.expect_err("a hung endpoint must produce an error, not hang");
+        assert!(err.is_timeout(), "the error must be a timeout, got: {err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "must time out promptly (~200ms), not hang"
+        );
+    }
 
     #[test]
     fn redact_routing_tokens_strips_the_token_from_a_revoke_error() {
