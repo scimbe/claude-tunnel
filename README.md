@@ -11,6 +11,7 @@ can route your traffic but never read it.
 ## Highlights
 
 - **Provider-blind payload** — Noise (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) end-to-end.
+- **Agent-to-agent overlay** — direct, Noise-secured channels between agents, edge-brokered (rendezvous or relay), composed into a best-connectivity mesh by a latency-weighted overlay optimizer and a per-user Topology Editor.
 - **One-command onboarding** — `ct-agent onboard`: install → enroll → tunnel.
 - **Deploy your way** — hosted Kubernetes bundle or a self-host Docker Compose file.
 - **Durable & self-healing** — SQLite-backed state, liveness/readiness probes.
@@ -25,10 +26,10 @@ A Rust Cargo workspace of six crates. Five form the tunnel and depend only on
 
 | Crate | Responsibility |
 |-------|----------------|
-| `ct-common` | wire types, Noise, PoW, framing, metrics |
-| `ct-edge` | provider-blind relay (role dispatch, QUIC/TLS) |
+| `ct-common` | wire types, Noise, PoW, framing, metrics, overlay optimizer |
+| `ct-edge` | provider-blind relay (role dispatch, QUIC/TLS), A2A channel broker |
 | `ct-agent` | customer-run; custodian of the origin key; serve path |
-| `ct-control-plane` | enrollment, tunnel registry/rendezvous, billing |
+| `ct-control-plane` | enrollment, tunnel registry/rendezvous, billing, Topology Editor API |
 | `ct-client` | tunnel setup, operating modes, bench harness |
 | `ct-dns` | authoritative DNS-01 responder for ACME (front door certs) |
 
