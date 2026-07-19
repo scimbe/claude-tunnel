@@ -125,20 +125,64 @@ pub async fn run_channel_join<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    let (peer_endpoint, peer_noise) = match present_channel_join(broker_conn, request, holder).await? {
+    // Admit over the single pre-dialed QUIC broker connection, then run the
+    // outcome-driven data path. The plane CLI instead admits over the broker *ladder*
+    // (direct QUIC → the `:443` front door) and calls [`run_channel_join_with_admission`]
+    // directly — same data path, but the broker leg reachable when the ports are blocked.
+    let admission = present_channel_join(broker_conn, request, holder).await?;
+    run_channel_join_with_admission(
+        admission,
+        relay_conn,
+        request,
+        holder,
+        role,
+        own_noise_private,
+        listener,
+        dial_timeout,
+        accept_timeout,
+        local,
+    )
+    .await
+}
+
+/// The **outcome-driven** core of [`run_channel_join`] (#106 client-dial-wire): given the
+/// broker's already-computed `admission` — obtained over a direct QUIC broker connection
+/// *or* the broker fallback ladder (direct QUIC → the `:443` TLS-TCP front door) — verify
+/// the peer's attested Noise key (#101) and run the same **direct-then-relay** data path.
+/// Decoupling admission (how we *reach* the broker) from the data path (how the two
+/// members *connect*) is what lets a restrictive network admit over `:443` while the
+/// direct/relay data legs stay unchanged. `role`, `listener`, and the timeouts behave
+/// exactly as in [`run_channel_join`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_channel_join_with_admission<P>(
+    admission: ChannelJoinOutcome,
+    relay_conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    listener: Option<Endpoint>,
+    dial_timeout: std::time::Duration,
+    accept_timeout: std::time::Duration,
+    local: P,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    let (peer_endpoint, peer_noise) = match admission {
         ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation } => {
             let noise = peer_noise_pubkey
                 .ok_or("broker admitted the join but relayed no peer Noise key (registry has none)")?;
             // #101 SEC101c-ii: verify the peer's Noise key is attested by its
             // grant-authenticated holder before pinning it — so even a tampered DB
             // can't make us pin a substituted key (the attestation wouldn't verify).
-            let holder = peer_holder
+            let peer_holder = peer_holder
                 .ok_or("broker relayed a Noise key without the peer holder — cannot verify (#101)")?;
             let attestation = peer_attestation
                 .ok_or("broker relayed a Noise key without an attestation (#101)")?;
             if !ct_common::channel::verify_member_noise_attestation(
                 &request.grant.grant.channel,
-                &holder,
+                &peer_holder,
                 &noise,
                 &attestation,
             ) {
@@ -239,6 +283,12 @@ pub struct ChannelJoinCliConfig {
     /// set, the dial ladder tries the direct broker/relay first, then this front door over
     /// TLS-TCP with the `ct-edge-channel` ALPN.
     pub front_door: Option<SocketAddr>,
+    /// The edge's TLS certificate (DER) the `:443` front-door dial trusts
+    /// (`CT_CHANNEL_FRONT_DOOR_CERT`, hex) — the trust anchor a front-door TLS-TCP dial
+    /// needs (#106). Present ⇒ `run_channel_join_command` admits over the broker *ladder*
+    /// (direct QUIC → the `:443` front door). Absent ⇒ direct-QUIC-only broker admission,
+    /// even if `front_door` is set (a front door you have no root for is unusable).
+    pub front_door_cert: Option<CertificateDer<'static>>,
 }
 
 /// One rung of the channel dial **fallback ladder** (#106): where + how to reach the edge
@@ -319,7 +369,16 @@ impl ChannelJoinCliConfig {
             ),
             _ => None,
         };
-        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, front_door })
+        // #106: the trust anchor for the `:443` front-door TLS-TCP dial. Optional and
+        // independent of `front_door` (a set-but-malformed value is an error — a typo
+        // shouldn't silently drop the fallback); absent ⇒ direct-QUIC-only admission.
+        let front_door_cert = match f("CT_CHANNEL_FRONT_DOOR_CERT") {
+            Some(s) if !s.trim().is_empty() => Some(CertificateDer::from(
+                hex_bytes(s.trim()).ok_or("CT_CHANNEL_FRONT_DOOR_CERT must be hex DER")?,
+            )),
+            _ => None,
+        };
+        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, front_door, front_door_cert })
     }
 }
 
@@ -583,15 +642,44 @@ impl ChannelRegisterRequest {
 /// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
 /// relays the peer's Noise key, so no `CT_CHANNEL_PEER_*` is needed.
 pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), BoxError> {
+    // Capture what the broker-ladder admission needs before `cfg.grant` is moved into
+    // `request` (a partial move would forbid the `cfg.broker_ladder()` `&self` call).
+    let broker_ladder = cfg.broker_ladder();
+    let front_door_cert = cfg.front_door_cert.clone();
     let request = ChannelJoinRequest {
         grant: cfg.grant,
         endpoint: cfg.listen_addr.to_string(),
     };
-    // Dial the broker + relay accept-any (the grant + possession proof are the auth;
-    // Noise_IK authenticates the peer end-to-end).
-    let broker_conn = crate::transport::build_channel_dialer()?
-        .connect(cfg.broker_addr, "localhost")?
-        .await?;
+    // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
+    // the peer end-to-end). With a `:443` front-door cert configured, walk the broker
+    // ladder — direct QUIC first, then the `:443` TLS-TCP front door — so a network that
+    // blocks the channel port still reaches the broker (#106 client-dial-wire). Otherwise
+    // the direct-QUIC broker join, unchanged.
+    let admission = match front_door_cert {
+        Some(edge_cert) => {
+            eprintln!(
+                "ct-agent channel: plane-brokered {:?}; broker ladder over {} (front door {:?})",
+                cfg.role, cfg.broker_addr, cfg.front_door
+            );
+            present_channel_join_via_ladder(
+                &broker_ladder,
+                &request,
+                &cfg.holder,
+                edge_cert,
+                DIRECT_DIAL_TIMEOUT,
+            )
+            .await?
+        }
+        None => {
+            let broker_conn = crate::transport::build_channel_dialer()?
+                .connect(cfg.broker_addr, "localhost")?
+                .await?;
+            present_channel_join(&broker_conn, &request, &cfg.holder).await?
+        }
+    };
+    // The relay data leg stays QUIC for now; a `:443`-only member (whose relay port 4436
+    // is blocked too) also needs the relay over the front door — the ⏳ follow slice
+    // (#106 relay-leg-443). Until it lands, a `:443`-only member's relay fallback fails.
     let relay_conn = crate::transport::build_channel_dialer()?
         .connect(cfg.relay_addr, "localhost")?
         .await?;
@@ -600,12 +688,12 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         ChannelRole::Initiate => None,
     };
     eprintln!(
-        "ct-agent channel: plane-brokered {:?} via broker {} (relay {})",
-        cfg.role, cfg.broker_addr, cfg.relay_addr
+        "ct-agent channel: plane-brokered {:?} (relay {})",
+        cfg.role, cfg.relay_addr
     );
     let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    run_channel_join(
-        &broker_conn,
+    run_channel_join_with_admission(
+        admission,
         &relay_conn,
         &request,
         &cfg.holder,
@@ -1533,6 +1621,161 @@ mod tests {
         a_task.abort();
         resp_task.abort();
         broker_task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladder_admission() {
+        // #106 client-dial-wire (frozen): the seam the plane CLI now uses. The AGENT
+        // admits over the broker LADDER — a DEAD direct rung (blocked channel port) then a
+        // real `:443` TLS-TCP front door driven by the production
+        // `ct_edge::channel_broker::admit_channel_join_on_duplex` gate — and the resulting
+        // ChannelJoinOutcome drives run_channel_join_with_admission's DIRECT data path to a
+        // real responder. Broker admission is thereby decoupled from (and reachable over
+        // `:443` independently of) the direct/relay data legs; data flows with zero
+        // out-of-band key/cert exchange. (The QUIC relay handle is present but unused — the
+        // direct dial succeeds — since the relay-leg-over-`:443` is the ⏳ follow slice.)
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::admit_channel_join_on_duplex;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert, build_tcp_tls_listener_at};
+        use ed25519_dalek::Signer;
+        use tokio::io::AsyncWriteExt;
+
+        let channel = [0x6Au8; 32];
+
+        // Responder: a real direct listener running the Accept side of the session.
+        let responder_noise = generate_static_keypair();
+        let (resp_listener, _c) =
+            crate::transport::build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+        let resp_addr = resp_listener.local_addr().expect("resp addr");
+        let (mut resp_local_test, resp_local_run) = tokio::io::duplex(8192);
+        let rnp = responder_noise.private;
+        let resp_task = tokio::spawn(async move {
+            let conn = resp_listener.accept().await.expect("incoming").await.expect("conn");
+            run_channel_session(&conn, ChannelRole::Accept, &rnp, &[0u8; 32], resp_local_run)
+                .await
+                .expect("responder session");
+        });
+
+        // The responder's attested-key triple (#101) the front door relays in its ack, so
+        // the initiator pins the responder's Noise key with nothing conveyed out-of-band.
+        let resp_holder = SigningKey::from_bytes(&[0x44u8; 32]);
+        let resp_hpub = resp_holder.verifying_key().to_bytes();
+        let resp_npub = responder_noise.public;
+        let resp_att = resp_holder
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &resp_hpub, &resp_npub))
+            .to_bytes();
+
+        // Operator-signed initiator grant; the front door authorizes it under op_pub.
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder = SigningKey::from_bytes(&[0x11u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+        // The advertised endpoint must be a SAFE (non-loopback) dialable addr for admission.
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.1:7001".to_string() };
+
+        // A real `:443`-style TLS-TCP edge front door: admit the join over the duplex, then
+        // ack the responder's addr + attested Noise triple (as the rendezvous broker would).
+        let (fd_listener, acceptor, edge_cert) =
+            build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
+        let fd_addr = fd_listener.local_addr().expect("front-door addr");
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = fd_listener.accept().await.expect("accept tcp");
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut stream, _req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+                tls,
+                500u64, // now < expires_at (1_000)
+                std::time::Duration::from_secs(5),
+                &move |c: ChannelId, _h: [u8; 32]| {
+                    let ok = c.0 == channel;
+                    async move { ok.then_some((op_pub, None, None)) }
+                },
+            )
+            .await
+            .expect("admit over the :443 TLS-TCP duplex");
+            let ack = format!(
+                "OK {} {} {} {}",
+                resp_addr,
+                hex_encode(&resp_npub),
+                hex_encode(&resp_hpub),
+                hex_encode(&resp_att)
+            );
+            stream.write_all(ack.as_bytes()).await.expect("ack");
+            stream.shutdown().await.expect("shutdown");
+        });
+
+        // The broker ladder: a DEAD direct rung (closed UDP port → the QUIC dial is
+        // Unreachable) then the LIVE `:443` front door.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let rungs = vec![
+            ChannelDialRung { endpoint: dead_addr, via_front_door: false },
+            ChannelDialRung { endpoint: fd_addr, via_front_door: true },
+        ];
+
+        // Admit over the ladder: direct is Unreachable → the `:443` front door completes it.
+        let admission = present_channel_join_via_ladder(
+            &rungs,
+            &request,
+            &holder,
+            edge_cert,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("admitted over the :443 front door after the dead direct rung");
+
+        // A scratch (unused) QUIC relay handle — the direct dial succeeds, so it is never
+        // touched; the outcome-driven data path still requires a `&Connection` for the leg.
+        let (scratch_ep, scratch_cert) = build_server_endpoint_with_cert().expect("scratch relay ep");
+        let scratch_addr = scratch_ep.local_addr().expect("scratch addr");
+        tokio::spawn(async move {
+            if let Some(inc) = scratch_ep.accept().await {
+                let _ = inc.await;
+            }
+        });
+        let sc = build_client_endpoint(scratch_cert).expect("scratch client");
+        let unused_relay = sc.connect(scratch_addr, "localhost").expect("cfg").await.expect("scratch conn");
+
+        // The outcome-driven data path dials the responder directly and pumps bytes.
+        let initiator_noise = generate_static_keypair();
+        let (mut a_local_test, a_local_run) = tokio::io::duplex(8192);
+        let inp = initiator_noise.private;
+        let a_task = tokio::spawn(async move {
+            run_channel_join_with_admission(
+                admission,
+                &unused_relay,
+                &request,
+                &holder,
+                ChannelRole::Initiate,
+                &inp,
+                None,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                a_local_run,
+            )
+            .await
+        });
+
+        // Data flows initiator -> responder: `:443` broker admission + direct data leg.
+        let payload = b"admitted over :443, then piped over the direct A2A session";
+        a_local_test.write_all(payload).await.expect("write");
+        a_local_test.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        resp_local_test.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, payload, "the responder receives the initiator's data (admitted over :443, direct data leg)");
+
+        edge.await.expect("edge task");
+        a_task.abort();
+        resp_task.abort();
     }
 
     #[tokio::test]

@@ -2858,9 +2858,28 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
       + a **live** real `:443`-style TLS-TCP edge whose accepted stream is admitted with the production
       `ct_edge::channel_broker::admit_channel_join_on_duplex` gate — asserts the agent falls through the dead direct
       rung and completes the join (Admitted, learning the peer endpoint) over the `:443` TLS-TCP rung. Gate green,
-      0 warnings. ⏳ Follow: `run_channel_join_command` still dials the broker/relay directly (QUIC) and its relay
-      data path is unchanged — rewiring it to drive `present_channel_join_via_ladder` (and the relay-path
-      integration over `:443`) is the next slice; the composable primitive is ready to be dropped in.
+      0 warnings.
+    - **#106-client-dial-wire** ✅ **`run_channel_join_command` admits over the broker ladder** (`ct_agent`): the
+      command now *uses* the `:443` fallback instead of only dialing QUIC directly. `run_channel_join` is split
+      **additively** — its data path is extracted into `run_channel_join_with_admission(admission:
+      ChannelJoinOutcome, relay_conn, …)`, and `run_channel_join(broker_conn, …)` becomes the thin wrapper
+      (`present_channel_join(broker_conn)` → delegate), so the peer-attestation verify (#101) + direct-then-relay
+      legs are unchanged and all existing QUIC integration tests keep passing untouched. The command captures the
+      broker ladder, then admits over `present_channel_join_via_ladder` (direct QUIC → the `:443` TLS-TCP front
+      door) whenever a front-door **cert** is configured, else the direct-QUIC `present_channel_join` — and feeds
+      the resulting outcome to `run_channel_join_with_admission`. `ChannelJoinCliConfig` gains
+      `front_door_cert: Option<CertificateDer>` from `CT_CHANNEL_FRONT_DOOR_CERT` (hex DER) — the trust anchor a
+      front-door TLS dial needs, independent of `CT_CHANNEL_FRONT_DOOR` (absent ⇒ direct-only admission). Frozen
+      test `run_channel_join_with_admission_runs_the_direct_session_from_a_443_ladder_admission`: a **dead** direct
+      broker rung + a real `:443` TLS-TCP front door (`build_tcp_tls_listener_at` +
+      `admit_channel_join_on_duplex`, acking the responder's attested-key triple) admit the join over `:443`, then
+      the outcome drives the direct A2A session to a real responder and application data flows — proving broker
+      admission is decoupled from and reachable over `:443` independently of the data legs. Gate green, 0 warnings.
+      ⏳ Follow: the **relay data leg** stays QUIC — a `:443`-only member (whose relay port 4436 is blocked too)
+      still can't relay-fall-back over `:443`; generalizing `join_via_relay` to a TLS-TCP front-door stream
+      (mirroring the edge's relay-splice) is the next slice (**#106-relay-leg-443**), plus **N4** (local
+      docker-compose A2A e2e over a real `:443` front door). Until both land, a `:443`-only member is admitted over
+      `:443` but not yet fully functional end-to-end when the direct path is also blocked.
   - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
     - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
       extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the
