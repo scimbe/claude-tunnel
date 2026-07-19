@@ -2662,12 +2662,23 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
   arm (closes cleanly with a clear reason — the dispatch is the follow packet). Frozen test
   `classify_front_door_routes_the_channel_alpn_to_the_broker` (channel ALPN → `ChannelBroker`, wins over a
   terminate-host SNI; the classic `ct-edge` ALPN still → `EdgeRelay`; the two ids are distinct). Gate green.
-- **#106-edge-dispatch** ⏳ next: a **TLS-TCP transport leg** for the channel broker (the broker speaks QUIC;
-  `:443` is TLS-TCP, so this mirrors the ADR-0004 relay's TLS-TCP fallback) + wire `serve_front_door`'s
-  `ChannelBroker` arm to hand the buffered ClientHello + stream to `broker_channel_rendezvous`/`_relay`.
-- **#106-client-fallback** ⏳ then: the agent's channel dial falls back to the `:443` front door with
-  `ALPN=ct-edge-channel` when `CT_CHANNEL_BROKER`/`_RELAY` on the direct port is blocked (the #31 FD3 / #74
-  fallback-ladder pattern). Unblocks the #103 live sink↔source test from a `:443`-only host.
+- **#106-client-fallback** — decomposed (too big for one cycle) into:
+  - **#106-client-ladder** ✅ **The dial fallback ladder** (`ct_agent::channel_run`): `ChannelJoinCliConfig`
+    gained an optional `CT_CHANNEL_FRONT_DOOR` (host:port) + pure `broker_ladder()`/`relay_ladder()` returning
+    the ordered `ChannelDialRung`s — the direct channel port first, then (if configured) the `:443` front door
+    (`via_front_door`, TLS-TCP + `ct-edge-channel` ALPN). A set-but-malformed front door is a hard error (a typo
+    can't silently drop the fallback). This is the client's fallback *decision* — pure/testable now; the actual
+    TLS-TCP dial through the front door is the next slice. Frozen test extends
+    `channel_join_cli_config_parses_the_plane_one_liner` (no front door → direct-only; set → direct then :443;
+    relay likewise; malformed → error). Gate green.
+  - **#106-client-dial** ⏳ next: `run_channel_join_command` walks the ladder — on a blocked/failed direct QUIC
+    dial, connect the `:443` front door over **TLS-TCP** with the `ct-edge-channel` ALPN and speak the
+    channel-join protocol over that stream (reuses the classic agent's `:443` TLS-TCP path, #74).
+  - **#106-edge-dispatch** ⏳ (the pairing half): a **TLS-TCP transport leg** for the broker (it speaks QUIC;
+    `:443` is TLS-TCP — mirror the ADR-0004 relay's TLS-TCP fallback) + wire `serve_front_door`'s
+    `ChannelBroker` arm to hand the buffered ClientHello + stream to `broker_channel_rendezvous`/`_relay`. Then
+    the deploy routes the channel ALPN on `:443`. This is what lets a `:443`-only host (the #103 sink) reach the
+    broker/relay end-to-end.
 
 ## #107 Topology Editor — per-user overlay composition from agents (feature, epic)
 

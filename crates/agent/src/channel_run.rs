@@ -233,11 +233,48 @@ pub struct ChannelJoinCliConfig {
     pub own_noise_private: [u8; 32],
     /// The host:port this member advertises for the direct path (`CT_CHANNEL_LISTEN`).
     pub listen_addr: SocketAddr,
+    /// Optional unified `:443` front door (`CT_CHANNEL_FRONT_DOOR`, host:port) — the #106
+    /// fallback for restrictive networks that block the channel broker/relay ports. When
+    /// set, the dial ladder tries the direct broker/relay first, then this front door over
+    /// TLS-TCP with the `ct-edge-channel` ALPN.
+    pub front_door: Option<SocketAddr>,
+}
+
+/// One rung of the channel dial **fallback ladder** (#106): where + how to reach the edge
+/// channel broker or relay. Tried in order; the first rung that connects wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelDialRung {
+    /// The endpoint to dial.
+    pub endpoint: SocketAddr,
+    /// `false` = a direct QUIC dial to the channel port; `true` = the unified `:443` front
+    /// door (TLS-TCP) advertising the `ct-edge-channel` ALPN, so a network that blocks the
+    /// channel ports can still reach the broker/relay (#106, the #31/#46 pattern).
+    pub via_front_door: bool,
 }
 
 impl ChannelJoinCliConfig {
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// The ordered dial plan for the **rendezvous broker**: the direct port first, then
+    /// (if `CT_CHANNEL_FRONT_DOOR` is configured) the `:443` front door. Pure.
+    pub fn broker_ladder(&self) -> Vec<ChannelDialRung> {
+        Self::ladder(self.broker_addr, self.front_door)
+    }
+
+    /// The ordered dial plan for the **relay** (used on direct-dial failure): the direct
+    /// port first, then (if configured) the `:443` front door. Pure.
+    pub fn relay_ladder(&self) -> Vec<ChannelDialRung> {
+        Self::ladder(self.relay_addr, self.front_door)
+    }
+
+    fn ladder(direct: SocketAddr, front_door: Option<SocketAddr>) -> Vec<ChannelDialRung> {
+        let mut rungs = vec![ChannelDialRung { endpoint: direct, via_front_door: false }];
+        if let Some(fd) = front_door {
+            rungs.push(ChannelDialRung { endpoint: fd, via_front_door: true });
+        }
+        rungs
     }
 
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
@@ -271,7 +308,17 @@ impl ChannelJoinCliConfig {
             .as_deref()
             .and_then(hex32)
             .ok_or("CT_CHANNEL_NOISE_KEY required (64 hex)")?;
-        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr })
+        // #106: optional :443 front-door fallback. Absent -> direct-only ladder; a set but
+        // malformed value is an error (a typo shouldn't silently drop the fallback).
+        let front_door = match f("CT_CHANNEL_FRONT_DOOR") {
+            Some(s) if !s.trim().is_empty() => Some(
+                s.trim()
+                    .parse()
+                    .map_err(|e| format!("CT_CHANNEL_FRONT_DOOR invalid: {e}"))?,
+            ),
+            _ => None,
+        };
+        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, front_door })
     }
 }
 
@@ -559,6 +606,38 @@ mod tests {
             let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
             assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
         }
+
+        // #106: without a front door, the dial ladder is direct-only.
+        assert_eq!(cfg.front_door, None);
+        assert_eq!(
+            cfg.broker_ladder(),
+            vec![ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), via_front_door: false }]
+        );
+
+        // With CT_CHANNEL_FRONT_DOOR set, each ladder tries the direct port then the :443
+        // front door (the fallback for networks that block the channel ports).
+        let mut with_fd = base.clone();
+        with_fd.push(("CT_CHANNEL_FRONT_DOOR", "203.0.113.5:443".into()));
+        let cfg = lookup(&with_fd).expect("front-door config parses");
+        assert_eq!(cfg.front_door, Some("203.0.113.5:443".parse().unwrap()));
+        assert_eq!(
+            cfg.broker_ladder(),
+            vec![
+                ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), via_front_door: false },
+                ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), via_front_door: true },
+            ],
+            "broker: direct then :443 front door"
+        );
+        assert_eq!(
+            cfg.relay_ladder().last().unwrap(),
+            &ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), via_front_door: true },
+            "relay also falls back to the front door"
+        );
+
+        // A set-but-malformed front door is a hard error (a typo must not silently drop it).
+        let mut bad_fd = base.clone();
+        bad_fd.push(("CT_CHANNEL_FRONT_DOOR", "not-an-addr".into()));
+        assert!(lookup(&bad_fd).is_err(), "malformed CT_CHANNEL_FRONT_DOOR rejected");
     }
 
     #[test]
