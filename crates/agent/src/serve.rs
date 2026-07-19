@@ -348,7 +348,7 @@ pub async fn run_agent(
                     .await;
                 }
                 eprintln!("ct-agent: edge dial failed ({e}); will reconnect");
-                match backoff.next_delay() {
+                match backoff.next_delay_jittered(rand::random::<f64>()) {
                     Some(d) => {
                         tokio::time::sleep(d).await;
                         continue;
@@ -360,7 +360,7 @@ pub async fn run_agent(
         first = false;
         if let Err(e) = register_tunnel(&conn, &token).await {
             eprintln!("ct-agent: registration failed ({e}); will reconnect");
-            match backoff.next_delay() {
+            match backoff.next_delay_jittered(rand::random::<f64>()) {
                 Some(d) => {
                     tokio::time::sleep(d).await;
                     continue;
@@ -389,7 +389,7 @@ pub async fn run_agent(
         )
         .await;
         eprintln!("ct-agent: edge connection dropped; reconnecting");
-        match backoff.next_delay() {
+        match backoff.next_delay_jittered(rand::random::<f64>()) {
             Some(d) => tokio::time::sleep(d).await,
             None => return Err("ct-agent: gave up reconnecting after the connection dropped".into()),
         }
@@ -497,7 +497,7 @@ async fn run_agent_tcp_fallback(
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no TCP rung configured".to_string());
             eprintln!("ct-agent: all TLS-TCP rungs failed ({e}); will reconnect");
-            match backoff.next_delay() {
+            match backoff.next_delay_jittered(rand::random::<f64>()) {
                 Some(d) => tokio::time::sleep(d).await,
                 None => {
                     return Err("ct-agent: gave up reconnecting over the TLS-TCP fallback".into())

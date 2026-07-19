@@ -2524,9 +2524,14 @@ hot-path pair landed first:
   reused buffer + clean EOF); the existing `noise_pump_streams_bidirectionally` freezes the end-to-end wire
   behaviour across the outbound in-place change. Gate green, 0 warnings. (Profiler-confirm before treating the
   pump as the bottleneck — but drop-in and directly serves the max-bandwidth goal, so low-risk to land now.)
-- **#114-backoff-jitter** ⏳ next (finding #3, cheap robustness win, independent of throughput): multiply the
-  reconnect backoff (`ct_agent::reconnect`) by a random `0.5..=1.5` factor so a shared-edge outage doesn't
-  trigger a synchronized retry storm across the fleet.
+- **#114-backoff-jitter** ✅ (finding #3, cheap robustness win, independent of throughput): `Backoff` gained
+  `next_delay_jittered(rand01)` applying **equal jitter** — the delay is spread uniformly in `[d/2, d]` (not a
+  naive `×0.5..1.5`, which could exceed `max`), so a shared-edge outage/restart no longer triggers a
+  synchronized fleet retry storm, while the exponential growth, the `max` cap and the give-up after
+  `max_attempts` are preserved. The caller supplies the random sample (`rand::random::<f64>()` at the 4 serve
+  reconnect sites), keeping `Backoff` pure + deterministically testable. Frozen test
+  `jitter_within_half_to_full_delay_and_still_gives_up` (endpoints `d/2`/`d`, in-range across the growth,
+  `≤ max`, unchanged give-up). Gate green, 0 warnings.
 - **#114-dialer-reuse** ⏳ (finding #4, **confirm first**): `build_channel_dialer` reportedly rebuilds a rustls
   `ClientConfig` + binds a new UDP `Endpoint` per dial (≈3× per plane-brokered join, more per #106 ladder rung);
   a single quinn `Endpoint` can `connect()` to many peers — build once + reuse. Verify against source before scoping.
