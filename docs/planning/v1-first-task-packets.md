@@ -2482,9 +2482,28 @@ for one cycle — decomposed so the pure correlator (the substrate for all three
   caller can close them with a clean `NO` (**the correlation half of #3**). Frozen test: park X→Parked, park Y
   (different channel)→Parked+both waiting (no cross-pair), second X holder→Paired(the two X members) with Y
   still parked, same-holder re-offer→Superseded, expired waiter→drained. Gate green.
-- **#109-concurrent** ⏳ next: drive the `run_edge` accept loop through the pairer — accept → read join → `offer`;
-  on `Paired`, `tokio::spawn` the rendezvous/relay brokerage as its own task so the loop stays free (**fixes #1**:
-  concurrent relays) and bound the park with the deadline + a periodic `drain_expired` (**completes #3**).
+- **#109-concurrent** — driving the accept loop through the pairer + spawning brokerage per pair is too big for one
+  cycle (it entangles a socket-accept-loop rewrite with the splice-off-the-hot-path fix). Decomposed into ordered,
+  finishable slices, each behaviour-frozen before the next:
+  - **#109-concurrent-a** ✅ **Separate *admit* from *pair-completion*** (`ct_edge::channel_broker`, mechanical, no
+    loop change): the two `broker_channel_*` functions each did two sequential `accept_and_read_join` calls then an
+    inline `authorize_channel_pair` + finish. Extracted an `AdmittedMember` (conn + reply stream + verified
+    `ChannelJoinRequest` + operator key + peer noise/attest) produced by an `accept_member` helper, and two
+    completers `finish_rendezvous_pair(a, b, now)` (ack + endpoint-swap) / `finish_relay_pair(a, b, now)` (ack +
+    `relay_initiator_to_acceptor` splice). `broker_channel_rendezvous`/`broker_channel_relay` now just admit two
+    members and delegate — behaviour-preserving, so the two QUIC integration tests
+    (`broker_pairs_two_agents_and_swaps_endpoints`, `broker_channel_relay_splices_two_members_tunnels`) freeze the
+    behaviour across the refactor. New frozen test `finish_rendezvous_pair_completes_two_separately_admitted_members`
+    admits two members and calls the finisher directly — the exact `offer→Paired(a,b)→spawn finish_*_pair` seam. This
+    is the mechanical prerequisite for the concurrent loop: `finish_*_pair(a, b)` is now a standalone `spawn`-able
+    task. Gate green, 0 warnings.
+  - **#109-concurrent-b** ⏳ next: **take the relay splice off the single global slot** — drive the RELAY accept loop
+    through the `ChannelPairer` (accept → `accept_member` → `offer`; on `Paired(a, b)` `tokio::spawn`
+    `finish_relay_pair(a, b, now)` so the loop stays free) (**fixes #1**: a persistent channel no longer wedges every
+    other member). The finisher from -a is already `spawn`-able; this slice adds only the pairer-driven loop.
+  - **#109-concurrent-c** ⏳ then: **bound the wait for a partner** — carry each parked member's `deadline` into the
+    pairer and run a periodic `drain_expired(now)`, closing timed-out lone waiters with a clean `NO` (**completes #3**:
+    the 2nd-accept has no timeout today). Apply the same pairer-driven loop to rendezvous.
 
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 

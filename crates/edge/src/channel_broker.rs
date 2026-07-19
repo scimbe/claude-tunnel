@@ -450,6 +450,129 @@ fn member_ack_suffix(noise: Option<[u8; 32]>, holder: &[u8; 32], attest: Option<
     }
 }
 
+/// A channel member that has cleared admission (`accept_and_read_join` /
+/// [`read_join_on_connection`]): its live QUIC connection and reply stream, the
+/// verified [`ChannelJoinRequest`] it presented, the operator key its grant was
+/// verified under, and the peer key material to relay to its partner. This is the
+/// unit the *admit* stage produces and the `finish_*_pair` *completers* consume —
+/// the seam that lets a `ChannelPairer`-driven concurrent accept loop park a lone
+/// arrival and hand off exactly two members once paired (#109-concurrent).
+struct AdmittedMember {
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    req: ChannelJoinRequest,
+    operator: [u8; 32],
+    noise: Option<[u8; 32]>,
+    attest: Option<[u8; 64]>,
+}
+
+/// Accept one QUIC connection and admit its channel-join, returning it as an
+/// [`AdmittedMember`] ready to pair. Thin wrapper over `accept_and_read_join` that
+/// packs the admitted tuple into the pairing unit both `broker_channel_*` functions
+/// (and, later, the concurrent accept loop) consume.
+async fn accept_member<F, Fut>(
+    endpoint: &Endpoint,
+    now: UnixSeconds,
+    authorize: &F,
+) -> Result<AdmittedMember, BoxError>
+where
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    let (conn, send, req, operator, noise, attest) =
+        accept_and_read_join(endpoint, now, authorize).await?;
+    Ok(AdmittedMember { conn, send, req, operator, noise, attest })
+}
+
+/// Complete a **rendezvous** pairing for two already-admitted members: authorize the
+/// pair under member A's operator key (`authorize_channel_pair` rejects a
+/// cross-channel / incompatible / same-holder pair), then hand each side the OTHER's
+/// advertised endpoint plus (when registered) the peer's attested Noise key +
+/// attestation to VERIFY and pin — so an A2A session forms with no operator-conveyed
+/// key. An unpairable pair gets `NO` on both sides. This is the behaviour-preserving
+/// pair-completion tail of [`broker_channel_rendezvous`], split from admission so a
+/// concurrent loop can `spawn` it per `ChannelPairer::offer` -> `Paired(a, b)`.
+async fn finish_rendezvous_pair(
+    mut a: AdmittedMember,
+    mut b: AdmittedMember,
+    now: UnixSeconds,
+) -> Result<ChannelPairing, BoxError> {
+    match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
+        Ok(pairing) => {
+            a.send
+                .write_all(
+                    format!(
+                        "OK {}{}",
+                        b.req.endpoint,
+                        member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest)
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            b.send
+                .write_all(
+                    format!(
+                        "OK {}{}",
+                        a.req.endpoint,
+                        member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest)
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            a.send.finish()?;
+            b.send.finish()?;
+            a.conn.closed().await;
+            b.conn.closed().await;
+            Ok(pairing)
+        }
+        Err(e) => {
+            let _ = a.send.write_all(b"NO").await;
+            let _ = b.send.write_all(b"NO").await;
+            let _ = a.send.finish();
+            let _ = b.send.finish();
+            Err(format!("channel pair refused: {e}").into())
+        }
+    }
+}
+
+/// Complete a **relay** pairing for two already-admitted members: authorize the pair,
+/// ack both `OK`, then splice each side's next bi-stream through the edge via
+/// [`crate::relay::relay_initiator_to_acceptor`] — preserving the direct-path stream
+/// roles (initiator opens, acceptor accepts the edge-opened stream) so the agents'
+/// `run_channel_session` runs unchanged. The tunnel flows through the edge as
+/// ciphertext. This is the behaviour-preserving pair-completion tail of
+/// [`broker_channel_relay`], split from admission so a concurrent loop can `spawn` it
+/// per pair — the mechanical prerequisite for taking the splice off the accept loop's
+/// single global slot (#109-concurrent).
+async fn finish_relay_pair(
+    mut a: AdmittedMember,
+    mut b: AdmittedMember,
+    now: UnixSeconds,
+) -> Result<ChannelPairing, BoxError> {
+    match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
+        Ok(pairing) => {
+            a.send.write_all(b"OK").await?;
+            b.send.write_all(b"OK").await?;
+            a.send.finish()?;
+            b.send.finish()?;
+            let (init_conn, acc_conn) = if pairing.initiator_holder == a.req.grant.grant.holder {
+                (&a.conn, &b.conn)
+            } else {
+                (&b.conn, &a.conn)
+            };
+            crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay").await?;
+            Ok(pairing)
+        }
+        Err(e) => {
+            let _ = a.send.write_all(b"NO").await;
+            let _ = b.send.write_all(b"NO").await;
+            let _ = a.send.finish();
+            let _ = b.send.finish();
+            Err(format!("channel relay pair refused: {e}").into())
+        }
+    }
+}
+
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
 /// channel-joins for the same channel, pair them via [`authorize_channel_pair`],
 /// and reply to each side with the *peer's* advertised endpoint (`OK <endpoint>`)
@@ -465,54 +588,12 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    let (conn_a, mut send_a, req_a, operator, noise_a, attest_a) =
-        accept_and_read_join(endpoint, now, &authorize).await?;
-    let (conn_b, mut send_b, req_b, _op_b, noise_b, attest_b) =
-        accept_and_read_join(endpoint, now, &authorize).await?;
-
-    // Both holders are authorized members with verified grants; pair using channel
-    // A's operator key (authorize_channel_pair rejects a cross-channel pair).
-    match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
-        Ok(pairing) => {
-            // Each agent learns the OTHER's advertised endpoint to dial directly, plus
-            // (when registered) the peer's attested Noise key + attestation to VERIFY
-            // and pin — so an A2A session forms with no operator-conveyed key and a
-            // DB-substituted key is rejected (#72 AF4 / #100 / #101). The peer holder
-            // is taken from the peer's verified grant.
-            send_a
-                .write_all(
-                    format!(
-                        "OK {}{}",
-                        req_b.endpoint,
-                        member_ack_suffix(noise_b, &req_b.grant.grant.holder, attest_b)
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            send_b
-                .write_all(
-                    format!(
-                        "OK {}{}",
-                        req_a.endpoint,
-                        member_ack_suffix(noise_a, &req_a.grant.grant.holder, attest_a)
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            send_a.finish()?;
-            send_b.finish()?;
-            conn_a.closed().await;
-            conn_b.closed().await;
-            Ok(pairing)
-        }
-        Err(e) => {
-            let _ = send_a.write_all(b"NO").await;
-            let _ = send_b.write_all(b"NO").await;
-            let _ = send_a.finish();
-            let _ = send_b.finish();
-            Err(format!("channel pair refused: {e}").into())
-        }
-    }
+    // Admit two members, then complete the pairing. Splitting admission from
+    // completion is the seam a `ChannelPairer`-driven concurrent loop will drive
+    // (park lone arrivals, spawn the finisher once two same-channel holders meet).
+    let a = accept_member(endpoint, now, &authorize).await?;
+    let b = accept_member(endpoint, now, &authorize).await?;
+    finish_rendezvous_pair(a, b, now).await
 }
 
 /// Relay-mode admission for two channel members that can't reach each other on the
@@ -533,37 +614,12 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    let (conn_a, mut send_a, req_a, operator, _na, _aa) =
-        accept_and_read_join(endpoint, now, &authorize).await?;
-    let (conn_b, mut send_b, req_b, _op_b, _nb, _ab) =
-        accept_and_read_join(endpoint, now, &authorize).await?;
-
-    match authorize_channel_pair(&operator, &req_a.grant, &req_b.grant, now) {
-        Ok(pairing) => {
-            // Ack both, then splice the tunnel — no endpoints are exchanged, the edge
-            // carries the ciphertext. Preserve the direct-path stream roles so the
-            // agents' `run_channel_session` works unchanged: the initiator opens its
-            // data stream, the acceptor accepts one the edge opens.
-            send_a.write_all(b"OK").await?;
-            send_b.write_all(b"OK").await?;
-            send_a.finish()?;
-            send_b.finish()?;
-            let (init_conn, acc_conn) = if pairing.initiator_holder == req_a.grant.grant.holder {
-                (&conn_a, &conn_b)
-            } else {
-                (&conn_b, &conn_a)
-            };
-            crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay").await?;
-            Ok(pairing)
-        }
-        Err(e) => {
-            let _ = send_a.write_all(b"NO").await;
-            let _ = send_b.write_all(b"NO").await;
-            let _ = send_a.finish();
-            let _ = send_b.finish();
-            Err(format!("channel relay pair refused: {e}").into())
-        }
-    }
+    // Admit two members, then complete the relay. The splice lives in
+    // `finish_relay_pair` so a concurrent loop can take it off the accept loop's
+    // single global slot (the #109 failure mode #1) in the follow sub-packet.
+    let a = accept_member(endpoint, now, &authorize).await?;
+    let b = accept_member(endpoint, now, &authorize).await?;
+    finish_relay_pair(a, b, now).await
 }
 
 #[cfg(test)]
@@ -1128,6 +1184,66 @@ mod tests {
         assert!(ack_b.contains("203.0.113.1:7001"), "agent B learns A's endpoint, got {ack_b:?}");
         // The initiator is the Initiate-holder, the acceptor the Accept-holder.
         assert_eq!(paired, (ia, ib), "roles follow the grants' directions");
+    }
+
+    #[tokio::test]
+    async fn finish_rendezvous_pair_completes_two_separately_admitted_members() {
+        // #109-concurrent finish-pair (frozen): admission is now separable from
+        // pair-completion. Admit two members with `accept_member`, THEN hand them to
+        // `finish_rendezvous_pair` directly — the exact seam a `ChannelPairer`-driven
+        // loop uses (`offer` -> `Paired(a, b)` -> spawn the finisher). The completion
+        // must match the monolithic broker: each side learns the OTHER's endpoint and
+        // roles follow the grants — proving the extraction is behaviour-preserving.
+        let pk = operator_pubkey();
+        let channel = [0xD5u8; 32];
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            let authorize =
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+            let a = accept_member(&server, 500, &authorize).await.expect("admit a");
+            let b = accept_member(&server, 500, &authorize).await.expect("admit b");
+            finish_rendezvous_pair(a, b, 500)
+                .await
+                .map(|p| (p.initiator_holder[0], p.acceptor_holder[0]))
+                .map_err(|e| e.to_string())
+        });
+
+        let holder_a = holder_sk(0xa1);
+        let holder_b = holder_sk(0xb2);
+        let ia = holder_a.verifying_key().to_bytes()[0];
+        let ib = holder_b.verifying_key().to_bytes()[0];
+        let req_a = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.1:7051".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
+            endpoint: "203.0.113.2:7052".to_string(),
+        };
+        let cert_b = cert.clone();
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_a.encode(), &holder_a).await;
+            conn.close(0u32.into(), b"done");
+            String::from_utf8(ack).unwrap_or_default()
+        });
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_b.encode(), &holder_b).await;
+            conn.close(0u32.into(), b"done");
+            String::from_utf8(ack).unwrap_or_default()
+        });
+
+        let ack_a = a.await.expect("a");
+        let ack_b = b.await.expect("b");
+        let paired = server_task.await.expect("join").expect("paired");
+
+        assert!(ack_a.contains("203.0.113.2:7052"), "A learns B's endpoint via the finisher, got {ack_a:?}");
+        assert!(ack_b.contains("203.0.113.1:7051"), "B learns A's endpoint via the finisher, got {ack_b:?}");
+        assert_eq!(paired, (ia, ib), "the finisher decides roles from the grants, same as the monolithic broker");
     }
 
     #[tokio::test]
