@@ -11,6 +11,7 @@
 use ct_common::channel::ChannelJoinRequest;
 use ed25519_dalek::{Signer, SigningKey};
 use quinn::Connection;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -51,7 +52,27 @@ pub async fn present_channel_join(
     request: &ChannelJoinRequest,
     holder: &SigningKey,
 ) -> Result<ChannelJoinOutcome, BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let (send, recv) = conn.open_bi().await?;
+    present_channel_join_on_stream(send, recv, request, holder).await
+}
+
+/// The transport-agnostic core of [`present_channel_join`]: run the channel-join wire
+/// protocol over an already-open bidirectional stream (#106 client-dial). The QUIC
+/// client reaches this via [`present_channel_join`] (a `quinn` bi-stream), but the
+/// identical protocol — length-framed request, possession challenge/response, `OK`/`NO`
+/// ack — runs over *any* duplex, so a TLS-over-TCP `:443` front-door stream (the
+/// fallback when the channel UDP/TCP ports are blocked) speaks it unchanged. `send`/
+/// `recv` are the write/read halves; the send half is closed after the possession step.
+pub async fn present_channel_join_on_stream<W, R>(
+    mut send: W,
+    mut recv: R,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+) -> Result<ChannelJoinOutcome, BoxError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let bytes = request.encode();
     let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
     send.write_all(&len.to_be_bytes()).await?;
@@ -64,11 +85,15 @@ pub async fn present_channel_join(
         let sig = holder.sign(&challenge).to_bytes();
         send.write_all(&sig).await?;
     }
-    send.finish()?;
+    // Close the write half (EOF to the edge) — the QUIC `finish()` equivalent over a
+    // generic stream. Lenient: on a refusal the edge may already have closed.
+    let _ = send.shutdown().await;
 
     // The ack can carry endpoint + noise(64) + holder(64) + attestation(128) hex plus
-    // separators — well over 256 bytes; allow room so the attestation isn't truncated.
-    let ack = recv.read_to_end(512).await.unwrap_or_default();
+    // separators — well over 256 bytes; cap at 512 so the attestation isn't truncated
+    // (the `take` bound is the generic-stream equivalent of quinn `read_to_end(512)`).
+    let mut ack = Vec::new();
+    let _ = recv.take(512).read_to_end(&mut ack).await;
     let ack = String::from_utf8_lossy(&ack);
     match ack.strip_prefix("OK") {
         // `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]]` — the broker
@@ -140,6 +165,57 @@ mod tests {
         };
         let signature = operator().sign(&g.signing_bytes()).to_bytes();
         SignedChannelGrant { grant: g, signature }
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_on_stream_speaks_the_protocol_over_a_plain_duplex() {
+        // #106 client-dial (frozen): the channel-join wire protocol is transport-agnostic
+        // — it runs over a plain in-memory duplex (the stand-in for a TLS-over-TCP :443
+        // front-door stream) identically to the QUIC path. A minimal test "edge" reads
+        // the framed request, issues a possession challenge, verifies the client's
+        // signature under the grant holder, then acks OK + a peer endpoint; the client
+        // returns Admitted with it.
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x3Cu8; 32];
+        let holder = SigningKey::from_bytes(&[0x21u8; 32]);
+        let holder_pub = holder.verifying_key().to_bytes();
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.7:7007".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            // send = write half, recv = read half — no quinn anywhere.
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder).await
+        });
+
+        // Minimal "edge": read the framed request, challenge, verify possession, ack OK.
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let n = u16::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; n];
+        er.read_exact(&mut body).await.expect("request");
+        let challenge = [0x9u8; 32];
+        ew.write_all(&challenge).await.expect("challenge");
+        let mut sig = [0u8; 64];
+        er.read_exact(&mut sig).await.expect("sig");
+        VerifyingKey::from_bytes(&holder_pub)
+            .unwrap()
+            .verify(&challenge, &Signature::from_bytes(&sig))
+            .expect("the client proved possession of the holder key over the duplex");
+        ew.write_all(b"OK 198.51.100.9:8008").await.expect("ack");
+        let _ = ew.shutdown().await;
+
+        match client.await.expect("client task").expect("join") {
+            ChannelJoinOutcome::Admitted { peer_endpoint, .. } => assert_eq!(
+                peer_endpoint, "198.51.100.9:8008",
+                "the client learns the peer endpoint over a non-QUIC stream",
+            ),
+            ChannelJoinOutcome::Refused => panic!("a valid join over the duplex must be Admitted, not Refused"),
+        }
     }
 
     #[tokio::test]

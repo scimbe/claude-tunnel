@@ -2788,11 +2788,21 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
       closure), so the walk is unit-testable without sockets. Frozen test
       `dial_ladder_falls_through_to_the_front_door_then_errors_when_all_blocked` (fall-through, first-success
       short-circuit, all-blocked→error). Gate green, 0 warnings.
-    - **#106-client-dial-443** ⏳ next: a `tcp_tls_connect_channel` (agent `transport.rs`) that TLS-TCP-connects
-      the `:443` front door advertising ALPN `ct-edge-channel` (parameterize the existing `ct-edge` dialer), and
-      make `run_channel_join_command` drive the broker/relay via `dial_ladder` with the real QUIC-direct dial and
-      this `:443` dial. Gated on the client channel-join protocol working over a non-quinn stream (mirror of the
-      edge's `read_channel_join_on_stream`) — the client analog of the edge generalization, its own slice.
+    - **#106-client-join-generic** ✅ **Transport-agnostic client join protocol**
+      (`ct_agent::channel::present_channel_join_on_stream`): extracted the channel-join wire protocol (framed
+      request, possession challenge/response, `OK`/`NO` ack) out of `present_channel_join` to run over any
+      `AsyncWrite + AsyncRead` duplex, not just a `quinn` bi-stream — the client mirror of the edge's
+      `read_channel_join_on_stream`. `present_channel_join(&conn, …)` is now the thin QUIC wrapper (`open_bi` →
+      delegate), signature unchanged so all callers are unaffected. Frozen test drives the full protocol over an
+      in-memory `tokio::io::duplex` against a minimal test "edge" (framed request → challenge → possession
+      verify → `OK <endpoint>`), asserting the client returns `Admitted` with the peer endpoint over a non-QUIC
+      stream. Gate green, 0 warnings.
+    - **#106-client-dial-443** ⏳ next (now unblocked): a `tcp_tls_connect_channel` (agent `transport.rs`) that
+      TLS-TCP-connects the `:443` front door advertising ALPN `ct-edge-channel` (parameterize the existing
+      `ct-edge` dialer), then make `run_channel_join_command` drive the broker/relay via `dial_ladder` — direct
+      QUIC (`present_channel_join`) first, then the `:443` stream (`present_channel_join_on_stream`) on a blocked
+      direct rung. All three primitives now exist (`dial_ladder`, the `:443` dialer, the generic join); this
+      slice wires them.
   - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
     - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
       extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the
