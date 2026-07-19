@@ -2596,10 +2596,17 @@ call. **Direction chosen by scimbe (2026-07-19): CLI self-service subcommand** �
     `operator_issues_a_grant_the_edge_verifies_and_the_member_cli_accepts` closes the loop: the issued grant
     **verifies under the operator public key** exactly as the edge's admission gate does, and the **member CLI
     (`from_lookup`) accepts** it alongside the member's self-generated keys. Gate green, 0 warnings.
-  - **#117-operator-register** ⏳ next: the CP interaction — an operator subcommand that `POST /channel/register`s
-    the operator public key (via the account OIDC token) so the edge's `ChannelAuthorizer` knows the channel's
-    authority, plus a `ct-agent channel grant` subcommand wrapping `issue_member_grant` (env/args in, grant hex
-    out) + cross-user invitations. With these, central's `agent-alpha`/`agent-beta` self-provision end-to-end.
+  - **#117-operator-cli** ✅ **Operator CLI: `channel operator-init` + `channel grant`** (`main.rs` +
+    `OperatorIdentity::operator_env_block` + `OperatorGrantRequest`): `ct-agent channel operator-init` mints the
+    operator key locally and prints its `eval`-safe env block (`CT_CHANNEL_OPERATOR_KEY` + the operator pubkey to
+    register); `ct-agent channel grant` reads the operator key + `CT_GRANT_*` (channel id, member holder pubkey,
+    direction, expiry) and prints the `CT_CHANNEL_GRANT` hex the member uses. Frozen test
+    `operator_grant_request_parses_env_and_issues_a_verifiable_grant` (env → params, issued grant verifies under
+    the operator key + binds the member, required-field enforcement). Gate green, 0 warnings.
+  - **#117-operator-register** ⏳ next: the CP interaction — `POST /channel/register` the operator public key via
+    the account OIDC token so the edge's `ChannelAuthorizer` knows the channel's authority, + cross-user
+    invitations. That closes end-to-end self-provisioning for central's `agent-alpha`/`agent-beta` (all the
+    local crypto/CLI now exists; only the register round-trip remains).
 - **#117-docs** ⏳: a short onboarding doc walking two accounts through create→invite→join over `:443` (ties to
   the #106 front-door path + the #100 one-liner).
 

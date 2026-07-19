@@ -444,6 +444,80 @@ impl OperatorIdentity {
         let signature = self.key.sign(&g.signing_bytes()).to_bytes();
         hex_encode(&SignedChannelGrant { grant: g, signature }.encode())
     }
+
+    /// A copy-pasteable, `eval`-safe shell block for `ct-agent channel operator-init`
+    /// (#117): the operator private key as the `export` the `channel grant` command
+    /// reads, plus the operator public key as a comment (the channel authority to
+    /// register with the control plane). Generated locally; the private key never leaves.
+    pub fn operator_env_block(&self) -> String {
+        format!(
+            "# Agent-Fabric channel OPERATOR identity — generated locally, keep the key secret.\n\
+             # Register this PUBLIC key as the channel authority (POST /channel/register):\n\
+             #   operator_pubkey = {op_pub}\n\
+             export CT_CHANNEL_OPERATOR_KEY={op_priv}\n",
+            op_pub = self.pubkey_hex(),
+            op_priv = self.key_hex(),
+        )
+    }
+}
+
+/// Inputs for `ct-agent channel grant` (#117-operator-flow): an operator signs one
+/// member's grant from the environment, parsed like [`ChannelJoinCliConfig::from_lookup`].
+/// `CT_CHANNEL_OPERATOR_KEY` is the operator's own key (from `channel operator-init`);
+/// `CT_GRANT_*` describe the member being admitted (their `channel init`
+/// `holder_pubkey`, the channel id, the direction, and an expiry).
+pub struct OperatorGrantRequest {
+    pub operator: SigningKey,
+    pub channel: ct_common::channel::ChannelId,
+    pub member_holder: [u8; 32],
+    pub direction: ct_common::channel::Direction,
+    pub expires_at: ct_common::channel::UnixSeconds,
+}
+
+impl OperatorGrantRequest {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let operator = SigningKey::from_bytes(
+            &f("CT_CHANNEL_OPERATOR_KEY")
+                .as_deref()
+                .and_then(hex32)
+                .ok_or("CT_CHANNEL_OPERATOR_KEY required (64 hex; from `channel operator-init`)")?,
+        );
+        let channel = ct_common::channel::ChannelId(
+            f("CT_GRANT_CHANNEL")
+                .as_deref()
+                .and_then(hex32)
+                .ok_or("CT_GRANT_CHANNEL required (64 hex channel id)")?,
+        );
+        let member_holder = f("CT_GRANT_MEMBER_HOLDER")
+            .as_deref()
+            .and_then(hex32)
+            .ok_or("CT_GRANT_MEMBER_HOLDER required (64 hex member holder pubkey)")?;
+        let direction = match f("CT_GRANT_DIRECTION").as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(ref d) if d == "initiate" || d == "initiator" => ct_common::channel::Direction::Initiate,
+            Some(ref d) if d == "accept" || d == "responder" => ct_common::channel::Direction::Accept,
+            other => return Err(format!("CT_GRANT_DIRECTION must be initiate|accept, got {other:?}")),
+        };
+        let expires_at = f("CT_GRANT_EXPIRES")
+            .ok_or("CT_GRANT_EXPIRES required (unix seconds)")?
+            .trim()
+            .parse()
+            .map_err(|e| format!("CT_GRANT_EXPIRES invalid: {e}"))?;
+        Ok(Self { operator, channel, member_holder, direction, expires_at })
+    }
+
+    /// The signed grant hex the member sets as `CT_CHANNEL_GRANT`.
+    pub fn issue(&self) -> String {
+        OperatorIdentity { key: self.operator.clone() }.issue_member_grant(
+            self.channel,
+            self.member_holder,
+            self.direction,
+            self.expires_at,
+        )
+    }
 }
 
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
@@ -886,6 +960,58 @@ mod tests {
         // Operator key hex round-trips to 64-hex private + public.
         assert_eq!(op.key_hex().len(), 64);
         assert_eq!(op.pubkey_hex().len(), 64);
+    }
+
+    #[test]
+    fn operator_grant_request_parses_env_and_issues_a_verifiable_grant() {
+        // #117-operator-flow (frozen): `ct-agent channel grant` parses the operator key +
+        // CT_GRANT_* from env and issues a grant that verifies under the operator key and
+        // binds the intended member/channel/direction. Required fields are enforced.
+        use ct_common::channel::{ChannelId, Direction, SignedChannelGrant};
+
+        let op = OperatorIdentity::generate();
+        let member = ChannelIdentity::generate();
+        let member_holder = member.holder.verifying_key().to_bytes();
+        let channel = [0x77u8; 32];
+
+        let base: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_OPERATOR_KEY", op.key_hex()),
+            ("CT_GRANT_CHANNEL", hex_encode(&channel)),
+            ("CT_GRANT_MEMBER_HOLDER", hex_encode(&member_holder)),
+            ("CT_GRANT_DIRECTION", "accept".into()),
+            ("CT_GRANT_EXPIRES", "1000".into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            OperatorGrantRequest::from_lookup(move |k| m.get(k).cloned())
+        };
+
+        let req = lookup(&base).expect("valid operator grant request parses");
+        assert_eq!(req.channel, ChannelId(channel));
+        assert_eq!(req.member_holder, member_holder);
+        assert_eq!(req.direction, Direction::Accept);
+
+        // The issued grant verifies under the operator key and binds the member.
+        let signed = SignedChannelGrant::decode(&hex_bytes(&req.issue()).expect("hex")).expect("decode");
+        assert!(
+            ct_common::channel::verify(&op.key.verifying_key().to_bytes(), &signed, 500).is_ok(),
+            "the issued grant verifies under the operator key"
+        );
+        assert_eq!(signed.grant.holder, member_holder);
+        assert_eq!(signed.grant.channel, ChannelId(channel));
+        assert_eq!(signed.grant.direction, Direction::Accept);
+
+        // Each required field is enforced.
+        for drop_key in [
+            "CT_CHANNEL_OPERATOR_KEY",
+            "CT_GRANT_CHANNEL",
+            "CT_GRANT_MEMBER_HOLDER",
+            "CT_GRANT_DIRECTION",
+            "CT_GRANT_EXPIRES",
+        ] {
+            let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
+            assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
+        }
     }
 
     #[tokio::test]

@@ -50,6 +50,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             print!("{}", ct_agent::channel_run::ChannelIdentity::generate().env_block());
             return Ok(());
         }
+        // #117 `ct-agent channel operator-init`: mint a channel OPERATOR key locally and
+        // print its env block (the operator authorizes a channel + signs member grants).
+        if std::env::args().nth(2).as_deref() == Some("operator-init") {
+            print!("{}", ct_agent::channel_run::OperatorIdentity::generate().operator_env_block());
+            return Ok(());
+        }
+        // #117 `ct-agent channel grant`: as the operator, sign a member's grant (from
+        // CT_CHANNEL_OPERATOR_KEY + CT_GRANT_*) and print the CT_CHANNEL_GRANT hex the
+        // member uses — self-service admission, no central provisioning.
+        if std::env::args().nth(2).as_deref() == Some("grant") {
+            let req = ct_agent::channel_run::OperatorGrantRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            println!("{}", req.issue());
+            return Ok(());
+        }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
         // the grant, learn the peer via the broker (keys relayed), connect
         // direct-then-relay. Otherwise the direct-address path (CT_CHANNEL_ADDR).
