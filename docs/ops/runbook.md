@@ -22,7 +22,9 @@ overlays below for the public-facing planes.
 
 **Optional `:443` front door** (`compose.frontdoor.yml`, #60) — publishes one
 `:443` that serves the **Portal landing page**, **Browser-Plane subdomains**
-(`help.<zone>`), and the tunnel data-plane relay, all SNI/ALPN-multiplexed, plus a
+(`help.<zone>`), the tunnel data-plane relay, and the **Agent-Fabric channel
+fallback** (ALPN `ct-edge-channel`) for members whose network blocks the
+`:4435`/`:4436` channel ports (#106), all SNI/ALPN-multiplexed, plus a
 redirect-only `:80` that 308-bounces plain `http://<zone>/` to `https` (#66). Point
 the Portal hostname's DNS at the edge, get a BYO cert for it (LE via deSEC DNS-01),
 then set these in `.env`:
