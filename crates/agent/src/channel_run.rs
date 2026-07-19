@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use ct_common::channel::ChannelJoinRequest;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
@@ -387,6 +387,62 @@ impl ChannelIdentity {
             holder_priv = self.holder_key_hex(),
             noise_priv = self.noise_key_hex(),
         )
+    }
+}
+
+/// A channel **operator's** signing identity (#117-operator-flow): the ed25519 key that
+/// *authorizes* a channel — its public key is the channel's authority (registered with
+/// the control plane so the edge can verify member grants), and it signs every member's
+/// grant. Generated locally, like a member's [`ChannelIdentity`]; the operator private
+/// key never leaves the operator's machine (provider-blind — the server sees only the
+/// public key). This lets an account create channels and admit members with no manual
+/// crypto provisioning by central.
+pub struct OperatorIdentity {
+    /// The operator ed25519 keypair (its private half signs member grants).
+    pub key: SigningKey,
+}
+
+impl OperatorIdentity {
+    /// Mint a fresh operator key from the OS CSPRNG.
+    pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        Self { key: SigningKey::from_bytes(&seed) }
+    }
+
+    /// The 64-hex operator **private** key (`CT_CHANNEL_OPERATOR_KEY`). SECRET.
+    pub fn key_hex(&self) -> String {
+        hex_encode(&self.key.to_bytes())
+    }
+    /// The 64-hex operator **public** key — the channel's authority, registered with the
+    /// control plane so the edge verifies member grants against it.
+    pub fn pubkey_hex(&self) -> String {
+        hex_encode(self.key.verifying_key().as_bytes())
+    }
+
+    /// Issue a member grant: sign a `ChannelGrant` binding `holder_pubkey` (the member's
+    /// `channel init` holder public key) to `channel` with `direction`/`expires_at`, and
+    /// return the hex the member sets as `CT_CHANNEL_GRANT`. Pure crypto — the operator
+    /// runs this locally after the member hands over their holder public key; no server
+    /// round-trip and no private key ever leaves either machine.
+    pub fn issue_member_grant(
+        &self,
+        channel: ct_common::channel::ChannelId,
+        holder_pubkey: [u8; 32],
+        direction: ct_common::channel::Direction,
+        expires_at: ct_common::channel::UnixSeconds,
+    ) -> String {
+        use ct_common::channel::{ChannelGrant, Rights, SignedChannelGrant};
+        let g = ChannelGrant {
+            channel,
+            holder: holder_pubkey,
+            direction,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at,
+        };
+        let signature = self.key.sign(&g.signing_bytes()).to_bytes();
+        hex_encode(&SignedChannelGrant { grant: g, signature }.encode())
     }
 }
 
@@ -782,6 +838,54 @@ mod tests {
                 "every line is a comment or an export, got {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn operator_issues_a_grant_the_edge_verifies_and_the_member_cli_accepts() {
+        // #117-operator-flow (frozen): the create-side crypto. An operator mints a key
+        // locally and signs a member's grant over the member's `channel init` holder
+        // public key; the edge verifies that grant under the operator's PUBLIC key, and
+        // the member CLI accepts it alongside the member's self-generated keys — closing
+        // the self-service loop (operator issues -> member joins) with no central step.
+        use ct_common::channel::{ChannelId, Direction, SignedChannelGrant};
+
+        let op = OperatorIdentity::generate();
+        let member = ChannelIdentity::generate();
+        let channel = ChannelId([0x5Eu8; 32]);
+        let holder_pub = member.holder.verifying_key().to_bytes();
+
+        let grant_hex = op.issue_member_grant(channel, holder_pub, Direction::Initiate, 1_000);
+
+        // The issued grant decodes + verifies under the operator public key, exactly as
+        // the edge's admission gate does, and binds the member's holder + channel.
+        let signed = SignedChannelGrant::decode(&hex_bytes(&grant_hex).expect("grant hex")).expect("decode");
+        let op_pub = op.key.verifying_key().to_bytes();
+        assert!(
+            ct_common::channel::verify(&op_pub, &signed, 500).is_ok(),
+            "the edge verifies the operator-issued grant under the operator key"
+        );
+        assert_eq!(signed.grant.holder, holder_pub, "grant binds the member's holder pubkey");
+        assert_eq!(signed.grant.channel, channel, "grant is for the intended channel");
+
+        // End-to-end: the member CLI accepts the operator-issued grant + the member's own
+        // (`channel init`) keys — nothing hand-crafted, no central provisioning.
+        let pairs: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_ROLE", "initiate".into()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+            ("CT_CHANNEL_LISTEN", "203.0.113.5:7000".into()),
+            ("CT_CHANNEL_GRANT", grant_hex),
+            ("CT_CHANNEL_HOLDER_KEY", member.holder_key_hex()),
+            ("CT_CHANNEL_NOISE_KEY", member.noise_key_hex()),
+        ];
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let cfg = ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+            .expect("member CLI accepts the operator-issued grant + self-generated keys");
+        assert_eq!(cfg.grant.grant.holder, holder_pub, "the CLI's grant binds the member's holder");
+
+        // Operator key hex round-trips to 64-hex private + public.
+        assert_eq!(op.key_hex().len(), 64);
+        assert_eq!(op.pubkey_hex().len(), 64);
     }
 
     #[tokio::test]

@@ -2587,9 +2587,19 @@ call. **Direction chosen by scimbe (2026-07-19): CLI self-service subcommand** �
   the machine. Frozen test `channel_identity_env_block_exports_the_keys_the_cli_reads` (block exports both
   private-key env vars, surfaces both public keys, and is `eval`-safe — every line a comment or an `export`).
   Gate green, 0 warnings.
-- **#117-operator-flow** ⏳: the create-a-channel side — an operator subcommand that generates the operator key,
-  `POST /channel/register`s (via the account OIDC token), and issues member grants (signs over a member's
-  `holder_pubkey_hex`) + cross-user invitations — so two self-service participants can be wired without central.
+- **#117-operator-flow** — the create-a-channel side; decomposed:
+  - **#117-operator-grant** ✅ **Operator identity + grant issuance** (`ct_agent::channel_run::OperatorIdentity`):
+    `generate()` mints the operator ed25519 key locally (its public key is the channel's authority);
+    `issue_member_grant(channel, holder_pubkey, direction, expires_at)` signs a `ChannelGrant` binding the
+    member's `channel init` holder public key and returns the hex the member sets as `CT_CHANNEL_GRANT`. Pure
+    crypto — no server round-trip, no private key leaves either machine. Frozen test
+    `operator_issues_a_grant_the_edge_verifies_and_the_member_cli_accepts` closes the loop: the issued grant
+    **verifies under the operator public key** exactly as the edge's admission gate does, and the **member CLI
+    (`from_lookup`) accepts** it alongside the member's self-generated keys. Gate green, 0 warnings.
+  - **#117-operator-register** ⏳ next: the CP interaction — an operator subcommand that `POST /channel/register`s
+    the operator public key (via the account OIDC token) so the edge's `ChannelAuthorizer` knows the channel's
+    authority, plus a `ct-agent channel grant` subcommand wrapping `issue_member_grant` (env/args in, grant hex
+    out) + cross-user invitations. With these, central's `agent-alpha`/`agent-beta` self-provision end-to-end.
 - **#117-docs** ⏳: a short onboarding doc walking two accounts through create→invite→join over `:443` (ties to
   the #106 front-door path + the #100 one-liner).
 
