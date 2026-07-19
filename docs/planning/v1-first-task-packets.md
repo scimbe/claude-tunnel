@@ -3230,3 +3230,30 @@ slices:
 - **#121-symmetric-fallback (Phase B2) ⏳**: symmetric-NAT (`RelayOnly`, no consistent reflexive mapping) stays on
   the relay; this is the #104 upgrade **trigger** — promote to direct only when `reachability_class` allows.
 - **Phase C (superpeer election) / D (DHT) / E (fail-static) ⏳**: later, classify on the B1 `Reachability`.
+
+### Phase B2→E under the libp2p decision (2026-07-19, maintainer-approved)
+
+**Decision:** adopt **libp2p** as the connectivity substrate (DHT routing, DCUtR hole-punch, Circuit-Relay v2) — chosen over a home-grown Kademlia. **Consequence:** the home-grown B2 stubs above (`#121-punch-signal` / `-simultaneous-open`) are **superseded** — the hole-punch is libp2p **DCUtR**, Phase C relay is libp2p **Circuit-Relay v2**, Phase D discovery is libp2p **Kademlia**. `#121-symmetric-fallback` stays (it's the #104 upgrade trigger, transport-agnostic). B1's reflexive-observe + `Reachability` remain the AutoNAT input regardless.
+
+**Governing principle:** the central (bunsenbrenner.org) is a **replaceable coordinator + policy authority + bootstrap seed**, never in the data path; absence degrades **fail-static** (existing channels + last overlay keep running), never fail-closed.
+
+**Normative security invariants (validated 2026-07-19; must hold across all libp2p integration — libp2p is untrusted plumbing, our security lives above it):**
+1. **Authorization = operator-signed grant + #101 attestation, NEVER the libp2p PeerId.** A libp2p connection implies nothing about channel membership.
+2. **E2E confidentiality/integrity = our channel-attested `Noise_IK` running INSIDE the libp2p stream** (accept libp2p-Noise-outer + our-Noise_IK-inner as defense-in-depth; do NOT fuse the channel key into the libp2p handshake).
+3. **A superpeer relays ONLY channels it is a grant-member of** (metadata containment — it learns nothing beyond membership it already holds). Enforced as a membership gate on the Circuit-Relay path (the circuit carries the `ChannelId`; forward only after the requester's grant proves co-membership).
+4. **DHT coordinate records are holder-signed** → poisoning defeated for authenticity (residual: availability/eclipse, mitigated by central-as-bootstrap).
+5. **Punch targets are edge-observed reflexive addresses (B1 ✅), never self-reported** → no punch redirection / SSRF.
+6. **Grants signed by the operator key held locally (#117), never on the central** → central compromise = DoS/metadata only, not impersonation.
+7. **Revocation latency = membership-staple TTL** (fail-static trade; operator-tunable). Proposed default: **1h staple / 15m gossip refresh** — pending maintainer confirmation.
+
+Residual risks are all **availability or metadata (none break confidentiality/integrity)**: metadata to in-channel superpeers (bounded by #3), availability under DHT eclipse/Sybil (bounded by central bootstrap + operator-designated superpeer eligibility), revocation latency (bounded by #7). Supply-chain note: libp2p enlarges the security-relevant dependency surface (its Noise/Kademlia/relay stack) — invariants #1–#2 keep our security above it, but the threat model must name this.
+
+**Bounded libp2p integration packets (decomposed; sequenced):**
+- **B2-libp2p-seam ⏳ (first slice, gated on: confirm pulling the libp2p dependency):** add the libp2p dep behind a feature flag + a minimal swarm; run our channel `Noise_IK` session over a libp2p **in-memory** transport stream. Frozen test: the two members form the Noise tunnel over a libp2p stream (invariant #2 — auth is still our grant, not the PeerId, invariant #1). No network, no DHT yet.
+- **B2-dcutr ⏳:** libp2p DCUtR hole-punch toward the B1 edge-observed reflexive address; symmetric-NAT → relay (the #104 trigger).
+- **C-circuit-relay ⏳:** libp2p Circuit-Relay v2 as the peer-run superpeer relay + **the invariant-#3 membership gate**.
+- **C-superpeer-election ⏳:** self-organizing election with operator policy/veto (maintainer-chosen trust boundary), classifying on B1 `Reachability`.
+- **D-kademlia ⏳:** libp2p Kademlia discovery `ChannelId → coordinates`, **holder-signed records** (invariant #4), central-as-bootstrap.
+- **E-fail-static ⏳:** soft-state cached signed intent + gossiped membership staples (invariant #7 TTL); existing channels survive a central outage.
+
+Full architecture belongs in an ADR (*"Decentralized NAT-aware overlay: replaceable coordinator, peer-run superpeer relays, fail-static control plane"*) — to be written on maintainer go (repo rule: no new doc files unprompted). Open confirmations before B2-libp2p-seam lands: (a) pull the libp2p dependency now? (b) staleness TTL (default above).
