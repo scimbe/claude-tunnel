@@ -520,6 +520,64 @@ impl OperatorGrantRequest {
     }
 }
 
+/// Inputs for `ct-agent channel register` (#117-operator-register): register the
+/// operator's channel authority with the control plane (`POST /me/channels`) so the edge
+/// accepts the member grants the operator signs — the last CP round-trip for an
+/// end-to-end self-service Agent-Fabric channel. Parsed from the environment like
+/// [`OperatorGrantRequest::from_lookup`], reusing the onboarding/operator vars:
+/// the control-plane URL (`CT_AGENT_CP_URL`, as onboarding uses), the channel id
+/// (`CT_GRANT_CHANNEL`), the OIDC bearer token (`CT_OIDC_TOKEN`), and the operator public
+/// key — derived from `CT_CHANNEL_OPERATOR_KEY` (the operator's own private key from
+/// `channel operator-init`) or supplied directly as `CT_CHANNEL_OPERATOR_PUBKEY`.
+pub struct ChannelRegisterRequest {
+    /// Control-plane base URL (`POST {cp_url}/me/channels`).
+    pub cp_url: String,
+    /// The channel id, canonical 64-hex.
+    pub channel_hex: String,
+    /// The operator ed25519 public key, canonical 64-hex — the channel's authority.
+    pub operator_pubkey_hex: String,
+    /// The OIDC bearer token identifying the owner (the verified subject).
+    pub token: String,
+}
+
+impl ChannelRegisterRequest {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let cp_url = f("CT_AGENT_CP_URL")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
+        let channel_hex = hex_encode(
+            &f("CT_GRANT_CHANNEL")
+                .as_deref()
+                .and_then(hex32)
+                .ok_or("CT_GRANT_CHANNEL required (64 hex channel id)")?,
+        );
+        // The channel authority: derive from the operator's own private key
+        // (CT_CHANNEL_OPERATOR_KEY, from `channel operator-init`), or take the public key
+        // directly (CT_CHANNEL_OPERATOR_PUBKEY) when only the pubkey is at hand.
+        let operator_pubkey_hex = if let Some(pk) =
+            f("CT_CHANNEL_OPERATOR_PUBKEY").as_deref().and_then(hex32)
+        {
+            hex_encode(&pk)
+        } else if let Some(sk) = f("CT_CHANNEL_OPERATOR_KEY").as_deref().and_then(hex32) {
+            OperatorIdentity { key: SigningKey::from_bytes(&sk) }.pubkey_hex()
+        } else {
+            return Err(
+                "CT_CHANNEL_OPERATOR_KEY (64 hex operator private, from `channel operator-init`) \
+                 or CT_CHANNEL_OPERATOR_PUBKEY (64 hex) required"
+                    .to_string(),
+            );
+        };
+        let token = f("CT_OIDC_TOKEN")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("CT_OIDC_TOKEN required (OIDC bearer token for the channel owner)")?;
+        Ok(Self { cp_url, channel_hex, operator_pubkey_hex, token })
+    }
+}
+
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
 /// rendezvous + relay, present the grant, and pipe **stdin/stdout** over the A2A tunnel
 /// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
@@ -1009,6 +1067,55 @@ mod tests {
             "CT_GRANT_DIRECTION",
             "CT_GRANT_EXPIRES",
         ] {
+            let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
+            assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
+        }
+    }
+
+    #[test]
+    fn channel_register_request_parses_env_and_derives_the_operator_pubkey() {
+        // #117-operator-register (frozen): `ct-agent channel register` parses the CP URL,
+        // channel id, OIDC token, and the operator authority from env — deriving the
+        // operator PUBLIC key from CT_CHANNEL_OPERATOR_KEY (never sending the private key),
+        // canonicalizing the channel hex, and enforcing the required fields.
+        let op = OperatorIdentity::generate();
+        let channel = [0x91u8; 32];
+
+        let base: Vec<(&str, String)> = vec![
+            ("CT_AGENT_CP_URL", "http://cp:8090".into()),
+            ("CT_GRANT_CHANNEL", hex_encode(&channel)),
+            ("CT_CHANNEL_OPERATOR_KEY", op.key_hex()),
+            ("CT_OIDC_TOKEN", "the-bearer-token".into()),
+        ];
+        let lookup = |pairs: &[(&str, String)]| {
+            let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            ChannelRegisterRequest::from_lookup(move |k| m.get(k).cloned())
+        };
+
+        let req = lookup(&base).expect("valid register request parses");
+        assert_eq!(req.cp_url, "http://cp:8090");
+        assert_eq!(req.channel_hex, hex_encode(&channel), "channel id round-trips as canonical hex");
+        assert_eq!(req.token, "the-bearer-token");
+        // The operator PRIVATE key is never surfaced — only its derived public key is sent.
+        assert_eq!(req.operator_pubkey_hex, op.pubkey_hex(), "derives the operator public key");
+        assert_ne!(req.operator_pubkey_hex, op.key_hex(), "the private key is not sent to the CP");
+
+        // The public key may also be supplied directly (CT_CHANNEL_OPERATOR_PUBKEY),
+        // without the private key present.
+        let pubkey_only: Vec<(&str, String)> = vec![
+            ("CT_AGENT_CP_URL", "http://cp:8090".into()),
+            ("CT_GRANT_CHANNEL", hex_encode(&channel)),
+            ("CT_CHANNEL_OPERATOR_PUBKEY", op.pubkey_hex()),
+            ("CT_OIDC_TOKEN", "tok".into()),
+        ];
+        assert_eq!(
+            lookup(&pubkey_only).expect("pubkey-only parses").operator_pubkey_hex,
+            op.pubkey_hex(),
+            "an operator pubkey supplied directly is accepted"
+        );
+
+        // Each required field is enforced (the operator key OR pubkey must be present).
+        for drop_key in ["CT_AGENT_CP_URL", "CT_GRANT_CHANNEL", "CT_CHANNEL_OPERATOR_KEY", "CT_OIDC_TOKEN"] {
             let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
             assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
         }

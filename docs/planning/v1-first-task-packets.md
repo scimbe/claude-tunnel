@@ -2603,10 +2603,18 @@ call. **Direction chosen by scimbe (2026-07-19): CLI self-service subcommand** �
     direction, expiry) and prints the `CT_CHANNEL_GRANT` hex the member uses. Frozen test
     `operator_grant_request_parses_env_and_issues_a_verifiable_grant` (env → params, issued grant verifies under
     the operator key + binds the member, required-field enforcement). Gate green, 0 warnings.
-  - **#117-operator-register** ⏳ next: the CP interaction — `POST /channel/register` the operator public key via
-    the account OIDC token so the edge's `ChannelAuthorizer` knows the channel's authority, + cross-user
-    invitations. That closes end-to-end self-provisioning for central's `agent-alpha`/`agent-beta` (all the
-    local crypto/CLI now exists; only the register round-trip remains).
+  - **#117-operator-register** ✅ **Register the channel authority with the CP** (`ControlPlaneClient::register_channel`
+    + `ct-agent channel register` + `ChannelRegisterRequest`): `register_channel(channel_hex, operator_pubkey_hex,
+    bearer_token)` does `POST /me/channels {channel, operator_pubkey}` with `Authorization: Bearer <token>` (owner =
+    the OIDC subject), so the edge's channel-authorize lookup knows the channel's authority. `ct-agent channel register`
+    reads `CT_AGENT_CP_URL` (as onboarding), `CT_GRANT_CHANNEL`, `CT_OIDC_TOKEN`, and the operator authority — deriving
+    the operator **public** key from `CT_CHANNEL_OPERATOR_KEY` (private never sent) or taking `CT_CHANNEL_OPERATOR_PUBKEY`
+    directly. Frozen tests: `channel_register_request_parses_env_and_derives_the_operator_pubkey` (env → params, pubkey
+    derivation, required-field enforcement) + `client_registers_a_channel_against_the_authed_service` (client-over-HTTP
+    round-trip against the real `authed_channel_router` with a minted OIDC bearer: 200 registers + store resolves the
+    operator key; non-owner re-key → 403; missing token → 401). Gate green, 0 warnings. The full self-service flow now
+    works end-to-end (operator-init → register → members init → operator grant → members join). ⏳ remaining:
+    cross-user invitations (deferred) + live verification by @central.
 - **#117-docs** ⏳: a short onboarding doc walking two accounts through create→invite→join over `:443` (ties to
   the #106 front-door path + the #100 one-liner).
 

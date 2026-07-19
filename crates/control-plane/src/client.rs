@@ -212,6 +212,34 @@ impl ControlPlaneClient {
         let body: TokenBody = resp.json().await?;
         Ok(RoutingToken(hex_decode_32(&body.token).ok_or(CpError::Malformed)?))
     }
+
+    /// `POST /me/channels` — register a channel authority (#117 operator-register).
+    /// Binds `channel_hex` (64-hex channel id) to `operator_pubkey_hex` (64-hex operator
+    /// ed25519 public key) under the caller's OIDC subject (owner = the bearer token's
+    /// subject), so the edge accepts the member grants that operator later signs — the
+    /// last control-plane round-trip for an end-to-end self-service Agent-Fabric channel.
+    /// Presents the OIDC token as `Authorization: Bearer`; the channel router is
+    /// owner-scoped, so a [`CpError::Status`] (403) means the channel already belongs to a
+    /// different subject, and (401) means the token was missing/invalid.
+    pub async fn register_channel(
+        &self,
+        channel_hex: &str,
+        operator_pubkey_hex: &str,
+        bearer_token: &str,
+    ) -> CpResult<()> {
+        let resp = self
+            .http
+            .post(format!("{}/me/channels", self.base))
+            .header("authorization", format!("Bearer {bearer_token}"))
+            .json(&serde_json::json!({
+                "channel": channel_hex,
+                "operator_pubkey": operator_pubkey_hex,
+            }))
+            .send()
+            .await?;
+        ok(resp)?;
+        Ok(())
+    }
 }
 
 /// Map a non-success status to [`CpError::Status`].
@@ -393,5 +421,69 @@ mod tests {
         // Confirming the same payment again is rejected (idempotent, 409).
         let replay = cp.confirm_payment(&payment).await;
         assert!(matches!(replay, Err(CpError::Status(_))), "confirmation is single-use");
+    }
+
+    /// #117-operator-register (frozen): the full client-over-HTTP round-trip against the
+    /// real authenticated channel router. `ControlPlaneClient::register_channel` with a
+    /// valid OIDC bearer registers the operator's channel authority (owner = the token
+    /// subject), and the durable store then resolves that operator key — the last CP
+    /// round-trip that makes an Agent-Fabric channel end-to-end self-service. An owner
+    /// mismatch (a second subject re-keying) surfaces as a Status(403), and a missing
+    /// token as a Status(401).
+    #[tokio::test]
+    async fn client_registers_a_channel_against_the_authed_service() {
+        use crate::oidc::OidcVerifier;
+        use crate::service::authed_channel_router;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::ChannelId;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let probe = channels.clone();
+        let app = authed_channel_router(channels, verifier);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+
+        let cp = ControlPlaneClient::new(format!("http://{addr}"));
+        let channel_hex = "a1".repeat(32);
+        let operator_hex = "b2".repeat(32);
+        let chan = ChannelId(hex_decode_32(&channel_hex).unwrap());
+
+        // Alice registers her channel authority via the client → 200, and the store
+        // resolves the operator key she bound (drives the edge's grant verification).
+        cp.register_channel(&channel_hex, &operator_hex, &jwt_for("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            probe.operator_pubkey(&chan).unwrap(),
+            Some(hex_decode_32(&operator_hex).unwrap()),
+            "the registered operator authority round-trips through the store"
+        );
+
+        // A different subject cannot re-key alice's channel → the client surfaces 403.
+        let mallory = cp
+            .register_channel(&channel_hex, &"ff".repeat(32), &jwt_for("mallory"))
+            .await;
+        assert!(matches!(mallory, Err(CpError::Status(_))), "non-owner re-key is a Status error (403)");
+        assert_eq!(
+            probe.operator_pubkey(&chan).unwrap(),
+            Some(hex_decode_32(&operator_hex).unwrap()),
+            "the refused re-key left the operator key unchanged"
+        );
+
+        // A missing/invalid bearer token → the client surfaces a Status error (401).
+        let no_auth = cp.register_channel(&channel_hex, &operator_hex, "").await;
+        assert!(matches!(no_auth, Err(CpError::Status(_))), "a missing token is a Status error (401)");
     }
 }

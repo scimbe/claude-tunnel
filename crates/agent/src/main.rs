@@ -65,6 +65,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{}", req.issue());
             return Ok(());
         }
+        // #117 `ct-agent channel register`: register the operator's channel authority with
+        // the control plane (POST /me/channels, owner = the OIDC subject) so the edge
+        // accepts the grants that operator signs — the last CP round-trip that makes an
+        // Agent-Fabric channel fully self-service. Reads CT_AGENT_CP_URL + CT_GRANT_CHANNEL
+        // + CT_OIDC_TOKEN + the operator key (CT_CHANNEL_OPERATOR_KEY / _PUBKEY).
+        if std::env::args().nth(2).as_deref() == Some("register") {
+            let req = ct_agent::channel_run::ChannelRegisterRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            ct_control_plane::client::ControlPlaneClient::new(req.cp_url.clone())
+                .register_channel(&req.channel_hex, &req.operator_pubkey_hex, &req.token)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            eprintln!("registered channel {} with the control plane", req.channel_hex);
+            return Ok(());
+        }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
         // the grant, learn the peer via the broker (keys relayed), connect
         // direct-then-relay. Otherwise the direct-address path (CT_CHANNEL_ADDR).
