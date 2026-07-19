@@ -2532,9 +2532,18 @@ hot-path pair landed first:
   reconnect sites), keeping `Backoff` pure + deterministically testable. Frozen test
   `jitter_within_half_to_full_delay_and_still_gives_up` (endpoints `d/2`/`d`, in-range across the growth,
   `≤ max`, unchanged give-up). Gate green, 0 warnings.
-- **#114-dialer-reuse** ⏳ (finding #4, **confirm first**): `build_channel_dialer` reportedly rebuilds a rustls
-  `ClientConfig` + binds a new UDP `Endpoint` per dial (≈3× per plane-brokered join, more per #106 ladder rung);
-  a single quinn `Endpoint` can `connect()` to many peers — build once + reuse. Verify against source before scoping.
+- **#114-dialer-reuse** ✅ (finding #4, config half) — **confirmed against source**: `build_channel_dialer`
+  rebuilt a rustls `ClientConfig` + cert verifier + QUIC crypto **and** bound a new UDP `Endpoint` on every
+  dial (broker, relay, each #106 ladder rung). Landed the **safe** half: the runtime-independent client config
+  is now cached in a `OnceLock` and cloned per call (built once, not per dial). The UDP socket is still bound
+  per call **by necessity** — a quinn `Endpoint`'s driver is tied to its creating tokio runtime, so a
+  process-wide shared `Endpoint` would break across runtimes (e.g. the per-test runtimes). Frozen test
+  `build_channel_dialer_reuses_config_but_binds_its_own_socket` asserts both calls build working, distinctly
+  bound endpoints. Gate green, 0 warnings.
+  - **#114-endpoint-reuse** ⏳ (optional follow): reuse ONE `Endpoint` *within a join flow* — build it once in
+    `run_channel_join_command` and thread it through the broker/relay/direct dials (`dial_peer_direct`,
+    `present_channel_join_via_ladder`). Localized (same runtime), so safe; saves the 2-3 extra socket binds per
+    join. Minor; the config rebuild (the allocation-heavy part) is already gone.
 - **#114-hex32** ✅ (finding #5, LOW): `hex32` now writes a static nibble table directly into the pre-sized
   `String` — **byte-identical** output to the old `format!("{:02x}")` loop (signing preimage unchanged, so all
   existing grant/invite signatures still verify), removing the ~64 throwaway `format!` allocs per call. Called

@@ -7,7 +7,7 @@
 //! actual TCP fallback transport (P1.2c) and reconnect-on-drop (P1.2b) follow.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use std::path::Path;
@@ -97,15 +97,30 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
 /// initiator can dial a paired peer without a pre-shared cert. Authentication is the
 /// Noise_IK session run over the connection, not the QUIC cert.
 pub fn build_channel_dialer() -> Result<Endpoint, BoxError> {
-    install_crypto_provider();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
-        .with_no_client_auth();
-    let cfg = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    ));
+    // #114 #4: cache the runtime-independent rustls/QUIC client config so it is built
+    // ONCE, not rebuilt (rustls builder + cert verifier + QUIC crypto) on every channel
+    // dial (broker, relay, and each direct-peer / ladder rung). The UDP socket is still
+    // bound per call: a quinn `Endpoint`'s driver is tied to its creating tokio runtime,
+    // so it cannot be safely memoized process-wide (that would break across runtimes);
+    // reusing one `Endpoint` per join flow is a separate, localized follow.
+    static CLIENT_CONFIG: OnceLock<quinn::ClientConfig> = OnceLock::new();
+    let cfg = match CLIENT_CONFIG.get() {
+        Some(c) => c.clone(),
+        None => {
+            install_crypto_provider();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let crypto = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_no_client_auth();
+            let cfg = quinn::ClientConfig::new(Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+            ));
+            // A concurrent racer may win the set(); either config is equivalent.
+            let _ = CLIENT_CONFIG.set(cfg.clone());
+            cfg
+        }
+    };
     let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
@@ -432,6 +447,20 @@ mod tests {
     #[test]
     fn prefers_quic_when_udp_reachable() {
         assert_eq!(select_transport(true), Transport::Quic);
+    }
+
+    #[tokio::test]
+    async fn build_channel_dialer_reuses_config_but_binds_its_own_socket() {
+        // #114 #4 (frozen): the client config is now built once and reused across dials,
+        // but each dialer still binds its OWN UDP socket (a quinn Endpoint's driver is
+        // tied to its creating runtime, so it can't be shared process-wide). Both calls
+        // must yield working, independently-bound client endpoints.
+        let a = build_channel_dialer().expect("first dialer builds");
+        let b = build_channel_dialer().expect("second dialer builds (config cache hit)");
+        let la = a.local_addr().expect("a is bound");
+        let lb = b.local_addr().expect("b is bound");
+        assert_ne!(la, lb, "each dialer binds its own socket (endpoints are not shared)");
+        assert!(la.port() != 0 && lb.port() != 0, "both endpoints are bound to a real port");
     }
 
     #[tokio::test]
