@@ -2505,6 +2505,35 @@ for one cycle — decomposed so the pure correlator (the substrate for all three
     pairer and run a periodic `drain_expired(now)`, closing timed-out lone waiters with a clean `NO` (**completes #3**:
     the 2nd-accept has no timeout today). Apply the same pairer-driven loop to rendezvous.
 
+## #114 Efficiency: per-frame heap allocs on the Noise bulk data path + backoff jitter (report, priority:high)
+
+Efficiency review of the hot data path. Five ranked findings; the two HIGH ones are symmetric per-frame
+framing allocations on `noise_pump` (the bulk tunnel path). Decomposed; the drop-in, wire-preserving
+hot-path pair landed first:
+
+- **#114-framing** ✅ **Zero-alloc framing on the `noise_pump` bulk path** (`ct_common::noise`): findings #1+#2.
+  Outbound no longer calls `frame()` (which heap-allocated a fresh `Vec` and copied the whole ≤16 KB ciphertext
+  just to prepend a 2-byte length) — the 2-byte length prefix is reserved at the front of the reused `ct`
+  buffer, `write_message` encrypts in place after it, and the frame ships as one `ct[..2+len]` slice (no
+  per-frame alloc, no second copy; wire bytes byte-identical to `frame()`). Inbound no longer calls
+  `read_frame` (fresh `Vec` per frame) — a new `read_frame_into(recv, &mut buf)` reads into one buffer hoisted
+  for the whole inbound loop (`resize` reuses capacity), returning the body length; `read_frame` stays as a
+  thin fresh-`Vec` wrapper for the low-rate handshake paths (client/a2a/transport unchanged). Net: two heap
+  allocs + up to two ~16 KB copies removed per 16 KB per direction. Frozen test
+  `read_frame_into_reuses_one_buffer_across_varied_frames` (large→small→mid, byte-identical bodies via the
+  reused buffer + clean EOF); the existing `noise_pump_streams_bidirectionally` freezes the end-to-end wire
+  behaviour across the outbound in-place change. Gate green, 0 warnings. (Profiler-confirm before treating the
+  pump as the bottleneck — but drop-in and directly serves the max-bandwidth goal, so low-risk to land now.)
+- **#114-backoff-jitter** ⏳ next (finding #3, cheap robustness win, independent of throughput): multiply the
+  reconnect backoff (`ct_agent::reconnect`) by a random `0.5..=1.5` factor so a shared-edge outage doesn't
+  trigger a synchronized retry storm across the fleet.
+- **#114-dialer-reuse** ⏳ (finding #4, **confirm first**): `build_channel_dialer` reportedly rebuilds a rustls
+  `ClientConfig` + binds a new UDP `Endpoint` per dial (≈3× per plane-brokered join, more per #106 ladder rung);
+  a single quinn `Endpoint` can `connect()` to many peers — build once + reuse. Verify against source before scoping.
+- **#114-hex32** ⏳ (finding #5, LOW): `hex32`/`signing_bytes` do ~66 small `format!` allocs per grant/invite
+  verify (admission gate); replace with a static hex lookup table into the pre-sized `String`. Drop-in (no
+  preimage change).
+
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
 Gutachten: Tabelle 7.1 „80,8 ± 91,9 ms" impliziert negative Latenz (symmetrisches Normal-KI auf

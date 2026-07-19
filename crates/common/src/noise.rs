@@ -117,15 +117,31 @@ pub fn take_frame(buf: &[u8]) -> Option<(&[u8], usize)> {
     Some((&buf[2..2 + n], 2 + n))
 }
 
-/// Read exactly one length-prefixed frame (2-byte big-endian length + body) from
-/// an async byte source. Returns an error (typically `UnexpectedEof`) when the
-/// source closes between frames.
-pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Vec<u8>> {
+/// Read exactly one length-prefixed frame (2-byte big-endian length + body) into a
+/// **reusable** buffer, returning the body length `n` (the body is `buf[..n]`). `buf`
+/// is resized to the frame body, so its capacity is retained across calls and the
+/// bulk inbound path allocates no per-frame `Vec` (#114). Returns an error (typically
+/// `UnexpectedEof`) when the source closes between frames.
+pub async fn read_frame_into<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    buf: &mut Vec<u8>,
+) -> io::Result<usize> {
     let mut len = [0u8; 2];
     recv.read_exact(&mut len).await?;
     let n = u16::from_be_bytes(len) as usize;
-    let mut body = vec![0u8; n];
-    recv.read_exact(&mut body).await?;
+    buf.resize(n, 0);
+    recv.read_exact(&mut buf[..n]).await?;
+    Ok(n)
+}
+
+/// Read exactly one length-prefixed frame (2-byte big-endian length + body) from
+/// an async byte source, returning a freshly-allocated body. Convenience wrapper over
+/// [`read_frame_into`] for the low-rate handshake paths; the bulk data path in
+/// [`noise_pump`] uses `read_frame_into` with a hoisted buffer instead. Returns an
+/// error (typically `UnexpectedEof`) when the source closes between frames.
+pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    read_frame_into(recv, &mut body).await?;
     Ok(body)
 }
 
@@ -157,15 +173,24 @@ where
     // plaintext -> encrypt -> ciphertext frames
     let outbound = async {
         let mut buf = vec![0u8; CHUNK];
-        let mut ct = vec![0u8; CHUNK + 256];
+        // Reserve the 2-byte length prefix at the FRONT of `ct`, so `write_message`
+        // encrypts in place after it and the frame is sent as one `ct[..2+len]` slice
+        // — no per-frame `Vec` alloc and no full-ciphertext copy on the bulk path
+        // (#114 #1). The wire bytes are byte-identical to `frame(&ct[..len])`.
+        let mut ct = vec![0u8; 2 + CHUNK + 256];
         loop {
             let n = p_read.read(&mut buf).await?;
             if n == 0 {
                 let _ = c_write.shutdown().await;
                 return Ok::<(), io::Error>(());
             }
-            let len = ts.lock().unwrap().write_message(&buf[..n], &mut ct).map_err(noise_err)?;
-            c_write.write_all(&frame(&ct[..len])).await?;
+            let len = ts
+                .lock()
+                .unwrap()
+                .write_message(&buf[..n], &mut ct[2..])
+                .map_err(noise_err)?;
+            ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+            c_write.write_all(&ct[..2 + len]).await?;
             c_write.flush().await?;
         }
     };
@@ -173,15 +198,18 @@ where
     // ciphertext frames -> decrypt -> plaintext
     let inbound = async {
         let mut pt = vec![0u8; CHUNK + 256];
+        // One reusable ciphertext-frame buffer for the whole inbound loop, so no
+        // per-frame `Vec` is allocated on the bulk path (#114 #2).
+        let mut fr = Vec::with_capacity(CHUNK + 256);
         loop {
-            let fr = match read_frame(&mut c_read).await {
-                Ok(f) => f,
+            let n = match read_frame_into(&mut c_read, &mut fr).await {
+                Ok(n) => n,
                 Err(_) => {
                     let _ = p_write.shutdown().await;
                     return Ok::<(), io::Error>(());
                 }
             };
-            let len = ts.lock().unwrap().read_message(&fr, &mut pt).map_err(noise_err)?;
+            let len = ts.lock().unwrap().read_message(&fr[..n], &mut pt).map_err(noise_err)?;
             p_write.write_all(&pt[..len]).await?;
             p_write.flush().await?;
         }
@@ -385,6 +413,39 @@ mod tests {
         assert_eq!(m1, b"a");
         let (m2, _c2) = take_frame(&buf[c1..]).unwrap();
         assert_eq!(m2, b"bb");
+    }
+
+    #[tokio::test]
+    async fn read_frame_into_reuses_one_buffer_across_varied_frames() {
+        // #114 #2 (frozen): the bulk inbound path reads each frame into ONE reused
+        // buffer via `read_frame_into` instead of allocating a fresh Vec per frame. It
+        // must return exactly the framed bodies across a large -> small -> mid size
+        // sequence (so the reused buffer both grows and shrinks), byte-for-byte
+        // identical to what `frame()` wrote, and signal EOF cleanly after the last
+        // frame. `&[u8]` is an `AsyncRead`, so it stands in for the ciphertext stream.
+        let big = vec![0xABu8; 4096];
+        let small = vec![0xCDu8; 3];
+        let mid = vec![0xEFu8; 1500];
+        let mut wire = Vec::new();
+        for m in [&big, &small, &mid] {
+            wire.extend_from_slice(&frame(m));
+        }
+
+        let mut src: &[u8] = &wire;
+        let mut buf = Vec::with_capacity(16);
+        for want in [&big, &small, &mid] {
+            let n = read_frame_into(&mut src, &mut buf).await.expect("frame present");
+            assert_eq!(n, want.len(), "reports the body length");
+            assert_eq!(&buf[..n], &want[..], "body matches frame() input via the reused buffer");
+        }
+        assert!(
+            read_frame_into(&mut src, &mut buf).await.is_err(),
+            "drained source -> EOF, the clean between-frames close signal"
+        );
+
+        // The fresh-Vec wrapper `read_frame` still yields identical bodies (handshake path).
+        let mut src2: &[u8] = &wire;
+        assert_eq!(read_frame(&mut src2).await.unwrap(), big, "read_frame wrapper unchanged");
     }
 
     #[test]
