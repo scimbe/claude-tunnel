@@ -245,10 +245,23 @@ impl SignedChannelGrant {
     }
 }
 
+/// The reserved advertised endpoint of a **relay-only** member (#121): a NAT-only host
+/// with no globally-routable address that participates purely via the edge relay (plus the
+/// #106 `:443` fallback) instead of a direct dial. A member sets `endpoint` to this literal
+/// instead of a `host:port` to declare it is not dialable. It is deliberately **not** a
+/// parseable [`std::net::SocketAddr`], so [`ChannelJoinRequest::is_relay_only`] is
+/// unambiguous and it can never collide with a real endpoint: the edge admits it as an
+/// explicit non-dialable marker *without* weakening its private/loopback endpoint filter
+/// (#94), and a peer that is paired with such a member skips the wasted direct dial and
+/// goes straight to the relay.
+pub const CHANNEL_ENDPOINT_RELAY_ONLY: &str = "relay-only";
+
 /// What an agent presents to the edge to join/operate a channel: its signed
 /// [`ChannelGrant`] plus the direct endpoint it advertises for the peer to reach it
-/// (host:port — the edge brokers the two advertised endpoints, ADR-0015). The
-/// channel and holder are inside the grant, so they are not repeated here.
+/// (host:port — the edge brokers the two advertised endpoints, ADR-0015), or the
+/// [`CHANNEL_ENDPOINT_RELAY_ONLY`] sentinel for a member that can only be reached via
+/// the relay (#121). The channel and holder are inside the grant, so they are not
+/// repeated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelJoinRequest {
     pub grant: SignedChannelGrant,
@@ -256,6 +269,12 @@ pub struct ChannelJoinRequest {
 }
 
 impl ChannelJoinRequest {
+    /// Whether this join advertises the [`CHANNEL_ENDPOINT_RELAY_ONLY`] sentinel (#121)
+    /// rather than a dialable address — a NAT-only member that participates via relay only.
+    pub fn is_relay_only(&self) -> bool {
+        self.endpoint == CHANNEL_ENDPOINT_RELAY_ONLY
+    }
+
     /// Wire form: the fixed-length grant, then the advertised endpoint as the tail
     /// (`grant(WIRE_LEN) | endpoint(utf8, rest)`). No length prefix is needed — the
     /// grant is fixed-size, so the endpoint is unambiguously the remainder.
@@ -828,6 +847,27 @@ mod tests {
         let mut bad_utf8 = signed.encode();
         bad_utf8.extend_from_slice(&[0xff, 0xfe]);
         assert_eq!(ChannelJoinRequest::decode(&bad_utf8), Err(GrantError::Malformed));
+    }
+
+    #[test]
+    fn relay_only_sentinel_is_recognized_and_is_not_a_socket_addr() {
+        // #121 (frozen): the reserved relay-only sentinel is recognized by `is_relay_only`
+        // and is deliberately NOT parseable as a SocketAddr, so it cannot collide with a real
+        // advertised endpoint — the edge admits it as an explicit non-dialable marker, not as
+        // an address, and `safe_endpoint` (which parses addresses) never sees it as one.
+        let (_pk, signed) = signed_grant(Direction::Accept, Rights::ReadWrite, false, 1_000);
+        let relay_only =
+            ChannelJoinRequest { grant: signed.clone(), endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string() };
+        assert!(relay_only.is_relay_only(), "the sentinel endpoint is recognized as relay-only");
+        assert!(
+            CHANNEL_ENDPOINT_RELAY_ONLY.parse::<std::net::SocketAddr>().is_err(),
+            "the sentinel is not a socket address, so it can't collide with a real endpoint"
+        );
+        // A real advertised endpoint is not relay-only.
+        let direct = ChannelJoinRequest { grant: signed, endpoint: "203.0.113.7:7001".to_string() };
+        assert!(!direct.is_relay_only());
+        // The sentinel round-trips through the join-request wire form (a normal non-empty tail).
+        assert_eq!(ChannelJoinRequest::decode(&relay_only.encode()), Ok(relay_only));
     }
 
     #[test]

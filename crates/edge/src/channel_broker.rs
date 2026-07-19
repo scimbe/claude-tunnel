@@ -226,6 +226,18 @@ fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
     Some(addr)
 }
 
+/// Admission predicate for a join's advertised endpoint (#121): admit the explicit
+/// `relay-only` sentinel (`CHANNEL_ENDPOINT_RELAY_ONLY`; a NAT-only member that participates via the
+/// relay only) **or** a safe, globally-routable address ([`safe_endpoint`]). A private /
+/// loopback / internal address is STILL refused exactly as #94 requires — the sentinel is a
+/// reserved non-address, so a member cannot smuggle a LAN SSRF target through it, and
+/// [`safe_endpoint`] itself is left untouched. So a member either advertises a global-unicast
+/// address it can be dialed at, or the sentinel (not an address at all): there is no third
+/// case a hostile holder can exploit.
+fn admissible_endpoint(req: &ChannelJoinRequest) -> bool {
+    req.is_relay_only() || safe_endpoint(&req.endpoint).is_some()
+}
+
 /// Accept one QUIC connection and read + verify a presented [`ChannelJoinRequest`],
 /// but do NOT ack yet — the caller owns the reply, because a single admission acks
 /// `OK` immediately while the two-party broker must defer until it knows the pairing.
@@ -325,8 +337,11 @@ where
             return Err("malformed channel join request".into());
         }
     };
-    // #81 gap 3: the advertised endpoint must be a safe, dialable socket address.
-    if safe_endpoint(&req.endpoint).is_none() {
+    // #81 gap 3 / #121: the advertised endpoint must be a safe, dialable socket address —
+    // OR the explicit relay-only sentinel for a NAT-only member that joins via relay only.
+    // A private/loopback address is still refused (the sentinel is not an address, so it
+    // can't smuggle a LAN SSRF target; `safe_endpoint` is untouched).
+    if !admissible_endpoint(&req) {
         let _ = send.write_all(b"NO").await;
         let _ = send.shutdown().await;
         return Err("unsafe advertised endpoint".into());
@@ -1023,6 +1038,31 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].payload, "Y-init");
         assert_eq!(pairer.len(), 1, "Z-v2 (deadline 200) is not yet expired at 150");
+    }
+
+    #[test]
+    fn admission_accepts_the_relay_only_sentinel_but_still_refuses_private_addresses() {
+        // #121 (frozen): a NAT-only member advertises the relay-only sentinel and is admitted
+        // WITHOUT weakening `safe_endpoint` — a private / loopback / internal address is still
+        // refused exactly as #94 requires. The sentinel is a reserved non-address, so a hostile
+        // holder can't smuggle a LAN SSRF target through it: it's the sentinel or a real
+        // global-unicast address, nothing in between.
+        use ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY;
+        let mk = |ep: &str| ChannelJoinRequest {
+            grant: grant([1u8; 32], 0xaa, Direction::Initiate, 1_000),
+            endpoint: ep.to_string(),
+        };
+        // The explicit sentinel is admitted...
+        assert!(admissible_endpoint(&mk(CHANNEL_ENDPOINT_RELAY_ONLY)), "the relay-only sentinel is admitted");
+        // ...and is not itself a parseable address, so it can't collide with a real endpoint
+        // and `safe_endpoint` (unchanged) never treats it as one.
+        assert!(safe_endpoint(CHANNEL_ENDPOINT_RELAY_ONLY).is_none(), "the sentinel is not a safe_endpoint address");
+        // Every private / loopback / internal address is STILL refused (safe_endpoint intact).
+        for bad in ["10.0.0.5:22", "127.0.0.1:22", "192.168.1.1:22", "169.254.169.254:80", "[fc00::1]:22"] {
+            assert!(!admissible_endpoint(&mk(bad)), "{bad} is still refused — the sentinel didn't weaken #94");
+        }
+        // A real global-unicast address still passes on its own merits.
+        assert!(admissible_endpoint(&mk("203.0.113.10:7001")), "a public address is still admitted");
     }
 
     #[test]

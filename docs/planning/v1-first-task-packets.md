@@ -3154,3 +3154,51 @@ with **no prior art** and **no dependency on those open questions** lands first:
   generalizes past two-connection (#107-nway) — the live-mesh e2e. **#107-ui** ⏳ **(design-gated)**: greenfield
   node-graph editor — awaiting the framework-vs-vanilla call. **#107-testing** ⏳: unit/API (done for the pure
   layers) + a real N-agent formation smoke once the mesh is live.
+
+## #121 NAT-only members can't join — no address satisfies both `safe_endpoint` and a bindable listener (report)
+
+After #106 landed, a `:443`-only Accept/sink member still can't join: `channel_run.rs` bound a **direct
+listener** at `CT_CHANNEL_LISTEN` and advertised that same value to the broker, but the broker's `safe_endpoint`
+(#94) rejects every private/loopback/CGNAT/link-local range. A NAT-only host has no address that is both
+bindable locally **and** a global-unicast address the broker will accept → `EADDRNOTAVAIL`. The edge relay
+already splices two non-dialable members (proven in #118); only the production **client** lacked a relay-only
+mode. The reporter offered three options: (1) an explicit relay-only sentinel, (2) skip the listener when
+relay-only, (3) relax `safe_endpoint`. **Decision: 1+2 hybrid, explicitly NOT 3** — `safe_endpoint` stays
+intact (a member can't smuggle a LAN SSRF target), and a NAT-only member advertises a reserved non-address
+sentinel + skips its listener.
+
+**Phase A — reachability floor (relay-only member mode) ✅** landed this cycle. Frozen e2e
+`two_relay_only_members_join_without_a_dialable_address_and_relay_splice` (in ct-agent): TWO relay-only members
+— both advertising the sentinel, both with `listener == None` — join and are relay-spliced by the **production**
+edge relay path (`broker_channel_relay`), and a real payload round-trips **both** directions with Noise staying
+end-to-end. What Phase A is:
+
+- **ct-common** `pub const CHANNEL_ENDPOINT_RELAY_ONLY = "relay-only"` + `ChannelJoinRequest::is_relay_only()`:
+  one shared definition of the reserved non-dialable sentinel (a value `safe_endpoint` never parses as a
+  `SocketAddr`, so it can't collide with a real endpoint). Frozen
+  `relay_only_sentinel_is_recognized_and_is_not_a_socket_addr`.
+- **ct-edge** admission accepts the sentinel **without weakening `safe_endpoint`**: the endpoint guard becomes
+  `is_relay_only() || safe_endpoint(..).is_some()` (helper `admissible_endpoint`). A real `10.x`/`127.0.0.1`/
+  `192.168.x` is STILL refused. Frozen
+  `admission_accepts_the_relay_only_sentinel_but_still_refuses_private_addresses`; existing
+  `edge_refuses_an_unsafe_endpoint` still passes.
+- **ct-agent** relay-only mode: `CT_CHANNEL_RELAY_ONLY=1` forces it on, PLUS auto-detect when the advertised
+  `CT_CHANNEL_LISTEN` is not globally routable (pure helper `relay_only_mode(explicit, listen_addr)`, frozen
+  `relay_only_mode_forces_on_explicitly_and_auto_detects_a_non_routable_listen_addr`). A relay-only member skips
+  binding the direct listener (`listener == None`) and advertises the sentinel. In
+  `run_channel_join_with_admission`: an **initiator** paired with a sentinel peer_endpoint skips
+  `dial_peer_direct` and goes straight to the relay fallback; an **acceptor** with no listener does the same.
+  Net: a NAT-only member (source or sink) participates purely via relay + the #106 `:443` fallback (outbound-only).
+
+**Phase B — direct P2P across NAT (hole-punching; the #104 mechanism) ⏳ — decomposed, not built.** Sequenced
+after Phase A (a hole-punch needs a joined member + the relay as its symmetric-NAT fallback). This is the #104
+opportunistic relay→direct **upgrade** (start relayed per Phase A, upgrade when NAT type allows). Follow-on
+slices:
+
+- **#121-reflexive-observe** ⏳: the edge observes each member's **post-NAT reflexive** source `ip:port` (edge-
+  OBSERVED, NOT self-reported — so #94's SSRF concern differs, but still sanity-check the punch target).
+- **#121-punch-signal** ⏳: broker punch-coordination signalling — relay the peer's reflexive address + a
+  synchronized instant to both members.
+- **#121-simultaneous-open** ⏳: client simultaneous-open at the agreed instant.
+- **#121-symmetric-fallback** ⏳: symmetric-NAT (no consistent reflexive mapping) stays on the relay; this is the
+  #104 upgrade **trigger** — promote to direct only when the NAT type allows, else remain relayed.

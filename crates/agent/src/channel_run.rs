@@ -227,6 +227,12 @@ where
         ChannelJoinOutcome::Refused => return Err("edge broker refused the channel join".into()),
     };
     match role {
+        // #121: the paired peer advertised the relay-only sentinel — it has no dialable
+        // address, so skip the wasted direct dial + timeout and go straight to the relay.
+        ChannelRole::Initiate if peer_endpoint == ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY => {
+            eprintln!("ct-agent channel: peer is relay-only (no dialable address) — using the edge relay (#121)");
+            join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+        }
         ChannelRole::Initiate => {
             let addr = peer_endpoint
                 .parse()
@@ -242,9 +248,14 @@ where
                 Err(ChannelDialError::Failed(e)) => return Err(e),
             }
         }
-        ChannelRole::Accept => {
-            let ep = listener.ok_or("responder role requires a bound listener")?;
-            match tokio::time::timeout(accept_timeout, ep.accept()).await {
+        ChannelRole::Accept => match listener {
+            // #121: a relay-only acceptor has no bound listener — it can't be dialed, so it
+            // relays directly instead of waiting for a direct connection that can never come.
+            None => {
+                eprintln!("ct-agent channel: relay-only acceptor (no listener) — using the edge relay (#121)");
+                join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+            }
+            Some(ep) => match tokio::time::timeout(accept_timeout, ep.accept()).await {
                 Ok(Some(incoming)) => {
                     let conn = incoming.await?;
                     run_channel_session(&conn, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
@@ -254,8 +265,8 @@ where
                     eprintln!("ct-agent channel: no direct connection within {accept_timeout:?} — falling back to the edge relay (#72)");
                     join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
                 }
-            }
-        }
+            },
+        },
     }
     Ok(())
 }
@@ -449,6 +460,11 @@ pub struct ChannelJoinCliConfig {
     pub own_noise_private: [u8; 32],
     /// The host:port this member advertises for the direct path (`CT_CHANNEL_LISTEN`).
     pub listen_addr: SocketAddr,
+    /// Whether this member joins in **relay-only** mode (#121): forced by
+    /// `CT_CHANNEL_RELAY_ONLY`, or auto-detected when `listen_addr` is not globally routable
+    /// (a NAT-only host). A relay-only member skips binding the direct listener and advertises
+    /// the relay-only sentinel, participating purely via the edge relay + the `:443` fallback.
+    pub relay_only: bool,
     /// Optional unified `:443` front door (`CT_CHANNEL_FRONT_DOOR`, host:port) — the #106
     /// fallback for restrictive networks that block the channel broker/relay ports. When
     /// set, the dial ladder tries the direct broker/relay first, then this front door over
@@ -472,6 +488,43 @@ pub struct ChannelDialRung {
     /// door (TLS-TCP) advertising the `ct-edge-channel` ALPN, so a network that blocks the
     /// channel ports can still reach the broker/relay (#106, the #31/#46 pattern).
     pub via_front_door: bool,
+}
+
+/// Decide whether this member joins in **relay-only** mode (#121): `explicit` (the
+/// `CT_CHANNEL_RELAY_ONLY` flag) always forces it on; otherwise it auto-detects relay-only
+/// when `listen_addr` is not a globally-routable (global-unicast) address — a NAT-only /
+/// private-address-only host that the edge would refuse to advertise (#94) and that no peer
+/// could dial. A relay-only member skips binding the direct listener and advertises the
+/// [`ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY`] sentinel, participating purely via the
+/// edge relay + the #106 `:443` fallback (outbound-only). Pure — it decides from the address
+/// alone, so it is unit-testable without touching real network interfaces.
+pub fn relay_only_mode(explicit: bool, listen_addr: SocketAddr) -> bool {
+    explicit || !is_globally_routable(listen_addr.ip())
+}
+
+/// Whether `ip` is a globally-routable (global-unicast) address — the mirror of the edge's
+/// `safe_endpoint` range check (#94): loopback / unspecified / multicast, RFC1918 private,
+/// link-local (`169.254/16`, `fe80::/10`), CGNAT (`100.64/10`) and IPv6 unique-local
+/// (`fc00::/7`) are all NOT routable. A member with only such an address can't be dialed, so
+/// it defaults to relay-only.
+fn is_globally_routable(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_private() || v4.is_link_local() {
+                return false;
+            }
+            let o = v4.octets();
+            !(o[0] == 100 && (64..=127).contains(&o[1])) // reject CGNAT 100.64.0.0/10
+        }
+        IpAddr::V6(v6) => {
+            let s0 = v6.segments()[0];
+            (s0 & 0xfe00) != 0xfc00 && (s0 & 0xffc0) != 0xfe80 // reject fc00::/7 + fe80::/10
+        }
+    }
 }
 
 impl ChannelJoinCliConfig {
@@ -549,7 +602,17 @@ impl ChannelJoinCliConfig {
             )),
             _ => None,
         };
-        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, front_door, front_door_cert })
+        // #121: relay-only mode. `CT_CHANNEL_RELAY_ONLY` forces it on; otherwise it is
+        // auto-detected when the advertised listen address is not globally routable (a
+        // NAT-only host that can't be dialed and the edge would refuse to advertise, #94).
+        let relay_only_explicit = f("CT_CHANNEL_RELAY_ONLY")
+            .map(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
+        let relay_only = relay_only_mode(relay_only_explicit, listen_addr);
+        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, relay_only, front_door, front_door_cert })
     }
 }
 
@@ -818,9 +881,15 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     let broker_ladder = cfg.broker_ladder();
     let relay_ladder = cfg.relay_ladder();
     let front_door_cert = cfg.front_door_cert.clone();
+    // #121: a relay-only member advertises the sentinel instead of a dialable address — it
+    // can't be reached directly, so it participates purely via the relay + `:443` fallback.
     let request = ChannelJoinRequest {
         grant: cfg.grant,
-        endpoint: cfg.listen_addr.to_string(),
+        endpoint: if cfg.relay_only {
+            ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string()
+        } else {
+            cfg.listen_addr.to_string()
+        },
     };
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
     // the peer end-to-end). With a `:443` front-door cert configured, walk the broker
@@ -869,9 +938,13 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             RelayFallback::Quic(&relay_conn)
         }
     };
+    // #121: a relay-only member skips binding the direct listener even in the Accept role —
+    // it can't be dialed, so `run_channel_join_with_admission` relays it directly.
     let listener = match cfg.role {
-        ChannelRole::Accept => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
-        ChannelRole::Initiate => None,
+        ChannelRole::Accept if !cfg.relay_only => {
+            Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0)
+        }
+        _ => None,
     };
     eprintln!(
         "ct-agent channel: plane-brokered {:?} (relay {})",
@@ -2475,5 +2548,181 @@ mod tests {
 
         init_task.abort();
         resp_task.abort();
+    }
+
+    #[test]
+    fn relay_only_mode_forces_on_explicitly_and_auto_detects_a_non_routable_listen_addr() {
+        // #121 (frozen): the pure relay-only decision. The explicit CT_CHANNEL_RELAY_ONLY flag
+        // always forces relay-only (even with a routable address); otherwise a member
+        // auto-detects relay-only when its advertised listen address is not globally routable
+        // (a NAT-only / private-address-only host the edge would refuse to advertise, #94), and
+        // stays direct-capable only with a real global-unicast address. It decides from the
+        // address alone — no network interfaces touched — so it is deterministically testable.
+        assert!(
+            relay_only_mode(true, "203.0.113.10:7000".parse().unwrap()),
+            "the explicit flag forces relay-only even for a routable address"
+        );
+        // Auto-detect: private / loopback / unspecified / CGNAT / link-local / ULA => relay-only.
+        for private in [
+            "10.0.0.5:7000",
+            "192.168.1.9:7000",
+            "172.16.0.1:7000",
+            "127.0.0.1:7000",
+            "0.0.0.0:7000",
+            "100.64.0.1:7000",
+            "169.254.1.1:7000",
+            "[fc00::1]:7000",
+            "[fe80::1]:7000",
+        ] {
+            assert!(relay_only_mode(false, private.parse().unwrap()), "{private} auto-detects relay-only");
+        }
+        // A real global-unicast address stays direct-capable (not forced relay-only).
+        for routable in ["203.0.113.10:7000", "8.8.8.8:7000", "[2001:4860:4860::8888]:7000"] {
+            assert!(!relay_only_mode(false, routable.parse().unwrap()), "{routable} stays direct-capable");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_relay_only_members_join_without_a_dialable_address_and_relay_splice() {
+        // #121 (frozen): the reachability floor. TWO relay-only members — each advertising the
+        // relay-only SENTINEL (no dialable address), each with NO bound listener — join and are
+        // relay-spliced by the PRODUCTION edge relay path (`broker_channel_relay`). Presenting
+        // the sentinel to the real relay proves the edge admits it in production. The initiator's
+        // paired peer_endpoint is the sentinel, so `run_channel_join_with_admission` SKIPS the
+        // wasted direct dial and relays straight away; the acceptor has no listener, so it relays
+        // directly too. A real payload round-trips BOTH directions, the Noise_IK session staying
+        // end-to-end (the edge splices ciphertext only) — so a NAT-only member with only a
+        // private address participates purely via the relay + the #106 :443 fallback.
+        use ct_common::channel::{
+            member_noise_attest_bytes, ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant,
+            CHANNEL_ENDPOINT_RELAY_ONLY,
+        };
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::broker_channel_relay;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x21u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x22u8; 32]);
+        let channel = [0xE5u8; 32];
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        // BOTH members advertise the relay-only sentinel — neither has a dialable address.
+        let req_a = ChannelJoinRequest {
+            grant: signed(&holder_a, Direction::Initiate),
+            endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: signed(&holder_b, Direction::Accept),
+            endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+
+        // Each member's attested-key triple (#101): its holder signs its Noise key for the
+        // channel so the peer verifies + pins it with nothing conveyed out-of-band.
+        let ha_pub = holder_a.verifying_key().to_bytes();
+        let hb_pub = holder_b.verifying_key().to_bytes();
+        let a_att = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &ha_pub, &noise_a.public)).to_bytes();
+        let b_att = holder_b.sign(&member_noise_attest_bytes(&ChannelId(channel), &hb_pub, &noise_b.public)).to_bytes();
+
+        // The PRODUCTION edge relay: admits both sentinel-advertising members (proving the edge
+        // admits the relay-only sentinel over the real relay path), pairs, and splices them.
+        let (relay_ep, cert) = build_server_endpoint_with_cert().expect("relay ep");
+        let relay_addr = relay_ep.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
+                (c.0 == channel).then_some((op_pub, None, None))
+            })
+            .await
+            .map(|_| ())
+        });
+
+        // Member A (initiator): its paired peer_endpoint is the SENTINEL → skip the direct dial,
+        // relay straight away. The admission is constructed directly (a real rendezvous would
+        // swap the two sentinel endpoints); the relay leg is the production edge.
+        let cert_a = cert.clone();
+        let (mut a_app, a_local) = tokio::io::duplex(8192);
+        let (na, nbpub) = (noise_a.private, noise_b.public);
+        let a = tokio::spawn(async move {
+            let rc = build_client_endpoint(cert_a).expect("rc a");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn a");
+            let admission = ChannelJoinOutcome::Admitted {
+                peer_endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+                peer_noise_pubkey: Some(nbpub),
+                peer_holder: Some(hb_pub),
+                peer_attestation: Some(b_att),
+            };
+            run_channel_join_with_admission(
+                admission,
+                RelayFallback::Quic(&relay_conn),
+                &req_a,
+                &holder_a,
+                ChannelRole::Initiate,
+                &na,
+                None, // relay-only: no bound listener
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                a_local,
+            )
+            .await
+        });
+
+        // Member B (acceptor): NO bound listener (relay-only) → relay straight away.
+        let cert_b = cert.clone();
+        let (mut b_app, b_local) = tokio::io::duplex(8192);
+        let (nb, napub) = (noise_b.private, noise_a.public);
+        let b = tokio::spawn(async move {
+            let rc = build_client_endpoint(cert_b).expect("rc b");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
+            let admission = ChannelJoinOutcome::Admitted {
+                peer_endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+                peer_noise_pubkey: Some(napub),
+                peer_holder: Some(ha_pub),
+                peer_attestation: Some(a_att),
+            };
+            run_channel_join_with_admission(
+                admission,
+                RelayFallback::Quic(&relay_conn),
+                &req_b,
+                &holder_b,
+                ChannelRole::Accept,
+                &nb,
+                None, // relay-only: no bound listener
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                b_local,
+            )
+            .await
+        });
+
+        // A -> B over the relay-only, edge-spliced, encrypted A2A tunnel.
+        a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+        let mut got = [0u8; 11];
+        b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+        assert_eq!(&got, b"ping-A-to-B", "A's plaintext arrives decrypted at B via the relay (both relay-only)");
+
+        // B -> A (reverse proves the splice is full-duplex).
+        b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+        let mut got2 = [0u8; 11];
+        a_app.read_exact(&mut got2).await.expect("a reads B's bytes");
+        assert_eq!(&got2, b"pong-B-to-A", "B's plaintext arrives decrypted at A via the relay");
+
+        // Both payloads are confirmed received BEFORE any teardown, so there is no last-byte
+        // race to lose; abort the tasks to end the still-open sessions.
+        a.abort();
+        b.abort();
+        relay_task.abort();
     }
 }
