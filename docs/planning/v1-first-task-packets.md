@@ -2677,8 +2677,17 @@ with **no prior art** and **no dependency on those open questions** lands first:
     durable datamodel is now complete** (exclusive assignment + Topology entity + edge-list). Next: the
     `/me/topologies*` REST surface (create/list/assign/wire), then the `<net_uuid>.<zone>` live page (reuse #38
     DL2 DNS + authorize-host).
-- **#107-rest** ⏳: `/me/topologies`, `/me/topologies/:id/agents`, … following the `/me/*` OIDC-bearer,
-  subject-scoped conventions.
+- **#107-rest** ✅ **The Topology Editor REST surface** (`service::authed_topology_router`, `/me/topologies*`):
+  the compose flow — `POST /me/topologies` (create; server-generated `id` + `net_uuid` → `{id, net_uuid}`),
+  `GET /me/topologies` (list), `GET /me/topologies/:id` (composite `{id, net_uuid, agents, edges}`),
+  `POST /me/topologies/:id/agents {agent}` (assign; `409` on the exclusivity conflict), `POST
+  /me/topologies/:id/edges {a,b}` (wire an undirected edge). Owner = verified subject (`subject_of`), never a
+  request field; a topology another subject doesn't own is `404` (isolation, not `403`). Mounted in the
+  `oidc`-gated block. Frozen test `authed_topology_editor_composes_an_overlay_and_is_owner_scoped` (no
+  bearer→401; create → assign two agents → an exclusive re-assign 409 → wire an edge → the composite view shows
+  agents + the canonical edge; mallory can neither see nor edit alice's topology, and her listing is empty).
+  Gate green. **The Topology Editor is now usable at the API level** (create + compose + read). Follow: the
+  `<net_uuid>.<zone>` live page (reuse #38 DL2), and the design-question-gated optimizer / N-way / UI slices.
 - **#107-subdomain** ⏳: `<net-uuid>.<zone>` live-status page reusing the #38 DL2 DNS + authorize-host pipeline
   (keyed by topology-id), UUID-only access first (owner auth-gate deferred — its own tracked placeholder).
 - **#107-nway** ⏳ **(hard core, gated on open questions)**: generalize `authorize_channel_pair` + the broker's

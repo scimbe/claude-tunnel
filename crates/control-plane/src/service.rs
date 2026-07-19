@@ -25,7 +25,7 @@ use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
     BootstrapError, LedgerOpError, PaymentOpError, RedeemError, SqliteBootstrap, SqliteChannelStore,
-    SqliteEnrollment, SqliteLedger, SqliteNetworkStore, SqliteRegistry,
+    SqliteEnrollment, SqliteLedger, SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -740,6 +740,186 @@ async fn network_plan(
     Ok(Json(NetworkPlanResp { desired }))
 }
 
+/// Shared state for the authenticated **Topology Editor** API (#107-rest): the durable
+/// [`SqliteTopologyStore`] + the OIDC verifier. Every topology is owned by the verified
+/// subject, so a caller only composes its own overlays.
+#[derive(Clone)]
+pub struct AuthedTopologyState {
+    topologies: Arc<SqliteTopologyStore>,
+    verifier: Arc<OidcVerifier>,
+}
+
+/// Build the **authenticated** Topology Editor router (#107-rest): compose an overlay by
+/// creating a topology, assigning agents into it (exclusive membership), and wiring
+/// edges — the REST half of the "click-together" editor, following the `/me/*`
+/// OIDC-bearer, subject-scoped convention (owner = verified subject, never a request
+/// field, so no unauthenticated write surface, cf. #87).
+///
+/// * `POST /me/topologies` → create (server-generated `id` + `net_uuid`) → `{id, net_uuid}`
+/// * `GET  /me/topologies` → the caller's topologies
+/// * `GET  /me/topologies/:id` → a composite view `{id, net_uuid, agents, edges}`
+/// * `POST /me/topologies/:id/agents` `{agent}` → assign (exclusive; `409` if already in a topology)
+/// * `POST /me/topologies/:id/edges` `{a, b}` → wire an undirected edge
+pub fn authed_topology_router(
+    topologies: Arc<SqliteTopologyStore>,
+    verifier: Arc<OidcVerifier>,
+) -> Router {
+    Router::new()
+        .route("/me/topologies", post(topology_create).get(topology_list))
+        .route("/me/topologies/:id", get(topology_view))
+        .route("/me/topologies/:id/agents", post(topology_assign))
+        .route("/me/topologies/:id/edges", post(topology_add_edge))
+        .with_state(AuthedTopologyState { topologies, verifier })
+}
+
+/// A random opaque id (16 bytes, hex) for a topology id / net_uuid.
+fn gen_hex_id() -> String {
+    let mut b = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+    hex_encode(&b)
+}
+
+#[derive(Serialize, Deserialize)]
+struct TopologyCreatedResp {
+    id: String,
+    net_uuid: String,
+}
+
+async fn topology_create(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+) -> Result<Json<TopologyCreatedResp>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    // Generate a unique (id, net_uuid); retry the negligible collision a few times.
+    for _ in 0..4 {
+        let id = gen_hex_id();
+        let net_uuid = gen_hex_id();
+        let created = state
+            .topologies
+            .create_topology(&owner, &id, &net_uuid)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if created {
+            return Ok(Json(TopologyCreatedResp { id, net_uuid }));
+        }
+    }
+    Err((StatusCode::INTERNAL_SERVER_ERROR, "could not allocate a unique topology id".to_string()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct TopologySummary {
+    id: String,
+    net_uuid: String,
+}
+
+async fn topology_list(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TopologySummary>>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let list = state
+        .topologies
+        .list_topologies(&owner)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|t| TopologySummary { id: t.id, net_uuid: t.net_uuid })
+        .collect();
+    Ok(Json(list))
+}
+
+#[derive(Serialize, Deserialize)]
+struct TopologyView {
+    id: String,
+    net_uuid: String,
+    agents: Vec<String>,
+    edges: Vec<(String, String)>,
+}
+
+/// Resolve `id` as a topology owned by `owner`, or a `404` (owner isolation — a topology
+/// a subject doesn't own is invisible, not a `403`).
+fn owned_topology(
+    state: &AuthedTopologyState,
+    owner: &str,
+    id: &str,
+) -> Result<crate::topology::Topology, (StatusCode, String)> {
+    let t = state
+        .topologies
+        .topology(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|t| t.owner == owner)
+        .ok_or((StatusCode::NOT_FOUND, "no such topology".to_string()))?;
+    Ok(t)
+}
+
+async fn topology_view(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<TopologyView>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let t = owned_topology(&state, &owner, &id)?;
+    let agents = state
+        .topologies
+        .agents_in(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let edges = state
+        .topologies
+        .edges(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(TopologyView { id: t.id, net_uuid: t.net_uuid, agents, edges }))
+}
+
+#[derive(Deserialize)]
+struct AssignReq {
+    agent: String,
+}
+
+async fn topology_assign(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AssignReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    // The caller must own the topology it is assigning into.
+    owned_topology(&state, &owner, &id)?;
+    state.topologies.assign(&owner, &req.agent, &id).map_err(|e| {
+        use crate::topology::AssignError;
+        let code = match e {
+            crate::storage::TopologyError::Assign(AssignError::AlreadyAssigned { .. }) => StatusCode::CONFLICT,
+            crate::storage::TopologyError::Assign(AssignError::NotAuthorized) => StatusCode::FORBIDDEN,
+            crate::storage::TopologyError::Assign(AssignError::NotAssigned) => StatusCode::BAD_REQUEST,
+            crate::storage::TopologyError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (code, e.to_string())
+    })?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct EdgeReq {
+    a: String,
+    b: String,
+}
+
+async fn topology_add_edge(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<EdgeReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let added = state
+        .topologies
+        .add_edge(&owner, &id, &req.a, &req.b)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // false → the caller doesn't own the topology, a self-loop, or a duplicate edge.
+    if added {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::CONFLICT, "edge not added (not owner, self-loop, or duplicate)".to_string()))
+    }
+}
+
 #[derive(Deserialize)]
 struct ChannelRegisterReq {
     channel: String,
@@ -1432,6 +1612,8 @@ pub fn persistent_control_plane_router(
     if let Some(oidc) = oidc {
         // #102-rest: the declarative-network REST surface (owner = verified subject).
         let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
+        // #107-rest: the Topology Editor REST surface (owner = verified subject).
+        let topologies = Arc::new(SqliteTopologyStore::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -1439,6 +1621,7 @@ pub fn persistent_control_plane_router(
                 AUTHED_ISSUES_PER_WINDOW,
             ))
             .merge(authed_network_router(networks, oidc.clone()))
+            .merge(authed_topology_router(topologies, oidc.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc));
@@ -2406,6 +2589,91 @@ mod tests {
         let body = to_bytes(plan.into_body(), 1 << 16).await.unwrap();
         let resp: NetworkPlanResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp.desired, vec![Pair::new("dev-1", "ops-1")], "dev<->ops is the one permitted channel");
+    }
+
+    #[tokio::test]
+    async fn authed_topology_editor_composes_an_overlay_and_is_owner_scoped() {
+        // #107-rest: create a topology, assign agents (exclusive), wire an edge, and
+        // read the composite view — all subject-scoped.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let app = authed_topology_router(topologies, verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let send = |method: &str, path: String, bearer: Option<&str>, body: String| {
+            let mut req = Request::builder().method(method).uri(&path).header("content-type", "application/json");
+            if let Some(b) = bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        // A bearer is required.
+        assert_eq!(
+            send("POST", "/me/topologies".into(), None, String::new()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Alice creates a topology; the server returns a generated id + net_uuid.
+        let created = send("POST", "/me/topologies".into(), Some(&alice), String::new()).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), 1 << 16).await.unwrap();
+        let created: TopologyCreatedResp = serde_json::from_slice(&body).unwrap();
+        let tid = created.id;
+
+        // Assign two agents; the second assignment of the same agent is exclusive (409).
+        for agent in ["agent-1", "agent-2"] {
+            let s = send("POST", format!("/me/topologies/{tid}/agents"), Some(&alice), format!(r#"{{"agent":"{agent}"}}"#))
+                .await.unwrap().status();
+            assert_eq!(s, StatusCode::OK, "assign {agent}");
+        }
+        // agent-1 is already in this topology -> exclusivity conflict.
+        let dup = send("POST", format!("/me/topologies/{tid}/agents"), Some(&alice), r#"{"agent":"agent-1"}"#.into())
+            .await.unwrap().status();
+        assert_eq!(dup, StatusCode::CONFLICT, "an agent belongs to at most one topology");
+
+        // Wire an edge between them.
+        let e = send("POST", format!("/me/topologies/{tid}/edges"), Some(&alice), r#"{"a":"agent-2","b":"agent-1"}"#.into())
+            .await.unwrap().status();
+        assert_eq!(e, StatusCode::OK, "edge wired");
+
+        // The composite view reflects the agents + the canonical edge.
+        let view = send("GET", format!("/me/topologies/{tid}"), Some(&alice), String::new()).await.unwrap();
+        assert_eq!(view.status(), StatusCode::OK);
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        let v: TopologyView = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.agents, vec!["agent-1", "agent-2"]);
+        assert_eq!(v.edges, vec![("agent-1".to_string(), "agent-2".to_string())]);
+
+        // Owner isolation: mallory can't see or edit alice's topology.
+        assert_eq!(
+            send("GET", format!("/me/topologies/{tid}"), Some(&mallory), String::new()).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/agents"), Some(&mallory), r#"{"agent":"x"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "mallory can't assign into alice's topology"
+        );
+        // Mallory's own listing is empty.
+        let list = send("GET", "/me/topologies".into(), Some(&mallory), String::new()).await.unwrap();
+        let body = to_bytes(list.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Vec<TopologySummary>>(&body).unwrap().len(), 0);
     }
 
     #[tokio::test]
