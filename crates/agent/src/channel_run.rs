@@ -366,6 +366,28 @@ impl ChannelIdentity {
     pub fn noise_pubkey_hex(&self) -> String {
         hex_encode(&self.noise.public)
     }
+
+    /// A copy-pasteable shell block a self-service participant `eval`s (or sources)
+    /// before running `ct-agent channel` (#117): the two **secret** private keys as
+    /// `export`s the CLI reads, plus the two **public** keys as comments to hand to the
+    /// channel operator (who signs this member's grant / registers the channel). The
+    /// operator still supplies `CT_CHANNEL_GRANT` and the broker/relay/front-door
+    /// addresses. Private keys are generated locally and never printed as anything but
+    /// the participant's own env — they never reach the operator or the server.
+    pub fn env_block(&self) -> String {
+        format!(
+            "# Agent-Fabric channel identity — generated locally, keep the private keys secret.\n\
+             # Give these PUBLIC keys to the channel operator (to sign your grant / register):\n\
+             #   holder_pubkey = {holder_pub}\n\
+             #   noise_pubkey  = {noise_pub}\n\
+             export CT_CHANNEL_HOLDER_KEY={holder_priv}\n\
+             export CT_CHANNEL_NOISE_KEY={noise_priv}\n",
+            holder_pub = self.holder_pubkey_hex(),
+            noise_pub = self.noise_pubkey_hex(),
+            holder_priv = self.holder_key_hex(),
+            noise_priv = self.noise_key_hex(),
+        )
+    }
 }
 
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
@@ -732,6 +754,34 @@ mod tests {
         let id2 = ChannelIdentity::generate();
         assert_ne!(id.holder.to_bytes(), id2.holder.to_bytes(), "holder keys are unique per mint");
         assert_ne!(id.noise.private, id2.noise.private, "Noise keys are unique per mint");
+    }
+
+    #[test]
+    fn channel_identity_env_block_exports_the_keys_the_cli_reads() {
+        // #117-cli-subcommand (frozen): `ct-agent channel init` prints this block; it must
+        // `export` exactly the two private-key env vars the CLI consumes, surface the two
+        // public keys (for the operator), and be safe to `eval` (only comments + exports).
+        let id = ChannelIdentity::generate();
+        let block = id.env_block();
+
+        assert!(
+            block.contains(&format!("export CT_CHANNEL_HOLDER_KEY={}", id.holder_key_hex())),
+            "exports the holder private key the CLI reads"
+        );
+        assert!(
+            block.contains(&format!("export CT_CHANNEL_NOISE_KEY={}", id.noise_key_hex())),
+            "exports the Noise private key the CLI reads"
+        );
+        assert!(block.contains(&id.holder_pubkey_hex()), "surfaces the holder public key for the operator");
+        assert!(block.contains(&id.noise_pubkey_hex()), "surfaces the Noise public key for the operator");
+
+        // Safe to `eval`: every non-blank line is a comment or an `export`.
+        for line in block.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                line.starts_with('#') || line.starts_with("export "),
+                "every line is a comment or an export, got {line:?}"
+            );
+        }
     }
 
     #[tokio::test]

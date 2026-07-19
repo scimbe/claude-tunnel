@@ -2562,9 +2562,15 @@ call. **Direction chosen by scimbe (2026-07-19): CLI self-service subcommand** �
   leaving their machine. Frozen test round-trips the generated holder + Noise keys through the real
   `ChannelJoinCliConfig::from_lookup` (with an operator-signed grant over the generated holder pubkey) and
   asserts the CLI parses back the *same* keys + unique-per-mint. Gate green, 0 warnings.
-- **#117-cli-subcommand** ⏳ next: surface `ChannelIdentity::generate` as a documented `ct-agent channel init`
-  (or `keygen`) subcommand that prints/persists the env block a participant then feeds to `ct-agent channel`
-  (role, broker/relay/front-door addrs from the plane, holder/noise keys, grant). Pure wiring on top of -identity.
+- **#117-cli-subcommand** ✅ **`ct-agent channel init`** (`main.rs` + `ChannelIdentity::env_block`): the
+  subcommand mints a fresh identity locally (`ChannelIdentity::generate`) and prints a copy-pasteable shell
+  block — the two SECRET private keys as `export CT_CHANNEL_HOLDER_KEY`/`CT_CHANNEL_NOISE_KEY` (exactly what
+  `ct-agent channel` reads) plus the two PUBLIC keys as comments to hand the operator. A participant runs
+  `eval "$(ct-agent channel init)"`, gives the operator the public keys, then runs `ct-agent channel` with the
+  operator-supplied `CT_CHANNEL_GRANT` — no hand-crafted keys, no central round-trip, private keys never leaving
+  the machine. Frozen test `channel_identity_env_block_exports_the_keys_the_cli_reads` (block exports both
+  private-key env vars, surfaces both public keys, and is `eval`-safe — every line a comment or an `export`).
+  Gate green, 0 warnings.
 - **#117-operator-flow** ⏳: the create-a-channel side — an operator subcommand that generates the operator key,
   `POST /channel/register`s (via the account OIDC token), and issues member grants (signs over a member's
   `holder_pubkey_hex`) + cross-user invitations — so two self-service participants can be wired without central.

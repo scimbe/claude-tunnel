@@ -41,6 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // an Agent-Fabric A2A channel and pipe stdin/stdout over the encrypted Noise_IK
     // tunnel to the paired peer. Config comes from CT_CHANNEL_* so it fits a one-liner.
     if std::env::args().nth(1).as_deref() == Some("channel") {
+        // #117 `ct-agent channel init`: mint a fresh channel identity LOCALLY and print
+        // the copy-pasteable env block (private keys never leave this machine — the
+        // self-service, provider-blind alternative to hand-crafted keys / central
+        // provisioning). The participant `eval`s it, hands the public keys to the
+        // operator, then runs `ct-agent channel` with the operator-supplied grant.
+        if std::env::args().nth(2).as_deref() == Some("init") {
+            print!("{}", ct_agent::channel_run::ChannelIdentity::generate().env_block());
+            return Ok(());
+        }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
         // the grant, learn the peer via the broker (keys relayed), connect
         // direct-then-relay. Otherwise the direct-address path (CT_CHANNEL_ADDR).
