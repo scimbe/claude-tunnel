@@ -1727,10 +1727,20 @@ Decomposed:
     `ct-grant:v1`), so an invitation can't be replayed as a grant. Frozen tests: verify sig+expiry+wrong-key;
     wire round-trip + truncation→Malformed; redemption binding (wrong holder/channel/identity all rejected);
     invitation≠grant domain separation. Gate green.
-  - **AF3-redeem-cp** ⏳ next: the CP flow — the invitee's agent presents `(SignedChannelInvitation,
-    redemption signature, chosen holder key)`; the CP verifies both and issues the real per-holder
-    `SignedChannelGrant` (+ registers membership + the member Noise key, reusing #101). This is the
-    server-side glue on top of the primitive; unblocks #100's brokered channel one-liner generator.
+  - **AF3-redeem-core** ✅ **Redemption verification** (`ct_common::channel::redeem_invitation`): the two-proof
+    gate the CP runs on a redemption — `verify_invitation` (operator authentic + current) **and**
+    `verify_invitation_redemption` (the intended invitee accepted + bound `holder`) — returning, on success,
+    the `ChannelGrant` claims (channel/direction/rights/delegable/expiry) now bound to the chosen `holder`,
+    exactly what the CP records as membership. **No operator private key at redeem time** — the operator
+    authority already rides in the signed invitation, so a provider-blind CP admits the member from the two
+    public-key proofs alone. Frozen test `redeem_invitation_yields_membership_claims_bound_to_the_chosen_holder`
+    (happy path binds the chosen member key not the invitee identity; expired→Expired; wrong operator→
+    BadSignature; a holder-swap→BadSignature). Gate green.
+  - **AF3-redeem-cp** ⏳ next: the HTTP glue — a proof-gated CP endpoint that takes `(SignedChannelInvitation,
+    redemption signature, holder, noise_pubkey, noise_attestation)`, looks up the channel's operator pubkey
+    from the registry, runs `redeem_invitation` + `verify_member_noise_attestation` (#101), and `add_member`s
+    the invitee's holder + Noise key. Server-side glue on top of the core; unblocks #100's brokered channel
+    one-liner generator.
 - **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**. Split:
   - **AF4-join** ✅ **Agent-side channel-join client** (`ct-agent::channel::present_channel_join`): the client
     half of the broker handshake — sends the `u16`-framed `ChannelJoinRequest`, answers the edge's 32-byte

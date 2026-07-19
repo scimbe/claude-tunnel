@@ -551,6 +551,42 @@ pub fn verify_invitation_redemption(
     }
 }
 
+/// Verify a cross-user invitation **redemption end-to-end** (#72 AF3) and, on success,
+/// return the membership claims the invitee earned. This is the two-proof gate the CP
+/// runs when an invitee's agent presents a redemption:
+///
+/// 1. the operator invitation is authentic + current ([`verify_invitation`]), and
+/// 2. the intended invitee accepted and bound `holder` ([`verify_invitation_redemption`]).
+///
+/// On success it returns the invitation's channel/direction/rights/delegable/expiry now
+/// bound to the invitee's chosen `holder` — exactly the [`ChannelGrant`] claims the CP
+/// records as membership. **No operator private key is needed at redeem time**: the
+/// operator authority already rides in the signed invitation, so a provider-blind CP can
+/// admit the member from the two public-key proofs alone. Errors mirror
+/// [`verify`]: `BadKey`/`BadSignature`/`Expired` (a failed redemption proof surfaces as
+/// `BadSignature`).
+pub fn redeem_invitation(
+    operator_pubkey: &[u8; 32],
+    signed: &SignedChannelInvitation,
+    redeem_signature: &[u8; 64],
+    holder: &[u8; 32],
+    now: UnixSeconds,
+) -> Result<ChannelGrant, GrantError> {
+    verify_invitation(operator_pubkey, signed, now)?;
+    let inv = &signed.invitation;
+    if !verify_invitation_redemption(&inv.channel, &inv.invitee_identity, holder, redeem_signature) {
+        return Err(GrantError::BadSignature);
+    }
+    Ok(ChannelGrant {
+        channel: inv.channel,
+        holder: *holder,
+        direction: inv.direction,
+        rights: inv.rights,
+        delegable: inv.delegable,
+        expires_at: inv.expires_at,
+    })
+}
+
 /// Lowercase-hex a 32-byte value for the canonical signing bytes.
 fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -831,6 +867,50 @@ mod tests {
         let mallory = SigningKey::from_bytes(&[0x99u8; 32]);
         let m_sig = mallory.sign(&invitation_redeem_bytes(&channel, &invitee, &holder)).to_bytes();
         assert!(!verify_invitation_redemption(&channel, &invitee, &holder, &m_sig));
+    }
+
+    #[test]
+    fn redeem_invitation_yields_membership_claims_bound_to_the_chosen_holder() {
+        // End-to-end AF3: operator invites invitee_identity; the invitee accepts and
+        // binds a *member* holder key; redeem_invitation checks both proofs and returns
+        // the grant claims bound to the chosen holder (not the invitee identity).
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pk = op.verifying_key().to_bytes();
+        let invitee_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let channel = ChannelId([0xabu8; 32]);
+        let holder = [0xcdu8; 32];
+
+        let invitation = ChannelInvitation {
+            channel,
+            invitee_identity: invitee,
+            direction: Direction::Initiate,
+            rights: Rights::Read,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let sig = op.sign(&invitation.signing_bytes()).to_bytes();
+        let signed = SignedChannelInvitation { invitation, signature: sig };
+        let redeem = invitee_sk.sign(&invitation_redeem_bytes(&channel, &invitee, &holder)).to_bytes();
+
+        // Happy path -> the membership grant claims, bound to the chosen holder.
+        let grant = redeem_invitation(&op_pk, &signed, &redeem, &holder, 999).unwrap();
+        assert_eq!(grant.holder, holder, "claims bind the chosen member key, not the invitee identity");
+        assert_eq!(grant.channel, channel);
+        assert_eq!(grant.direction, Direction::Initiate);
+        assert_eq!(grant.rights, Rights::Read);
+        assert_eq!(grant.expires_at, 1_000);
+
+        // Expired invitation -> Expired.
+        assert_eq!(redeem_invitation(&op_pk, &signed, &redeem, &holder, 1_000), Err(GrantError::Expired));
+        // Wrong operator key -> BadSignature.
+        let other = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
+        assert_eq!(redeem_invitation(&other, &signed, &redeem, &holder, 999), Err(GrantError::BadSignature));
+        // A redemption that bound a different holder -> BadSignature (can't swap the key).
+        assert_eq!(
+            redeem_invitation(&op_pk, &signed, &redeem, &[0xee; 32], 999),
+            Err(GrantError::BadSignature)
+        );
     }
 
     #[test]
