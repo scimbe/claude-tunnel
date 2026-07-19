@@ -375,18 +375,45 @@ pub async fn tcp_tls_connect(
     addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    // #46 FB-b: advertise ALPN `ct-edge` so the unified :443 front door (#31 FD2)
+    // classifies this as the data-plane relay (EdgeRelay) and routes it to
+    // serve_tcp_connection — the register ('A'/'B') + revoke ('R') path.
+    tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge").await
+}
+
+/// Connect to the unified `:443` **front door** for the Agent-Fabric A2A channel
+/// route (#106): TLS-over-TCP to `addr`, trusting `edge_cert`, advertising ALPN
+/// `ct-edge-channel` so the front door (#31/#46 pattern) classifies this as the
+/// channel broker/relay and dispatches it to the channel admit+pair path — the
+/// fallback dialer for a restrictive network that blocks the direct channel ports.
+/// The returned stream is then split and driven with
+/// [`crate::channel::present_channel_join_on_stream`].
+pub async fn tcp_tls_connect_channel(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
+    tcp_tls_connect_with_alpn(addr, edge_cert, b"ct-edge-channel").await
+}
+
+/// TLS-over-TCP dialer to `addr` trusting `edge_cert`, advertising `alpn` in the
+/// ClientHello (issue #3 / P1.2c-4 core, generalized for #106). The ALPN selects
+/// which unified `:443` front-door route the connection is classified into:
+/// `ct-edge` → the data-plane relay, `ct-edge-channel` → the A2A channel broker.
+/// Harmless on the direct TLS listeners (they advertise no ALPN, so the offer is
+/// ignored). The thin [`tcp_tls_connect`] / [`tcp_tls_connect_channel`] wrappers
+/// pin the two protocol strings.
+pub async fn tcp_tls_connect_with_alpn(
+    addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    alpn: &[u8],
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BoxError> {
     install_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(edge_cert)?;
     let mut cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    // #46 FB-b: advertise ALPN `ct-edge` in the ClientHello so the unified :443
-    // front door (#31 FD2) classifies this as the data-plane relay (EdgeRelay) and
-    // routes it to serve_tcp_connection — the path that handles register ('A'/'B')
-    // and revoke ('R'). Harmless on the direct :4433 TLS listener (it advertises no
-    // ALPN, so the server ignores the client's offer).
-    cfg.alpn_protocols = vec![b"ct-edge".to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
     let tcp = TcpStream::connect(addr).await?;
     let server_name = rustls::pki_types::ServerName::try_from("localhost")?;

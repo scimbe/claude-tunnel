@@ -19,7 +19,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::channel::{present_channel_join, ChannelJoinOutcome};
+use crate::channel::{present_channel_join, present_channel_join_on_stream, ChannelJoinOutcome};
 use ct_common::a2a::{a2a_initiate, a2a_respond};
 use ct_common::noise::noise_pump;
 
@@ -480,6 +480,52 @@ where
     Err(last.unwrap_or(ChannelDialError::Unreachable))
 }
 
+/// Present a channel join by walking the fallback `rungs` (#106 client-dial-443): for a
+/// **direct** rung, dial the channel port over QUIC ([`dial_peer_direct`]) and run the
+/// join on a fresh bi-stream ([`present_channel_join`]); for a **front-door** rung, open
+/// the unified `:443` route over TLS-TCP ([`crate::transport::tcp_tls_connect_channel`],
+/// ALPN `ct-edge-channel`) and run the identical join over the split TLS stream
+/// ([`present_channel_join_on_stream`]). Composed over [`dial_ladder`], so the first rung
+/// that *completes* the join — an `Admitted` **or** `Refused` outcome, either being a
+/// finished handshake — wins; a rung whose transport can't connect (`Unreachable` on a
+/// blocked direct port, or a `Failed` TLS/connect) falls through to the next, letting a
+/// network that blocks the direct channel port recover over `:443`. Errors only when
+/// every rung is blocked. `edge_cert` is the root the front-door TLS dial trusts;
+/// `direct_timeout` bounds each direct QUIC dial (the [`DIRECT_DIAL_TIMEOUT`] signal).
+pub async fn present_channel_join_via_ladder(
+    rungs: &[ChannelDialRung],
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    edge_cert: CertificateDer<'static>,
+    direct_timeout: std::time::Duration,
+) -> Result<ChannelJoinOutcome, BoxError> {
+    dial_ladder(rungs, |rung: &ChannelDialRung| {
+        let endpoint = rung.endpoint;
+        let via_front_door = rung.via_front_door;
+        let edge_cert = edge_cert.clone();
+        async move {
+            if via_front_door {
+                // #106 fallback: the :443 front door over TLS-TCP (ALPN ct-edge-channel).
+                let stream = crate::transport::tcp_tls_connect_channel(endpoint, edge_cert)
+                    .await
+                    .map_err(ChannelDialError::Failed)?;
+                let (recv, send) = tokio::io::split(stream);
+                present_channel_join_on_stream(send, recv, request, holder)
+                    .await
+                    .map_err(ChannelDialError::Failed)
+            } else {
+                // Direct: QUIC to the channel port. Unreachable falls through to :443.
+                let conn = dial_peer_direct(endpoint, direct_timeout).await?;
+                present_channel_join(&conn, request, holder)
+                    .await
+                    .map_err(ChannelDialError::Failed)
+            }
+        }
+    })
+    .await
+    .map_err(Into::into)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -724,6 +770,93 @@ mod tests {
             dial_ladder(&[direct, fd], |_r: &ChannelDialRung| async move { Err(ChannelDialError::Unreachable) })
                 .await;
         assert!(all_blocked.is_err(), "all rungs blocked surfaces an error");
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_via_ladder_falls_back_to_the_443_front_door() {
+        // #106 client-dial-443 (frozen): the AGENT actually uses :443. The dial ladder's
+        // DIRECT rung points at a dead/closed port (the QUIC dial is Unreachable), so
+        // present_channel_join_via_ladder falls through to the FRONT-DOOR rung — a real
+        // TLS-TCP `:443`-style edge whose accepted stream is admitted with the production
+        // `ct_edge::channel_broker::admit_channel_join_on_duplex` gate — and completes the
+        // join (Admitted) over TLS-over-TCP. This is the fallback for a network that blocks
+        // the direct channel port.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_edge::channel_broker::admit_channel_join_on_duplex;
+        use ct_edge::transport::build_tcp_tls_listener_at;
+        use ed25519_dalek::Signer;
+        use tokio::io::AsyncWriteExt;
+
+        // Operator-signed grant; the edge `authorize` closure yields this operator's key.
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let channel = [0x06u8; 32];
+        let holder = SigningKey::from_bytes(&[0x11u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId(channel),
+            holder: holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant = SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() };
+        // The advertised endpoint must be a SAFE (non-loopback) dialable addr for admission.
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.7:7007".to_string() };
+
+        // A real `:443`-style TLS-TCP edge front door.
+        let (listener, acceptor, edge_cert) = build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("tls-tcp listener");
+        let fd_addr = listener.local_addr().expect("front-door addr");
+
+        // Edge: accept one TLS-TCP connection, admit the channel join over the duplex, then
+        // ack `OK <peer_endpoint>` and close the write half so the client reads the ack to EOF.
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept tcp");
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut stream, _req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+                tls,
+                500u64, // now < expires_at (1_000)
+                std::time::Duration::from_secs(5),
+                &move |c: ChannelId, _h: [u8; 32]| {
+                    let ok = c.0 == channel;
+                    async move { ok.then_some((op_pub, None, None)) }
+                },
+            )
+            .await
+            .expect("admit over the :443 TLS-TCP duplex");
+            stream.write_all(b"OK 198.51.100.9:8008").await.expect("ack");
+            stream.shutdown().await.expect("shutdown");
+        });
+
+        // The dial ladder: a DEAD direct rung (closed port) then the LIVE :443 front door.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // nothing on that UDP port -> the direct QUIC dial is Unreachable
+        let rungs = vec![
+            ChannelDialRung { endpoint: dead_addr, via_front_door: false },
+            ChannelDialRung { endpoint: fd_addr, via_front_door: true },
+        ];
+
+        let outcome = present_channel_join_via_ladder(
+            &rungs,
+            &request,
+            &holder,
+            edge_cert,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("the join completes over the :443 front door after the dead direct rung");
+
+        match outcome {
+            ChannelJoinOutcome::Admitted { peer_endpoint, .. } => assert_eq!(
+                peer_endpoint, "198.51.100.9:8008",
+                "the agent learns the peer endpoint over the :443 TLS-TCP fallback rung"
+            ),
+            ChannelJoinOutcome::Refused => panic!("a valid join over :443 must be Admitted, not Refused"),
+        }
+        edge.await.expect("edge task");
     }
 
     #[test]

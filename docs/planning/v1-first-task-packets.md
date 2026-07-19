@@ -2797,12 +2797,23 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
       in-memory `tokio::io::duplex` against a minimal test "edge" (framed request → challenge → possession
       verify → `OK <endpoint>`), asserting the client returns `Admitted` with the peer endpoint over a non-QUIC
       stream. Gate green, 0 warnings.
-    - **#106-client-dial-443** ⏳ next (now unblocked): a `tcp_tls_connect_channel` (agent `transport.rs`) that
-      TLS-TCP-connects the `:443` front door advertising ALPN `ct-edge-channel` (parameterize the existing
-      `ct-edge` dialer), then make `run_channel_join_command` drive the broker/relay via `dial_ladder` — direct
-      QUIC (`present_channel_join`) first, then the `:443` stream (`present_channel_join_on_stream`) on a blocked
-      direct rung. All three primitives now exist (`dial_ladder`, the `:443` dialer, the generic join); this
-      slice wires them.
+    - **#106-client-dial-443** ✅ **The agent broker-join fallback over `:443`** (`ct_agent`): the `:443` channel
+      dialer + the ladder-driven join that composes the three primitives. `transport.rs` gains
+      `tcp_tls_connect_channel` (TLS-TCP to the `:443` front door advertising ALPN `ct-edge-channel`) by
+      **additively** extracting a `tcp_tls_connect_with_alpn(addr, cert, alpn)` helper — `tcp_tls_connect` is now a
+      thin `b"ct-edge"` wrapper (existing callers unchanged). `channel_run.rs` gains
+      `present_channel_join_via_ladder(rungs, request, holder, edge_cert, direct_timeout)`: walks the broker/relay
+      ladder over `dial_ladder` — a **direct** rung dials QUIC (`dial_peer_direct` → `present_channel_join`); a
+      **front-door** rung dials TLS-TCP (`tcp_tls_connect_channel`) and runs the identical join over the split
+      stream (`present_channel_join_on_stream`). The first rung that *completes* the join (Admitted or Refused)
+      wins; a transport `Unreachable`/`Failed` falls through, so a blocked direct channel port recovers over
+      `:443`. Frozen test `present_channel_join_via_ladder_falls_back_to_the_443_front_door`: a **dead** direct rung
+      + a **live** real `:443`-style TLS-TCP edge whose accepted stream is admitted with the production
+      `ct_edge::channel_broker::admit_channel_join_on_duplex` gate — asserts the agent falls through the dead direct
+      rung and completes the join (Admitted, learning the peer endpoint) over the `:443` TLS-TCP rung. Gate green,
+      0 warnings. ⏳ Follow: `run_channel_join_command` still dials the broker/relay directly (QUIC) and its relay
+      data path is unchanged — rewiring it to drive `present_channel_join_via_ladder` (and the relay-path
+      integration over `:443`) is the next slice; the composable primitive is ready to be dropped in.
   - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
     - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
       extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the
