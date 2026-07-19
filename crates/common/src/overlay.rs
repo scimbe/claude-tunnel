@@ -132,6 +132,106 @@ pub fn min_latency_overlay(nodes: &[String], links: &[WeightedLink]) -> OverlayP
     plan
 }
 
+/// Extend an overlay `base` (typically a [`min_latency_overlay`] spanning tree) with up
+/// to `budget` latency-reducing **shortcut** links beyond the tree backbone (#107 /
+/// #76's smart-shortcuts topology). Greedy + deterministic: each round adds the candidate
+/// link — not already chosen — that most reduces the overlay's **worst pairwise path
+/// latency** (the two agents currently farthest apart get a direct link), until the
+/// budget is spent or no remaining candidate shortens any path. Pure; ties broken by the
+/// canonical pair. The tree keeps the graph connected, so shortcuts only ever *reduce*
+/// path latency — they never disconnect it.
+pub fn add_shortcuts(
+    nodes: &[String],
+    links: &[WeightedLink],
+    base: OverlayPlan,
+    budget: usize,
+) -> OverlayPlan {
+    let n = nodes.len();
+    if n < 2 || budget == 0 {
+        return base;
+    }
+    let index: std::collections::HashMap<&str, usize> =
+        nodes.iter().enumerate().map(|(i, x)| (x.as_str(), i)).collect();
+
+    // Cheapest candidate cost per canonical pair (ignore self-loops / unknown nodes).
+    let mut cost: std::collections::HashMap<(usize, usize), u64> = std::collections::HashMap::new();
+    for l in links {
+        if l.a == l.b {
+            continue;
+        }
+        let (ia, ib) = match (index.get(l.a.as_str()), index.get(l.b.as_str())) {
+            (Some(&ia), Some(&ib)) => (ia.min(ib), ia.max(ib)),
+            _ => continue,
+        };
+        cost.entry((ia, ib)).and_modify(|c| *c = (*c).min(l.cost)).or_insert(l.cost);
+    }
+
+    let mut chosen: std::collections::HashSet<(usize, usize)> = base
+        .links
+        .iter()
+        .filter_map(|(a, b)| Some((*index.get(a.as_str())?, *index.get(b.as_str())?)))
+        .map(|(a, b)| (a.min(b), a.max(b)))
+        .collect();
+
+    let inf = u64::MAX / 4;
+    let mut plan = base;
+    for _ in 0..budget {
+        // All-pairs shortest paths over the currently-chosen links (Floyd–Warshall).
+        let mut dist = vec![vec![inf; n]; n];
+        for (d, di) in dist.iter_mut().enumerate() {
+            di[d] = 0;
+        }
+        for &(a, b) in &chosen {
+            let c = cost[&(a, b)];
+            dist[a][b] = dist[a][b].min(c);
+            dist[b][a] = dist[b][a].min(c);
+        }
+        for k in 0..n {
+            for i in 0..n {
+                if dist[i][k] == inf {
+                    continue;
+                }
+                for j in 0..n {
+                    let via = dist[i][k].saturating_add(dist[k][j]);
+                    if via < dist[i][j] {
+                        dist[i][j] = via;
+                    }
+                }
+            }
+        }
+        // Pick the candidate link that most reduces its endpoints' current path latency.
+        let mut best: Option<((usize, usize), u64)> = None;
+        for (&(a, b), &c) in &cost {
+            if chosen.contains(&(a, b)) {
+                continue;
+            }
+            let improvement = dist[a][b].saturating_sub(c);
+            if improvement == 0 {
+                continue;
+            }
+            // Deterministic: max improvement, ties broken by the smaller (a, b) pair
+            // (the HashMap iteration order is otherwise unspecified).
+            let better = match best {
+                None => true,
+                Some((pair, bi)) => improvement > bi || (improvement == bi && (a, b) < pair),
+            };
+            if better {
+                best = Some(((a, b), improvement));
+            }
+        }
+        match best {
+            Some(((a, b), _)) => {
+                chosen.insert((a, b));
+                let (ca, cb) = canon(&nodes[a], &nodes[b]);
+                plan.links.push((ca, cb));
+                plan.total_cost = plan.total_cost.saturating_add(cost[&(a, b)]);
+            }
+            None => break, // no shortcut improves any path
+        }
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +296,45 @@ mod tests {
         assert_eq!(min_latency_overlay(&[], &[]), OverlayPlan { links: vec![], total_cost: 0, connected: true });
         let one = min_latency_overlay(&nodes(&["solo"]), &[]);
         assert!(one.connected && one.links.is_empty(), "a single agent needs no links");
+    }
+
+    #[test]
+    fn shortcuts_cut_the_worst_path_latency_within_budget() {
+        // Line a-b-c-d (each hop cost 1): the MST is that line (cost 3), so a<->d costs 3
+        // over it. A direct a-d candidate of cost 2 is skipped by the MST (the three cost-1
+        // hops span first) but is a genuine shortcut (2 < the 3-hop path).
+        let ns = nodes(&["a", "b", "c", "d"]);
+        let links = vec![
+            WeightedLink::new("a", "b", 1),
+            WeightedLink::new("b", "c", 1),
+            WeightedLink::new("c", "d", 1),
+            WeightedLink::new("a", "d", 2), // shortcut across the ends: dearer than a hop, cheaper than the path
+        ];
+        let base = min_latency_overlay(&ns, &links);
+        assert_eq!(base.links.len(), 3, "MST is the line (a-d not needed for connectivity)");
+        assert!(!base.links.contains(&("a".to_string(), "d".to_string())), "the line MST excludes a-d");
+
+        // Budget 1 adds the highest-improvement shortcut: a-d (path 3 -> direct 2).
+        let one = add_shortcuts(&ns, &links, base.clone(), 1);
+        assert_eq!(one.links.len(), 4, "one shortcut added");
+        assert!(one.links.contains(&("a".to_string(), "d".to_string())), "the a-d shortcut");
+        assert_eq!(one.total_cost, base.total_cost + 2);
+
+        // Budget 0 is a no-op; a huge budget adds no more once no path improves.
+        assert_eq!(add_shortcuts(&ns, &links, base.clone(), 0), base, "budget 0 -> unchanged");
+        let maxed = add_shortcuts(&ns, &links, base.clone(), 100);
+        assert_eq!(maxed.links.len(), 4, "only the improving shortcut is added, then it stops");
+    }
+
+    #[test]
+    fn shortcuts_are_a_noop_when_no_candidate_improves_a_path() {
+        // A triangle where every pair is already a direct MST/base edge -> no shortcut helps.
+        let ns = nodes(&["a", "b", "c"]);
+        let links = vec![WeightedLink::new("a", "b", 1), WeightedLink::new("b", "c", 1)];
+        let base = min_latency_overlay(&ns, &links); // a-b, b-c
+        // Only candidate not chosen would be... none improving (no a-c candidate exists).
+        let out = add_shortcuts(&ns, &links, base.clone(), 5);
+        assert_eq!(out, base, "no improving candidate -> unchanged");
     }
 
     #[test]

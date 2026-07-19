@@ -2751,7 +2751,16 @@ with **no prior art** and **no dependency on those open questions** lands first:
 - **#107-nway** ⏳ (now unblocked — scale=arbitrary N, phase=graph-wiring): generalize `authorize_channel_pair`
   + the broker's fixed two-connection loop so a topology's MST links (from `min_latency_overlay`) each form an
   A2A channel — the controller compiles the plan into per-link grants. Needs the live mesh (#99/#103) for e2e.
-- **#107-optimize-follow** ⏳: measure/supply per-link latencies (edge probes) + shortcut edges to cut stretch
-  (#76). **#107-ui** ⏳ **(design-gated)**: greenfield node-graph editor — awaiting the framework-vs-vanilla
-  call. **#107-testing** ⏳: unit/API (done for the pure layers) + a real N-agent formation smoke once the mesh
-  is live.
+- **#107-shortcuts** ✅ **Latency-reducing shortcut edges** (`ct_common::overlay::add_shortcuts`): extends the
+  MST backbone with up to `budget` shortcut links (the #76 smart-shortcuts topology). Greedy + deterministic —
+  each round adds the unchosen candidate that most reduces the overlay's **worst pairwise path latency** (the
+  two agents currently farthest apart get a direct link, via Floyd–Warshall over the chosen edges), until the
+  budget is spent or no candidate shortens any path; ties broken by the canonical pair. The tree keeps it
+  connected, so shortcuts only ever *reduce* latency. Frozen tests: a line's `a↔d` shortcut is added within
+  budget (path 3 → direct 2), budget 0 is a no-op, a huge budget stops once nothing improves, and no-improving-
+  candidate → unchanged. Gate green. **The #107 optimizer is now a two-phase pipeline: MST backbone → greedy
+  shortcuts**, both pure/deterministic for arbitrary N.
+- **#107-optimize-follow** ⏳: measure/supply per-link latencies (edge probes feed `WeightedLink.cost`); then
+  the controller compiles the plan's links into per-link channel grants (#107-nway). **#107-ui** ⏳
+  **(design-gated)**: greenfield node-graph editor — awaiting the framework-vs-vanilla call. **#107-testing** ⏳:
+  unit/API (done for the pure layers) + a real N-agent formation smoke once the mesh is live.
