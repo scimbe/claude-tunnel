@@ -1448,6 +1448,12 @@ impl SqliteTopologyStore {
                  id       TEXT PRIMARY KEY,
                  owner    TEXT NOT NULL,
                  net_uuid TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE IF NOT EXISTS topology_edges (
+                 topology TEXT NOT NULL,
+                 a        TEXT NOT NULL,
+                 b        TEXT NOT NULL,
+                 PRIMARY KEY (topology, a, b)
              );",
         )?;
         Ok(Self {
@@ -1528,6 +1534,67 @@ impl SqliteTopologyStore {
             params![id, owner],
         )?;
         Ok(n > 0)
+    }
+
+    /// Whether `owner` owns topology `id` (the edit-authorization check).
+    fn owns_topology(conn: &Connection, owner: &str, topology: &str) -> rusqlite::Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM topologies WHERE id = ?1 AND owner = ?2",
+                params![topology, owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Wire an **undirected edge** `a—b` into `owner`'s topology (who connects to whom,
+    /// #107). Owner-scoped (only the topology owner may edit its wiring) and idempotent;
+    /// the pair is canonicalized (`a—b` == `b—a`), so an edge is stored once. Returns
+    /// `false` (no-op) if the caller doesn't own the topology, the edge is a self-loop
+    /// (`a == b`), or it already exists.
+    pub fn add_edge(&self, owner: &str, topology: &str, a: &str, b: &str) -> rusqlite::Result<bool> {
+        if a == b {
+            return Ok(false);
+        }
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let conn = self.conn.lock_safe();
+        if !Self::owns_topology(&conn, owner, topology)? {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO topology_edges (topology, a, b) VALUES (?1, ?2, ?3)",
+            params![topology, a, b],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Remove the undirected edge `a—b` from `owner`'s topology (owner-scoped, canonical).
+    /// Returns whether a row was removed.
+    pub fn remove_edge(&self, owner: &str, topology: &str, a: &str, b: &str) -> rusqlite::Result<bool> {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let conn = self.conn.lock_safe();
+        if !Self::owns_topology(&conn, owner, topology)? {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "DELETE FROM topology_edges WHERE topology = ?1 AND a = ?2 AND b = ?3",
+            params![topology, a, b],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The undirected edges wired into `topology`, each canonical `(a, b)` with `a <= b`,
+    /// sorted. This is the topology's adjacency the optimizer / renderer consume.
+    pub fn edges(&self, topology: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT a, b FROM topology_edges WHERE topology = ?1 ORDER BY a, b",
+        )?;
+        let edges = stmt
+            .query_map(params![topology], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(edges)
     }
 
     /// Load the current assignment for `agent`, reconstructed from its row.
@@ -1727,6 +1794,37 @@ mod tests {
         assert!(store.topology("corp").unwrap().is_some(), "still there");
         assert!(store.delete_topology("alice", "corp").unwrap(), "owner deletes");
         assert!(store.topology("corp").unwrap().is_none());
+    }
+
+    #[test]
+    fn topology_edge_list_is_undirected_owner_scoped_and_deduped() {
+        // #107: the who-connects-to-whom wiring — undirected + canonical, owner-scoped.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "u1").unwrap();
+
+        // Wire b—a; it is stored canonically as (a, b).
+        assert!(store.add_edge("alice", "t1", "b", "a").unwrap(), "edge added");
+        assert_eq!(store.edges("t1").unwrap(), vec![("a".into(), "b".into())]);
+        // Undirected + idempotent: the reverse / same edge is a no-op.
+        assert!(!store.add_edge("alice", "t1", "a", "b").unwrap(), "dup edge -> no-op");
+        // Self-loop rejected.
+        assert!(!store.add_edge("alice", "t1", "x", "x").unwrap(), "self-loop -> no-op");
+        // Owner-scoped: a non-owner can't wire the topology.
+        assert!(!store.add_edge("mallory", "t1", "c", "d").unwrap(), "non-owner -> no-op");
+        assert_eq!(store.edges("t1").unwrap(), vec![("a".into(), "b".into())], "unchanged");
+
+        // A second edge; the adjacency is sorted.
+        assert!(store.add_edge("alice", "t1", "c", "a").unwrap());
+        assert_eq!(
+            store.edges("t1").unwrap(),
+            vec![("a".into(), "b".into()), ("a".into(), "c".into())]
+        );
+
+        // Remove is canonical + owner-scoped.
+        assert!(!store.remove_edge("mallory", "t1", "b", "a").unwrap(), "non-owner remove -> no-op");
+        assert!(store.remove_edge("alice", "t1", "b", "a").unwrap(), "owner removes b—a");
+        assert!(!store.remove_edge("alice", "t1", "a", "b").unwrap(), "already gone");
+        assert_eq!(store.edges("t1").unwrap(), vec![("a".into(), "c".into())]);
     }
 
     #[test]

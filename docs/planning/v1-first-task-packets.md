@@ -2668,8 +2668,15 @@ with **no prior art** and **no dependency on those open questions** lands first:
     `create_topology(owner, id, net_uuid)` (no-op `false` on a duplicate id **or** net_uuid — both stay
     unique), `topology(id)`, `topology_by_uuid(net_uuid)` (the `<net_uuid>.<zone>` resolver),
     `list_topologies(owner)`, `delete_topology(owner, id)` (owner-scoped). Frozen test
-    `topology_entity_has_unique_id_and_net_uuid_and_is_owner_scoped`. Gate green. **Next:** the edge-list
-    (who-connects-to-whom), then `/me/topologies*` REST, then the subdomain live page (reuse #38 DL2).
+    `topology_entity_has_unique_id_and_net_uuid_and_is_owner_scoped`. Gate green.
+  - **#107-edge-list** ✅ **The who-connects-to-whom wiring** (`SqliteTopologyStore`): `add_edge`/`remove_edge`/
+    `edges(topology)` over undirected, canonical (`a—b` == `b—a`) edges. Owner-scoped (only the topology owner
+    may edit its wiring), idempotent, self-loops rejected. `edges` returns the sorted adjacency the optimizer /
+    renderer consume. Frozen test `topology_edge_list_is_undirected_owner_scoped_and_deduped` (canonical store;
+    dup/self-loop/non-owner no-ops; sorted adjacency; canonical owner-scoped removal). Gate green. **The #107
+    durable datamodel is now complete** (exclusive assignment + Topology entity + edge-list). Next: the
+    `/me/topologies*` REST surface (create/list/assign/wire), then the `<net_uuid>.<zone>` live page (reuse #38
+    DL2 DNS + authorize-host).
 - **#107-rest** ⏳: `/me/topologies`, `/me/topologies/:id/agents`, … following the `/me/*` OIDC-bearer,
   subject-scoped conventions.
 - **#107-subdomain** ⏳: `<net-uuid>.<zone>` live-status page reusing the #38 DL2 DNS + authorize-host pipeline
