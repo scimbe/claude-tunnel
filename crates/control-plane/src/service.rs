@@ -920,15 +920,76 @@ async fn topology_add_edge(
     }
 }
 
+/// Render the overlay as a self-contained inline **SVG node-graph** (#107 "live
+/// diagram"): agents are laid out on a circle as labelled nodes, edges as lines between
+/// them. Pure, no external assets. A single node is centred; an empty topology yields an
+/// empty canvas with a hint.
+fn render_topology_svg(agents: &[String], edges: &[(String, String)]) -> String {
+    use std::f64::consts::PI;
+    let esc = crate::portal::escape;
+    const W: f64 = 420.0;
+    const CX: f64 = 210.0;
+    const CY: f64 = 190.0;
+    const R: f64 = 140.0;
+    if agents.is_empty() {
+        return format!(
+            "<svg viewBox=\"0 0 {W} 360\" width=\"100%\" role=\"img\" aria-label=\"empty topology\">\
+             <text x=\"{CX}\" y=\"180\" text-anchor=\"middle\">no agents yet</text></svg>"
+        );
+    }
+    // Position each agent on a circle (a single node sits at the centre).
+    let n = agents.len();
+    let pos: std::collections::HashMap<&str, (f64, f64)> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if n == 1 {
+                (a.as_str(), (CX, CY))
+            } else {
+                let theta = 2.0 * PI * (i as f64) / (n as f64) - PI / 2.0;
+                (a.as_str(), (CX + R * theta.cos(), CY + R * theta.sin()))
+            }
+        })
+        .collect();
+    // Edges first (drawn under the nodes).
+    let lines: String = edges
+        .iter()
+        .filter_map(|(a, b)| {
+            let (&(x1, y1), &(x2, y2)) = (pos.get(a.as_str())?, pos.get(b.as_str())?);
+            Some(format!(
+                "<line x1=\"{x1:.1}\" y1=\"{y1:.1}\" x2=\"{x2:.1}\" y2=\"{y2:.1}\" stroke=\"#888\" stroke-width=\"2\"/>"
+            ))
+        })
+        .collect();
+    let nodes: String = agents
+        .iter()
+        .map(|a| {
+            let (x, y) = pos[a.as_str()];
+            format!(
+                "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"10\" fill=\"#4a90d9\"/>\
+                 <text x=\"{x:.1}\" y=\"{ty:.1}\" text-anchor=\"middle\" font-size=\"12\">{label}</text>",
+                ty = y - 16.0,
+                label = esc(a),
+            )
+        })
+        .collect();
+    format!(
+        "<svg viewBox=\"0 0 {W} 360\" width=\"100%\" role=\"img\" aria-label=\"topology diagram\">\
+         {lines}{nodes}</svg>"
+    )
+}
+
 /// Render the public **live-status page** for a topology (#107-subdomain): a
 /// self-contained (CSP-safe, no external assets) HTML view of the overlay — its
-/// net-uuid, member agents, and links. Addressed by net-uuid (unauthenticated for now).
+/// net-uuid, a live node-graph diagram, and the member agents + links. Addressed by
+/// net-uuid (unauthenticated for now).
 fn render_topology_status(
     t: &crate::topology::Topology,
     agents: &[String],
     edges: &[(String, String)],
 ) -> String {
     let esc = crate::portal::escape;
+    let svg = render_topology_svg(agents, edges);
     let agents_html: String = agents
         .iter()
         .map(|a| format!("<li><code>{}</code></li>", esc(a)))
@@ -943,6 +1004,7 @@ fn render_topology_status(
          <title>topology {uuid}</title></head><body>\
          <h1>Overlay topology</h1>\
          <p>net-uuid: <code>{uuid}</code></p>\
+         <figure>{svg}</figure>\
          <h2>Agents ({na})</h2><ul>{agents_html}</ul>\
          <h2>Links ({ne})</h2><ul>{edges_html}</ul>\
          </body></html>",
@@ -2734,6 +2796,28 @@ mod tests {
         let list = send("GET", "/me/topologies".into(), Some(&mallory), String::new()).await.unwrap();
         let body = to_bytes(list.into_body(), 1 << 16).await.unwrap();
         assert_eq!(serde_json::from_slice::<Vec<TopologySummary>>(&body).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn topology_svg_diagram_has_a_node_per_agent_and_a_line_per_edge() {
+        // #107 "live diagram": the status page renders an inline SVG node-graph.
+        let agents = vec!["agent-1".to_string(), "agent-2".to_string(), "agent-3".to_string()];
+        let edges = vec![
+            ("agent-1".to_string(), "agent-2".to_string()),
+            ("agent-2".to_string(), "agent-3".to_string()),
+        ];
+        let svg = render_topology_svg(&agents, &edges);
+        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"), "self-contained inline SVG");
+        assert_eq!(svg.matches("<circle").count(), 3, "one node per agent");
+        assert_eq!(svg.matches("<line").count(), 2, "one line per edge");
+        for a in &agents {
+            assert!(svg.contains(&format!(">{a}</text>")), "labels {a}");
+        }
+        // An edge to an unknown agent is skipped (no dangling line), never a panic.
+        let dangling = render_topology_svg(&agents, &[("agent-1".into(), "ghost".into())]);
+        assert_eq!(dangling.matches("<line").count(), 0, "an edge to a non-member is dropped");
+        // Empty topology -> a valid empty canvas, no panic.
+        assert!(render_topology_svg(&[], &[]).contains("no agents yet"));
     }
 
     #[tokio::test]

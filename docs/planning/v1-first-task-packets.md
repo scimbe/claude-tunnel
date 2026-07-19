@@ -2697,7 +2697,14 @@ with **no prior art** and **no dependency on those open questions** lands first:
   `topology_status_page_is_public_and_resolves_by_net_uuid` (known uuid → 200 HTML listing the agents + the
   link, no bearer; unknown → 404). Gate green. **Follow:** the actual `<net_uuid>.<zone>` **subdomain** routing
   (Host-header → this page) + auto DNS, reusing the Browser-Plane / #38 DL2 pipeline — deploy wiring on top of
-  this path-addressed page; and a richer live **diagram** (inline SVG) over the current list.
+  this path-addressed page.
+- **#107-diagram** ✅ **The live node-graph diagram** (`service::render_topology_svg`): the status page now
+  renders a self-contained inline **SVG** — agents laid out on a circle as labelled nodes, edges as lines
+  between them (a single node centred; an empty topology → an empty canvas). Pure, no external assets; an edge
+  to a non-member is dropped (never a dangling line / panic). Directly satisfies the issue's "live **diagram**
+  + current status" for the subdomain page. Frozen test
+  `topology_svg_diagram_has_a_node_per_agent_and_a_line_per_edge` (one `<circle>` per agent, one `<line>` per
+  edge, labels present; dangling edge dropped; empty canvas). Gate green.
 - **#107-nway** ⏳ **(hard core, gated on open questions)**: generalize `authorize_channel_pair` + the broker's
   fixed two-connection loop to N-way — needs scimbe's answers on scale (≤8 vs arbitrary N) and "SDN" scope.
 - **#107-optimize** ⏳ **(blocked)**: the best-connectivity objective function — cannot start until scimbe
