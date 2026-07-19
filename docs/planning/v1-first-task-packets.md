@@ -2545,3 +2545,25 @@ offload. Decomposed so the pure, mesh-independent core lands first:
   (reusing `AF4-resilience-classify`) while relayed; on success open a second direct QUIC connection, run a
   fresh Noise_IK over it, hand the ciphertext stream over, and release the relay only after the direct path is
   confirmed live both ways. Needs live connections, so its e2e is the follow packet.
+
+## #106 :443 front-door fallback for the Agent-Fabric channel broker + relay (feature, priority:high)
+
+The channel broker listens only on `:4435`; a restrictive/NAT'd network (empirically `:4433` open, **`:4435`
+filtered**, `:443` open — #103) can't reach it, so channel-to-channel is usable only from permissive networks.
+Same problem the classic tunnel had before #31/#46 — fix by multiplexing the channel service behind the unified
+`:443` front door with an ALPN discriminator, mirroring the `ct-edge` data-plane leg. Decomposed:
+
+- **#106-alpn-classify** ✅ **Channel ALPN discriminator + front-door routing** (`ct_edge::sni`): new
+  `CT_EDGE_CHANNEL_ALPN = "ct-edge-channel"` (the channel-service analog of `CT_EDGE_ALPN`) and a
+  `FrontDoorRoute::ChannelBroker` variant; `classify_front_door` routes a ClientHello carrying the channel ALPN
+  to it, ahead of any SNI (the channel leg, like `ct-edge`, carries no SNI). This is the pure demux decision
+  both the edge dispatch and the client fallback build on (the #31 FD1 pattern). `serve_front_door` gains the
+  arm (closes cleanly with a clear reason — the dispatch is the follow packet). Frozen test
+  `classify_front_door_routes_the_channel_alpn_to_the_broker` (channel ALPN → `ChannelBroker`, wins over a
+  terminate-host SNI; the classic `ct-edge` ALPN still → `EdgeRelay`; the two ids are distinct). Gate green.
+- **#106-edge-dispatch** ⏳ next: a **TLS-TCP transport leg** for the channel broker (the broker speaks QUIC;
+  `:443` is TLS-TCP, so this mirrors the ADR-0004 relay's TLS-TCP fallback) + wire `serve_front_door`'s
+  `ChannelBroker` arm to hand the buffered ClientHello + stream to `broker_channel_rendezvous`/`_relay`.
+- **#106-client-fallback** ⏳ then: the agent's channel dial falls back to the `:443` front door with
+  `ALPN=ct-edge-channel` when `CT_CHANNEL_BROKER`/`_RELAY` on the direct port is blocked (the #31 FD3 / #74
+  fallback-ladder pattern). Unblocks the #103 live sink↔source test from a `:443`-only host.

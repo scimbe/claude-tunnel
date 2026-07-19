@@ -14,6 +14,13 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// door (#31): a ClientHello carrying it is routed to the edge TLS-TCP relay.
 pub const CT_EDGE_ALPN: &str = "ct-edge";
 
+/// ALPN protocol id an Agent-Fabric **channel** member advertises on the unified
+/// :443 front door (#106): a ClientHello carrying it is routed to the channel broker
+/// (rendezvous + relay), the `:443` fallback for members on restrictive networks that
+/// cannot reach the channel port (`:4435`). The channel-service analog of
+/// [`CT_EDGE_ALPN`], mirroring the #31/#46 classic-tunnel fallback.
+pub const CT_EDGE_CHANNEL_ALPN: &str = "ct-edge-channel";
+
 /// Return the raw `extensions` block of a buffered TLS ClientHello record, or
 /// `None` if `buf` is not a ClientHello. Fully bounds-checked — never panics.
 fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
@@ -118,6 +125,10 @@ pub enum FrontDoorRoute {
     /// Tunnel data plane — the client advertised the `ct-edge` ALPN: hand off to
     /// the edge TLS-TCP relay (the ADR-0004 fallback rung on :443).
     EdgeRelay,
+    /// Agent-Fabric channel service — the client advertised the `ct-edge-channel`
+    /// ALPN (#106): hand off to the channel broker (rendezvous + relay), the `:443`
+    /// fallback for members that cannot reach the channel port `:4435`.
+    ChannelBroker,
     /// Terminate TLS + reverse-proxy to a configured terminate-host's upstream —
     /// the Portal (control plane) or, since #48, any additional host such as the
     /// Keycloak IdP (`auth.<zone>`). The `String` is the matched, lowercased host;
@@ -145,6 +156,12 @@ pub fn classify_front_door(
 ) -> FrontDoorRoute {
     if alpn.iter().any(|p| p == CT_EDGE_ALPN) {
         return FrontDoorRoute::EdgeRelay;
+    }
+    // #106: a channel member on a `:4435`-blocked network falls back to `:443` with
+    // the channel ALPN. Like the `ct-edge` data-plane leg, it carries no SNI, so the
+    // ALPN discriminator wins ahead of any SNI-based routing.
+    if alpn.iter().any(|p| p == CT_EDGE_CHANNEL_ALPN) {
+        return FrontDoorRoute::ChannelBroker;
     }
     if let Some(sni) = sni.map(|s| s.to_ascii_lowercase()) {
         if let Some(h) = terminate_hosts
@@ -338,6 +355,33 @@ mod tests {
         );
         // Nothing usable -> reject.
         assert_eq!(classify_front_door(&[], None, &hosts, default), FrontDoorRoute::Reject);
+    }
+
+    #[test]
+    fn classify_front_door_routes_the_channel_alpn_to_the_broker() {
+        // #106: a channel member blocked on :4435 falls back to :443 with the
+        // ct-edge-channel ALPN; the front door routes it to the channel broker.
+        let s = |v: &str| v.to_string();
+        let hosts = ["portal.z", "auth.z"];
+        let default = Some("portal.z");
+        // The channel ALPN -> ChannelBroker, and (like the ct-edge leg) it wins ahead
+        // of any SNI-based routing.
+        assert_eq!(
+            classify_front_door(&[s(CT_EDGE_CHANNEL_ALPN)], None, &hosts, default),
+            FrontDoorRoute::ChannelBroker
+        );
+        assert_eq!(
+            classify_front_door(&[s("ct-edge-channel")], Some("portal.z"), &hosts, default),
+            FrontDoorRoute::ChannelBroker,
+            "channel ALPN wins over a terminate-host SNI"
+        );
+        // The classic tunnel ALPN is unaffected — still routes to the edge relay.
+        assert_eq!(
+            classify_front_door(&[s(CT_EDGE_ALPN)], None, &hosts, default),
+            FrontDoorRoute::EdgeRelay
+        );
+        // The two data-plane ALPN ids are distinct.
+        assert_ne!(CT_EDGE_ALPN, CT_EDGE_CHANNEL_ALPN);
     }
 
     #[test]

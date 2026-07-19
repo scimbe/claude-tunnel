@@ -440,6 +440,13 @@ pub async fn serve_front_door(
             };
             serve_sni_passthrough(joined, state).await
         }
+        // #106: a channel member reached the :443 front door with the channel ALPN.
+        // Classification is landed here; the TLS-TCP -> channel-broker dispatch (the
+        // broker speaks QUIC, so this needs a TLS-TCP transport leg mirroring the
+        // ADR-0004 relay) is the follow packet — close cleanly with a clear reason.
+        crate::sni::FrontDoorRoute::ChannelBroker => {
+            Err("front door: channel :443 dispatch not yet wired (#106 follow packet)".into())
+        }
         crate::sni::FrontDoorRoute::Reject => Ok(()),
     }
 }
