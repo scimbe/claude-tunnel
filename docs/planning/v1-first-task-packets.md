@@ -2460,7 +2460,31 @@ A connection that completes the QUIC handshake but never submits a join blocked 
   (a silent connection → error in <2 s, not a hang). Gate green.
 - **Follow ⏳** the serial `run_edge` loop still processes rounds one at a time, so a stalled connection can
   delay others for up to the timeout; running rounds concurrently (`spawn` per round) + correlating the two
-  connections of a pairing is a separate robustness redesign (the reporter's second suggestion).
+  connections of a pairing is a separate robustness redesign (the reporter's second suggestion) — see **#109**.
+
+## #109 broker/relay pair the next-two-arrivals in one serial loop — single-slot, cross-channel mis-pairing, no 2nd-accept timeout (report, priority:high)
+
+Robustness report on `broker_channel_rendezvous`/`broker_channel_relay`: both accept **two channel-blind,
+sequential** connections and pair whatever arrives next. Three failure modes: **(1)** the relay splice runs
+**inline** in the accept loop, so it serves exactly one channel globally — a persistent channel (the #103 sink)
+wedges every other NAT'd member; **(2)** channel-blind pairing mis-pairs two concurrent channels' members
+(`X-init` gets paired with `Y-init` → both refused); **(3)** the second `endpoint.accept()` has **no timeout**
+(the #105 fix bounded the join *read*, not the wait for a partner), so a lone first-comer stalls the round.
+The concept decision (scale model) is the developer's; the fix is a demux-by-`ChannelId` accept model. Too big
+for one cycle — decomposed so the pure correlator (the substrate for all three) lands first:
+
+- **#109-pairer** ✅ **Channel-keyed pairing correlator** (`ct_edge::channel_broker::ChannelPairer<T>`, pure, no
+  sockets): a per-`ChannelId` waiting map. `offer(member)` parks the first holder of a channel and returns
+  `Parked`; when a **different holder of the same channel** arrives it returns `Paired(first, second)` so the
+  caller brokers exactly those two — two *different* channels park independently and never cross-pair (**fixes
+  #2**). A same-holder re-offer (a retry) `Superseded`s the stale wait rather than pairing a holder with itself.
+  Each parked member carries a `deadline`; `drain_expired(now)` evicts and returns timed-out lone waiters so the
+  caller can close them with a clean `NO` (**the correlation half of #3**). Frozen test: park X→Parked, park Y
+  (different channel)→Parked+both waiting (no cross-pair), second X holder→Paired(the two X members) with Y
+  still parked, same-holder re-offer→Superseded, expired waiter→drained. Gate green.
+- **#109-concurrent** ⏳ next: drive the `run_edge` accept loop through the pairer — accept → read join → `offer`;
+  on `Paired`, `tokio::spawn` the rendezvous/relay brokerage as its own task so the loop stays free (**fixes #1**:
+  concurrent relays) and bound the park with the deadline + a periodic `drain_expired` (**completes #3**).
 
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 

@@ -101,6 +101,92 @@ pub fn authorize_channel_pair(
     }
 }
 
+/// A member parked in the [`ChannelPairer`] waiting to be matched with the other
+/// holder of its channel. `payload` is opaque to the pairer — the live broker carries
+/// the accepted connection + its send stream + the verified [`ChannelJoinRequest`] +
+/// operator key there; the pairer itself only correlates by `channel`/`holder` and
+/// enforces `deadline`, so it stays pure and socket-free (unit-testable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingMember<T> {
+    pub channel: ChannelId,
+    pub holder: [u8; 32],
+    /// Absolute time by which this lone waiter must be paired or evicted (#109 #3).
+    pub deadline: UnixSeconds,
+    pub payload: T,
+}
+
+/// The outcome of offering a member to the [`ChannelPairer`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairOutcome<T> {
+    /// First holder of this channel — now parked, waiting for its partner.
+    Parked,
+    /// A different holder of the *same* channel arrived: broker exactly these two.
+    Paired(WaitingMember<T>, WaitingMember<T>),
+    /// The same holder re-presented (a retry) before its partner arrived: the newer
+    /// offer supersedes and stays parked; the returned stale waiter must be closed
+    /// (pairing a holder with itself would only earn a `SameHolder` refusal).
+    Superseded(WaitingMember<T>),
+}
+
+/// Channel-keyed pairing correlator (#109 robustness): the substrate that replaces the
+/// broker's channel-blind "pair the next two arrivals" accept model. Each accepted +
+/// admitted member is `offer`ed here; the pairer parks the first holder of a channel
+/// and only pairs it with a *different holder of the same channel* — so two channels'
+/// members racing to connect can never cross-pair (the #109 mis-pairing failure), and
+/// a lone first-comer is bounded by its `deadline` instead of wedging the round.
+#[derive(Debug, Default)]
+pub struct ChannelPairer<T> {
+    waiting: std::collections::HashMap<ChannelId, WaitingMember<T>>,
+}
+
+impl<T> ChannelPairer<T> {
+    pub fn new() -> Self {
+        Self { waiting: std::collections::HashMap::new() }
+    }
+
+    /// Offer an admitted member. Parks it, pairs it with the waiting partner of the
+    /// same channel, or supersedes a stale same-holder wait — see [`PairOutcome`].
+    pub fn offer(&mut self, member: WaitingMember<T>) -> PairOutcome<T> {
+        match self.waiting.remove(&member.channel) {
+            None => {
+                self.waiting.insert(member.channel, member);
+                PairOutcome::Parked
+            }
+            Some(existing) if existing.holder == member.holder => {
+                // Same holder retried before its partner showed up: keep the fresh
+                // offer parked, hand the stale one back to be closed.
+                self.waiting.insert(member.channel, member);
+                PairOutcome::Superseded(existing)
+            }
+            Some(existing) => PairOutcome::Paired(existing, member),
+        }
+    }
+
+    /// Evict and return every lone waiter whose `deadline` is at or before `now` (#3):
+    /// a first-comer with no partner is bounded instead of wedging the round forever.
+    pub fn drain_expired(&mut self, now: UnixSeconds) -> Vec<WaitingMember<T>> {
+        let expired: Vec<ChannelId> = self
+            .waiting
+            .iter()
+            .filter(|(_, m)| m.deadline <= now)
+            .map(|(c, _)| *c)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|c| self.waiting.remove(&c))
+            .collect()
+    }
+
+    /// Number of members currently parked (one per waiting channel).
+    pub fn len(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+}
+
 /// Endpoint policy (#81 gap 3, tightened for #94): a peer agent will *dial* this
 /// advertised address, so it must be a real, **publicly-routable** socket address and
 /// not an SSRF / internal-pivot target. A malicious holder must not be able to make the
@@ -596,6 +682,56 @@ mod tests {
             authorize_channel_pair(&other, &a, &b, 500),
             Err(BrokerError::GrantInvalid(GrantError::BadSignature))
         );
+    }
+
+    #[test]
+    fn channel_pairer_correlates_by_channel_and_never_cross_pairs() {
+        // #109-pairer (frozen): the channel-keyed correlator that replaces the broker's
+        // channel-blind "pair the next two arrivals". Two channels racing to connect
+        // must park independently and pair only same-channel holders — never cross.
+        let m = |chan: u8, holder: u8, deadline: UnixSeconds, tag: &'static str| WaitingMember {
+            channel: ChannelId([chan; 32]),
+            holder: [holder; 32],
+            deadline,
+            payload: tag,
+        };
+        let mut pairer: ChannelPairer<&'static str> = ChannelPairer::new();
+
+        // First holder of channel X parks.
+        assert_eq!(pairer.offer(m(0x11, 0xAA, 100, "X-init")), PairOutcome::Parked);
+        assert_eq!(pairer.len(), 1);
+
+        // A different channel Y parks independently — it does NOT cross-pair with the
+        // waiting X member (this is the #109 mis-pairing failure the pairer closes).
+        assert_eq!(pairer.offer(m(0x22, 0xCC, 100, "Y-init")), PairOutcome::Parked);
+        assert_eq!(pairer.len(), 2);
+
+        // The second holder of channel X pairs with exactly the first X member; Y stays.
+        match pairer.offer(m(0x11, 0xBB, 100, "X-acc")) {
+            PairOutcome::Paired(first, second) => {
+                assert_eq!(first.payload, "X-init");
+                assert_eq!(second.payload, "X-acc");
+                assert_eq!(first.channel, ChannelId([0x11; 32]));
+            }
+            other => panic!("expected Paired(X-init, X-acc), got {other:?}"),
+        }
+        assert_eq!(pairer.len(), 1, "X consumed by the pairing; Y still parked");
+
+        // A same-holder re-offer (a retry) supersedes the stale wait rather than
+        // pairing the holder with itself.
+        assert_eq!(pairer.offer(m(0x33, 0xDD, 100, "Z-v1")), PairOutcome::Parked);
+        match pairer.offer(m(0x33, 0xDD, 200, "Z-v2")) {
+            PairOutcome::Superseded(stale) => assert_eq!(stale.payload, "Z-v1"),
+            other => panic!("expected Superseded(Z-v1), got {other:?}"),
+        }
+        assert_eq!(pairer.len(), 2, "the fresh Z offer stays parked, plus Y");
+
+        // Lone waiters past their deadline are drained (#3): Y (deadline 100) is evicted
+        // at now=150, but the fresh Z-v2 (deadline 200) survives.
+        let drained = pairer.drain_expired(150);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload, "Y-init");
+        assert_eq!(pairer.len(), 1, "Z-v2 (deadline 200) is not yet expired at 150");
     }
 
     #[test]
