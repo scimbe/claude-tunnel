@@ -14,8 +14,11 @@ docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.e
 
 Brings up the control plane (durable `cpdata` volume) and one edge, both with
 `restart: unless-stopped` and a `/readyz` healthcheck. The base stack publishes
-**only the mesh-plane relay on `:4433`** (udp+tcp) and metrics on `:9600` — no
-`:443`. Add the overlays below for the public-facing planes.
+the **mesh-plane relay on `:4433`** and the **Agent-Fabric channel
+rendezvous/relay on `:4435`/`:4436`** (all udp+tcp), plus metrics on `:9600` — but
+**no `:443`**. The channel-broker ports are mapped but the edge only binds them
+once `CT_EDGE_ADMIN_TOKEN` is set (#100/#105), so they sit idle until then. Add the
+overlays below for the public-facing planes.
 
 **Optional `:443` front door** (`compose.frontdoor.yml`, #60) — publishes one
 `:443` that serves the **Portal landing page**, **Browser-Plane subdomains**
