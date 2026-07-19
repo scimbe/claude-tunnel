@@ -643,11 +643,18 @@ pub fn redeem_invitation(
     })
 }
 
-/// Lowercase-hex a 32-byte value for the canonical signing bytes.
+/// Lowercase-hex a 32-byte value for the canonical signing bytes. Writes a static
+/// nibble table directly into the pre-sized `String` — **byte-identical** output to
+/// the old `format!("{:02x}")` loop (so the signature preimage is unchanged), but
+/// without the ~64 throwaway `format!` allocations per call. `signing_bytes` calls
+/// this twice on every grant/invitation verify, which is the per-connection A2A
+/// admission gate (#114 #5).
 fn hex32(b: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
-    for x in b {
-        s.push_str(&format!("{x:02x}"));
+    for &x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0x0f) as usize] as char);
     }
     s
 }
@@ -656,6 +663,29 @@ fn hex32(b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn hex32_is_byte_identical_to_the_format_loop() {
+        // #114 #5 (frozen): the table-driven hex32 must produce EXACTLY the lowercase
+        // hex the old `format!("{:02x}")` loop did — the signing preimage must not
+        // change (a different preimage would invalidate every existing grant/invite
+        // signature). Check fixed vectors + an arbitrary pattern against the reference.
+        let reference = |b: &[u8; 32]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+
+        let zero = [0x00u8; 32];
+        let max = [0xffu8; 32];
+        let mut pat = [0u8; 32];
+        for (i, p) in pat.iter_mut().enumerate() {
+            *p = (i as u8).wrapping_mul(37).wrapping_add(0x0a); // spans low/high nibbles
+        }
+
+        assert_eq!(hex32(&zero), "00".repeat(32));
+        assert_eq!(hex32(&max), "ff".repeat(32));
+        for v in [&zero, &max, &pat] {
+            assert_eq!(hex32(v), reference(v), "table hex must equal the format! loop byte-for-byte");
+            assert_eq!(hex32(v).len(), 64, "always 64 lowercase hex chars");
+        }
+    }
 
     /// Sign a grant with a deterministic operator key (no rng needed in tests).
     fn signed_grant(

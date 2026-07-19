@@ -2535,9 +2535,13 @@ hot-path pair landed first:
 - **#114-dialer-reuse** ⏳ (finding #4, **confirm first**): `build_channel_dialer` reportedly rebuilds a rustls
   `ClientConfig` + binds a new UDP `Endpoint` per dial (≈3× per plane-brokered join, more per #106 ladder rung);
   a single quinn `Endpoint` can `connect()` to many peers — build once + reuse. Verify against source before scoping.
-- **#114-hex32** ⏳ (finding #5, LOW): `hex32`/`signing_bytes` do ~66 small `format!` allocs per grant/invite
-  verify (admission gate); replace with a static hex lookup table into the pre-sized `String`. Drop-in (no
-  preimage change).
+- **#114-hex32** ✅ (finding #5, LOW): `hex32` now writes a static nibble table directly into the pre-sized
+  `String` — **byte-identical** output to the old `format!("{:02x}")` loop (signing preimage unchanged, so all
+  existing grant/invite signatures still verify), removing the ~64 throwaway `format!` allocs per call. Called
+  twice per grant/invitation verify on the per-connection A2A admission gate. Frozen test
+  `hex32_is_byte_identical_to_the_format_loop` (fixed `00…`/`ff…` vectors + an arbitrary nibble-spanning
+  pattern, each equal to the `format!`-loop reference, always 64 chars); the existing grant/invite verify
+  tests freeze the preimage end-to-end. Gate green, 0 warnings.
 
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
