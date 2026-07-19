@@ -2655,8 +2655,15 @@ with **no prior art** and **no dependency on those open questions** lands first:
   errors; serde round-trip. Gate green.
   - **Chosen interpretation** of the issue's revocation open-question: revoking returns control to the
     **original owner** (reassignable only by them), *not* free-for-all — the safe default; flagged for scimbe.
-- **#107-datamodel** ⏳ next: `Topology` entity + agent-membership (wrapping the state machine) + edge-list as
-  durable CP schema (`SqliteTopologyStore`), owner-scoped.
+- **#107-datamodel** ✅ (membership core) **Durable exclusive assignment** (`storage::SqliteTopologyStore`):
+  the durable equivalent of the `AgentAssignment` state machine, so the exclusivity constraint holds **across
+  restarts**. One row per agent (`agent PK, owner, topology?`); `assign(by, agent, topology)` (first touch
+  registers `by` as owner; owner-only + exclusivity enforced by the pure state machine), `revoke(by, agent)`
+  (owner-reclaim or topology-release), `assignment(agent)`, `agents_in(topology)`. `TopologyError` wraps
+  `AssignError`/DB. Frozen test `topology_store_enforces_exclusivity_across_a_restart` (assign; AlreadyAssigned
+  blocks a second topology; a non-owner can neither reassign nor revoke; **reopen on the same file → state
+  persisted, still exclusive**; revoke→owner control→reassign; revoke-unassigned errors). Gate green. The
+  `Topology` entity (id/owner/`net-uuid`) + the edge-list are the next durable pieces.
 - **#107-rest** ⏳: `/me/topologies`, `/me/topologies/:id/agents`, … following the `/me/*` OIDC-bearer,
   subject-scoped conventions.
 - **#107-subdomain** ⏳: `<net-uuid>.<zone>` live-status page reusing the #38 DL2 DNS + authorize-host pipeline

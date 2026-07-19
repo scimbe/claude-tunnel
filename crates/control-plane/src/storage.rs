@@ -1382,6 +1382,141 @@ impl SqliteNetworkStore {
     }
 }
 
+/// Why a durable topology-assignment operation failed: either an assignment-rule
+/// violation ([`crate::topology::AssignError`]) or the database.
+#[derive(Debug)]
+pub enum TopologyError {
+    /// The transition violated the exclusivity / ownership rules.
+    Assign(crate::topology::AssignError),
+    /// A database error.
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for TopologyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TopologyError::Assign(e) => write!(f, "{e}"),
+            TopologyError::Db(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TopologyError {}
+
+impl From<rusqlite::Error> for TopologyError {
+    fn from(e: rusqlite::Error) -> Self {
+        TopologyError::Db(e)
+    }
+}
+
+impl From<crate::topology::AssignError> for TopologyError {
+    fn from(e: crate::topology::AssignError) -> Self {
+        TopologyError::Assign(e)
+    }
+}
+
+/// SQLite-backed store for the Topology Editor's **exclusive agent-to-topology
+/// assignment** (#107): the durable equivalent of [`crate::topology::AgentAssignment`],
+/// so the exclusivity constraint (*an agent belongs to at most one topology; sharing can
+/// only be revoked, not reassigned*) holds across restarts. One row per agent records its
+/// owner and, if shared, the single topology it belongs to; the pure state machine
+/// enforces every transition. (The `Topology` entity + edge-list are follow packets; this
+/// is the membership core.)
+pub struct SqliteTopologyStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteTopologyStore {
+    /// Open (creating if needed) a durable store at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory store (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS topology_agents (
+                 agent    TEXT PRIMARY KEY,
+                 owner    TEXT NOT NULL,
+                 topology TEXT
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Load the current assignment for `agent`, reconstructed from its row.
+    fn load(conn: &Connection, agent: &str) -> rusqlite::Result<Option<crate::topology::AgentAssignment>> {
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT owner, topology FROM topology_agents WHERE agent = ?1",
+                params![agent],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(owner, topology)| {
+            let mut a = crate::topology::AgentAssignment::new(owner.clone());
+            if let Some(t) = topology {
+                // Reconstruction: the owner (re)assigns itself, which always succeeds.
+                let _ = a.assign(&owner, t);
+            }
+            a
+        }))
+    }
+
+    fn persist(conn: &Connection, agent: &str, a: &crate::topology::AgentAssignment) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO topology_agents (agent, owner, topology) VALUES (?1, ?2, ?3)",
+            params![agent, a.owner(), a.topology()],
+        )?;
+        Ok(())
+    }
+
+    /// The current assignment for `agent`, if it has ever been touched.
+    pub fn assignment(&self, agent: &str) -> rusqlite::Result<Option<crate::topology::AgentAssignment>> {
+        Self::load(&self.conn.lock_safe(), agent)
+    }
+
+    /// Share `agent` into `topology` on behalf of `by`. First touch registers the agent
+    /// as owned by `by`; thereafter only the owner may assign, and only when unassigned
+    /// (exclusivity — [`crate::topology::AssignError::AlreadyAssigned`] otherwise). The
+    /// transition is enforced by the pure state machine and persisted.
+    pub fn assign(&self, by: &str, agent: &str, topology: &str) -> Result<(), TopologyError> {
+        let conn = self.conn.lock_safe();
+        let mut a = Self::load(&conn, agent)?.unwrap_or_else(|| crate::topology::AgentAssignment::new(by));
+        a.assign(by, topology)?;
+        Self::persist(&conn, agent, &a)?;
+        Ok(())
+    }
+
+    /// End `agent`'s current sharing (the owner reclaims, or the current topology
+    /// releases), returning it to its owner's control. Persisted so exclusivity survives
+    /// a restart. [`crate::topology::AssignError::NotAssigned`] if it is not in a topology.
+    pub fn revoke(&self, by: &str, agent: &str) -> Result<(), TopologyError> {
+        let conn = self.conn.lock_safe();
+        let mut a = Self::load(&conn, agent)?.ok_or(crate::topology::AssignError::NotAssigned)?;
+        a.revoke(by)?;
+        Self::persist(&conn, agent, &a)?;
+        Ok(())
+    }
+
+    /// The agents currently assigned to `topology` (sorted).
+    pub fn agents_in(&self, topology: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT agent FROM topology_agents WHERE topology = ?1 ORDER BY agent")?;
+        let agents = stmt
+            .query_map(params![topology], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(agents)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1426,6 +1561,62 @@ mod tests {
         assert!(store.delete("alice", "corp").unwrap());
         assert!(!store.delete("alice", "corp").unwrap(), "already gone");
         assert_eq!(store.list("alice").unwrap(), vec!["team".to_string()]);
+    }
+
+    #[test]
+    fn topology_store_enforces_exclusivity_across_a_restart() {
+        use crate::topology::AssignError;
+
+        let path = temp_db_path();
+        {
+            let store = SqliteTopologyStore::open(&path).unwrap();
+            // Alice shares her agent into net-1 (first touch registers her as owner).
+            store.assign("alice", "agent-1", "net-1").unwrap();
+            assert_eq!(store.assignment("agent-1").unwrap().unwrap().topology(), Some("net-1"));
+
+            // Exclusivity: it can't join a second topology while assigned.
+            assert!(matches!(
+                store.assign("alice", "agent-1", "net-2"),
+                Err(TopologyError::Assign(AssignError::AlreadyAssigned { .. }))
+            ));
+            // Owner-scoped: another subject can neither reassign nor revoke it.
+            assert!(matches!(
+                store.assign("mallory", "agent-1", "net-2"),
+                Err(TopologyError::Assign(AssignError::NotAuthorized))
+            ));
+            assert!(matches!(
+                store.revoke("mallory", "agent-1"),
+                Err(TopologyError::Assign(AssignError::NotAuthorized))
+            ));
+            // A second agent joins net-1 too.
+            store.assign("alice", "agent-2", "net-1").unwrap();
+            assert_eq!(store.agents_in("net-1").unwrap(), vec!["agent-1", "agent-2"]);
+        }
+
+        // Reopen on the same file: the exclusivity state persisted.
+        {
+            let store = SqliteTopologyStore::open(&path).unwrap();
+            assert_eq!(store.assignment("agent-1").unwrap().unwrap().topology(), Some("net-1"));
+            // Still exclusive after restart.
+            assert!(matches!(
+                store.assign("alice", "agent-1", "net-2"),
+                Err(TopologyError::Assign(AssignError::AlreadyAssigned { .. }))
+            ));
+
+            // Revoke returns control to the owner; only then can it be reassigned.
+            store.revoke("net-1", "agent-1").unwrap(); // the topology releases it
+            assert!(!store.assignment("agent-1").unwrap().unwrap().is_assigned());
+            store.assign("alice", "agent-1", "net-2").unwrap();
+            assert_eq!(store.assignment("agent-1").unwrap().unwrap().topology(), Some("net-2"));
+
+            // Revoking an unassigned agent errors.
+            store.revoke("alice", "agent-2").unwrap();
+            assert!(matches!(
+                store.revoke("alice", "agent-2"),
+                Err(TopologyError::Assign(AssignError::NotAssigned))
+            ));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
