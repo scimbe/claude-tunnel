@@ -2737,9 +2737,21 @@ with **no prior art** and **no dependency on those open questions** lands first:
   + current status" for the subdomain page. Frozen test
   `topology_svg_diagram_has_a_node_per_agent_and_a_line_per_edge` (one `<circle>` per agent, one `<line>` per
   edge, labels present; dangling edge dropped; empty canvas). Gate green.
-- **#107-nway** ⏳ **(hard core, gated on open questions)**: generalize `authorize_channel_pair` + the broker's
-  fixed two-connection loop to N-way — needs scimbe's answers on scale (≤8 vs arbitrary N) and "SDN" scope.
-- **#107-optimize** ⏳ **(blocked)**: the best-connectivity objective function — cannot start until scimbe
-  states what it optimizes (latency / hops / redundancy / bandwidth). **#107-ui** ⏳: greenfield node-graph
-  editor (frontend-stack decision — no existing SPA infra). **#107-testing** ⏳: unit/API (cheap) + a real
-  N-agent formation smoke (reuse #76's harness or a lighter docker rig).
+- **Design answers (scimbe 2026-07-19):** objective = **latency**, scale = **arbitrary N**, "SDN" = **both /
+  phased** (graph-wiring first, flow-rules later). See [[project_scimbe_decisions_2026-07-19]].
+- **#107-optimize** ✅ (backbone) **Minimum-latency overlay** (`ct_common::overlay::min_latency_overlay`): the
+  "best-connectivity" computation, now unblocked. Given the agents + policy-allowed candidate links (each with a
+  measured latency `cost`), it computes a **minimum spanning tree** (Kruskal + union-find) — a connected overlay
+  of `N-1` links with **minimal total latency**, for **arbitrary N** (a real graph algorithm per the scale
+  answer), deterministic (ties broken by the canonical node pair). Ignores self-loops / unknown-node links; a
+  partitioned candidate set yields the spanning **forest** with `connected=false`; a 0/1-node network is
+  connected with no links. This is the graph-wiring phase's connectivity backbone; latency-reducing **shortcuts**
+  (stretch, cf. #76) and later real flow-rules build on it. Frozen tests: MST minimizes total latency + connects
+  all; partition→not-connected; tie/canonical/bad-link handling; trivial networks; serde round-trip. Gate green.
+- **#107-nway** ⏳ (now unblocked — scale=arbitrary N, phase=graph-wiring): generalize `authorize_channel_pair`
+  + the broker's fixed two-connection loop so a topology's MST links (from `min_latency_overlay`) each form an
+  A2A channel — the controller compiles the plan into per-link grants. Needs the live mesh (#99/#103) for e2e.
+- **#107-optimize-follow** ⏳: measure/supply per-link latencies (edge probes) + shortcut edges to cut stretch
+  (#76). **#107-ui** ⏳ **(design-gated)**: greenfield node-graph editor — awaiting the framework-vs-vanilla
+  call. **#107-testing** ⏳: unit/API (done for the pure layers) + a real N-agent formation smoke once the mesh
+  is live.
