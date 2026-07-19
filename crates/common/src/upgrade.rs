@@ -1,0 +1,254 @@
+//! Opportunistic relay→direct upgrade coordination for A2A channels (#104).
+//!
+//! When two channel members can't reach each other directly they fall back to the
+//! edge relay (`AF4-relay-clientwire`), which then carries the full ciphertext path
+//! for the session's lifetime — even if a direct path later becomes viable (NAT
+//! rebinds, a firewall opens, peers roam). This module is the pure, deterministic
+//! **coordination + accounting** core of promoting such a session back to direct and
+//! freeing the relay — the Tailscale DERP→direct shape.
+//!
+//! Two pieces, both mesh-independent and unit-testable (the live QUIC re-dial + stream
+//! handover is a follow packet):
+//!
+//! * [`UpgradeCoordinator`] — decides **when** and **who**: only the initiator side
+//!   owns triggering the swap (so both peers don't race), retries a background direct
+//!   dial on a backoff while still relayed, and records the handover (with the
+//!   time-to-upgrade metric) once a direct path is confirmed.
+//! * [`PathMeter`] — per-session byte accounting (relay vs direct) so the offload goal
+//!   is *measurable*, not just asserted.
+//!
+//! Time is caller-supplied (`now`, unix seconds) for deterministic tests, mirroring
+//! [`crate::replay`] and [`crate::ratelimit`].
+
+use serde::{Deserialize, Serialize};
+
+/// Which transport an A2A session's data path is currently riding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Path {
+    /// Forwarded through the edge relay (ciphertext only).
+    Relay,
+    /// Peer-to-peer direct connection (edge offloaded).
+    Direct,
+}
+
+/// A member's role in the channel (mirrors the grant `Direction`). Exactly one side —
+/// the initiator — owns *triggering* an upgrade; the responder reacts, so the two
+/// peers never race to swap simultaneously.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    /// Dials the peer (grant `Direction::Initiate`) — owns triggering the upgrade.
+    Initiator,
+    /// Accepts (grant `Direction::Accept`) — reacts to the initiator's swap.
+    Responder,
+}
+
+/// Backoff bounds (seconds) for the background direct-dial retry while relayed.
+const DEFAULT_BASE_INTERVAL_SECS: u64 = 5;
+const DEFAULT_MAX_INTERVAL_SECS: u64 = 60;
+
+/// Coordinates the opportunistic relay→direct upgrade of one A2A session (#104).
+///
+/// Constructed when a session starts on the relay. The initiator polls
+/// [`should_attempt`](Self::should_attempt); on each failed background dial it calls
+/// [`record_attempt_failed`](Self::record_attempt_failed) (which schedules the next
+/// attempt with exponential backoff up to a cap); once a direct path is confirmed live
+/// both ways it calls [`confirm_upgraded`](Self::confirm_upgraded), which flips the
+/// path to [`Path::Direct`], stops further attempts, and records the time-to-upgrade.
+#[derive(Clone, Debug)]
+pub struct UpgradeCoordinator {
+    role: Role,
+    path: Path,
+    started_at: u64,
+    upgraded_at: Option<u64>,
+    next_attempt_at: u64,
+    attempts: u32,
+    base_interval: u64,
+    max_interval: u64,
+}
+
+impl UpgradeCoordinator {
+    /// Start coordinating a session that began on the relay at `now`, for this member's
+    /// `role`. The first background dial is scheduled one base interval out (don't
+    /// hammer the moment fallback happens).
+    pub fn new(role: Role, now: u64) -> Self {
+        Self::with_backoff(role, now, DEFAULT_BASE_INTERVAL_SECS, DEFAULT_MAX_INTERVAL_SECS)
+    }
+
+    /// Like [`new`](Self::new) with explicit backoff bounds (for tests / tuning).
+    pub fn with_backoff(role: Role, now: u64, base_interval: u64, max_interval: u64) -> Self {
+        let base = base_interval.max(1);
+        Self {
+            role,
+            path: Path::Relay,
+            started_at: now,
+            upgraded_at: None,
+            next_attempt_at: now.saturating_add(base),
+            attempts: 0,
+            base_interval: base,
+            max_interval: max_interval.max(base),
+        }
+    }
+
+    /// Whether this member should attempt a background direct dial now. True only for
+    /// the initiator, only while still relayed, and only once the scheduled time has
+    /// arrived — so the responder never triggers, and an already-upgraded session stops.
+    pub fn should_attempt(&self, now: u64) -> bool {
+        self.role == Role::Initiator && self.path == Path::Relay && now >= self.next_attempt_at
+    }
+
+    /// Record that a background direct dial failed; schedule the next attempt with
+    /// exponential backoff (`base · 2^attempts`, capped at `max_interval`).
+    pub fn record_attempt_failed(&mut self, now: u64) {
+        self.attempts = self.attempts.saturating_add(1);
+        let shift = self.attempts.min(16); // cap the exponent so the shift can't overflow
+        let backoff = self
+            .base_interval
+            .saturating_mul(1u64 << shift)
+            .min(self.max_interval);
+        self.next_attempt_at = now.saturating_add(backoff);
+    }
+
+    /// Confirm the direct path is live both ways: promote to [`Path::Direct`] and record
+    /// the handover time. Idempotent — a second confirm keeps the first upgrade time.
+    pub fn confirm_upgraded(&mut self, now: u64) {
+        if self.path != Path::Direct {
+            self.path = Path::Direct;
+            self.upgraded_at = Some(now);
+        }
+    }
+
+    /// The current data path.
+    pub fn path(&self) -> Path {
+        self.path
+    }
+
+    /// Whether the session has been promoted to the direct path.
+    pub fn is_direct(&self) -> bool {
+        self.path == Path::Direct
+    }
+
+    /// Seconds from relay-fallback to a confirmed direct path (#104's time-to-upgrade
+    /// metric), or `None` while still relayed.
+    pub fn time_to_upgrade(&self) -> Option<u64> {
+        self.upgraded_at.map(|t| t.saturating_sub(self.started_at))
+    }
+
+    /// Number of background dial attempts recorded so far.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
+/// Per-session byte accounting for the relay→direct offload metric (#104): how much
+/// data rode the edge relay vs the direct path. `direct_fraction` is the number that
+/// demonstrates the edge is actually being offloaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathMeter {
+    relay_bytes: u64,
+    direct_bytes: u64,
+}
+
+impl PathMeter {
+    /// A fresh meter (both counters zero).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `bytes` transferred over `path`.
+    pub fn record(&mut self, path: Path, bytes: u64) {
+        match path {
+            Path::Relay => self.relay_bytes = self.relay_bytes.saturating_add(bytes),
+            Path::Direct => self.direct_bytes = self.direct_bytes.saturating_add(bytes),
+        }
+    }
+
+    /// Bytes carried by the edge relay.
+    pub fn relay_bytes(&self) -> u64 {
+        self.relay_bytes
+    }
+
+    /// Bytes carried by the direct path (edge offloaded).
+    pub fn direct_bytes(&self) -> u64 {
+        self.direct_bytes
+    }
+
+    /// Total bytes across both paths.
+    pub fn total_bytes(&self) -> u64 {
+        self.relay_bytes.saturating_add(self.direct_bytes)
+    }
+
+    /// Fraction of bytes that went direct (0.0 when nothing sent yet). Higher = more
+    /// of the session offloaded from the edge.
+    pub fn direct_fraction(&self) -> f64 {
+        let total = self.total_bytes();
+        if total == 0 {
+            0.0
+        } else {
+            self.direct_bytes as f64 / total as f64
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_initiator_triggers_upgrades_and_respects_the_schedule() {
+        // The responder reacts, it never triggers — so both peers don't race.
+        let responder = UpgradeCoordinator::new(Role::Responder, 1_000);
+        assert!(!responder.should_attempt(1_000_000), "responder never triggers");
+
+        // The initiator waits one base interval before the first attempt, then fires.
+        let init = UpgradeCoordinator::with_backoff(Role::Initiator, 1_000, 5, 60);
+        assert!(!init.should_attempt(1_002), "not before the first scheduled attempt");
+        assert!(init.should_attempt(1_005), "fires once the base interval elapses");
+    }
+
+    #[test]
+    fn failed_attempts_back_off_exponentially_up_to_the_cap() {
+        let mut c = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 5, 60);
+        // First window opens at t=5.
+        assert!(c.should_attempt(5));
+        c.record_attempt_failed(5); // next: 5 + 5*2 = 15
+        assert!(!c.should_attempt(14) && c.should_attempt(15), "backoff to +10s");
+        c.record_attempt_failed(15); // next: 15 + 5*4 = 35
+        assert!(!c.should_attempt(34) && c.should_attempt(35), "backoff to +20s");
+        // Keep failing — the interval is capped at max_interval (60s), never unbounded.
+        for t in [35, 95, 155, 215] {
+            c.record_attempt_failed(t);
+        }
+        // After the cap, the next attempt is exactly max_interval out.
+        c.record_attempt_failed(1_000);
+        assert!(!c.should_attempt(1_059) && c.should_attempt(1_060), "capped at +60s");
+    }
+
+    #[test]
+    fn confirming_the_direct_path_stops_attempts_and_records_time_to_upgrade() {
+        let mut c = UpgradeCoordinator::with_backoff(Role::Initiator, 100, 5, 60);
+        assert_eq!(c.path(), Path::Relay);
+        assert_eq!(c.time_to_upgrade(), None, "no upgrade time while relayed");
+        assert!(c.should_attempt(200), "would attempt while relayed");
+
+        c.confirm_upgraded(160); // 60s after the session started at 100
+        assert!(c.is_direct() && c.path() == Path::Direct);
+        assert_eq!(c.time_to_upgrade(), Some(60), "time-to-upgrade = confirmed - started");
+        assert!(!c.should_attempt(1_000_000), "no further attempts once direct");
+
+        // Idempotent: a second confirm keeps the original upgrade time.
+        c.confirm_upgraded(999);
+        assert_eq!(c.time_to_upgrade(), Some(60));
+    }
+
+    #[test]
+    fn path_meter_accounts_relay_vs_direct_bytes() {
+        let mut m = PathMeter::new();
+        assert_eq!(m.direct_fraction(), 0.0, "nothing sent yet");
+        m.record(Path::Relay, 300);
+        m.record(Path::Direct, 900);
+        assert_eq!(m.relay_bytes(), 300);
+        assert_eq!(m.direct_bytes(), 900);
+        assert_eq!(m.total_bytes(), 1_200);
+        assert!((m.direct_fraction() - 0.75).abs() < 1e-9, "75% offloaded to direct");
+    }
+}

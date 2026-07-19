@@ -2518,3 +2518,30 @@ mesh-independent core lands first:
 - **#102-mcp** ⏳: the same operations as agent-native MCP tools (`net.apply`, `net.grant`, `net.revoke`,
   `net.explain(a, b) → allowed? why`). Depends on the live A2A mesh (#99/#98/#100/#81/#72) for the end-to-end
   "allowed flow connects, disallowed refused at the broker" acceptance.
+
+## #104 Opportunistic relay→direct upgrade for A2A channels (feature)
+
+Once two members fall back to the edge relay (`AF4-relay-clientwire`), the edge carries the full ciphertext
+path for the session's life — even if a direct path later becomes viable (NAT rebinds, firewall opens, peers
+roam). Goal: silently promote back to direct and free the relay (the Tailscale DERP→direct shape), a real edge
+offload. Decomposed so the pure, mesh-independent core lands first:
+
+- **#104-coordinate** ✅ **Upgrade coordination + offload metric** (`ct_common::upgrade`, pure/deterministic):
+  the two pieces the issue calls out as the load-reduction proof and the race-avoidance rule.
+  - `UpgradeCoordinator` — decides **when** and **who**: only the **initiator** owns triggering the swap
+    (`should_attempt` is always false for the responder, so the peers never race), retries a background direct
+    dial on **exponential backoff** (`base·2^n`, capped) while still relayed, and `confirm_upgraded` flips the
+    path `Relay→Direct`, stops further attempts, and records the **time-to-upgrade**. Caller-supplied `now`
+    (deterministic, mirrors `replay`/`ratelimit`).
+  - `PathMeter` — per-session **relay-vs-direct byte accounting** + `direct_fraction()`, the number that shows
+    the edge is actually offloaded.
+  Frozen tests: initiator-only triggering + schedule, exponential backoff to the cap, confirm→direct stops
+  attempts + records time-to-upgrade (idempotent), and relay/direct byte accounting. Gate green
+  (full `cargo test --workspace -D warnings`).
+- **#104-signal** ⏳ next: the small control message over the still-open relay stream that lets the initiator
+  tell the responder "I can reach you direct — swap now", and the both-ways-live confirmation before either
+  side stops the relay leg (no drop window).
+- **#104-handover** ⏳ then: wire `UpgradeCoordinator` into `run_channel_session` — background `dial_peer_direct`
+  (reusing `AF4-resilience-classify`) while relayed; on success open a second direct QUIC connection, run a
+  fresh Noise_IK over it, hand the ciphertext stream over, and release the relay only after the direct path is
+  confirmed live both ways. Needs live connections, so its e2e is the follow packet.
