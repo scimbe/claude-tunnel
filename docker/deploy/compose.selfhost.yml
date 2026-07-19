@@ -85,10 +85,15 @@ services:
     ports:
       - "${EDGE_PORT:-4433}:4433/udp"
       - "${EDGE_PORT:-4433}:4433/tcp"
-      # Agent-Fabric channel rendezvous/relay (#100/#103). Restrictive client networks
-      # that block this port fall back to the :443 front door (#106, ALPN=ct-edge-channel).
+      # Agent-Fabric channel RENDEZVOUS (#100/#103) — pairs two members for a direct dial.
       - "${EDGE_CHANNEL_PORT:-4435}:4435/udp"
       - "${EDGE_CHANNEL_PORT:-4435}:4435/tcp"
+      # Agent-Fabric channel RELAY (#105): the fallback both NAT'd members tunnel through
+      # (rendezvous alone can't pair peers that can't reach each other directly). run_edge
+      # binds it at the rendezvous port + 1 by default. Restrictive client networks that
+      # block these ports fall back to the :443 front door (#106, ALPN=ct-edge-channel).
+      - "${EDGE_CHANNEL_RELAY_PORT:-4436}:4436/udp"
+      - "${EDGE_CHANNEL_RELAY_PORT:-4436}:4436/tcp"
       # Operator-facing metrics scrape endpoint (#19), bound to LOOPBACK (#85) — it's
       # unauthenticated, so it must not be published on a public interface; scrape it
       # from 127.0.0.1 (or internally via the docker network at edge:9600). Override

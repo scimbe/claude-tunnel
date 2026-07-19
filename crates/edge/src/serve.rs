@@ -1098,6 +1098,55 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     Ok((chan_ep, _root)) => {
                         let authorizer =
                             crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+
+                        // #105 / #72 AF4-relay: also mount the RELAY on a second endpoint
+                        // (default channel port + 1, or CT_EDGE_CHANNEL_RELAY_LISTEN). Two
+                        // members BOTH behind NAT can't reach each other on the direct path,
+                        // so rendezvous alone can't pair them — they fall back to this relay,
+                        // which authorizes both joins and splices their streams through the
+                        // edge (ciphertext; the Noise_IK session stays end-to-end). Without
+                        // this spawn, a NAT'd agent's relay connection has nowhere to go.
+                        let relay_addr = std::env::var("CT_EDGE_CHANNEL_RELAY_LISTEN")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+                            .unwrap_or_else(|| {
+                                std::net::SocketAddr::new(chan_addr.ip(), chan_addr.port().saturating_add(1))
+                            });
+                        match build_server_endpoint_from_ca(&ca, relay_addr, vec!["localhost".to_string()]) {
+                            Ok((relay_ep, _)) => {
+                                let relay_az = authorizer.clone();
+                                eprintln!("ct-edge: Agent-Fabric channel RELAY on {relay_addr} (#105/#72 AF4-relay)");
+                                tokio::spawn(async move {
+                                    loop {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
+                                        let az = relay_az.clone();
+                                        match crate::channel_broker::broker_channel_relay(
+                                            &relay_ep,
+                                            now,
+                                            move |c, h| {
+                                                let a = az.clone();
+                                                async move {
+                                                    a.resolve(&c, &h).await.map(|m| {
+                                                        (m.operator_pubkey, m.noise_pubkey, m.noise_attestation)
+                                                    })
+                                                }
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => eprintln!("ct-edge: channel relay spliced two agents"),
+                                            Err(e) => eprintln!("ct-edge: channel relay round ended: {e}"),
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => eprintln!("ct-edge: cannot bind channel relay {relay_addr}: {e}"),
+                        }
+
                         eprintln!(
                             "ct-edge: Agent-Fabric channel broker on {chan_addr} \
                              (authorize via {cp_url}, #81 SEC81c-c)"
