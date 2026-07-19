@@ -235,6 +235,66 @@ pub fn channel_one_liner_bootstrap(portal_base: &str, bootstrap_token: &str, os:
     }
 }
 
+/// Everything the **broker-mediated** A2A one-liner needs (#100): the plane path where
+/// two members rendezvous through the edge channel broker (and fall back to the edge
+/// relay) rather than exchanging endpoints out of band. Mirrors the `CT_CHANNEL_*`
+/// brokered env `ct-agent channel` reads (`ChannelJoinCliConfig`). The grant + the two
+/// private keys ride in the environment, never argv (SEC90; the still-inline-secret
+/// concern is #97, addressed for the direct form by [`channel_one_liner_bootstrap`]).
+pub struct BrokeredChannelOneLiner<'a> {
+    pub side: ChannelSide,
+    /// Edge rendezvous endpoint (`CT_CHANNEL_BROKER`, host:port).
+    pub broker: &'a str,
+    /// Edge relay endpoint used on direct-dial failure (`CT_CHANNEL_RELAY`, host:port).
+    pub relay: &'a str,
+    /// The operator-signed channel grant this member holds (`CT_CHANNEL_GRANT`, hex).
+    pub grant_hex: &'a str,
+    /// The holder ed25519 **private** key proving possession (`CT_CHANNEL_HOLDER_KEY`, hex).
+    pub holder_key_hex: &'a str,
+    /// This member's Noise (X25519) **private** key (`CT_CHANNEL_NOISE_KEY`, hex).
+    pub noise_key_hex: &'a str,
+    /// The host:port this member advertises for the direct path (`CT_CHANNEL_LISTEN`).
+    pub listen: &'a str,
+}
+
+/// Render the copy-paste command that brings a machine up as a channel member via the
+/// **edge broker** (#100 plane path): it rendezvous through `CT_CHANNEL_BROKER`, dials the
+/// peer direct, and falls back to `CT_CHANNEL_RELAY` — the broker relays the peer's
+/// attested Noise key, so no out-of-band peer key is needed. Targets the shipped
+/// `ct-agent channel` subcommand (brokered branch); keys/grant ride in `CT_CHANNEL_*`
+/// env, never argv. `os` selects POSIX `env VAR=… cmd` vs PowerShell `$env:`.
+pub fn brokered_channel_one_liner(p: &BrokeredChannelOneLiner, os: InstallOs) -> String {
+    let role = match p.side {
+        ChannelSide::Responder => "accept",
+        ChannelSide::Initiator => "initiate",
+    };
+    match os {
+        InstallOs::Unix => format!(
+            "CT_CHANNEL_ROLE={role} CT_CHANNEL_BROKER={broker} CT_CHANNEL_RELAY={relay} \
+             CT_CHANNEL_GRANT={grant} CT_CHANNEL_HOLDER_KEY={hk} CT_CHANNEL_NOISE_KEY={nk} \
+             CT_CHANNEL_LISTEN={listen} ct-agent channel",
+            broker = p.broker,
+            relay = p.relay,
+            grant = p.grant_hex,
+            hk = p.holder_key_hex,
+            nk = p.noise_key_hex,
+            listen = p.listen,
+        ),
+        InstallOs::Windows => format!(
+            "$env:CT_CHANNEL_ROLE='{role}'; $env:CT_CHANNEL_BROKER='{broker}'; \
+             $env:CT_CHANNEL_RELAY='{relay}'; $env:CT_CHANNEL_GRANT='{grant}'; \
+             $env:CT_CHANNEL_HOLDER_KEY='{hk}'; $env:CT_CHANNEL_NOISE_KEY='{nk}'; \
+             $env:CT_CHANNEL_LISTEN='{listen}'; ct-agent channel",
+            broker = p.broker,
+            relay = p.relay,
+            grant = p.grant_hex,
+            hk = p.holder_key_hex,
+            nk = p.noise_key_hex,
+            listen = p.listen,
+        ),
+    }
+}
+
 /// Render the POSIX `/channel.sh` script the A2A one-liner pipes into `sh` (#100).
 /// It detects OS+arch, downloads the matching prebuilt `ct-agent` from `release_base`,
 /// and execs `ct-agent channel` — which reads the `CT_CHANNEL_*` config (role, addr,
@@ -706,6 +766,45 @@ mod tests {
             assert!(!cmd.contains("aa11deadbeefsecretprivatekey00"), "noise private key must not appear");
             assert_eq!(cmd.matches(boot).count(), 1, "bootstrap token carried exactly once");
         }
+    }
+
+    #[test]
+    fn brokered_channel_one_liner_renders_the_plane_path_command() {
+        // #100: the broker-mediated A2A command. Keys/grant ride in CT_CHANNEL_* env,
+        // never argv; the command targets `ct-agent channel` (brokered branch).
+        let p = BrokeredChannelOneLiner {
+            side: ChannelSide::Initiator,
+            broker: "45.133.9.145:4435",
+            relay: "45.133.9.145:4436",
+            grant_hex: "abcd",
+            holder_key_hex: "hk-secret",
+            noise_key_hex: "nk-secret",
+            listen: "0.0.0.0:5000",
+        };
+        let unix = brokered_channel_one_liner(&p, InstallOs::Unix);
+        assert!(unix.contains("CT_CHANNEL_ROLE=initiate"), "initiator role");
+        for kv in [
+            "CT_CHANNEL_BROKER=45.133.9.145:4435",
+            "CT_CHANNEL_RELAY=45.133.9.145:4436",
+            "CT_CHANNEL_GRANT=abcd",
+            "CT_CHANNEL_HOLDER_KEY=hk-secret",
+            "CT_CHANNEL_NOISE_KEY=nk-secret",
+            "CT_CHANNEL_LISTEN=0.0.0.0:5000",
+        ] {
+            assert!(unix.contains(kv), "carries {kv}");
+        }
+        assert!(unix.trim_end().ends_with("ct-agent channel"), "invokes the subcommand");
+        // Secrets ride in the env, never as positional args to the subcommand.
+        assert!(!unix.contains("channel hk-secret") && !unix.contains("channel nk-secret"), "no secret in argv");
+
+        // Windows analog uses $env: and the same subcommand + role mapping.
+        let win = brokered_channel_one_liner(
+            &BrokeredChannelOneLiner { side: ChannelSide::Responder, ..p },
+            InstallOs::Windows,
+        );
+        assert!(win.contains("$env:CT_CHANNEL_ROLE='accept';"), "responder -> accept");
+        assert!(win.contains("$env:CT_CHANNEL_BROKER='45.133.9.145:4435';"), "ps broker env");
+        assert!(win.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
     }
 
     #[test]

@@ -1826,6 +1826,16 @@ Decomposed:
     redeem-capable scripts. Frozen test `channel_bootstrap_one_liner_carries_no_noise_private_key` (bundle
     round-trips incl. the optional cert; the Noise private key never appears in either OS one-liner). Gate
     green. The manual inline form (`channel_one_liner`) stays for the direct/back-compat path.
+  - **#100 brokered-oneliner** ✅ **The plane-path (broker-mediated) one-liner generator**
+    (`installer::brokered_channel_one_liner` + `BrokeredChannelOneLiner`): renders the copy-paste command for
+    the *brokered* A2A path (`CT_CHANNEL_ROLE`/`_BROKER`/`_RELAY`/`_GRANT`/`_HOLDER_KEY`/`_NOISE_KEY`/`_LISTEN`
+    … `ct-agent channel`) — the plane path where members rendezvous through the edge broker + relay-fallback and
+    the broker relays the peer's attested Noise key (no out-of-band peer key). Mirrors `channel_one_liner` for
+    the brokered `ChannelJoinCliConfig` env; grant + both private keys ride in `CT_CHANNEL_*` env, never argv.
+    Frozen test `brokered_channel_one_liner_renders_the_plane_path_command` (all vars present, role mapping,
+    `ct-agent channel`, no secret in argv, both OSes). Gate green. *(Bootstrap-hardening the brokered form —
+    generalizing `channel.sh`'s redeem to export any `CT_CHANNEL_*` field — is the follow, mirroring the direct
+    form's `channel-bootstrap`.)*
   - **AF4-session-swap** ✅ **The broker relays the peer's attested Noise key in the rendezvous ack.** The
     `authorize` closure now returns `(operator, member_noise)`; `broker_channel_rendezvous` appends the peer's
     Noise key to each `OK <endpoint> <noise_hex>`; `present_channel_join` parses it into
