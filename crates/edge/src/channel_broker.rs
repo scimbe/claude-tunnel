@@ -270,7 +270,11 @@ where
             )
         }
     };
-    read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await
+    // The quinn broker pairs over the `quinn::Connection` (rendezvous endpoint swap /
+    // relay bi-stream), not over this join stream, so the returned read half is dropped.
+    let (send, _recv, req, operator, member_noise, member_attest) =
+        read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await?;
+    Ok((send, req, operator, member_noise, member_attest))
 }
 
 /// Admit a channel join over an already-established bidirectional byte stream —
@@ -280,15 +284,17 @@ where
 /// single-use holder-possession challenge — runs unchanged over *any* duplex, so a
 /// TLS-over-TCP `:443` front-door stream (for members whose network blocks the
 /// channel UDP/TCP ports) is admitted identically. `send`/`recv` are the write/read
-/// halves of the stream; on success `send` is returned so the caller can drive the
-/// pairing (rendezvous endpoint exchange or relay splice) on the same stream.
+/// halves of the stream; on success **both** are returned (the write half first, then
+/// the read half) so the caller can reunite them into the full duplex and drive the
+/// pairing (rendezvous endpoint exchange or relay splice) on the same stream — the
+/// read half is not consumed by admission (#106 complete-wire443).
 pub async fn read_channel_join_on_stream<W, R, F, Fut>(
     mut send: W,
     mut recv: R,
     now: UnixSeconds,
     join_timeout: std::time::Duration,
     authorize: &F,
-) -> Result<(W, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>), BoxError>
+) -> Result<(W, R, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>), BoxError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -357,7 +363,7 @@ where
         let _ = send.shutdown().await;
         return Err("holder possession proof failed".into());
     }
-    Ok((send, req, operator, member_noise, member_attest))
+    Ok((send, recv, req, operator, member_noise, member_attest))
     };
     match tokio::time::timeout(join_timeout, read).await {
         Ok(r) => r,
@@ -377,31 +383,28 @@ where
 /// [`read_channel_join_on_stream`] admission (length-framed [`ChannelJoinRequest`],
 /// membership + grant verification, single-use holder-possession challenge) over
 /// them — so a real TLS-over-TCP stream is admitted exactly as a QUIC bi-stream is.
-/// On success the write half is returned alongside the admitted request/keys so the
-/// caller can drive the pairing.
-///
-/// Scope (bounded): this lands **admission** over TLS-TCP only. Driving the pairing
-/// completion (`broker_channel_rendezvous` / `broker_channel_relay`) over the same
-/// stream is a later sub-packet — [`AdmittedMember`] and the `finish_*_pair`
-/// completers are still quinn-specific (they hold a `quinn::Connection` and the relay
-/// splice runs `relay_initiator_to_acceptor` over quinn), so they must be generalised
-/// past quinn before a `:443` stream can be paired end-to-end.
+/// On success the **reunited full-duplex stream** is returned (the read half is not
+/// consumed by admission), alongside the admitted request/keys, so the caller can hand
+/// it straight to [`finish_relay_pair_over_streams`] to relay-splice two `:443` members
+/// end-to-end (#106 complete-wire443).
 pub async fn admit_channel_join_on_duplex<S, F, Fut>(
     stream: S,
     now: UnixSeconds,
     join_timeout: std::time::Duration,
     authorize: &F,
-) -> Result<
-    (tokio::io::WriteHalf<S>, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>),
-    BoxError,
->
+) -> Result<(S, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
     let (recv, send) = tokio::io::split(stream);
-    read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await
+    let (send, recv, req, operator, member_noise, member_attest) =
+        read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await?;
+    // Reunite the split halves back into the original stream (`ReadHalf::unsplit`), so
+    // the post-admission data path is the whole duplex — the read half is no longer
+    // trapped inside admission and the caller can relay-splice it.
+    Ok((recv.unsplit(send), req, operator, member_noise, member_attest))
 }
 
 /// The bound on a single connection's join read (#105). A legitimate join completes
@@ -1056,7 +1059,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             // Note: read/write halves are passed as distinct AsyncRead/AsyncWrite, not a
             // quinn connection — no QUIC anywhere in this path.
-            let (mut send, req, _op, _noise, _attest) = read_channel_join_on_stream(
+            let (mut send, _recv, req, _op, _noise, _attest) = read_channel_join_on_stream(
                 srv_w,
                 srv_r,
                 500,
@@ -1124,7 +1127,7 @@ mod tests {
             // A real TLS handshake terminates here — `tls` is a tokio_rustls server
             // stream, the exact transport the `:443` front door yields.
             let tls = acceptor.accept(tcp).await.expect("tls accept");
-            let (mut send, req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+            let (mut stream, req, _op, _noise, _attest) = admit_channel_join_on_duplex(
                 tls,
                 500,
                 std::time::Duration::from_secs(5),
@@ -1132,9 +1135,15 @@ mod tests {
             )
             .await
             .expect("admitted over a real TLS-TCP stream");
-            send.write_all(b"OK").await.expect("ack");
-            send.shutdown().await.expect("shutdown");
-            req.endpoint
+            // #106 complete-wire443: `admit_channel_join_on_duplex` returns the REUNITED
+            // full duplex, not just the write half. Prove it: ack on the write side, then
+            // read a post-admission app byte off the SAME stream — the read half survived
+            // admission, so this stream is ready to hand to `finish_relay_pair_over_streams`.
+            stream.write_all(b"OK").await.expect("ack");
+            let mut app = [0u8; 1];
+            stream.read_exact(&mut app).await.expect("read app byte over the reunited stream");
+            stream.shutdown().await.expect("shutdown");
+            (req.endpoint, app[0])
         });
 
         // Client: connect over TLS-TCP and drive the same handshake `present_join` drives
@@ -1153,11 +1162,18 @@ mod tests {
         let mut ack = [0u8; 2];
         client.read_exact(&mut ack).await.expect("read ack");
         assert_eq!(&ack, b"OK", "TLS-TCP admission returns the same OK ack as QUIC");
+        // Post-admission app byte on the same TLS-TCP stream — the server reads it off
+        // the reunited duplex, proving the full stream survives admission (wire443).
+        client.write_all(&[0x5a]).await.expect("write app byte after OK");
 
+        let (endpoint, app) = server_task.await.expect("join");
         assert_eq!(
-            server_task.await.expect("join"),
-            "203.0.113.9:6041",
+            endpoint, "203.0.113.9:6041",
             "the admitted member's advertised endpoint matches the QUIC path",
+        );
+        assert_eq!(
+            app, 0x5a,
+            "the reunited TLS-TCP stream carries post-admission app data (read half survived)",
         );
     }
 

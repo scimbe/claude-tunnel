@@ -2798,12 +2798,17 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
           transport-generic rendezvous finisher (endpoint-swap + attested-key `member_ack_suffix` over a plain
           duplex write half, no `quinn::Connection`), so a `:443` member that *can* be reached can also be
           rendezvous-paired. Optional-after-relay for the `:443`-only sink but needed for symmetry.
-        - **#106-complete-wire443** ⏳: thread the admitted **read half** through the accept leg so an admitted
-          `:443` stream can be reunited into a full duplex `AdmittedStreamMember` (`admit_channel_join_on_duplex`
-          currently drops the read half inside `read_channel_join_on_stream`), then drive
-          `finish_relay_pair_over_streams` over a genuine admitted TLS-over-TCP stream end-to-end. Consider
-          adapting the quinn `finish_relay_pair` onto the same seam here only if it stays trivially clean; otherwise
-          leave the quinn path as-is (it works) and keep the two completers parallel.
+        - **#106-complete-wire443** ✅ (reunite): the admitted **read half** is no longer trapped —
+          `read_channel_join_on_stream` now returns *both* halves (write, read), and `admit_channel_join_on_duplex`
+          reunites them via `ReadHalf::unsplit` and returns the **whole full-duplex stream** (was: only the write
+          half). So an admitted `:443`/TLS-TCP stream is ready to hand straight to `finish_relay_pair_over_streams`.
+          The quinn wrapper `read_join_on_connection` drops the returned read half (quinn pairs over the
+          `Connection`, not the join stream — behaviour unchanged). Frozen: the real TLS-TCP admission test now also
+          reads a post-admission app byte off the reunited stream (proving the read half survived), and the
+          plain-duplex admission test updated for the new arity. Gate green, 0 warnings.
+          - **#106-complete-wire443-e2e** ⏳ next: drive `finish_relay_pair_over_streams` over *two* genuinely
+            admitted TLS-TCP streams (admit both via `admit_channel_join_on_duplex`, then relay-splice) — the full
+            `:443` source↔sink relay path minus the front-door ALPN routing (`#106-dispatch-frontdoor`).
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
       what lets a `:443`-only host (the #103 sink) reach the broker/relay end-to-end.
