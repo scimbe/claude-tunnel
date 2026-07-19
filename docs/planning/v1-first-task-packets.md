@@ -3151,7 +3151,13 @@ with **no prior art** and **no dependency on those open questions** lands first:
   network + measured latencies, here are the exact A2A channels to establish."
 - **#107-optimize-follow** ⏳: edge latency probes feed `plan_network_overlay`'s `latency`; then the controller
   mints a per-link channel grant for each planned link (grant signing is operator/client-side) and the broker
-  generalizes past two-connection (#107-nway) — the live-mesh e2e. **#107-ui** ⏳ **(design-gated)**: greenfield
+  generalizes past two-connection (#107-nway) — the live-mesh e2e.
+  **REQUIRED precondition (#113, preventive):** before `add_shortcuts`/`plan_network_overlay` is wired into ANY
+  live handler, this slice MUST cap the topology size `n` and the shortcut `budget` — `add_shortcuts` runs
+  Floyd–Warshall O(n³) per round, so cost is O(budget·n³). The primitive is inert today (no caller outside
+  `overlay.rs` tests) and panic-safe (saturating arithmetic), so the bound is a *product topology-size policy*
+  decided here at the wiring point (with the request-auth context), not an arbitrary constant retrofitted into
+  the pure library fn. Reject or gracefully degrade oversized topologies at the handler before invoking the optimizer. **#107-ui** ⏳ **(design-gated)**: greenfield
   node-graph editor — awaiting the framework-vs-vanilla call. **#107-testing** ⏳: unit/API (done for the pure
   layers) + a real N-agent formation smoke once the mesh is live.
 
