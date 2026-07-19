@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 
 use ct_common::channel::ChannelJoinRequest;
 use ed25519_dalek::SigningKey;
+use rand::RngCore;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -322,6 +323,51 @@ impl ChannelJoinCliConfig {
     }
 }
 
+/// A freshly-minted Agent-Fabric channel identity for **self-service** participation
+/// (#117): the ed25519 *holder* keypair (proves possession of a grant) and the X25519
+/// *Noise* keypair (the member's session key). Both are generated **locally** so the
+/// private keys never leave the participant's machine — which is why self-service
+/// channel setup is a local CLI step, not a browser/server flow: it preserves the
+/// provider-blind property (the operator never sees a private key). Before this, a
+/// participant had to hand-craft these keys or have the operator provision them by hand
+/// for every new member. The hex accessors emit exactly what the `ct-agent channel` CLI
+/// consumes (`CT_CHANNEL_HOLDER_KEY`, `CT_CHANNEL_NOISE_KEY`) plus the two **public**
+/// keys an operator needs to register the channel / sign this member's grant.
+pub struct ChannelIdentity {
+    /// The holder ed25519 keypair (its private half proves grant possession).
+    pub holder: SigningKey,
+    /// The member's X25519 Noise static keypair.
+    pub noise: ct_common::noise::StaticKeypair,
+}
+
+impl ChannelIdentity {
+    /// Mint a fresh identity from the OS CSPRNG.
+    pub fn generate() -> Self {
+        let mut holder_seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut holder_seed);
+        let holder = SigningKey::from_bytes(&holder_seed);
+        let noise = ct_common::noise::generate_static_keypair();
+        Self { holder, noise }
+    }
+
+    /// Value for `CT_CHANNEL_HOLDER_KEY` — the 64-hex ed25519 holder **private** key. SECRET.
+    pub fn holder_key_hex(&self) -> String {
+        hex_encode(&self.holder.to_bytes())
+    }
+    /// Value for `CT_CHANNEL_NOISE_KEY` — the 64-hex X25519 Noise **private** key. SECRET.
+    pub fn noise_key_hex(&self) -> String {
+        hex_encode(&self.noise.private)
+    }
+    /// The 64-hex ed25519 holder **public** key — an operator signs this member's grant over it.
+    pub fn holder_pubkey_hex(&self) -> String {
+        hex_encode(self.holder.verifying_key().as_bytes())
+    }
+    /// The 64-hex X25519 Noise **public** key — the member's attested session key.
+    pub fn noise_pubkey_hex(&self) -> String {
+        hex_encode(&self.noise.public)
+    }
+}
+
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
 /// rendezvous + relay, present the grant, and pipe **stdin/stdout** over the A2A tunnel
 /// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
@@ -560,6 +606,64 @@ mod tests {
     }
 
     const K64: &str = "aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20";
+
+    #[test]
+    fn channel_identity_generates_self_service_keys_the_cli_accepts() {
+        // #117-cli-identity (frozen): a participant mints a fresh channel identity
+        // LOCALLY, and the emitted hex is exactly what the `ct-agent channel` CLI
+        // consumes — so no hand-crafted keys and no central provisioning are needed to
+        // get channel crypto material. Round-trip the generated holder + Noise keys
+        // through the real `from_lookup` parser.
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer;
+
+        let id = ChannelIdentity::generate();
+        assert_eq!(id.holder_key_hex().len(), 64, "holder private is 64 hex");
+        assert_eq!(id.noise_key_hex().len(), 64, "Noise private is 64 hex");
+        assert_eq!(id.holder_pubkey_hex().len(), 64, "holder public is 64 hex");
+        assert_eq!(id.noise_pubkey_hex().len(), 64, "Noise public is 64 hex");
+
+        // An operator signs a grant over the generated holder public key.
+        let op = SigningKey::from_bytes(&[9u8; 32]);
+        let g = ChannelGrant {
+            channel: ChannelId([0xC7u8; 32]),
+            holder: id.holder.verifying_key().to_bytes(),
+            direction: Direction::Initiate,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 1_000,
+        };
+        let grant_hex =
+            hex_encode(&SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }.encode());
+
+        let pairs: Vec<(&str, String)> = vec![
+            ("CT_CHANNEL_ROLE", "initiate".into()),
+            ("CT_CHANNEL_BROKER", "203.0.113.5:9443".into()),
+            ("CT_CHANNEL_RELAY", "203.0.113.5:9444".into()),
+            ("CT_CHANNEL_LISTEN", "203.0.113.5:7000".into()),
+            ("CT_CHANNEL_GRANT", grant_hex),
+            ("CT_CHANNEL_HOLDER_KEY", id.holder_key_hex()),
+            ("CT_CHANNEL_NOISE_KEY", id.noise_key_hex()),
+        ];
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let cfg = ChannelJoinCliConfig::from_lookup(move |k| m.get(k).cloned())
+            .expect("the CLI accepts a self-generated channel identity");
+
+        // The parsed keys ARE the generated ones — the generator's output is exactly
+        // what the CLI consumes, so self-service key generation needs nothing hand-crafted.
+        assert_eq!(cfg.holder.to_bytes(), id.holder.to_bytes(), "holder key round-trips through the CLI");
+        assert_eq!(cfg.own_noise_private, id.noise.private, "Noise key round-trips through the CLI");
+        assert_eq!(
+            cfg.grant.grant.holder,
+            id.holder.verifying_key().to_bytes(),
+            "the grant binds the generated holder public key"
+        );
+
+        // Two mints differ — real randomness, not a fixed/default key.
+        let id2 = ChannelIdentity::generate();
+        assert_ne!(id.holder.to_bytes(), id2.holder.to_bytes(), "holder keys are unique per mint");
+        assert_ne!(id.noise.private, id2.noise.private, "Noise keys are unique per mint");
+    }
 
     #[test]
     fn channel_join_cli_config_parses_the_plane_one_liner() {

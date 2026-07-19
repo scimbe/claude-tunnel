@@ -2543,6 +2543,34 @@ hot-path pair landed first:
   pattern, each equal to the `format!`-loop reference, always 64 chars); the existing grant/invite verify
   tests freeze the preimage end-to-end. Gate green, 0 warnings.
 
+## #117 self-service Agent-Fabric channel provisioning (feature, priority:medium)
+
+Central flagged a real operational gap: portal accounts are fully self-service for **tunnels** but not for
+**Agent-Fabric channels** — registering/joining a channel assumes the caller already holds an ed25519 holder
+key + X25519 Noise key + a signed grant, so today an account either runs CLI tooling with hand-generated keys
+or comes back to central for manual crypto provisioning (as was done for #103). The concept is the developer's
+call. **Direction chosen by scimbe (2026-07-19): CLI self-service subcommand** — keys are generated **locally**
+(never in the browser or on the server), preserving the provider-blind/zero-knowledge posture. Decomposed:
+
+- **#117-cli-identity** ✅ **Local channel-identity generator** (`ct_agent::channel_run::ChannelIdentity`):
+  `ChannelIdentity::generate()` mints a fresh holder ed25519 keypair (`SigningKey` from the OS CSPRNG) + an
+  X25519 Noise static keypair (`ct_common::noise::generate_static_keypair`) locally, and emits them in exactly
+  the hex the `ct-agent channel` CLI consumes — `holder_key_hex()`→`CT_CHANNEL_HOLDER_KEY`,
+  `noise_key_hex()`→`CT_CHANNEL_NOISE_KEY` — plus the two public keys (`holder_pubkey_hex`/`noise_pubkey_hex`)
+  an operator needs to register the channel / sign the member's grant. Closes the "must hand-generate keys"
+  half of the gap: a participant mints their own material with no central round-trip, private keys never
+  leaving their machine. Frozen test round-trips the generated holder + Noise keys through the real
+  `ChannelJoinCliConfig::from_lookup` (with an operator-signed grant over the generated holder pubkey) and
+  asserts the CLI parses back the *same* keys + unique-per-mint. Gate green, 0 warnings.
+- **#117-cli-subcommand** ⏳ next: surface `ChannelIdentity::generate` as a documented `ct-agent channel init`
+  (or `keygen`) subcommand that prints/persists the env block a participant then feeds to `ct-agent channel`
+  (role, broker/relay/front-door addrs from the plane, holder/noise keys, grant). Pure wiring on top of -identity.
+- **#117-operator-flow** ⏳: the create-a-channel side — an operator subcommand that generates the operator key,
+  `POST /channel/register`s (via the account OIDC token), and issues member grants (signs over a member's
+  `holder_pubkey_hex`) + cross-user invitations — so two self-service participants can be wired without central.
+- **#117-docs** ⏳: a short onboarding doc walking two accounts through create→invite→join over `:443` (ties to
+  the #106 front-door path + the #100 one-liner).
+
 ## #52 Tail-Latenz-Statistik — symmetrisches KI auf schiefen Daten; p99 aus n=30 unbelastbar (thesis)
 
 Gutachten: Tabelle 7.1 „80,8 ± 91,9 ms" impliziert negative Latenz (symmetrisches Normal-KI auf
