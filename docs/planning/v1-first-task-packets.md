@@ -2909,12 +2909,25 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
       `run_channel_session_on_stream_forms_the_noise_tunnel_over_a_plain_duplex`: two members handshake over an
       in-memory duplex, then plaintext written to one member's local side arrives **decrypted** at the other's —
       the Noise tunnel forms over a non-quinn stream. Gate green, 0 warnings.
-    - **#106-relay-leg-wire** ⏳ next: wire `join_via_relay` to walk the **relay** ladder (`relay_ladder()`) —
-      present the join at the relay over direct QUIC or the `:443` front door, then run the session over that
-      stream via `run_channel_session_on_stream` (splitting the reunited admitted `:443` stream). All primitives
-      now exist (relay ladder + transport-agnostic session); this is the wire that makes a truly `:443`-only member
-      (both broker AND relay ports blocked) fully functional. Then **N4** — local docker-compose A2A e2e over a
-      real `:443` front door.
+    - **#106-relay-leg-443** ✅ **The relay data leg walks the `:443` front-door ladder** (`ct_agent::channel_run`):
+      the relay leg was hardcoded QUIC — a `:443`-only member whose relay port is also FILTERED could not reach the
+      relay at all (the exact #103-sink blocker). Added `join_via_relay_ladder` — the relay-leg analog of
+      `present_channel_join_via_ladder`: it walks `relay_ladder()`, falls through a blocked **direct** rung
+      (`Unreachable`) to the `:443` **front-door** rung, presents the join over TLS-TCP **without** consuming the
+      stream (new `present_channel_relay_join_on_stream` — no `shutdown`, reads exactly the 2-byte `OK`/`NO` ack so
+      the spliced session's first frame isn't swallowed), and runs the Noise session over that **same**
+      relay-spliced stream via `run_channel_session_on_stream`. `run_channel_join_with_admission`'s relay param
+      changed from `&Connection` to a `RelayFallback<'_>` descriptor (`Quic` | `Ladder{rungs, edge_cert,
+      direct_timeout}`) selected in one seam; every existing QUIC caller is wrapped `RelayFallback::Quic(..)` and is
+      unchanged. `run_channel_join_command` passes `RelayFallback::Ladder` when a front-door cert is configured
+      (else the eager QUIC relay dial, so nothing regresses). Frozen test
+      `join_via_relay_ladder_falls_back_to_the_443_front_door_and_forms_the_noise_tunnel`: two members (Initiate +
+      Accept) each walk `join_via_relay_ladder` with a DEAD direct rung + a LIVE `:443` front door driven by the
+      **production** edge relay path (`admit_and_pair_on_stream` → `finish_relay_pair_over_streams`); a real payload
+      round-trips **both** directions over the `:443` relay, Noise staying end-to-end. Gate green, 0 warnings; the
+      frozen test + both concurrency tests ran 5×/5× non-flaky. This makes a truly `:443`-only member (broker AND
+      relay ports blocked) fully functional. Remaining tail: **N4** — a local docker-compose A2A e2e ops artifact
+      exercising the `:443` front door end-to-end (deployment/ops, not code).
   - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
     - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
       extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the

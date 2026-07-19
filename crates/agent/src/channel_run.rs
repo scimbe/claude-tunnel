@@ -19,7 +19,10 @@ use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::channel::{present_channel_join, present_channel_join_on_stream, ChannelJoinOutcome};
+use crate::channel::{
+    present_channel_join, present_channel_join_on_stream, present_channel_relay_join_on_stream,
+    ChannelJoinOutcome,
+};
 use ct_common::a2a::{a2a_initiate, a2a_respond};
 use ct_common::noise::noise_pump;
 
@@ -160,7 +163,7 @@ where
     let admission = present_channel_join(broker_conn, request, holder).await?;
     run_channel_join_with_admission(
         admission,
-        relay_conn,
+        RelayFallback::Quic(relay_conn),
         request,
         holder,
         role,
@@ -180,11 +183,14 @@ where
 /// Decoupling admission (how we *reach* the broker) from the data path (how the two
 /// members *connect*) is what lets a restrictive network admit over `:443` while the
 /// direct/relay data legs stay unchanged. `role`, `listener`, and the timeouts behave
-/// exactly as in [`run_channel_join`].
+/// exactly as in [`run_channel_join`]. `relay` selects the relay-leg transport used on
+/// direct-dial failure: [`RelayFallback::Quic`] (a pre-dialed QUIC relay connection) or —
+/// for a member whose relay port is also blocked — [`RelayFallback::Ladder`], which walks
+/// the relay ladder (direct QUIC → the `:443` front door) via [`join_via_relay_ladder`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_channel_join_with_admission<P>(
     admission: ChannelJoinOutcome,
-    relay_conn: &Connection,
+    relay: RelayFallback<'_>,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
     role: ChannelRole,
@@ -231,7 +237,7 @@ where
                 }
                 Err(ChannelDialError::Unreachable) => {
                     eprintln!("ct-agent channel: direct dial to {addr} unreachable — falling back to the edge relay (#72)");
-                    join_via_relay(relay_conn, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
+                    join_via_relay_fallback(relay, request, holder, ChannelRole::Initiate, own_noise_private, &peer_noise, local).await?;
                 }
                 Err(ChannelDialError::Failed(e)) => return Err(e),
             }
@@ -246,7 +252,7 @@ where
                 Ok(None) => return Err("channel listener closed with no incoming".into()),
                 Err(_timeout) => {
                     eprintln!("ct-agent channel: no direct connection within {accept_timeout:?} — falling back to the edge relay (#72)");
-                    join_via_relay(relay_conn, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
+                    join_via_relay_fallback(relay, request, holder, ChannelRole::Accept, own_noise_private, &peer_noise, local).await?;
                 }
             }
         }
@@ -281,6 +287,143 @@ where
     run_channel_session(relay_conn, role, own_noise_private, peer_noise_public, local)
         .await
         .map_err(Into::into)
+}
+
+/// Which relay-leg transport [`run_channel_join_with_admission`] falls back to when the
+/// direct dial fails (#106 relay-leg-443). The direct-QUIC relay works for a member that
+/// can still reach the relay port; a member on a truly `:443`-only network (relay port
+/// FILTERED too) needs the relay itself walked over the fallback ladder — direct QUIC,
+/// then the unified `:443` TLS-TCP front door — so it can relay at all. Selecting on this
+/// keeps every existing QUIC caller unchanged while adding the ladder-capable relay leg.
+pub enum RelayFallback<'a> {
+    /// A pre-dialed QUIC relay connection (the original relay leg): present the join over
+    /// it and run the session over a fresh bi-stream ([`join_via_relay`]).
+    Quic(&'a Connection),
+    /// Walk the relay ladder (direct QUIC → the `:443` front door) via
+    /// [`join_via_relay_ladder`]. `rungs` is [`ChannelJoinCliConfig::relay_ladder`];
+    /// `edge_cert` is the trust anchor the front-door TLS dial needs; `direct_timeout`
+    /// bounds each direct QUIC relay dial before it falls through to `:443`.
+    Ladder {
+        rungs: &'a [ChannelDialRung],
+        edge_cert: CertificateDer<'static>,
+        direct_timeout: std::time::Duration,
+    },
+}
+
+/// Dispatch the relay fallback to the selected transport (#106 relay-leg-443): a
+/// [`RelayFallback::Quic`] connection reuses the original [`join_via_relay`]; a
+/// [`RelayFallback::Ladder`] walks the relay ladder via [`join_via_relay_ladder`]. This
+/// is the single seam both fallback arms of [`run_channel_join_with_admission`] call, so
+/// the outcome-driven data path stays identical regardless of the relay transport.
+#[allow(clippy::too_many_arguments)]
+async fn join_via_relay_fallback<P>(
+    relay: RelayFallback<'_>,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    match relay {
+        RelayFallback::Quic(conn) => {
+            join_via_relay(conn, request, holder, role, own_noise_private, peer_noise_public, local).await
+        }
+        RelayFallback::Ladder { rungs, edge_cert, direct_timeout } => {
+            join_via_relay_ladder(
+                rungs,
+                edge_cert,
+                direct_timeout,
+                request,
+                holder,
+                role,
+                own_noise_private,
+                peer_noise_public,
+                local,
+            )
+            .await
+        }
+    }
+}
+
+/// The relay-leg analog of [`present_channel_join_via_ladder`] (#106 relay-leg-443): walk
+/// the relay `rungs`, and on the first rung whose **transport connects**, present the join
+/// and run the Noise session over that rung — committing `local` to it. A rung whose
+/// transport can't connect (a blocked direct relay port → [`ChannelDialError::Unreachable`],
+/// or a `Failed` TLS/connect) falls through to the next; once a rung connects, the session
+/// is the terminal action, so we never retry after it starts (`local` is single-move). A
+/// **direct** rung dials QUIC to the relay port and delegates to [`join_via_relay`] (join +
+/// session on a fresh bi-stream of the same connection). A **front-door** rung opens the
+/// `:443` TLS-TCP route ([`crate::transport::tcp_tls_connect_channel`], ALPN
+/// `ct-edge-channel`), presents the join *without* consuming the stream
+/// ([`present_channel_relay_join_on_stream`]), and — on `Admitted` — runs the session over
+/// that **same** relay-spliced stream ([`run_channel_session_on_stream`]); a `Refused` is a
+/// finished handshake, not a transport failure, so it errors rather than falling through.
+/// This is what lets a fully `:443`-only member (relay port also blocked) relay at all —
+/// closing the exact gap the #103 sink reported. Errors only when every rung is blocked.
+#[allow(clippy::too_many_arguments)]
+pub async fn join_via_relay_ladder<P>(
+    rungs: &[ChannelDialRung],
+    edge_cert: CertificateDer<'static>,
+    direct_timeout: std::time::Duration,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    // `local` is single-move: hold it in an Option and commit it to the first rung whose
+    // transport connects. Fall through ONLY on a transport error, tracked in `last`.
+    let mut local = Some(local);
+    let mut last: Option<BoxError> = None;
+    for rung in rungs {
+        if rung.via_front_door {
+            // The `:443` front door over TLS-TCP (ALPN ct-edge-channel). The SAME stream
+            // carries the join AND the spliced session, so present without consuming it.
+            match crate::transport::tcp_tls_connect_channel(rung.endpoint, edge_cert.clone()).await {
+                Ok(stream) => {
+                    let (mut recv, mut send) = tokio::io::split(stream);
+                    let local = local.take().expect("local is committed to exactly one rung");
+                    match present_channel_relay_join_on_stream(&mut send, &mut recv, request, holder).await? {
+                        ChannelJoinOutcome::Admitted { .. } => {}
+                        ChannelJoinOutcome::Refused => {
+                            return Err("edge relay refused the channel join over the :443 front door".into());
+                        }
+                    }
+                    return run_channel_session_on_stream(
+                        send,
+                        recv,
+                        role,
+                        own_noise_private,
+                        peer_noise_public,
+                        local,
+                    )
+                    .await
+                    .map_err(Into::into);
+                }
+                Err(e) => last = Some(e),
+            }
+        } else {
+            // Direct: QUIC to the relay port. Unreachable/Failed falls through to :443.
+            match dial_peer_direct(rung.endpoint, direct_timeout).await {
+                Ok(conn) => {
+                    let local = local.take().expect("local is committed to exactly one rung");
+                    return join_via_relay(&conn, request, holder, role, own_noise_private, peer_noise_public, local)
+                        .await;
+                }
+                Err(ChannelDialError::Unreachable) => last = Some(ChannelDialError::Unreachable.into()),
+                Err(ChannelDialError::Failed(e)) => last = Some(e),
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| "relay ladder had no rungs to dial".into()))
 }
 
 /// How long the acceptor waits for a direct connection before falling back to the
@@ -670,9 +813,10 @@ impl ChannelRegisterRequest {
 /// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
 /// relays the peer's Noise key, so no `CT_CHANNEL_PEER_*` is needed.
 pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), BoxError> {
-    // Capture what the broker-ladder admission needs before `cfg.grant` is moved into
+    // Capture what the broker/relay ladders need before `cfg.grant` is moved into
     // `request` (a partial move would forbid the `cfg.broker_ladder()` `&self` call).
     let broker_ladder = cfg.broker_ladder();
+    let relay_ladder = cfg.relay_ladder();
     let front_door_cert = cfg.front_door_cert.clone();
     let request = ChannelJoinRequest {
         grant: cfg.grant,
@@ -682,8 +826,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // the peer end-to-end). With a `:443` front-door cert configured, walk the broker
     // ladder — direct QUIC first, then the `:443` TLS-TCP front door — so a network that
     // blocks the channel port still reaches the broker (#106 client-dial-wire). Otherwise
-    // the direct-QUIC broker join, unchanged.
-    let admission = match front_door_cert {
+    // the direct-QUIC broker join, unchanged. Borrow the cert so it survives for the relay
+    // leg's ladder below.
+    let admission = match &front_door_cert {
         Some(edge_cert) => {
             eprintln!(
                 "ct-agent channel: plane-brokered {:?}; broker ladder over {} (front door {:?})",
@@ -693,7 +838,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
                 &broker_ladder,
                 &request,
                 &cfg.holder,
-                edge_cert,
+                edge_cert.clone(),
                 DIRECT_DIAL_TIMEOUT,
             )
             .await?
@@ -705,12 +850,25 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             present_channel_join(&broker_conn, &request, &cfg.holder).await?
         }
     };
-    // The relay data leg stays QUIC for now; a `:443`-only member (whose relay port 4436
-    // is blocked too) also needs the relay over the front door — the ⏳ follow slice
-    // (#106 relay-leg-443). Until it lands, a `:443`-only member's relay fallback fails.
-    let relay_conn = crate::transport::build_channel_dialer()?
-        .connect(cfg.relay_addr, "localhost")?
-        .await?;
+    // The relay data leg mirrors the broker leg (#106 relay-leg-443): with a `:443`
+    // front-door cert, the relay fallback walks its own ladder — direct QUIC to the relay
+    // port, then the `:443` front door — so a member whose relay port is ALSO filtered
+    // (a fully `:443`-only network) can still relay. Without a cert, keep the eager
+    // direct-QUIC relay dial unchanged (nothing regresses for members that reach the port).
+    let relay_conn;
+    let relay = match &front_door_cert {
+        Some(edge_cert) => RelayFallback::Ladder {
+            rungs: &relay_ladder,
+            edge_cert: edge_cert.clone(),
+            direct_timeout: DIRECT_DIAL_TIMEOUT,
+        },
+        None => {
+            relay_conn = crate::transport::build_channel_dialer()?
+                .connect(cfg.relay_addr, "localhost")?
+                .await?;
+            RelayFallback::Quic(&relay_conn)
+        }
+    };
     let listener = match cfg.role {
         ChannelRole::Accept => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
         ChannelRole::Initiate => None,
@@ -722,7 +880,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
     run_channel_join_with_admission(
         admission,
-        &relay_conn,
+        relay,
         &request,
         &cfg.holder,
         cfg.role,
@@ -1830,7 +1988,7 @@ mod tests {
         let a_task = tokio::spawn(async move {
             run_channel_join_with_admission(
                 admission,
-                &unused_relay,
+                RelayFallback::Quic(&unused_relay),
                 &request,
                 &holder,
                 ChannelRole::Initiate,
@@ -1928,6 +2086,154 @@ mod tests {
         a.abort();
         b.abort();
         relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn join_via_relay_ladder_falls_back_to_the_443_front_door_and_forms_the_noise_tunnel() {
+        // #106 relay-leg-443 (frozen): the relay-leg analog of the `:443` broker fallback,
+        // and the capstone for a fully `:443`-only member. BOTH members' relay ladders have
+        // a DEAD direct rung (the relay port is FILTERED → the QUIC dial is Unreachable) then
+        // a LIVE `:443` TLS-TCP front door driven by the PRODUCTION edge relay path
+        // (`admit_and_pair_on_stream` → `finish_relay_pair_over_streams`). Each member walks
+        // `join_via_relay_ladder`, falls through the dead direct rung, presents its join over
+        // `:443` WITHOUT consuming the stream, and runs the Noise_IK session over that SAME
+        // relay-spliced stream. A real payload round-trips BOTH directions — proving a member
+        // whose relay port is also blocked relays end-to-end over `:443` (the #103 sink),
+        // Noise staying end-to-end (the edge splices ciphertext only).
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::{
+            admit_and_pair_on_stream, finish_relay_pair_over_streams, ChannelPairer,
+        };
+        use ct_edge::transport::build_tcp_tls_listener_at;
+        use ed25519_dalek::Signer;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x21u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x22u8; 32]);
+        let channel = [0xE4u8; 32];
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        // Advertised endpoints must be SAFE (non-loopback) to pass the admission gate, even
+        // though the relay leg never dials them (the members can't be dialed — that's why
+        // they relay).
+        let req_a = ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: "203.0.113.1:7001".to_string() };
+        let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".to_string() };
+
+        // A real `:443`-style TLS-TCP edge front door: admit two independently-arriving
+        // members, correlate them by channel, and relay-splice the two `:443` duplexes —
+        // the production front-door relay path (#106).
+        let (listener, acceptor, edge_cert) = build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("tls-tcp listener");
+        let fd_addr = listener.local_addr().expect("front-door addr");
+        let edge = tokio::spawn(async move {
+            let pairer: Mutex<ChannelPairer<_>> = Mutex::new(ChannelPairer::new());
+            let authorize =
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((op_pub, None, None)) };
+            let mut paired = None;
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.expect("accept tcp");
+                let tls = acceptor.accept(tcp).await.expect("tls accept");
+                if let Some((x, y)) = admit_and_pair_on_stream(
+                    tls,
+                    500u64, // now < expires_at (1_000)
+                    Duration::from_secs(5),
+                    &authorize,
+                    10_000u64, // parked-member deadline (never reached in this test)
+                    &pairer,
+                )
+                .await
+                .expect("admit + pair the :443 member")
+                {
+                    paired = Some((x, y));
+                }
+            }
+            let (x, y) = paired.expect("two same-channel members paired over :443");
+            finish_relay_pair_over_streams(x, y, 500u64).await.expect("relay-splice the two :443 duplexes");
+        });
+
+        // Each member's relay ladder: a DEAD direct rung (closed UDP port → the QUIC relay
+        // dial is Unreachable) then the LIVE `:443` front door.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // nothing on that UDP port -> the direct QUIC relay dial is Unreachable
+        let rungs = vec![
+            ChannelDialRung { endpoint: dead_addr, via_front_door: false },
+            ChannelDialRung { endpoint: fd_addr, via_front_door: true },
+        ];
+
+        // Two members drive `join_via_relay_ladder`: A initiates, B accepts. Each pins the
+        // peer's Noise key directly (the relay leg conveys no peer material).
+        let (mut a_app, a_local) = duplex(16 * 1024);
+        let (mut b_app, b_local) = duplex(16 * 1024);
+        let (na, nbpub) = (noise_a.private, noise_b.public);
+        let rungs_a = rungs.clone();
+        let cert_a = edge_cert.clone();
+        let a = tokio::spawn(async move {
+            join_via_relay_ladder(
+                &rungs_a,
+                cert_a,
+                Duration::from_millis(400),
+                &req_a,
+                &holder_a,
+                ChannelRole::Initiate,
+                &na,
+                &nbpub,
+                a_local,
+            )
+            .await
+        });
+        let (nb, napub) = (noise_b.private, noise_a.public);
+        let b = tokio::spawn(async move {
+            join_via_relay_ladder(
+                &rungs,
+                edge_cert,
+                Duration::from_millis(400),
+                &req_b,
+                &holder_b,
+                ChannelRole::Accept,
+                &nb,
+                &napub,
+                b_local,
+            )
+            .await
+        });
+
+        // A -> B over the `:443`-relayed, encrypted A2A tunnel.
+        a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+        let mut got = [0u8; 11];
+        b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+        assert_eq!(&got, b"ping-A-to-B", "A's plaintext arrives decrypted at B over the :443 relay");
+
+        // B -> A (reverse direction proves the splice is full-duplex).
+        b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+        let mut got2 = [0u8; 11];
+        a_app.read_exact(&mut got2).await.expect("a reads B's bytes");
+        assert_eq!(&got2, b"pong-B-to-A", "B's plaintext arrives decrypted at A over the :443 relay");
+
+        // Closing both local sides tears the sessions down cleanly (noise_pump shuts down
+        // each transport write half → graceful TLS close_notify → the relay sees EOF).
+        drop(a_app);
+        drop(b_app);
+        let _ = a.await.expect("initiator task joins");
+        let _ = b.await.expect("acceptor task joins");
+        edge.await.expect("edge relay task joins");
     }
 
     #[tokio::test]

@@ -116,6 +116,57 @@ where
     }
 }
 
+/// Present a channel join over a **relay** stream that then carries the spliced Noise
+/// session on the *same* duplex (#106 relay-leg-443). This differs from
+/// [`present_channel_join_on_stream`] — the QUIC / front-door **broker** leg, where the
+/// join stream is throwaway (it reads the ack to EOF and closes its write half, and the
+/// data path is a *separate* connection) — in two ways the `:443` relay leg requires:
+/// it must **not** close the send half (the session writes over it next), and it must
+/// read **exactly** the 2-byte `OK`/`NO` ack, leaving every subsequent byte for
+/// [`crate::channel_run::run_channel_session_on_stream`]. The edge relay acks a bare
+/// `OK` (no peer endpoint/keys — the caller already holds the peer's attested Noise key)
+/// and then splices the two members' streams, so the relay ack carries no peer material.
+/// `send`/`recv` are borrowed, not consumed, so the caller reuses them for the session.
+pub async fn present_channel_relay_join_on_stream<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+) -> Result<ChannelJoinOutcome, BoxError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let bytes = request.encode();
+    let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
+    send.write_all(&len.to_be_bytes()).await?;
+    send.write_all(&bytes).await?;
+    send.flush().await?;
+
+    // Answer the edge's possession challenge, same as the broker leg — but leave the send
+    // half OPEN afterward (the spliced session writes over it), so no `shutdown()` here.
+    let mut challenge = [0u8; 32];
+    recv.read_exact(&mut challenge).await?;
+    let sig = holder.sign(&challenge).to_bytes();
+    send.write_all(&sig).await?;
+    send.flush().await?;
+
+    // Read EXACTLY the 2-byte `OK`/`NO` ack. Unlike the broker leg's `read_to_end`, we
+    // must not read past it: the Noise session ciphertext follows immediately on this same
+    // relay-spliced stream, and over-reading would swallow the session's first frame.
+    let mut ack = [0u8; 2];
+    recv.read_exact(&mut ack).await?;
+    match &ack {
+        b"OK" => Ok(ChannelJoinOutcome::Admitted {
+            peer_endpoint: String::new(),
+            peer_noise_pubkey: None,
+            peer_holder: None,
+            peer_attestation: None,
+        }),
+        _ => Ok(ChannelJoinOutcome::Refused),
+    }
+}
+
 /// Decode 64 lowercase-hex chars into 32 bytes (the peer Noise key / holder the
 /// broker relays), or `None` if malformed.
 fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
