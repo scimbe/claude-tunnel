@@ -32,6 +32,12 @@ services:
       CT_CP_EDGE_METRICS_URL: "http://edge:9600/metrics"
       # OIDC / Keycloak (verified for /me/* endpoints); set in .env.
       CT_OIDC_ISSUER: "${CT_OIDC_ISSUER:-}"
+      # #81 SEC81c-c-i / #100 / #103: the edge-facing channel-authorize endpoint
+      # (POST /internal/channel/authorize) mounts only when this shared admin token is
+      # set. It is the SAME 64-hex CT_EDGE_ADMIN_TOKEN the edge holds — so setting that
+      # one secret (already required for the front door / tunnel revoke) also turns on
+      # the Agent-Fabric channel broker end-to-end, with no extra step.
+      CT_CP_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:-}"
     env_file:
       - .env
     volumes:
@@ -64,11 +70,25 @@ services:
       # The control plane scrapes this internally for /status (#17); it is also
       # published to the host loopback below so operators can scrape it locally (#19).
       CT_EDGE_METRICS_LISTEN: "0.0.0.0:9600"
+      # #81 SEC81c-c / #100 / #103: the Agent-Fabric channel broker. It binds a
+      # rendezvous QUIC endpoint and authorizes channel joins against the control plane.
+      # run_edge activates it ONLY when all three of these are set-and-non-empty (else it
+      # is gracefully absent), so it turns on automatically the moment the operator has
+      # CT_EDGE_ADMIN_TOKEN configured (which the front door / tunnel-revoke already
+      # require) — no separate deploy step. This is the plane-side of the A2A channel
+      # tunnel (source <-> sink, #98/#99/#103).
+      CT_EDGE_CP_URL: "http://control-plane:8090"
+      CT_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:-}"
+      CT_EDGE_CHANNEL_LISTEN: "0.0.0.0:4435"
     volumes:
       - shared:/shared
     ports:
       - "${EDGE_PORT:-4433}:4433/udp"
       - "${EDGE_PORT:-4433}:4433/tcp"
+      # Agent-Fabric channel rendezvous/relay (#100/#103). Restrictive client networks
+      # that block this port fall back to the :443 front door (#106, ALPN=ct-edge-channel).
+      - "${EDGE_CHANNEL_PORT:-4435}:4435/udp"
+      - "${EDGE_CHANNEL_PORT:-4435}:4435/tcp"
       # Operator-facing metrics scrape endpoint (#19), bound to LOOPBACK (#85) — it's
       # unauthenticated, so it must not be published on a public interface; scrape it
       # from 127.0.0.1 (or internally via the docker network at edge:9600). Override
