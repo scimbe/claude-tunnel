@@ -215,9 +215,15 @@ pub async fn serve_sni_passthrough<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (hello, sni) = crate::sni::read_client_hello(&mut inbound)
-        .await
-        .ok_or("no SNI in the TLS ClientHello")?;
+    // #111: bound the ClientHello read on this public `:443` SNI entry too, so a Slowloris
+    // client that stalls mid-record is dropped rather than pinning the connection forever.
+    let (hello, sni) = tokio::time::timeout(
+        CLIENT_HELLO_READ_TIMEOUT,
+        crate::sni::read_client_hello(&mut inbound),
+    )
+    .await
+    .map_err(|_| "sni passthrough: ClientHello read timed out")?
+    .ok_or("no SNI in the TLS ClientHello")?;
     let token = state
         .route_host(&sni)
         .ok_or_else(|| format!("no tunnel registered for host '{sni}'"))?;
@@ -483,6 +489,30 @@ const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// `drain_expired` on the front-door pairer is a separate concern — see the packet note.)
 const CHANNEL_PARK_TTL_SECS: u64 = 30;
 
+/// Bound how long a public `:443` client may take to deliver its complete TLS ClientHello
+/// (#111 Slowloris defense). A real browser ships the ClientHello in its first TCP
+/// segment(s); a Slowloris client instead dribbles or stalls mid-record to pin the
+/// connection open forever. #119 already caps concurrent front-door connections
+/// (`ConnectionCap`), but a stalled read still holds its cap permit indefinitely, so N slow
+/// clients exhaust the cap and lock out the port — the cap needs a companion read deadline.
+/// Applied at BOTH public entry points ([`serve_front_door`] and [`serve_sni_passthrough`]);
+/// the pure parsers in [`crate::sni`] stay timeout-free so their unit tests are unaffected.
+const CLIENT_HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read the raw front-door ClientHello under [`CLIENT_HELLO_READ_TIMEOUT`] (#111): the
+/// timeout-bounded seam wrapping the panic-free parser [`crate::sni::read_client_hello_bytes`]
+/// so a client that stalls mid-record is dropped (freeing its #119 cap permit) instead of
+/// wedging the port. Kept as a named helper — separate from the parser — so the timeout is
+/// unit-testable over an in-memory duplex.
+async fn read_client_hello_bytes_bounded<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<Vec<u8>, BoxError> {
+    tokio::time::timeout(CLIENT_HELLO_READ_TIMEOUT, crate::sni::read_client_hello_bytes(stream))
+        .await
+        .map_err(|_| "front door: ClientHello read timed out")?
+        .ok_or_else(|| "front door: not a TLS ClientHello".into())
+}
+
 pub async fn serve_front_door(
     mut inbound: tokio::net::TcpStream,
     state: &EdgeState<Connection>,
@@ -496,9 +526,7 @@ pub async fn serve_front_door(
     // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
     // (the TLS-TCP analog of QUIC's `conn.remote_address()`).
     let observed = inbound.peer_addr()?;
-    let hello = crate::sni::read_client_hello_bytes(&mut inbound)
-        .await
-        .ok_or("front door: not a TLS ClientHello")?;
+    let hello = read_client_hello_bytes_bounded(&mut inbound).await?;
     let alpn = crate::sni::peek_alpn(&hello);
     let sni = crate::sni::peek_sni(&hello);
     let hosts: Vec<&str> = proxies.keys().map(|s| s.as_str()).collect();
@@ -1494,6 +1522,33 @@ mod tests {
         assert_eq!(resolve_flood_limit(Some("none"), 600), None, "none disables");
         assert_eq!(resolve_flood_limit(Some("garbage"), 600), Some(600), "unparseable -> safe default, not off");
         assert_eq!(resolve_flood_limit(Some("-5"), 600), Some(600), "negative -> safe default, not off");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn front_door_drops_a_stalled_client_hello_after_the_timeout() {
+        // #111 Slowloris: a client sends a valid TLS record header claiming a full-size
+        // (16384-byte) record, then stalls forever — no body, never closes. The bounded
+        // front-door read must return the timeout error rather than hanging indefinitely
+        // (which, with #119's ConnectionCap, would otherwise pin the cap permit). With the
+        // clock paused, tokio auto-advances virtual time to the deadline, so this is
+        // deterministic and fast.
+        let (mut client, mut edge) = tokio::io::duplex(64);
+        // TLS handshake record header: type=0x16, version 0x0303, length=0x4000 (16384).
+        client.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).await.unwrap();
+        client.flush().await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let res = read_client_hello_bytes_bounded(&mut edge).await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "a stalled ClientHello must be dropped, got Ok");
+        assert!(
+            elapsed >= CLIENT_HELLO_READ_TIMEOUT,
+            "must wait for the read timeout before dropping, elapsed {elapsed:?}"
+        );
+        // Keep the stalling client end alive until after the read resolves, so the read
+        // times out rather than seeing an EOF.
+        drop(client);
     }
 
     #[tokio::test]

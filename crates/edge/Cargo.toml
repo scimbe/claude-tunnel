@@ -22,6 +22,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+# `test-util` (dev-only) enables tokio's paused clock for the #111 Slowloris timeout test
+# (`#[tokio::test(start_paused = true)]`); it stays out of the production build.
+tokio = { version = "1", features = ["test-util"] }
 ct-control-plane = { path = "../control-plane" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
