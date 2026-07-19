@@ -2567,3 +2567,34 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
 - **#106-client-fallback** ⏳ then: the agent's channel dial falls back to the `:443` front door with
   `ALPN=ct-edge-channel` when `CT_CHANNEL_BROKER`/`_RELAY` on the direct port is blocked (the #31 FD3 / #74
   fallback-ladder pattern). Unblocks the #103 live sink↔source test from a `:443`-only host.
+
+## #107 Topology Editor — per-user overlay composition from agents (feature, epic)
+
+Per-user editor to wire agents (own or shared-in) into an overlay topology, with an exclusivity rule, a
+best-connectivity computation, a per-topology `<net-uuid>` live-status subdomain, and a click-together UI. A
+big epic with **open design questions** (see the issue) that gate several parts. Decomposed so the one piece
+with **no prior art** and **no dependency on those open questions** lands first:
+
+- **#107-exclusivity** ✅ **Exclusive agent-to-topology assignment state machine** (`control-plane::topology`,
+  pure): the "genuinely new constraint" the issue flags — *an agent belongs to at most one topology; sharing
+  can only be revoked, not reassigned*. `AgentAssignment { owner, topology: Option<_> }` with
+  `assign(by, topology)` (owner-only; `AlreadyAssigned` if already in a topology — exclusivity) and
+  `revoke(by)` (the owner **or** the current topology may end it; returns to unassigned/owner control).
+  Separate from storage, like `accounts::Ledger` ↔ `storage::SqliteLedger` (the durable `SqliteTopologyStore`
+  is a follow packet). Wire-serializable for the REST surface. Frozen tests: fresh=owned+unassigned;
+  owner-only assign + exclusivity block; revoke returns to owner then owner can reassign; revoke-unassigned
+  errors; serde round-trip. Gate green.
+  - **Chosen interpretation** of the issue's revocation open-question: revoking returns control to the
+    **original owner** (reassignable only by them), *not* free-for-all — the safe default; flagged for scimbe.
+- **#107-datamodel** ⏳ next: `Topology` entity + agent-membership (wrapping the state machine) + edge-list as
+  durable CP schema (`SqliteTopologyStore`), owner-scoped.
+- **#107-rest** ⏳: `/me/topologies`, `/me/topologies/:id/agents`, … following the `/me/*` OIDC-bearer,
+  subject-scoped conventions.
+- **#107-subdomain** ⏳: `<net-uuid>.<zone>` live-status page reusing the #38 DL2 DNS + authorize-host pipeline
+  (keyed by topology-id), UUID-only access first (owner auth-gate deferred — its own tracked placeholder).
+- **#107-nway** ⏳ **(hard core, gated on open questions)**: generalize `authorize_channel_pair` + the broker's
+  fixed two-connection loop to N-way — needs scimbe's answers on scale (≤8 vs arbitrary N) and "SDN" scope.
+- **#107-optimize** ⏳ **(blocked)**: the best-connectivity objective function — cannot start until scimbe
+  states what it optimizes (latency / hops / redundancy / bandwidth). **#107-ui** ⏳: greenfield node-graph
+  editor (frontend-stack decision — no existing SPA infra). **#107-testing** ⏳: unit/API (cheap) + a real
+  N-agent formation smoke (reuse #76's harness or a lighter docker rig).
