@@ -2780,9 +2780,19 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
     TLS-TCP dial through the front door is the next slice. Frozen test extends
     `channel_join_cli_config_parses_the_plane_one_liner` (no front door → direct-only; set → direct then :443;
     relay likewise; malformed → error). Gate green.
-  - **#106-client-dial** ⏳ next: `run_channel_join_command` walks the ladder — on a blocked/failed direct QUIC
-    dial, connect the `:443` front door over **TLS-TCP** with the `ct-edge-channel` ALPN and speak the
-    channel-join protocol over that stream (reuses the classic agent's `:443` TLS-TCP path, #74).
+  - **#106-client-dial** — decomposed (the ladder-walk control logic is separable from the transport dials):
+    - **#106-client-dial-walk** ✅ **The fallback-ladder walker** (`ct_agent::channel_run::dial_ladder`): pure,
+      socket-free — tries each `ChannelDialRung` in order, returns the first that connects, and falls through a
+      failed rung (`Unreachable`/`Failed`) to the next, so a blocked *direct* rung falls back to the `:443`
+      front-door rung; errors only when EVERY rung is blocked. The per-rung transport connect is **injected** (a
+      closure), so the walk is unit-testable without sockets. Frozen test
+      `dial_ladder_falls_through_to_the_front_door_then_errors_when_all_blocked` (fall-through, first-success
+      short-circuit, all-blocked→error). Gate green, 0 warnings.
+    - **#106-client-dial-443** ⏳ next: a `tcp_tls_connect_channel` (agent `transport.rs`) that TLS-TCP-connects
+      the `:443` front door advertising ALPN `ct-edge-channel` (parameterize the existing `ct-edge` dialer), and
+      make `run_channel_join_command` drive the broker/relay via `dial_ladder` with the real QUIC-direct dial and
+      this `:443` dial. Gated on the client channel-join protocol working over a non-quinn stream (mirror of the
+      edge's `read_channel_join_on_stream`) — the client analog of the edge generalization, its own slice.
   - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
     - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
       extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the

@@ -457,6 +457,29 @@ pub async fn dial_peer_direct(
     }
 }
 
+/// Walk a channel dial **fallback ladder** (#106): try each rung in order and return
+/// the first that connects. A rung that fails — `Unreachable` (a restrictive network
+/// blocked the direct channel port) or `Failed` — falls through to the next, so a
+/// blocked *direct* rung falls back to the `:443` front-door rung. Errors only when
+/// **every** rung is blocked (all paths down). The per-rung transport connect is
+/// injected as `dial`, so the ladder-walk is pure and unit-testable without sockets;
+/// the caller supplies the real QUIC-direct / TLS-TCP-`:443` dials (the latter carries
+/// the `ct-edge-channel` ALPN so the `:443` front door routes it to the broker).
+pub async fn dial_ladder<C, D, Fut>(rungs: &[ChannelDialRung], dial: D) -> Result<C, ChannelDialError>
+where
+    D: Fn(&ChannelDialRung) -> Fut,
+    Fut: std::future::Future<Output = Result<C, ChannelDialError>>,
+{
+    let mut last: Option<ChannelDialError> = None;
+    for rung in rungs {
+        match dial(rung).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or(ChannelDialError::Unreachable))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -663,6 +686,44 @@ mod tests {
         let id2 = ChannelIdentity::generate();
         assert_ne!(id.holder.to_bytes(), id2.holder.to_bytes(), "holder keys are unique per mint");
         assert_ne!(id.noise.private, id2.noise.private, "Noise keys are unique per mint");
+    }
+
+    #[tokio::test]
+    async fn dial_ladder_falls_through_to_the_front_door_then_errors_when_all_blocked() {
+        // #106-client-dial (frozen): the ladder-walk tries rungs in order and returns the
+        // first that connects, so a direct rung blocked by a restrictive network falls
+        // back to the :443 front-door rung; it errors only when EVERY rung is blocked.
+        let direct = ChannelDialRung { endpoint: "203.0.113.5:9443".parse().unwrap(), via_front_door: false };
+        let fd = ChannelDialRung { endpoint: "203.0.113.5:443".parse().unwrap(), via_front_door: true };
+
+        // Direct blocked -> fall through to the :443 front-door rung.
+        let picked: &str = dial_ladder(&[direct, fd], |r: &ChannelDialRung| {
+            let via = r.via_front_door;
+            async move {
+                if via { Ok("front-door") } else { Err(ChannelDialError::Unreachable) }
+            }
+        })
+        .await
+        .expect("falls back to the front door when the direct port is blocked");
+        assert_eq!(picked, "front-door");
+
+        // First success short-circuits: direct connects -> the front door is never tried.
+        let picked: &str = dial_ladder(&[direct, fd], |r: &ChannelDialRung| {
+            let via = r.via_front_door;
+            async move {
+                assert!(!via, "the front-door rung must not be tried once the direct rung connects");
+                Ok("direct")
+            }
+        })
+        .await
+        .expect("direct connects on the first rung");
+        assert_eq!(picked, "direct");
+
+        // Every rung blocked -> error (all paths down).
+        let all_blocked: Result<&str, _> =
+            dial_ladder(&[direct, fd], |_r: &ChannelDialRung| async move { Err(ChannelDialError::Unreachable) })
+                .await;
+        assert!(all_blocked.is_err(), "all rungs blocked surfaces an error");
     }
 
     #[test]
