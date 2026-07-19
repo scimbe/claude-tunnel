@@ -1220,6 +1220,20 @@ async fn channel_invite_redeem(
             "noise_attestation does not verify against the holder key".to_string(),
         ));
     }
+    // #108: enforce single-use. The invitation is a static signed object with a static
+    // redemption proof, so without this a **revoked** member could replay the identical
+    // redemption to restore membership until expiry (bypassing remove_member). Consume it
+    // by its operator signature *after* the proofs verify (a bad proof burns nothing) and
+    // *before* add_member; a replay is a 409. Mirrors verify_fresh/ReplayCache for grants.
+    let fresh = channels
+        .consume_invitation(&signed.signature, signed.invitation.expires_at, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !fresh {
+        return Err((
+            StatusCode::CONFLICT,
+            "invitation already redeemed (single-use)".to_string(),
+        ));
+    }
     // The invitation is the owner's authorization, so add the member on the owner's
     // behalf (add_member is owner-scoped; look up the channel's owner to satisfy it).
     let owner = channels
@@ -2158,6 +2172,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "mint open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn channel_invite_redeem_single_use_survives_revocation() {
+        // #108: a redemption is single-use — a replay is 409, and a REVOKED member cannot
+        // replay the identical redemption to restore membership (the bypass this fixes).
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let operator_sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let operator_pk = operator_sk.verifying_key().to_bytes();
+        let chan = ChannelId([0xa1u8; 32]);
+        channels.register_channel(&chan, &operator_pk, "alice").unwrap();
+
+        let invitee_sk = SigningKey::from_bytes(&[0x62u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder_sk = SigningKey::from_bytes(&[0x73u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let nk = [0xd4u8; 32];
+
+        let invitation = ct_common::channel::ChannelInvitation {
+            channel: chan,
+            invitee_identity: invitee,
+            direction: ct_common::channel::Direction::Both,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000_000_000,
+        };
+        let inv_sig = operator_sk.sign(&invitation.signing_bytes()).to_bytes();
+        let signed = ct_common::channel::SignedChannelInvitation { invitation, signature: inv_sig };
+        let inv_hex = hex_encode(&signed.encode());
+        let redeem = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_bytes(&chan, &invitee, &holder))
+                .to_bytes(),
+        );
+        let attest = hex_encode(
+            &holder_sk
+                .sign(&ct_common::channel::member_noise_attest_bytes(&chan, &holder, &nk))
+                .to_bytes(),
+        );
+
+        let app = channel_invite_router(channels.clone());
+        let body = format!(
+            r#"{{"invitation":"{inv_hex}","redeem_sig":"{redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{a}"}}"#,
+            h = hex_encode(&holder),
+            n = hex_encode(&nk),
+            a = attest,
+        );
+        let post = || {
+            app.clone().oneshot(
+                Request::post("/channel/invite/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+        };
+
+        // First redemption admits the member.
+        assert_eq!(post().await.unwrap().status(), StatusCode::OK, "first redeem admits");
+        assert_eq!(channels.authorize_holder(&chan, &holder).unwrap(), Some(operator_pk));
+
+        // An identical replay is rejected — single-use.
+        assert_eq!(post().await.unwrap().status(), StatusCode::CONFLICT, "replay -> 409");
+
+        // The owner revokes the member.
+        assert!(channels.remove_member(&chan, "alice", &holder).unwrap());
+        assert_eq!(channels.authorize_holder(&chan, &holder).unwrap(), None, "revoked at the gate");
+
+        // The revoked member replays the identical redemption -> still 409; membership is
+        // NOT restored. This is the #108 bypass, now closed.
+        assert_eq!(
+            post().await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "a revoked member cannot replay the redemption to restore membership"
+        );
+        assert_eq!(channels.authorize_holder(&chan, &holder).unwrap(), None, "still revoked -- remove_member holds");
     }
 
     #[tokio::test]

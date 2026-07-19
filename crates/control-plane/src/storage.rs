@@ -1084,6 +1084,10 @@ impl SqliteChannelStore {
                  channel BLOB NOT NULL,
                  holder  BLOB NOT NULL,
                  PRIMARY KEY (channel, holder)
+             );
+             CREATE TABLE IF NOT EXISTS consumed_invitations (
+                 signature  BLOB PRIMARY KEY,
+                 expires_at INTEGER NOT NULL
              );",
         )?;
         // #72 AF4 (registry carries the key): each member's X25519 Noise static key,
@@ -1207,6 +1211,37 @@ impl SqliteChannelStore {
             params![&channel.0[..], &holder[..], &noise_pubkey[..], &noise_attestation[..]],
         )?;
         Ok(true)
+    }
+
+    /// Record a cross-user invitation redemption as **consumed** (#72 AF3 / #108),
+    /// keyed by the invitation's 64-byte operator signature (unique per invitation — a
+    /// replay carries the identical bytes). Returns `true` the **first** time an
+    /// unexpired invitation is redeemed and `false` on any replay, so a redemption is
+    /// genuinely single-use and a **revoked member cannot restore membership** by
+    /// re-POSTing the same redemption. Mirrors `verify_fresh`/`ReplayCache` for grants
+    /// (#88 SEC88b); the caller (redeem endpoint) checks proofs first, then consumes.
+    /// Expired records are pruned on each call so the table stays bounded, and an
+    /// already-expired invitation is never fresh (defensive — `verify_invitation`
+    /// rejects it first anyway).
+    pub fn consume_invitation(
+        &self,
+        signature: &[u8; 64],
+        expires_at: u64,
+        now: u64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        conn.execute(
+            "DELETE FROM consumed_invitations WHERE expires_at <= ?1",
+            params![now as i64],
+        )?;
+        if now >= expires_at {
+            return Ok(false);
+        }
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO consumed_invitations (signature, expires_at) VALUES (?1, ?2)",
+            params![&signature[..], expires_at as i64],
+        )?;
+        Ok(inserted > 0)
     }
 
     /// The holder-signed attestation over `holder`'s Noise key on `channel` (#101), if
@@ -1825,6 +1860,24 @@ mod tests {
         assert!(store.remove_edge("alice", "t1", "b", "a").unwrap(), "owner removes b—a");
         assert!(!store.remove_edge("alice", "t1", "a", "b").unwrap(), "already gone");
         assert_eq!(store.edges("t1").unwrap(), vec![("a".into(), "c".into())]);
+    }
+
+    #[test]
+    fn consume_invitation_is_single_use_and_prunes_expired() {
+        // #108: an invitation redemption is recorded consumed by its signature; a replay
+        // is rejected, a distinct invitation is independent, an expired one is never fresh.
+        let store = SqliteChannelStore::open_in_memory().unwrap();
+        let sig = [0x11u8; 64];
+        assert!(store.consume_invitation(&sig, 1_000, 100).unwrap(), "first redeem is fresh");
+        assert!(!store.consume_invitation(&sig, 1_000, 200).unwrap(), "replay rejected");
+        // A distinct invitation (its own signature) is independently fresh.
+        assert!(store.consume_invitation(&[0x22u8; 64], 1_000, 200).unwrap());
+        // An already-expired invitation is never fresh (defensive; verify_invitation
+        // rejects an expired one first anyway).
+        assert!(!store.consume_invitation(&[0x33u8; 64], 1_000, 1_000).unwrap(), "expired -> not fresh");
+        // A still-unexpired consumed record stays consumed across a later call.
+        assert!(store.consume_invitation(&[0x44u8; 64], 5_000, 2_000).unwrap());
+        assert!(!store.consume_invitation(&[0x44u8; 64], 5_000, 2_001).unwrap(), "still consumed before expiry");
     }
 
     #[test]

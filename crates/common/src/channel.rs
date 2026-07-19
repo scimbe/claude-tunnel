@@ -386,8 +386,13 @@ pub fn verify_member_noise_attestation(
 /// it holds the invitee identity key and choosing a holder key (see
 /// [`invitation_redeem_bytes`]) — after which the operator/CP issues the real per-holder
 /// [`SignedChannelGrant`]. Distinct from *sharing*: an invitation crosses users and is
-/// redeemed once into a scoped grant. Same claim shape as [`ChannelGrant`], but bound to
-/// the invitee's *identity* key rather than a member key.
+/// meant to be redeemed **once** into a scoped membership. The invitation object itself is
+/// stateless (a signed token with a static redemption proof), so single-use is **not**
+/// self-enforcing — the redeeming CP MUST record consumption (keyed by the operator
+/// signature) and reject a replay, exactly as `verify_fresh`/`ReplayCache` do for grants
+/// (#88 SEC88b). Without that, a **revoked** member could replay the identical redemption
+/// to restore membership until expiry (#108). Same claim shape as [`ChannelGrant`], but
+/// bound to the invitee's *identity* key rather than a member key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelInvitation {
     /// The channel the invitee is invited to.
@@ -565,6 +570,12 @@ pub fn verify_invitation_redemption(
 /// admit the member from the two public-key proofs alone. Errors mirror
 /// [`verify`]: `BadKey`/`BadSignature`/`Expired` (a failed redemption proof surfaces as
 /// `BadSignature`).
+///
+/// This is **pure verification** — like [`verify`] vs [`verify_fresh`], it does NOT
+/// enforce single-use. The caller MUST record consumption of the invitation (by its
+/// operator signature) and reject a replay, or a revoked member can replay this to
+/// restore membership until expiry (#108). The live redeem endpoint does so via
+/// `SqliteChannelStore::consume_invitation`.
 pub fn redeem_invitation(
     operator_pubkey: &[u8; 32],
     signed: &SignedChannelInvitation,

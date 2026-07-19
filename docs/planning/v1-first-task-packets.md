@@ -1751,6 +1751,21 @@ Decomposed:
     channel→404). Gate green. **This makes cross-user channel membership drivable end-to-end** and unblocks
     #100's brokered channel one-liner generator (an operator surface can now mint an invitation an invitee
     redeems into real membership).
+  - **#108 SEC — invitation redemption is single-use** ✅ **(security-review fix; the replay/revocation
+    bypass).** The invitation is a stateless signed object with a *static* redemption proof (no nonce), and
+    `add_member` is `INSERT OR REPLACE`, so before this a **revoked** member could re-POST the identical
+    `/channel/invite/redeem` to re-insert its `channel_members` row and restore membership until `expires_at` —
+    defeating `remove_member`. Fix: `SqliteChannelStore::consume_invitation(signature, expires_at, now)` records
+    a durable `consumed_invitations` row keyed by the invitation's 64-byte operator signature (unique per
+    invitation; a replay carries the identical bytes) — `true` the first time an unexpired invitation is
+    redeemed, `false` on any replay; expired rows pruned. The redeem endpoint consumes **after** the proofs
+    verify (a bad proof burns nothing, mirroring `verify_fresh`) and **before** `add_member`; a replay is a
+    `409`. So a revoked member replaying the same redemption is refused and `remove_member` stays effective. The
+    `channel.rs` docs are corrected: an invitation object is stateless and single-use is the redeeming CP's
+    responsibility (like `verify` vs `verify_fresh`). Frozen tests
+    `consume_invitation_is_single_use_and_prunes_expired` (storage) and
+    `channel_invite_redeem_single_use_survives_revocation` (the exact #108 scenario: redeem→409 replay→revoke→
+    409 replay, membership never restored). Gate green.
 - **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**. Split:
   - **AF4-join** ✅ **Agent-side channel-join client** (`ct-agent::channel::present_channel_join`): the client
     half of the broker handshake — sends the `u16`-framed `ChannelJoinRequest`, answers the edge's 32-byte
