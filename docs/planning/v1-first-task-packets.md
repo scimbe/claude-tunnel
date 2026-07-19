@@ -2574,9 +2574,14 @@ offload. Decomposed so the pure, mesh-independent core lands first:
   Frozen tests: initiator-only triggering + schedule, exponential backoff to the cap, confirm→direct stops
   attempts + records time-to-upgrade (idempotent), and relay/direct byte accounting. Gate green
   (full `cargo test --workspace -D warnings`).
-- **#104-signal** ⏳ next: the small control message over the still-open relay stream that lets the initiator
-  tell the responder "I can reach you direct — swap now", and the both-ways-live confirmation before either
-  side stops the relay leg (no drop window).
+- **#104-signal** ✅ **Handover control protocol** (`ct_common::upgrade::UpgradeMsg`): the tiny message the two
+  members speak **over the still-open relay stream** to coordinate the swap. `Offer { direct_endpoint }`
+  (initiator → responder: "I can reach you direct — prepare the swap, here's the endpoint"), `Ready`
+  (responder → initiator: the direct path is live on my side — the both-ways-live confirmation before either
+  side drops the relay, so no data-drop window), and `Abort` (back out, stay on relay). Wire form `tag(1) |
+  payload` with `encode`/`decode`; decode is bounds-checked/panic-free (empty, unknown tag, empty-endpoint
+  Offer, non-UTF-8 endpoint, or a payload on a payloadless tag all → `None`), so a garbled relay byte can't
+  crash the coordination. Frozen test `upgrade_msg_round_trips_and_rejects_malformed`. Gate green.
 - **#104-handover** ⏳ then: wire `UpgradeCoordinator` into `run_channel_session` — background `dial_peer_direct`
   (reusing `AF4-resilience-classify`) while relayed; on success open a second direct QUIC connection, run a
   fresh Noise_IK over it, hand the ciphertext stream over, and release the relay only after the direct path is

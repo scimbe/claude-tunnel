@@ -46,6 +46,65 @@ pub enum Role {
 const DEFAULT_BASE_INTERVAL_SECS: u64 = 5;
 const DEFAULT_MAX_INTERVAL_SECS: u64 = 60;
 
+/// The tiny control protocol the two members speak **over the still-open relay stream**
+/// to coordinate a relay→direct handover (#104). The initiator (which owns triggering,
+/// per [`UpgradeCoordinator`]) offers its now-reachable direct endpoint; the responder
+/// sets up the direct path and acks `Ready`; only then does either side stop the relay
+/// leg — so there is no window where data silently drops. `Abort` lets a side back out
+/// (e.g. the direct path failed to come up) and stay on the relay.
+///
+/// Wire form: a 1-byte tag, then a tag-specific payload. `Offer` carries the direct
+/// endpoint as trailing UTF-8 (no length prefix needed — it is the remainder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeMsg {
+    /// Initiator → responder: "I can reach you direct — prepare the swap. Here is the
+    /// direct endpoint (host:port) to expect/dial."
+    Offer { direct_endpoint: String },
+    /// Responder → initiator: the direct path is set up and live on my side.
+    Ready,
+    /// Either side: abandon this upgrade attempt and stay on the relay.
+    Abort,
+}
+
+impl UpgradeMsg {
+    const TAG_OFFER: u8 = 0;
+    const TAG_READY: u8 = 1;
+    const TAG_ABORT: u8 = 2;
+
+    /// Encode to the wire form (`tag(1) | payload`).
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            UpgradeMsg::Offer { direct_endpoint } => {
+                let mut out = Vec::with_capacity(1 + direct_endpoint.len());
+                out.push(Self::TAG_OFFER);
+                out.extend_from_slice(direct_endpoint.as_bytes());
+                out
+            }
+            UpgradeMsg::Ready => vec![Self::TAG_READY],
+            UpgradeMsg::Abort => vec![Self::TAG_ABORT],
+        }
+    }
+
+    /// Decode from [`encode`](Self::encode). Bounds-checked and panic-free: an empty
+    /// buffer, an unknown tag, a non-UTF-8 or empty `Offer` endpoint, or trailing bytes
+    /// on a payloadless tag all return `None`.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&tag, rest) = bytes.split_first()?;
+        match tag {
+            Self::TAG_OFFER => {
+                if rest.is_empty() {
+                    return None; // an Offer must carry an endpoint
+                }
+                let endpoint = std::str::from_utf8(rest).ok()?.to_string();
+                Some(UpgradeMsg::Offer { direct_endpoint: endpoint })
+            }
+            Self::TAG_READY if rest.is_empty() => Some(UpgradeMsg::Ready),
+            Self::TAG_ABORT if rest.is_empty() => Some(UpgradeMsg::Abort),
+            _ => None,
+        }
+    }
+}
+
 /// Coordinates the opportunistic relay→direct upgrade of one A2A session (#104).
 ///
 /// Constructed when a session starts on the relay. The initiator polls
@@ -238,6 +297,31 @@ mod tests {
         // Idempotent: a second confirm keeps the original upgrade time.
         c.confirm_upgraded(999);
         assert_eq!(c.time_to_upgrade(), Some(60));
+    }
+
+    #[test]
+    fn upgrade_msg_round_trips_and_rejects_malformed() {
+        // #104-signal: the relay-borne handover control messages round-trip, and any
+        // malformed frame is rejected (never panics) so a garbled relay byte can't
+        // crash the swap coordination.
+        for msg in [
+            UpgradeMsg::Offer { direct_endpoint: "203.0.113.7:4500".into() },
+            UpgradeMsg::Ready,
+            UpgradeMsg::Abort,
+        ] {
+            assert_eq!(UpgradeMsg::decode(&msg.encode()), Some(msg.clone()), "round-trips: {msg:?}");
+        }
+        // The Offer's endpoint is carried verbatim.
+        let off = UpgradeMsg::decode(&UpgradeMsg::Offer { direct_endpoint: "h:1".into() }.encode());
+        assert_eq!(off, Some(UpgradeMsg::Offer { direct_endpoint: "h:1".into() }));
+
+        // Malformed frames -> None (no panic): empty, unknown tag, empty-endpoint Offer,
+        // and trailing bytes on a payloadless tag.
+        assert_eq!(UpgradeMsg::decode(&[]), None, "empty");
+        assert_eq!(UpgradeMsg::decode(&[9]), None, "unknown tag");
+        assert_eq!(UpgradeMsg::decode(&[UpgradeMsg::TAG_OFFER]), None, "offer needs an endpoint");
+        assert_eq!(UpgradeMsg::decode(&[UpgradeMsg::TAG_READY, 0xff]), None, "ready takes no payload");
+        assert_eq!(UpgradeMsg::decode(&[UpgradeMsg::TAG_OFFER, 0xff, 0xfe]), None, "non-utf8 endpoint");
     }
 
     #[test]
