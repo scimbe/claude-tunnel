@@ -2875,11 +2875,21 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
       `admit_channel_join_on_duplex`, acking the responder's attested-key triple) admit the join over `:443`, then
       the outcome drives the direct A2A session to a real responder and application data flows — proving broker
       admission is decoupled from and reachable over `:443` independently of the data legs. Gate green, 0 warnings.
-      ⏳ Follow: the **relay data leg** stays QUIC — a `:443`-only member (whose relay port 4436 is blocked too)
-      still can't relay-fall-back over `:443`; generalizing `join_via_relay` to a TLS-TCP front-door stream
-      (mirroring the edge's relay-splice) is the next slice (**#106-relay-leg-443**), plus **N4** (local
-      docker-compose A2A e2e over a real `:443` front door). Until both land, a `:443`-only member is admitted over
-      `:443` but not yet fully functional end-to-end when the direct path is also blocked.
+    - **#106-relay-session-generic** ✅ **Transport-agnostic A2A session** (`ct_agent::channel_run`): the Noise_IK
+      session was quinn-only (`BiStream` held `SendStream`/`RecvStream`; `run_channel_session` did `open_bi`/
+      `accept_bi`). Made `BiStream<W, R>` generic and extracted `run_channel_session_on_stream<W, R, P>` — the
+      handshake (`a2a_initiate`/`a2a_respond`, already generic) + `noise_pump` over any split write/read halves.
+      `run_channel_session(conn, …)` is now the thin QUIC wrapper (`open_bi` → delegate). A `:443`/TLS-TCP relay
+      stream runs the identical session by `tokio::io::split`ting it. Frozen test
+      `run_channel_session_on_stream_forms_the_noise_tunnel_over_a_plain_duplex`: two members handshake over an
+      in-memory duplex, then plaintext written to one member's local side arrives **decrypted** at the other's —
+      the Noise tunnel forms over a non-quinn stream. Gate green, 0 warnings.
+    - **#106-relay-leg-wire** ⏳ next: wire `join_via_relay` to walk the **relay** ladder (`relay_ladder()`) —
+      present the join at the relay over direct QUIC or the `:443` front door, then run the session over that
+      stream via `run_channel_session_on_stream` (splitting the reunited admitted `:443` stream). All primitives
+      now exist (relay ladder + transport-agnostic session); this is the wire that makes a truly `:443`-only member
+      (both broker AND relay ports blocked) fully functional. Then **N4** — local docker-compose A2A e2e over a
+      real `:443` front door.
   - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
     - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
       extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the

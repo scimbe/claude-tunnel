@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use ct_common::channel::ChannelJoinRequest;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -39,14 +39,18 @@ pub enum ChannelRole {
 /// A quinn bi-stream (`SendStream` + `RecvStream`) presented as one combined
 /// `AsyncRead + AsyncWrite`, so [`noise_pump`] (which `tokio::io::split`s a single
 /// duplex) can relay over it. Reads delegate to `recv`, writes to `send`.
-struct BiStream {
-    send: SendStream,
-    recv: RecvStream,
+// A combined duplex from separate write/read halves. Generic over the halves so it
+// wraps both a quinn `SendStream`/`RecvStream` pair (the direct/QUIC path) and the
+// split halves of a `:443`/TLS-TCP relay stream (#106 relay-leg-443).
+struct BiStream<W, R> {
+    send: W,
+    recv: R,
 }
 
 // quinn's Send/RecvStream carry inherent poll_* methods (quinn error types) that
-// shadow the tokio trait methods, so delegate with fully-qualified trait syntax.
-impl AsyncRead for BiStream {
+// shadow the tokio trait methods, so delegate with fully-qualified trait syntax
+// (harmless for the generic case, where no inherent methods exist).
+impl<W: AsyncWrite + Unpin, R: AsyncRead + Unpin> AsyncRead for BiStream<W, R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -56,7 +60,7 @@ impl AsyncRead for BiStream {
     }
 }
 
-impl AsyncWrite for BiStream {
+impl<W: AsyncWrite + Unpin, R: AsyncRead + Unpin> AsyncWrite for BiStream<W, R> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
     }
@@ -84,10 +88,34 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
-    let (mut send, mut recv) = match role {
+    let (send, recv) = match role {
         ChannelRole::Initiate => conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
         ChannelRole::Accept => conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
     };
+    run_channel_session_on_stream(send, recv, role, own_noise_private, peer_noise_public, local).await
+}
+
+/// The transport-agnostic core of [`run_channel_session`] (#106 relay-leg-443): run one
+/// side of the A2A Noise_IK handshake over already-split write/read halves, then pump
+/// `local` over the encrypted tunnel until either end closes. The QUIC path reaches this
+/// via [`run_channel_session`] (`open_bi`/`accept_bi`), but a `:443`/TLS-TCP relay stream
+/// — whose data path IS the single stream it joined on — runs the identical session by
+/// `tokio::io::split`ting the stream and passing the halves here. So a member whose relay
+/// port is also blocked (a truly `:443`-only network) relays over `:443` unchanged; the
+/// Noise_IK session stays end-to-end and the edge only forwards ciphertext.
+pub async fn run_channel_session_on_stream<W, R, P>(
+    mut send: W,
+    mut recv: R,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
     let session = match role {
         ChannelRole::Initiate => {
             a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await
@@ -1332,6 +1360,56 @@ mod tests {
             ChannelJoinOutcome::Refused => panic!("a valid join over :443 must be Admitted, not Refused"),
         }
         edge.await.expect("edge task");
+    }
+
+    #[tokio::test]
+    async fn run_channel_session_on_stream_forms_the_noise_tunnel_over_a_plain_duplex() {
+        // #106 relay-leg-443 (frozen): the A2A session is transport-agnostic — the
+        // Noise_IK handshake + bidirectional pump run over a plain in-memory duplex (the
+        // stand-in for a :443/TLS-TCP relay-spliced stream), not just a quinn bi-stream.
+        // Two members hand-shake over the transport duplex, then plaintext written to one
+        // member's local side arrives DECRYPTED at the other's — proving a :443-only
+        // member (relay port also blocked) can relay end-to-end over :443.
+        use ct_common::noise::generate_static_keypair;
+        use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
+
+        let a = generate_static_keypair();
+        let b = generate_static_keypair();
+        let (a_priv, a_pub) = (a.private, a.public);
+        let (b_priv, b_pub) = (b.private, b.public);
+
+        // The relay-spliced transport between the two members.
+        let (a_transport, b_transport) = duplex(16 * 1024);
+        // Each member's local plaintext side (the CLI's stdio stand-in).
+        let (mut a_app, a_local) = duplex(16 * 1024);
+        let (mut b_app, b_local) = duplex(16 * 1024);
+
+        let a_task = tokio::spawn(async move {
+            let (ar, aw) = split(a_transport);
+            run_channel_session_on_stream(aw, ar, ChannelRole::Initiate, &a_priv, &b_pub, a_local).await
+        });
+        let b_task = tokio::spawn(async move {
+            let (br, bw) = split(b_transport);
+            run_channel_session_on_stream(bw, br, ChannelRole::Accept, &b_priv, &a_pub, b_local).await
+        });
+
+        // A -> B over the encrypted tunnel.
+        a_app.write_all(b"ping-A-to-B").await.expect("a writes");
+        let mut got = [0u8; 11];
+        b_app.read_exact(&mut got).await.expect("b reads A's bytes");
+        assert_eq!(&got, b"ping-A-to-B", "A's plaintext arrives decrypted at B over the duplex relay");
+
+        // B -> A.
+        b_app.write_all(b"pong-B-to-A").await.expect("b writes");
+        let mut got2 = [0u8; 11];
+        a_app.read_exact(&mut got2).await.expect("a reads B's bytes");
+        assert_eq!(&got2, b"pong-B-to-A", "B's plaintext arrives decrypted at A");
+
+        // Closing a local side tears the session down cleanly.
+        drop(a_app);
+        drop(b_app);
+        let _ = a_task.await;
+        let _ = b_task.await;
     }
 
     #[test]
