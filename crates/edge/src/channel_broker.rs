@@ -766,6 +766,89 @@ where
     finish_relay_pair(a, b, now).await
 }
 
+/// Drive the QUIC channel **relay** endpoint as a concurrent, channel-keyed broker
+/// (#109-concurrent-b) — the QUIC analog of the front-door [`admit_and_pair_on_stream`]
+/// loop. This replaces the serial `loop { broker_channel_relay(..).await }` the edge used
+/// to run, which admitted exactly two connections and then ran the splice **inline**: a
+/// single long-lived relay (the #103 persistent sink) held that one global slot forever,
+/// so every other NAT'd member was blocked (#109 failure #1), and two channels racing were
+/// paired blind by arrival order (#109 failure #2).
+///
+/// Each accepted + admitted member is `offer`ed to a channel-keyed [`ChannelPairer`]: the
+/// first holder of a channel parks; when a *different holder of the same channel* arrives
+/// the two are paired and their splice ([`finish_relay_pair`]) is `spawn`ed on its own
+/// task, so the accept loop immediately returns to admit the next member — a persistent
+/// relay can no longer wedge the endpoint (#1), and channel-keying means two channels can
+/// never cross-pair (#2). A same-holder retry supersedes the stale wait (its connection is
+/// closed). On each accept the pairer is swept for lone waiters past their `park_ttl`
+/// deadline, which are closed instead of parked forever (#109 failure #3). `now_fn` is
+/// sampled per accept (a real clock in the daemon, a fixed stub in tests). The `Mutex` is
+/// held only for the synchronous `offer`/`drain_expired`, never across an `.await`.
+///
+/// Never returns: it *is* the relay endpoint's accept loop, spawned by `run_edge`.
+pub async fn run_relay_broker_loop<F, Fut, N>(
+    endpoint: &Endpoint,
+    now_fn: N,
+    authorize: F,
+    park_ttl: UnixSeconds,
+) where
+    N: Fn() -> UnixSeconds,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    let pairer: std::sync::Mutex<ChannelPairer<AdmittedMember>> =
+        std::sync::Mutex::new(ChannelPairer::new());
+    loop {
+        let now = now_fn();
+
+        // Sweep lone waiters past their park deadline (#3) before admitting the next member,
+        // so a first-comer with no partner is bounded instead of wedging the endpoint. The
+        // guard is dropped before the following `.await`.
+        let expired = pairer.lock().unwrap().drain_expired(now);
+        for m in expired {
+            m.payload.conn.close(0u32.into(), b"relay park timeout");
+        }
+
+        // Admit ONE member (its join read is bounded by #105); on error, log and keep
+        // serving — a single bad connection must not tear down the endpoint loop.
+        let member = match accept_member(endpoint, now, &authorize).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("ct-edge: channel relay admit failed: {e}");
+                continue;
+            }
+        };
+        let channel = member.req.grant.grant.channel;
+        let holder = member.req.grant.grant.holder;
+
+        // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
+        let outcome = pairer.lock().unwrap().offer(WaitingMember {
+            channel,
+            holder,
+            deadline: now.saturating_add(park_ttl),
+            payload: member,
+        });
+        match outcome {
+            // First holder of this channel — parked, waiting for its partner.
+            PairOutcome::Parked => {}
+            // Its partner met it: splice the pair on its OWN task so the accept loop stays
+            // free to admit the next member. This is the fix for the single-slot wedge (#1).
+            PairOutcome::Paired(a, b) => {
+                tokio::spawn(async move {
+                    if let Err(e) = finish_relay_pair(a.payload, b.payload, now).await {
+                        eprintln!("ct-edge: channel relay pair ended: {e}");
+                    }
+                });
+            }
+            // Same holder re-presented before its partner arrived: the fresh offer stays
+            // parked; close the stale connection (pairing a holder with itself is refused).
+            PairOutcome::Superseded(stale) => {
+                stale.payload.conn.close(0u32.into(), b"superseded by newer join");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,6 +1634,138 @@ mod tests {
         let _ = relay_task.await;
         assert_eq!(&got_a, b"tunnel B->A via edge", "A receives B's bytes through the edge relay");
         assert_eq!(&got_b, b"tunnel A->B via edge", "B receives A's bytes through the edge relay");
+    }
+
+    /// One relay member for the concurrency test: connect over QUIC, run the admission
+    /// handshake, await the relay's `OK` (written only once the member is PAIRED), then run
+    /// the data-stream dance for its role and exchange one byte through the edge. The
+    /// Initiate side opens its data stream; the Accept side accepts the edge-opened one
+    /// (roles come from the grant direction), exactly as the live Noise session does. After
+    /// the byte crosses, it signals `on_ready` (proving it paired + is relaying) and, when
+    /// `hold` is set, keeps its connection open until notified — so one channel's relay can
+    /// be held LIVE while another channel races to pair. Returns the peer's byte.
+    async fn run_relay_member(
+        cert: rustls::pki_types::CertificateDer<'static>,
+        addr: std::net::SocketAddr,
+        channel: [u8; 32],
+        holder: SigningKey,
+        direction: Direction,
+        send_byte: u8,
+        on_ready: Option<tokio::sync::mpsc::Sender<()>>,
+        hold: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> u8 {
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, direction, 1_000),
+            endpoint: "203.0.113.9:7000".to_string(),
+        };
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        assert_eq!(present_join(&conn, &req.encode(), &holder).await, b"OK", "member admitted + paired");
+        let mut got = [0u8; 1];
+        if direction == Direction::Initiate {
+            let (mut s, mut r) = conn.open_bi().await.expect("init data bi"); // initiator opens
+            s.write_all(&[send_byte]).await.expect("init write");
+            r.read_exact(&mut got).await.expect("init read");
+        } else {
+            let (mut s, mut r) = conn.accept_bi().await.expect("acc data bi"); // acceptor accepts edge-opened
+            r.read_exact(&mut got).await.expect("acc read");
+            s.write_all(&[send_byte]).await.expect("acc write");
+            let _ = s.finish(); // finish (not abort) so the relay forwards the byte + EOF
+        }
+        if let Some(tx) = on_ready {
+            let _ = tx.send(()).await; // paired + a byte has crossed → relay is live
+        }
+        if let Some(rx) = hold {
+            let _ = rx.await; // keep the relay (and connection) open until released
+        }
+        // Teardown order matches the passing `broker_channel_relay_splices` test: the
+        // initiator closes the connection (tearing the relay down), and the acceptor
+        // WAITS for that teardown so its finished byte is fully forwarded first — an
+        // abrupt `conn.close()` on the writer races the relay and drops the last byte.
+        if direction == Direction::Initiate {
+            conn.close(0u32.into(), b"done");
+        } else {
+            conn.closed().await;
+        }
+        got[0]
+    }
+
+    #[tokio::test]
+    async fn relay_broker_loop_pairs_two_channels_concurrently_without_wedging() {
+        // #109-concurrent-b (frozen): the anti-wedge + correct-correlation property over real
+        // QUIC, driving the RELAY endpoint with `run_relay_broker_loop`. Channel X and channel
+        // Y each present an Initiate+Accept member (4 connections). We deterministically pair X
+        // FIRST and HOLD its relay open, then race Y in: with the pairer-driven loop that spawns
+        // each splice on its own task, Y still pairs and its bytes cross (anti-wedge, #1) while
+        // being channel-keyed so X and Y never cross-pair (#2). Under the old serial
+        // `loop { broker_channel_relay }`, X's held-open inline splice would block the accept
+        // loop forever and Y would never be admitted — this test would hang.
+        let pk = operator_pubkey();
+        let chan_x = [0x11u8; 32];
+        let chan_y = [0x22u8; 32];
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        // Drive the relay endpoint with the concurrent, channel-keyed broker loop. Fixed clock
+        // + generous park TTL so no lone waiter is evicted mid-test.
+        let driver = tokio::spawn(async move {
+            run_relay_broker_loop(
+                &server,
+                || 500u64,
+                move |c: ChannelId, _h: [u8; 32]| async move {
+                    (c.0 == chan_x || c.0 == chan_y).then_some((pk, None, None))
+                },
+                10_000,
+            )
+            .await;
+        });
+
+        // Phase 1: pair channel X and hold its relay OPEN. A per-member oneshot keeps X's two
+        // members (hence X's spawned splice task) alive until we release them after Y is done
+        // — a oneshot is race-free (the release is delivered even if sent before the member
+        // awaits it, unlike `Notify::notify_waiters`).
+        let (x1_tx, x1_rx) = tokio::sync::oneshot::channel::<()>();
+        let (x2_tx, x2_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(2);
+        let x_init = tokio::spawn(run_relay_member(
+            cert.clone(), addr, chan_x, holder_sk(0xa1), Direction::Initiate, 0x01,
+            Some(ready_tx.clone()), Some(x1_rx),
+        ));
+        let x_acc = tokio::spawn(run_relay_member(
+            cert.clone(), addr, chan_x, holder_sk(0xb2), Direction::Accept, 0x02,
+            Some(ready_tx.clone()), Some(x2_rx),
+        ));
+        drop(ready_tx);
+        // Both X members report a byte has crossed: X is paired and its relay is actively
+        // splicing (and held open) BEFORE any Y connection exists.
+        ready_rx.recv().await.expect("x member 1 relaying");
+        ready_rx.recv().await.expect("x member 2 relaying");
+
+        // Phase 2: now race channel Y in. If the accept loop were wedged by X's held-open relay,
+        // these would hang; with the pairer-driven loop they pair on a fresh spawned splice.
+        let y_init = tokio::spawn(run_relay_member(
+            cert.clone(), addr, chan_y, holder_sk(0xc3), Direction::Initiate, 0x91,
+            None, None,
+        ));
+        let y_acc = tokio::spawn(run_relay_member(
+            cert.clone(), addr, chan_y, holder_sk(0xd4), Direction::Accept, 0x92,
+            None, None,
+        ));
+        let got_y_init = y_init.await.expect("y init task");
+        let got_y_acc = y_acc.await.expect("y acc task");
+        assert_eq!(got_y_init, 0x92, "Y initiator received Y acceptor's byte (Y paired while X held)");
+        assert_eq!(got_y_acc, 0x91, "Y acceptor received Y initiator's byte (no cross-channel mis-pair)");
+
+        // Release X and verify its own bytes crossed correctly (X paired with X, not Y).
+        let _ = x1_tx.send(());
+        let _ = x2_tx.send(());
+        let got_x_init = x_init.await.expect("x init task");
+        let got_x_acc = x_acc.await.expect("x acc task");
+        assert_eq!(got_x_init, 0x02, "X initiator received X acceptor's byte");
+        assert_eq!(got_x_acc, 0x01, "X acceptor received X initiator's byte");
+
+        driver.abort();
     }
 
     #[tokio::test]

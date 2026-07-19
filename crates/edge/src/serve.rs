@@ -1282,32 +1282,36 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         match build_server_endpoint_from_ca(&ca, relay_addr, vec!["localhost".to_string()]) {
                             Ok((relay_ep, _)) => {
                                 let relay_az = authorizer.clone();
-                                eprintln!("ct-edge: Agent-Fabric channel RELAY on {relay_addr} (#105/#72 AF4-relay)");
+                                eprintln!("ct-edge: Agent-Fabric channel RELAY on {relay_addr} (#105/#72 AF4-relay, #109 concurrent)");
                                 tokio::spawn(async move {
-                                    loop {
-                                        let now = std::time::SystemTime::now()
+                                    // #109-concurrent-b: drive the relay with a channel-keyed
+                                    // pairer that spawns each splice on its own task, so a
+                                    // long-lived relay can't wedge the single global slot and
+                                    // two channels can never cross-pair. Replaces the old serial
+                                    // `loop { broker_channel_relay(..).await }` that ran the
+                                    // splice inline on the accept loop.
+                                    let now_fn = || {
+                                        std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_secs())
-                                            .unwrap_or(0);
-                                        let az = relay_az.clone();
-                                        match crate::channel_broker::broker_channel_relay(
-                                            &relay_ep,
-                                            now,
-                                            move |c, h| {
-                                                let a = az.clone();
-                                                async move {
-                                                    a.resolve(&c, &h).await.map(|m| {
-                                                        (m.operator_pubkey, m.noise_pubkey, m.noise_attestation)
-                                                    })
-                                                }
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => eprintln!("ct-edge: channel relay spliced two agents"),
-                                            Err(e) => eprintln!("ct-edge: channel relay round ended: {e}"),
-                                        }
-                                    }
+                                            .unwrap_or(0)
+                                    };
+                                    let authorize =
+                                        move |c: ct_common::channel::ChannelId, h: [u8; 32]| {
+                                            let a = relay_az.clone();
+                                            async move {
+                                                a.resolve(&c, &h).await.map(|m| {
+                                                    (m.operator_pubkey, m.noise_pubkey, m.noise_attestation)
+                                                })
+                                            }
+                                        };
+                                    crate::channel_broker::run_relay_broker_loop(
+                                        &relay_ep,
+                                        now_fn,
+                                        authorize,
+                                        CHANNEL_PARK_TTL_SECS,
+                                    )
+                                    .await;
                                 });
                             }
                             Err(e) => eprintln!("ct-edge: cannot bind channel relay {relay_addr}: {e}"),

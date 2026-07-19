@@ -2497,13 +2497,20 @@ for one cycle — decomposed so the pure correlator (the substrate for all three
     admits two members and calls the finisher directly — the exact `offer→Paired(a,b)→spawn finish_*_pair` seam. This
     is the mechanical prerequisite for the concurrent loop: `finish_*_pair(a, b)` is now a standalone `spawn`-able
     task. Gate green, 0 warnings.
-  - **#109-concurrent-b** ⏳ next: **take the relay splice off the single global slot** — drive the RELAY accept loop
-    through the `ChannelPairer` (accept → `accept_member` → `offer`; on `Paired(a, b)` `tokio::spawn`
-    `finish_relay_pair(a, b, now)` so the loop stays free) (**fixes #1**: a persistent channel no longer wedges every
-    other member). The finisher from -a is already `spawn`-able; this slice adds only the pairer-driven loop.
-  - **#109-concurrent-c** ⏳ then: **bound the wait for a partner** — carry each parked member's `deadline` into the
-    pairer and run a periodic `drain_expired(now)`, closing timed-out lone waiters with a clean `NO` (**completes #3**:
-    the 2nd-accept has no timeout today). Apply the same pairer-driven loop to rendezvous.
+  - **#109-concurrent-b** ✅ **pairer-driven concurrent RELAY** (`ct_edge::channel_broker::run_relay_broker_loop`,
+    wired in `serve.rs`): the RELAY accept loop now accepts one member (`accept_member`), offers it to a shared
+    `ChannelPairer` keyed by `ChannelId`, and on `Paired(a, b)` `tokio::spawn`s `finish_relay_pair(a, b, now)` so
+    the accept loop stays free — a persistent channel's splice no longer wedges the loop (**fixes #1**). Same-
+    channel-only correlation (**fixes #2**: no cross-channel mis-pair). Each accept also `drain_expired`s the
+    pairer, closing lone waiters past their park TTL (**addresses #3**: the 2nd-accept no longer waits unbounded).
+    Replaces the serial `loop { broker_channel_relay(..).await }`. Frozen test
+    `relay_broker_loop_pairs_two_channels_concurrently_without_wedging`: two channels over real QUIC — channel X
+    is paired and its relay HELD OPEN, then Y races in and pairs (its bytes cross both ways) while X is held —
+    which would hang under the old serial loop; asserts channel-keyed correlation (no X↔Y cross-pair). Verified
+    non-flaky (5/5 runs). Gate green, 0 warnings.
+  - **#109-concurrent-rendezvous** ⏳ (optional follow): apply the same pairer-driven loop to the RENDEZVOUS
+    endpoint (rendezvous is a short endpoint-swap, not a long splice, so its single-slot exposure is far smaller —
+    lower priority than the relay fix above).
 
 ## #114 Efficiency: per-frame heap allocs on the Noise bulk data path + backoff jitter (report, priority:high)
 
