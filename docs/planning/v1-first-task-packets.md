@@ -2555,8 +2555,17 @@ mesh-independent core lands first:
   declaration (the actual grant minting / teardown is the caller's job). Frozen tests: `Pair` canonical
   regardless of order; `desired_channels` compiles exactly the policy-permitted pairs on the "verteilte Firma"
   fixture (dev↔dev, dev↔ops in; dev↔finance + finance internal↔secret out); `reconcile` establishes the
-  missing allowed channels + revokes a stale one + is a no-op when converged. Gate green. *(The durable
-  `SqliteNetworkStore` persisting a Network is the small follow wrapper; the pure model + diff are the core.)*
+  missing allowed channels + revokes a stale one + is a no-op when converged. Gate green.
+  - **#102-network-store** ✅ **Durable owner-scoped persistence** (`control-plane::storage::SqliteNetworkStore`):
+    a `Network` is stored as a JSON blob keyed by `(owner, id)` — strictly owner-scoped, so a subject only
+    reads/writes networks it owns. `put`/`get`/`delete`/`list(owner)`; `get` for another owner or an unknown id
+    returns `None` (isolation), and a blob that no longer deserializes is treated as absent rather than
+    erroring the caller. Frozen test `network_store_is_owner_scoped_and_round_trips` (round-trips the full
+    Network for its owner; invisible to another subject; owner-scoped list; in-place replace; scoped delete).
+    Gate green.
+  - **#102-rest** ⏳ next: `PUT /me/networks/:id` (persist via the store) + `GET` (load) + a
+    `GET /me/networks/:id/plan` that returns `reconcile(desired_channels, live)` — following the `/me/*`
+    OIDC-bearer, subject-scoped conventions (the store's `owner` = the verified subject).
 - **#102-rest** ⏳ then: `PUT /networks/:id` + imperative overrides (`POST /channels`, `/grants/:id/revoke`),
   OpenAPI schema, OIDC-bearer + scoped-API-token authN.
 - **#102-broker-enforce** ⏳: the edge broker's `authorize` closure consults the compiled policy so a

@@ -1294,12 +1294,138 @@ impl SqliteChannelStore {
     }
 }
 
+/// SQLite-backed store for declarative **networks** (#102): the durable desired-state
+/// the SDN-style control plane reconciles the mesh toward. A [`ct_common::policy::Network`]
+/// (agents + policy) is persisted as a JSON blob keyed by `(owner, id)`, so it is strictly
+/// **owner-scoped** — a subject can only read or write networks it owns. The controller
+/// loads a network, calls `desired_channels()` + `reconcile(...)`, and mints/revokes grants
+/// (a later packet); this store is just the persistence.
+pub struct SqliteNetworkStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteNetworkStore {
+    /// Open (creating if needed) a durable store at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory store (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS networks (
+                 owner TEXT NOT NULL,
+                 id    TEXT NOT NULL,
+                 json  TEXT NOT NULL,
+                 PRIMARY KEY (owner, id)
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Persist (create or replace) `owner`'s network `id`. The `Network` is stored as
+    /// JSON; a malformed serialization is a programming error, so it maps to a DB error.
+    pub fn put(
+        &self,
+        owner: &str,
+        id: &str,
+        network: &ct_common::policy::Network,
+    ) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(network)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.conn.lock_safe().execute(
+            "INSERT OR REPLACE INTO networks (owner, id, json) VALUES (?1, ?2, ?3)",
+            params![owner, id, json],
+        )?;
+        Ok(())
+    }
+
+    /// Load `owner`'s network `id`, or `None` if they own no such network (so another
+    /// subject's network id is invisible — owner isolation). A stored blob that no longer
+    /// deserializes is treated as absent rather than erroring the caller.
+    pub fn get(&self, owner: &str, id: &str) -> rusqlite::Result<Option<ct_common::policy::Network>> {
+        let json: Option<String> = self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT json FROM networks WHERE owner = ?1 AND id = ?2",
+                params![owner, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(json.and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    /// Delete `owner`'s network `id`; returns whether a row was removed.
+    pub fn delete(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "DELETE FROM networks WHERE owner = ?1 AND id = ?2",
+            params![owner, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The ids of every network `owner` owns (sorted), for a listing view.
+    pub fn list(&self, owner: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare("SELECT id FROM networks WHERE owner = ?1 ORDER BY id")?;
+        let ids = stmt
+            .query_map(params![owner], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tenant() -> TenantId {
         TenantId("tenant-1".into())
+    }
+
+    #[test]
+    fn network_store_is_owner_scoped_and_round_trips() {
+        // #102: a declarative Network persists per (owner, id) and is strictly
+        // owner-scoped — another subject can't see it.
+        use ct_common::policy::{Agent, AllowRule, Levels, Network, Policy, Selector};
+
+        let store = SqliteNetworkStore::open_in_memory().unwrap();
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+            ],
+            policy: Policy {
+                levels: Levels::new(["public", "internal", "secret"]),
+                rules: vec![AllowRule { from: Selector::group("dev"), to: Selector::group("ops") }],
+                mac_flow_control: true,
+            },
+        };
+
+        // Put + get round-trips the whole Network for its owner.
+        store.put("alice", "corp", &net).unwrap();
+        assert_eq!(store.get("alice", "corp").unwrap().as_ref(), Some(&net), "round-trips for the owner");
+
+        // Owner isolation: another subject sees nothing under the same id.
+        assert_eq!(store.get("mallory", "corp").unwrap(), None, "not visible to another owner");
+        assert_eq!(store.get("alice", "other").unwrap(), None, "unknown id -> None");
+
+        // List is owner-scoped; put replaces in place.
+        store.put("alice", "team", &Network::default()).unwrap();
+        assert_eq!(store.list("alice").unwrap(), vec!["corp".to_string(), "team".to_string()]);
+        assert_eq!(store.list("mallory").unwrap(), Vec::<String>::new());
+
+        // Delete removes only that owner's row.
+        assert!(store.delete("alice", "corp").unwrap());
+        assert!(!store.delete("alice", "corp").unwrap(), "already gone");
+        assert_eq!(store.list("alice").unwrap(), vec!["team".to_string()]);
     }
 
     #[test]
