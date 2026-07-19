@@ -15,6 +15,7 @@ use ct_common::channel::{
 };
 use quinn::Endpoint;
 use rand::RngCore;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -170,12 +171,47 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    // #105: bound the whole join read (accept_bi + framed request + possession
-    // round-trip) so a connection that completes the QUIC handshake but never submits
-    // a valid join can't wedge the broker's serial round loop for every other channel.
-    let read = async {
-    let (mut send, mut recv) = conn.accept_bi().await?;
+    // #105: bound `accept_bi` itself — a connection that completes the QUIC handshake
+    // but never opens a stream can't wedge the broker's serial round loop. The framed
+    // request + possession round-trip is then bounded a second time inside
+    // `read_channel_join_on_stream`, so each phase has its own guard.
+    let (send, recv) = match tokio::time::timeout(join_timeout, conn.accept_bi()).await {
+        Ok(streams) => streams?,
+        Err(_) => {
+            return Err(
+                "channel join not submitted within the timeout — dropping stalled connection (#105)"
+                    .into(),
+            )
+        }
+    };
+    read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await
+}
 
+/// Admit a channel join over an already-established bidirectional byte stream —
+/// transport-agnostic (#106 edge-dispatch). The QUIC broker reaches this via
+/// [`read_join_on_connection`] (a `quinn` bi-stream), but the same admission —
+/// length-framed [`ChannelJoinRequest`], membership + grant verification, and the
+/// single-use holder-possession challenge — runs unchanged over *any* duplex, so a
+/// TLS-over-TCP `:443` front-door stream (for members whose network blocks the
+/// channel UDP/TCP ports) is admitted identically. `send`/`recv` are the write/read
+/// halves of the stream; on success `send` is returned so the caller can drive the
+/// pairing (rendezvous endpoint exchange or relay splice) on the same stream.
+pub async fn read_channel_join_on_stream<W, R, F, Fut>(
+    mut send: W,
+    mut recv: R,
+    now: UnixSeconds,
+    join_timeout: std::time::Duration,
+    authorize: &F,
+) -> Result<(W, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>), BoxError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    // #105: bound the framed request + possession round-trip so a peer that opens the
+    // stream but never submits a valid join can't wedge the broker's serial round loop.
+    let read = async {
     // Length-framed request so the presenter's send stream stays open for the
     // possession challenge-response below.
     let mut len_buf = [0u8; 2];
@@ -183,7 +219,7 @@ where
     let len = u16::from_be_bytes(len_buf) as usize;
     if len == 0 || len > 1024 {
         let _ = send.write_all(b"NO").await;
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         return Err("channel join request length out of range".into());
     }
     let mut bytes = vec![0u8; len];
@@ -193,14 +229,14 @@ where
         Ok(r) => r,
         Err(_) => {
             let _ = send.write_all(b"NO").await;
-            let _ = send.finish();
+            let _ = send.shutdown().await;
             return Err("malformed channel join request".into());
         }
     };
     // #81 gap 3: the advertised endpoint must be a safe, dialable socket address.
     if safe_endpoint(&req.endpoint).is_none() {
         let _ = send.write_all(b"NO").await;
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         return Err("unsafe advertised endpoint".into());
     }
     // #81 gap 2: the holder must be a current member; `authorize` yields the
@@ -210,13 +246,13 @@ where
             Some(t) => t,
             None => {
                 let _ = send.write_all(b"NO").await;
-                let _ = send.finish();
+                let _ = send.shutdown().await;
                 return Err("unknown channel or holder not a member".into());
             }
         };
     if let Err(e) = verify(&operator, &req.grant, now) {
         let _ = send.write_all(b"NO").await;
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         return Err(format!("channel grant rejected: {e}").into());
     }
     // #81 gap 1: a signed grant is bearer bytes until the presenter proves it holds
@@ -232,7 +268,7 @@ where
         || !verify_holder_possession(&req.grant.grant.holder, &challenge, &sig)
     {
         let _ = send.write_all(b"NO").await;
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         return Err("holder possession proof failed".into());
     }
     Ok((send, req, operator, member_noise, member_attest))
@@ -713,6 +749,65 @@ mod tests {
         assert_eq!(ack, b"OK", "connection-level gate admits a valid join");
         conn.close(0u32.into(), b"done");
         assert_eq!(server_task.await.expect("join"), "203.0.113.9:6011");
+    }
+
+    #[tokio::test]
+    async fn read_channel_join_on_stream_admits_over_a_plain_duplex() {
+        // #106 edge-dispatch (frozen): the admission is transport-agnostic. The SAME
+        // framed request + membership/grant check + single-use possession challenge the
+        // QUIC broker runs over a quinn bi-stream must admit an identical join presented
+        // over a plain in-memory duplex — the stand-in for a TLS-over-TCP `:443`
+        // front-door stream. This is what lets a member whose restrictive network blocks
+        // the channel UDP/TCP ports reach the broker through the `:443` front door.
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+        let pk = operator_pubkey();
+        let channel = [0xE2u8; 32];
+        let holder = holder_sk(0x0a);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6021".to_string(),
+        };
+
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = split(server_end);
+        let server_task = tokio::spawn(async move {
+            // Note: read/write halves are passed as distinct AsyncRead/AsyncWrite, not a
+            // quinn connection — no QUIC anywhere in this path.
+            let (mut send, req, _op, _noise, _attest) = read_channel_join_on_stream(
+                srv_w,
+                srv_r,
+                500,
+                std::time::Duration::from_secs(5),
+                &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) },
+            )
+            .await
+            .expect("admitted over a plain duplex");
+            send.write_all(b"OK").await.expect("ack");
+            send.shutdown().await.expect("shutdown");
+            req.endpoint
+        });
+
+        // Drive the client side of the admission handshake over the same duplex.
+        let (mut cli_r, mut cli_w) = split(client_end);
+        let req_bytes = req.encode();
+        cli_w
+            .write_all(&(req_bytes.len() as u16).to_be_bytes())
+            .await
+            .expect("write length");
+        cli_w.write_all(&req_bytes).await.expect("write request");
+        let mut challenge = [0u8; 32];
+        cli_r.read_exact(&mut challenge).await.expect("read challenge");
+        let sig = holder.sign(&challenge).to_bytes();
+        cli_w.write_all(&sig).await.expect("write possession sig");
+        let mut ack = [0u8; 2];
+        cli_r.read_exact(&mut ack).await.expect("read ack");
+        assert_eq!(&ack, b"OK", "plain-duplex admission returns the same OK ack as QUIC");
+
+        assert_eq!(
+            server_task.await.expect("join"),
+            "203.0.113.9:6021",
+            "the handler receives the advertised endpoint over a non-QUIC transport",
+        );
     }
 
     #[tokio::test]

@@ -2674,11 +2674,21 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
   - **#106-client-dial** ⏳ next: `run_channel_join_command` walks the ladder — on a blocked/failed direct QUIC
     dial, connect the `:443` front door over **TLS-TCP** with the `ct-edge-channel` ALPN and speak the
     channel-join protocol over that stream (reuses the classic agent's `:443` TLS-TCP path, #74).
-  - **#106-edge-dispatch** ⏳ (the pairing half): a **TLS-TCP transport leg** for the broker (it speaks QUIC;
-    `:443` is TLS-TCP — mirror the ADR-0004 relay's TLS-TCP fallback) + wire `serve_front_door`'s
-    `ChannelBroker` arm to hand the buffered ClientHello + stream to `broker_channel_rendezvous`/`_relay`. Then
-    the deploy routes the channel ALPN on `:443`. This is what lets a `:443`-only host (the #103 sink) reach the
-    broker/relay end-to-end.
+  - **#106-edge-dispatch** — the pairing half; too big for one cycle, decomposed into:
+    - **#106-dispatch-admit** ✅ **Transport-agnostic channel-join admission** (`ct_edge::channel_broker`):
+      extracted `read_channel_join_on_stream<W: AsyncWrite, R: AsyncRead>` from `read_join_on_connection` — the
+      framed `ChannelJoinRequest` read + membership/grant verify + single-use possession challenge now run over
+      *any* duplex, not just a `quinn` bi-stream. `read_join_on_connection` is now a thin QUIC wrapper (bounds
+      `accept_bi`, then delegates). This is the piece that lets a TLS-over-TCP `:443` stream be admitted
+      identically to a QUIC stream — no QUIC assumption left in the admission path. Frozen test drives the full
+      handshake (framed request → possession challenge → OK ack) over an in-memory `tokio::io::duplex` (the
+      `:443`/TLS-TCP stand-in), asserting the same OK ack + advertised endpoint as the QUIC path. Gate green.
+    - **#106-dispatch-transport** ⏳ next: a **TLS-TCP accept leg** for the broker (it speaks QUIC; `:443` is
+      TLS-TCP — mirror the ADR-0004 relay's TLS-TCP fallback) that hands the accepted (read, write) halves to
+      `read_channel_join_on_stream` and then drives `broker_channel_rendezvous`/`_relay` over the same stream.
+    - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
+      ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
+      what lets a `:443`-only host (the #103 sink) reach the broker/relay end-to-end.
 
 ## #107 Topology Editor — per-user overlay composition from agents (feature, epic)
 
