@@ -378,6 +378,99 @@ where
 /// additive and off unless `CT_FRONT_DOOR` is set.
 pub type ProxyTarget = (SocketAddr, Option<tokio_rustls::TlsAcceptor>);
 
+/// The membership-resolution seam the `:443` front door's `ChannelBroker` arm uses to
+/// authorize a channel join (#106 frontdoor-wire). The live edge resolves against the
+/// control plane via [`crate::channel_authorize::ChannelAuthorizer`]; tests supply a
+/// mock. It is a boxed trait object (not a generic) so [`serve_front_door`] stays
+/// non-generic — every non-channel caller just passes `None`. It yields exactly the
+/// tuple [`crate::channel_broker::admit_and_pair_on_stream`]'s `authorize` closure
+/// needs — `(operator_pubkey, member_noise, member_attestation)` iff `holder` is a
+/// current member of `channel`, else `None` (fail-closed).
+pub trait ChannelMemberResolver: Send + Sync {
+    fn resolve_member<'a>(
+        &'a self,
+        channel: ct_common::channel::ChannelId,
+        holder: [u8; 32],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+impl ChannelMemberResolver for crate::channel_authorize::ChannelAuthorizer {
+    fn resolve_member<'a>(
+        &'a self,
+        channel: ct_common::channel::ChannelId,
+        holder: [u8; 32],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.resolve(&channel, &holder)
+                .await
+                .map(|m| (m.operator_pubkey, m.noise_pubkey, m.noise_attestation))
+        })
+    }
+}
+
+/// The concrete stream the `:443` front door hands the channel broker: the buffered
+/// ClientHello (`Prepend`) replayed into the raw TCP socket, then TLS-terminated with
+/// the edge leaf (the same acceptor the `EdgeRelay` leg uses). The shared pairer keys
+/// its `AdmittedStreamMember`s on exactly this `S`, so it is named once here.
+type FrontDoorChannelStream = tokio_rustls::server::TlsStream<Prepend<tokio::net::TcpStream>>;
+
+/// The optional channel-broker context the `:443` front door needs to service a
+/// `ct-edge-channel` ALPN member (#106 frontdoor-wire). Bundles the **long-lived**
+/// shared [`crate::channel_broker::ChannelPairer`] (so two independently-arriving
+/// `:443` members of the same channel correlate + pair — front-door members can't be
+/// dialed, so "pair the next two arrivals" is wrong; they must correlate by
+/// `ChannelId`) and the CP-backed membership [`ChannelMemberResolver`]. A cloned-Arc
+/// context is handed to each `serve_front_door`; `None` disables channel brokering (the
+/// arm returns a clear error), so every non-channel front-door caller/test is unaffected.
+#[derive(Clone)]
+pub struct ChannelFrontDoor {
+    pairer: Arc<
+        std::sync::Mutex<
+            crate::channel_broker::ChannelPairer<
+                crate::channel_broker::AdmittedStreamMember<FrontDoorChannelStream>,
+            >,
+        >,
+    >,
+    resolver: Arc<dyn ChannelMemberResolver>,
+}
+
+impl ChannelFrontDoor {
+    /// Build a front-door channel context around a shared membership `resolver` (the
+    /// CP-backed [`crate::channel_authorize::ChannelAuthorizer`] in production). The
+    /// pairer starts empty and is shared across every connection this context serves.
+    pub fn new(resolver: Arc<dyn ChannelMemberResolver>) -> Self {
+        Self {
+            pairer: Arc::new(std::sync::Mutex::new(crate::channel_broker::ChannelPairer::new())),
+            resolver,
+        }
+    }
+}
+
+/// Bounds one `:443` channel join's admission read (#105 parity with the QUIC broker's
+/// `JOIN_READ_TIMEOUT`): a legitimate join completes in one CP authorize round-trip plus
+/// a local possession exchange; a slower/hostile client is dropped so it can't wedge the
+/// arm.
+const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a lone first-arriving `:443` channel member stays parked in the pairer,
+/// waiting for its partner, before it is eligible for eviction via
+/// [`crate::channel_broker::ChannelPairer::drain_expired`] (#109 #3). Generous, since the
+/// two holders of a channel may reach `:443` seconds apart. (A reaper that actually calls
+/// `drain_expired` on the front-door pairer is a separate concern — see the packet note.)
+const CHANNEL_PARK_TTL_SECS: u64 = 30;
+
 pub async fn serve_front_door(
     mut inbound: tokio::net::TcpStream,
     state: &EdgeState<Connection>,
@@ -385,6 +478,7 @@ pub async fn serve_front_door(
     proxies: &std::collections::HashMap<String, ProxyTarget>,
     default_host: Option<&str>,
     challenge: &Challenge,
+    channel: Option<&ChannelFrontDoor>,
 ) -> Result<(), BoxError> {
     let hello = crate::sni::read_client_hello_bytes(&mut inbound)
         .await
@@ -440,12 +534,58 @@ pub async fn serve_front_door(
             };
             serve_sni_passthrough(joined, state).await
         }
-        // #106: a channel member reached the :443 front door with the channel ALPN.
-        // Classification is landed here; the TLS-TCP -> channel-broker dispatch (the
-        // broker speaks QUIC, so this needs a TLS-TCP transport leg mirroring the
-        // ADR-0004 relay) is the follow packet — close cleanly with a clear reason.
+        // #106 frontdoor-wire: a channel member whose network blocks the channel port
+        // (`:4435`) reached the `:443` front door with the channel ALPN. Without a
+        // configured broker context we can't authorize joins (the CP-backed resolver is
+        // the membership gate) — refuse clearly. With one: TLS-terminate with the edge
+        // leaf (same as the `EdgeRelay` leg), admit the join over that stream, and offer
+        // it to the shared channel-keyed pairer. The first holder of a channel parks
+        // (`Ok(None)`); when its partner arrives (`Ok(Some((a, b)))`) relay-splice exactly
+        // those two `:443` members on their own task so the accept loop stays free.
         crate::sni::FrontDoorRoute::ChannelBroker => {
-            Err("front door: channel :443 dispatch not yet wired (#106 follow packet)".into())
+            let Some(ctx) = channel else {
+                return Err(
+                    "front door: channel :443 brokering not configured \
+                     (set CT_EDGE_CP_URL + CT_EDGE_ADMIN_TOKEN)"
+                        .into(),
+                );
+            };
+            let joined = Prepend {
+                pre: hello,
+                pos: 0,
+                inner: inbound,
+            };
+            let tls = acceptor.accept(joined).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // Same closure shape the QUIC broker builds from its `ChannelAuthorizer`,
+            // here routed through the boxed resolver so a test can supply a mock.
+            let resolver = ctx.resolver.clone();
+            let authorize = move |c: ct_common::channel::ChannelId, h: [u8; 32]| {
+                let resolver = resolver.clone();
+                async move { resolver.resolve_member(c, h).await }
+            };
+            let paired = crate::channel_broker::admit_and_pair_on_stream(
+                tls,
+                now,
+                CHANNEL_JOIN_TIMEOUT,
+                &authorize,
+                now + CHANNEL_PARK_TTL_SECS,
+                &ctx.pairer,
+            )
+            .await?;
+            if let Some((a, b)) = paired {
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::channel_broker::finish_relay_pair_over_streams(a, b, now).await
+                    {
+                        eprintln!("ct-edge: front-door :443 channel relay ended: {e}");
+                    }
+                });
+            }
+            Ok(())
         }
         crate::sni::FrontDoorRoute::Reject => Ok(()),
     }
@@ -995,12 +1135,37 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     let n_proxies = proxies.len();
                     let proxies = std::sync::Arc::new(proxies);
                     let default_host = std::sync::Arc::new(default_host);
+                    // #106 frontdoor-wire: when the CP URL + admin token are set, the front
+                    // door also brokers `:443` channel joins (a member whose network blocks
+                    // `:4435` reaches the broker here). Build the long-lived shared pairer +
+                    // CP-backed resolver ONCE, outside the accept loop, so all `:443` channel
+                    // members correlate through one pairer; hand a cloned-Arc context to each
+                    // connection. Unset -> None (the ChannelBroker arm refuses with a clear
+                    // "not configured" error). Mirrors the QUIC broker's opt-in style.
+                    let channel_fd: Option<ChannelFrontDoor> = match (
+                        std::env::var("CT_EDGE_CP_URL").ok().filter(|s| !s.is_empty()),
+                        std::env::var("CT_EDGE_ADMIN_TOKEN")
+                            .ok()
+                            .and_then(|s| parse_admin_token_hex(&s)),
+                    ) {
+                        (Some(cp_url), Some(admin_tok)) => {
+                            let authorizer =
+                                crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                            eprintln!(
+                                "ct-edge: front-door :443 channel broker active \
+                                 (authorize via {cp_url}, #106)"
+                            );
+                            Some(ChannelFrontDoor::new(std::sync::Arc::new(authorizer)))
+                        }
+                        _ => None,
+                    };
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = fl.accept().await {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
                             let proxies = proxies.clone();
                             let default_host = default_host.clone();
+                            let channel_fd = channel_fd.clone();
                             tokio::spawn(async move {
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -1012,6 +1177,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     &proxies,
                                     default_host.as_deref(),
                                     &challenge,
+                                    channel_fd.as_ref(),
                                 )
                                 .await;
                             });
@@ -2126,7 +2292,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None).await
         });
 
         // Client: send the ClientHello (SNI=portal.test) + extra, read it echoed.
@@ -2260,7 +2426,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
-            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge)
+            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None)
                 .await
         });
 
@@ -2348,7 +2514,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge).await
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None).await
         });
 
         // Browser -> SNI=auth.test -> AUTH cert terminates -> AUTH upstream.
@@ -2365,6 +2531,179 @@ mod tests {
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("AUTH"), "routed to the AUTH upstream: {text:?}");
         assert!(!text.contains("PORTAL"), "not the Portal upstream");
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
+    async fn front_door_wires_channel_alpn_to_the_admit_pair_relay_broker() {
+        // #106 frontdoor-wire (frozen): the WIRED `:443` front door end-to-end for the
+        // channel path. Two `:443`-only members of the same channel each reach the front
+        // door over REAL TLS-over-TCP carrying ALPN `ct-edge-channel`, drive the full
+        // admission handshake (framed ChannelJoinRequest → possession challenge → OK)
+        // through `serve_front_door` — with a `Some(ctx)` built from a MOCK resolver (no
+        // HTTP control plane) and a SHARED long-lived pairer. The first parks; the second
+        // pairs, so the arm `tokio::spawn`s the relay splice. An app byte must cross both
+        // ways: proof the two independently-arriving `:443` members were paired by
+        // `ChannelId` and relay-spliced through the front door.
+        use ct_common::channel::{
+            ChannelGrant, ChannelId, ChannelJoinRequest, Direction, Rights, SignedChannelGrant,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        const OP_SEED: [u8; 32] = [5u8; 32];
+        let op_sk = SigningKey::from_bytes(&OP_SEED);
+        let operator = op_sk.verifying_key().to_bytes();
+        let channel = ChannelId([0x9Au8; 32]);
+
+        // A grant bound to a real holder pubkey, signed by the operator. `expires_at` is
+        // far in the future because `serve_front_door` verifies against the real system
+        // clock (unlike the unit tests, which pass a fixed `now`).
+        let grant_h = |holder: &SigningKey, dir: Direction| -> SignedChannelGrant {
+            let g = ChannelGrant {
+                channel,
+                holder: holder.verifying_key().to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 4_000_000_000,
+            };
+            let signature = op_sk.sign(&g.signing_bytes()).to_bytes();
+            SignedChannelGrant { grant: g, signature }
+        };
+
+        let src = SigningKey::from_bytes(&[0xa1u8; 32]); // Initiate → initiator
+        let snk = SigningKey::from_bytes(&[0xb2u8; 32]); // Accept → acceptor
+        let req_src = ChannelJoinRequest {
+            grant: grant_h(&src, Direction::Initiate),
+            endpoint: "203.0.113.1:9001".to_string(),
+        };
+        let req_snk = ChannelJoinRequest {
+            grant: grant_h(&snk, Direction::Accept),
+            endpoint: "203.0.113.2:9002".to_string(),
+        };
+
+        // Mock resolver: yields the operator key iff the channel matches — no HTTP CP.
+        struct MockResolver {
+            operator: [u8; 32],
+            channel: ChannelId,
+        }
+        impl ChannelMemberResolver for MockResolver {
+            fn resolve_member<'a>(
+                &'a self,
+                channel: ChannelId,
+                _holder: [u8; 32],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                let op = self.operator;
+                let ok = channel == self.channel;
+                Box::pin(async move { ok.then_some((op, None, None)) })
+            }
+        }
+
+        // The edge leaf the front door terminates channel TLS with (any AsyncRead+Write
+        // acceptor). Clients trust it and connect with server_name "edge.test".
+        let edge = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+        let edge_der = edge.cert.der().clone();
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![edge_der.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(edge.key_pair.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        // The SHARED front-door channel context — one pairer across both connections, so
+        // the two independently-arriving members correlate by ChannelId (cloning shares
+        // the same Arc pairer + resolver).
+        let ctx = ChannelFrontDoor::new(Arc::new(MockResolver { operator, channel }));
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            // Accept exactly the two channel members and serve each through the WIRED
+            // front door with the shared ctx. The channel ALPN classifies to the
+            // ChannelBroker arm; the first parks, the second pairs + spawns the relay.
+            for _ in 0..2 {
+                let (tcp, _) = fd.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let acceptor = acceptor.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let proxies: std::collections::HashMap<String, ProxyTarget> =
+                        std::collections::HashMap::new();
+                    let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                    let _ = serve_front_door(
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // One channel member: TLS-connect to `:443` with ALPN `ct-edge-channel`, run the
+        // admission handshake, wait for the relay's OK (written once both are paired),
+        // then push one app byte and read the peer's — the bytes cross only if the front
+        // door paired the two and relay-spliced them.
+        async fn channel_member(
+            addr: SocketAddr,
+            cert: rustls::pki_types::CertificateDer<'static>,
+            req: ChannelJoinRequest,
+            holder: SigningKey,
+            send_byte: u8,
+        ) -> u8 {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let mut ccfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            // The front door classifies on the peeked ClientHello ALPN — set it so the
+            // connection routes to the ChannelBroker arm (not EdgeRelay / a proxy).
+            ccfg.alpn_protocols = vec![b"ct-edge-channel".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let sni = rustls::pki_types::ServerName::try_from("edge.test").unwrap();
+            let mut tls = connector.connect(sni, tcp).await.expect("channel TLS terminates at :443");
+
+            let rb = req.encode();
+            tls.write_all(&(rb.len() as u16).to_be_bytes()).await.unwrap();
+            tls.write_all(&rb).await.unwrap();
+            let mut ch = [0u8; 32];
+            tls.read_exact(&mut ch).await.unwrap();
+            tls.write_all(&holder.sign(&ch).to_bytes()).await.unwrap();
+            let mut ok = [0u8; 2];
+            tls.read_exact(&mut ok).await.unwrap();
+            assert_eq!(&ok, b"OK", "the front door acks OK once both :443 members are paired");
+            tls.write_all(&[send_byte]).await.unwrap();
+            let mut got = [0u8; 1];
+            tls.read_exact(&mut got).await.unwrap();
+            let _ = tls.shutdown().await;
+            got[0]
+        }
+
+        let c1 = edge_der.clone();
+        let src_task =
+            tokio::spawn(async move { channel_member(fd_addr, c1, req_src, src, 0x11).await });
+        let c2 = edge_der.clone();
+        let snk_task =
+            tokio::spawn(async move { channel_member(fd_addr, c2, req_snk, snk, 0x22).await });
+
+        let got_src = src_task.await.expect("src task");
+        let got_snk = snk_task.await.expect("snk task");
+        assert_eq!(got_src, 0x22, "source got the sink's byte through the wired :443 front door");
+        assert_eq!(got_snk, 0x11, "sink got the source's byte through the wired :443 front door");
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }
