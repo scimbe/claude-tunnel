@@ -765,6 +765,102 @@ async fn channel_remove_member(
     }
 }
 
+/// Build the **cross-user channel invitation redemption** router (#72 AF3-redeem-cp):
+/// `POST /channel/invite/redeem`, backed by the durable [`SqliteChannelStore`].
+///
+/// This is how a *different* user's agent joins a channel it was invited to. It is
+/// **public but proof-gated** — not an open write surface (cf. #87): every redemption
+/// must carry an operator-signed `SignedChannelInvitation` (the channel owner's
+/// authorization, verified against the registry's `operator_pubkey`), the invitee's
+/// redemption signature binding the member `holder` key, and the holder's Noise-key
+/// attestation (#101). Only when all three verify does the CP record the invitee's
+/// holder as a member — on the owner's behalf, since the invitation *is* the owner's
+/// authorization. No operator/owner session is involved (the invitee is another user).
+pub fn channel_invite_router(channels: Arc<SqliteChannelStore>) -> Router {
+    Router::new()
+        .route("/channel/invite/redeem", post(channel_invite_redeem))
+        .with_state(channels)
+}
+
+#[derive(Deserialize)]
+struct InviteRedeemReq {
+    /// The operator-signed invitation, hex of [`SignedChannelInvitation::encode`].
+    invitation: String,
+    /// The invitee's ed25519 signature over `invitation_redeem_bytes(channel,
+    /// invitee_identity, holder)`, hex — proves the intended invitee accepted + chose
+    /// `holder`.
+    redeem_sig: String,
+    /// The member (holder) key the invitee will use on the channel, hex.
+    holder: String,
+    /// The holder's X25519 Noise static key, hex.
+    noise_pubkey: String,
+    /// The holder's attestation over `noise_pubkey` (#101), hex.
+    noise_attestation: String,
+}
+
+async fn channel_invite_redeem(
+    State(channels): State<Arc<SqliteChannelStore>>,
+    Json(req): Json<InviteRedeemReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    use ct_common::channel::{redeem_invitation, verify_member_noise_attestation, SignedChannelInvitation};
+
+    let inv_bytes = hex_decode(&req.invitation)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed invitation".to_string()))?;
+    let signed = SignedChannelInvitation::decode(&inv_bytes)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invitation: {e}")))?;
+    let redeem_sig = hex_decode_64(&req.redeem_sig)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed redeem_sig".to_string()))?;
+    let holder = hex_decode_32(&req.holder)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let noise_pubkey = hex_decode_32(&req.noise_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
+    let noise_attestation = hex_decode_64(&req.noise_attestation)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_attestation".to_string()))?;
+
+    let channel = signed.invitation.channel;
+    // The operator authority is the channel's registered signing key; an unknown
+    // channel has no operator, so a redemption for it is a 404.
+    let operator = channels
+        .operator_pubkey(&channel)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
+
+    // Proof 1+2: the operator-signed invitation is authentic + current, and the
+    // intended invitee accepted + bound this holder key.
+    let now = now_secs();
+    redeem_invitation(&operator, &signed, &redeem_sig, &holder, now).map_err(|e| {
+        let code = match e {
+            ct_common::channel::GrantError::Expired => StatusCode::GONE,
+            _ => StatusCode::FORBIDDEN,
+        };
+        (code, format!("invitation redemption: {e}"))
+    })?;
+    // Proof 3 (#101): the Noise key is attested by the holder, so a substituted key
+    // (e.g. by a DB-controlling operator) is rejected before it can MITM the A2A path.
+    if !verify_member_noise_attestation(&channel, &holder, &noise_pubkey, &noise_attestation) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "noise_attestation does not verify against the holder key".to_string(),
+        ));
+    }
+    // The invitation is the owner's authorization, so add the member on the owner's
+    // behalf (add_member is owner-scoped; look up the channel's owner to satisfy it).
+    let owner = channels
+        .channel_owner(&channel)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
+    let ok = channels
+        .add_member(&channel, &owner, &holder, &noise_pubkey, &noise_attestation)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        // The owner was looked up from the same channel row, so a false here means the
+        // channel vanished between reads — treat as gone.
+        Err((StatusCode::NOT_FOUND, "channel no longer registered".to_string()))
+    }
+}
+
 /// Extract + verify the `Authorization: Bearer` token against `verifier`,
 /// returning the authenticated subject. Shared by every self-scoped endpoint so
 /// the acting identity always comes from a verified token, never the request body.
@@ -1195,6 +1291,9 @@ pub fn persistent_control_plane_router(
         // #90/#97 SEC90b-wire: bootstrap-token exchange — /bootstrap/mint (admin-gated)
         // + /bootstrap/redeem (public, single-use short-TTL token handed off over TLS).
         .merge(bootstrap_router(bootstrap.clone(), admin_token))
+        // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
+        // proof-gated (operator-signed invitation + invitee redemption + Noise attest).
+        .merge(channel_invite_router(channels.clone()))
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
@@ -1399,6 +1498,16 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(out)
+}
+
+/// Decode an arbitrary-length lowercase/upper hex string to bytes (even length).
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+        .collect()
 }
 
 fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
@@ -1663,6 +1772,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "mint open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn channel_invite_redeem_admits_a_cross_user_member_from_the_proofs() {
+        // #72 AF3-redeem-cp: a *different* user's agent joins a channel it was invited
+        // to, with no session — the operator-signed invitation + the invitee redemption
+        // + the holder Noise attestation are the authorization.
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        // The channel owner ("alice") registers her channel under a REAL operator key.
+        let operator_sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let operator_pk = operator_sk.verifying_key().to_bytes();
+        let chan = ChannelId([0xa1u8; 32]);
+        channels.register_channel(&chan, &operator_pk, "alice").unwrap();
+
+        // A different user's agent: an identity key (invited) + a member holder key.
+        let invitee_sk = SigningKey::from_bytes(&[0x62u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder_sk = SigningKey::from_bytes(&[0x73u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let nk = [0xd4u8; 32];
+
+        // The owner (operator) signs an invitation for the invitee identity.
+        let invitation = ct_common::channel::ChannelInvitation {
+            channel: chan,
+            invitee_identity: invitee,
+            direction: ct_common::channel::Direction::Both,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000_000_000, // far future — the handler uses the wall clock
+        };
+        let inv_sig = operator_sk.sign(&invitation.signing_bytes()).to_bytes();
+        let signed = ct_common::channel::SignedChannelInvitation { invitation, signature: inv_sig };
+        let inv_hex = hex_encode(&signed.encode());
+        // The invitee accepts + binds `holder`; the holder attests its Noise key.
+        let redeem = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_bytes(&chan, &invitee, &holder))
+                .to_bytes(),
+        );
+        let attest = hex_encode(
+            &holder_sk
+                .sign(&ct_common::channel::member_noise_attest_bytes(&chan, &holder, &nk))
+                .to_bytes(),
+        );
+
+        let app = channel_invite_router(channels.clone());
+        let body = |redeem: &str| {
+            format!(
+                r#"{{"invitation":"{inv_hex}","redeem_sig":"{redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{a}"}}"#,
+                h = hex_encode(&holder),
+                n = hex_encode(&nk),
+                a = attest,
+            )
+        };
+        let post = |b: String| {
+            app.clone().oneshot(
+                Request::post("/channel/invite/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(b))
+                    .unwrap(),
+            )
+        };
+
+        // Valid proofs -> the invitee's holder is admitted as a member.
+        assert_eq!(post(body(&redeem)).await.unwrap().status(), StatusCode::OK, "valid redemption admits");
+        assert_eq!(
+            channels.authorize_holder(&chan, &holder).unwrap(),
+            Some(operator_pk),
+            "the invited member now resolves the channel operator key (drives the broker)"
+        );
+        assert_eq!(
+            channels.member_noise_key(&chan, &holder).unwrap(),
+            Some(nk),
+            "the invited member's attested Noise key is pinned"
+        );
+
+        // A redemption signature that bound a DIFFERENT holder does not verify -> 403.
+        let wrong = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_bytes(&chan, &invitee, &[0xee; 32]))
+                .to_bytes(),
+        );
+        assert_eq!(post(body(&wrong)).await.unwrap().status(), StatusCode::FORBIDDEN, "bad redemption -> 403");
+
+        // An invitation for an unregistered channel -> 404 (no operator to verify against).
+        let other_chan = ChannelId([0x0bu8; 32]);
+        let other_inv = ct_common::channel::ChannelInvitation {
+            channel: other_chan,
+            invitee_identity: invitee,
+            direction: ct_common::channel::Direction::Both,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000_000_000,
+        };
+        let other_sig = operator_sk.sign(&other_inv.signing_bytes()).to_bytes();
+        let other_hex = hex_encode(
+            &ct_common::channel::SignedChannelInvitation { invitation: other_inv, signature: other_sig }.encode(),
+        );
+        let other_redeem = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_bytes(&other_chan, &invitee, &holder))
+                .to_bytes(),
+        );
+        let b = format!(
+            r#"{{"invitation":"{other_hex}","redeem_sig":"{other_redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{a}"}}"#,
+            h = hex_encode(&holder),
+            n = hex_encode(&nk),
+            a = attest,
+        );
+        assert_eq!(post(b).await.unwrap().status(), StatusCode::NOT_FOUND, "unknown channel -> 404");
     }
 
     #[tokio::test]

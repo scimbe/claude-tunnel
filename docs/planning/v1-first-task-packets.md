@@ -1736,11 +1736,21 @@ Decomposed:
     public-key proofs alone. Frozen test `redeem_invitation_yields_membership_claims_bound_to_the_chosen_holder`
     (happy path binds the chosen member key not the invitee identity; expired→Expired; wrong operator→
     BadSignature; a holder-swap→BadSignature). Gate green.
-  - **AF3-redeem-cp** ⏳ next: the HTTP glue — a proof-gated CP endpoint that takes `(SignedChannelInvitation,
-    redemption signature, holder, noise_pubkey, noise_attestation)`, looks up the channel's operator pubkey
-    from the registry, runs `redeem_invitation` + `verify_member_noise_attestation` (#101), and `add_member`s
-    the invitee's holder + Noise key. Server-side glue on top of the core; unblocks #100's brokered channel
-    one-liner generator.
+  - **AF3-redeem-cp** ✅ **The proof-gated CP endpoint** (`service::channel_invite_router` →
+    `POST /channel/invite/redeem`): a *different* user's agent joins a channel it was invited to, **with no
+    session**. Takes `{invitation, redeem_sig, holder, noise_pubkey, noise_attestation}` (hex), looks up the
+    channel's `operator_pubkey` from the registry (404 if unknown), runs `redeem_invitation` (operator
+    invitation + invitee redemption; `Expired`→410, other→403) then `verify_member_noise_attestation` (#101;
+    403), and `add_member`s the invitee's holder + Noise key **on the owner's behalf** (the invitation *is* the
+    owner's authorization; the owner is looked up via `channel_owner` to satisfy the owner-scoped `add_member`).
+    **Public but proof-gated — not an open write (cf. #87):** no membership can be added without the owner's
+    signature on an invitation, the invitee's possession proof, and the holder's Noise attestation. Merged into
+    `persistent_control_plane_router`. Frozen test
+    `channel_invite_redeem_admits_a_cross_user_member_from_the_proofs` (valid proofs admit + the member then
+    resolves the operator key and its pinned Noise key; a holder-swapped redemption→403; an unregistered
+    channel→404). Gate green. **This makes cross-user channel membership drivable end-to-end** and unblocks
+    #100's brokered channel one-liner generator (an operator surface can now mint an invitation an invitee
+    redeems into real membership).
 - **AF4** ⏳ **Agent-side channel role + Noise session + relay fallback**. Split:
   - **AF4-join** ✅ **Agent-side channel-join client** (`ct-agent::channel::present_channel_join`): the client
     half of the broker handshake — sends the `u16`-framed `ChannelJoinRequest`, answers the edge's 32-byte
