@@ -1155,17 +1155,43 @@ async fn channel_remove_member(
 /// authorization. No operator/owner session is involved (the invitee is another user).
 pub fn channel_invite_router(channels: Arc<SqliteChannelStore>) -> Router {
     Router::new()
+        .route("/channel/invite/challenge", post(channel_invite_challenge))
         .route("/channel/invite/redeem", post(channel_invite_redeem))
         .with_state(channels)
+}
+
+/// TTL (seconds) for a redemption challenge nonce (#108): short — it exists only to be
+/// signed into the immediately-following redeem.
+const INVITE_CHALLENGE_TTL_SECS: u64 = 120;
+
+#[derive(Serialize, Deserialize)]
+struct InviteChallengeResp {
+    /// A fresh, single-use nonce (hex) the invitee binds into its redemption signature.
+    challenge: String,
+}
+
+/// `POST /channel/invite/challenge` (#108 defense-in-depth): issue a fresh, single-use
+/// redemption challenge. The invitee signs it into `invitation_redeem_challenge_bytes`
+/// and presents it (+ the nonce) to `/channel/invite/redeem`, so a captured redemption is
+/// non-replayable even independent of the single-use invitation record. Public — the
+/// nonce is not a secret and confers nothing on its own.
+async fn channel_invite_challenge(
+    State(channels): State<Arc<SqliteChannelStore>>,
+) -> Result<Json<InviteChallengeResp>, (StatusCode, String)> {
+    let nonce = channels
+        .issue_challenge(now_secs(), INVITE_CHALLENGE_TTL_SECS)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(InviteChallengeResp { challenge: hex_encode(&nonce) }))
 }
 
 #[derive(Deserialize)]
 struct InviteRedeemReq {
     /// The operator-signed invitation, hex of [`SignedChannelInvitation::encode`].
     invitation: String,
-    /// The invitee's ed25519 signature over `invitation_redeem_bytes(channel,
-    /// invitee_identity, holder)`, hex — proves the intended invitee accepted + chose
-    /// `holder`.
+    /// The invitee's ed25519 signature over the redemption bytes, hex — proves the
+    /// intended invitee accepted + chose `holder`. Without `challenge` it covers
+    /// `invitation_redeem_bytes`; with `challenge` it covers
+    /// `invitation_redeem_challenge_bytes` (the nonce-bound v2 form).
     redeem_sig: String,
     /// The member (holder) key the invitee will use on the channel, hex.
     holder: String,
@@ -1173,13 +1199,18 @@ struct InviteRedeemReq {
     noise_pubkey: String,
     /// The holder's attestation over `noise_pubkey` (#101), hex.
     noise_attestation: String,
+    /// Optional fresh CP challenge nonce (#108, hex from `/channel/invite/challenge`).
+    /// When present, the redemption must be bound to it and it is consumed single-use —
+    /// belt-and-braces over the invitation single-use record. Absent → the static path.
+    #[serde(default)]
+    challenge: Option<String>,
 }
 
 async fn channel_invite_redeem(
     State(channels): State<Arc<SqliteChannelStore>>,
     Json(req): Json<InviteRedeemReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    use ct_common::channel::{redeem_invitation, verify_member_noise_attestation, SignedChannelInvitation};
+    use ct_common::channel::{verify_member_noise_attestation, SignedChannelInvitation};
 
     let inv_bytes = hex_decode(&req.invitation)
         .ok_or((StatusCode::BAD_REQUEST, "malformed invitation".to_string()))?;
@@ -1202,16 +1233,40 @@ async fn channel_invite_redeem(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
 
-    // Proof 1+2: the operator-signed invitation is authentic + current, and the
-    // intended invitee accepted + bound this holder key.
+    // Proof 1: the operator-signed invitation is authentic + current.
     let now = now_secs();
-    redeem_invitation(&operator, &signed, &redeem_sig, &holder, now).map_err(|e| {
+    ct_common::channel::verify_invitation(&operator, &signed, now).map_err(|e| {
         let code = match e {
             ct_common::channel::GrantError::Expired => StatusCode::GONE,
             _ => StatusCode::FORBIDDEN,
         };
-        (code, format!("invitation redemption: {e}"))
+        (code, format!("invitation: {e}"))
     })?;
+    // Proof 2: the intended invitee accepted + bound this holder key. Two variants:
+    // - with a fresh CP `challenge` (#108 defense-in-depth): the redemption is bound to a
+    //   single-use nonce we consume here, so a captured signature is non-replayable even
+    //   independent of the invitation single-use record below;
+    // - without one: the static v1 redemption (still protected by single-use consumption).
+    let invitee = signed.invitation.invitee_identity;
+    let redemption_ok = match &req.challenge {
+        Some(ch) => {
+            let nonce = hex_decode_32(ch)
+                .ok_or((StatusCode::BAD_REQUEST, "malformed challenge".to_string()))?;
+            if !channels
+                .consume_challenge(&nonce, now)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            {
+                return Err((StatusCode::FORBIDDEN, "stale or unknown challenge".to_string()));
+            }
+            ct_common::channel::verify_invitation_redemption_challenge(
+                &channel, &invitee, &holder, &nonce, &redeem_sig,
+            )
+        }
+        None => ct_common::channel::verify_invitation_redemption(&channel, &invitee, &holder, &redeem_sig),
+    };
+    if !redemption_ok {
+        return Err((StatusCode::FORBIDDEN, "invitation redemption proof invalid".to_string()));
+    }
     // Proof 3 (#101): the Noise key is attested by the holder, so a substituted key
     // (e.g. by a DB-controlling operator) is rejected before it can MITM the A2A path.
     if !verify_member_noise_attestation(&channel, &holder, &noise_pubkey, &noise_attestation) {
@@ -2172,6 +2227,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "mint open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn channel_invite_redeem_with_fresh_challenge_is_single_use() {
+        // #108 defense-in-depth: fetch a challenge, sign the challenge-bound redemption,
+        // redeem -> 200; the same challenge again -> 403 (nonce consumed); a redemption
+        // bound to a stale/unknown nonce -> 403.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let operator_sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let operator_pk = operator_sk.verifying_key().to_bytes();
+        let chan = ChannelId([0xa1u8; 32]);
+        channels.register_channel(&chan, &operator_pk, "alice").unwrap();
+
+        let invitee_sk = SigningKey::from_bytes(&[0x62u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder_sk = SigningKey::from_bytes(&[0x73u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let nk = [0xd4u8; 32];
+
+        let invitation = ct_common::channel::ChannelInvitation {
+            channel: chan,
+            invitee_identity: invitee,
+            direction: ct_common::channel::Direction::Both,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000_000_000,
+        };
+        let inv_sig = operator_sk.sign(&invitation.signing_bytes()).to_bytes();
+        let signed = ct_common::channel::SignedChannelInvitation { invitation, signature: inv_sig };
+        let inv_hex = hex_encode(&signed.encode());
+        let attest = hex_encode(
+            &holder_sk.sign(&ct_common::channel::member_noise_attest_bytes(&chan, &holder, &nk)).to_bytes(),
+        );
+
+        let app = channel_invite_router(channels.clone());
+
+        // 1) Fetch a fresh challenge nonce.
+        let ch_resp = app
+            .clone()
+            .oneshot(Request::post("/channel/invite/challenge").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ch_resp.status(), StatusCode::OK);
+        let cb = to_bytes(ch_resp.into_body(), 1 << 16).await.unwrap();
+        let challenge: InviteChallengeResp = serde_json::from_slice(&cb).unwrap();
+        let nonce = hex_decode_32(&challenge.challenge).unwrap();
+
+        // 2) Sign the challenge-bound redemption and redeem.
+        let redeem = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_challenge_bytes(&chan, &invitee, &holder, &nonce))
+                .to_bytes(),
+        );
+        let body = format!(
+            r#"{{"invitation":"{inv_hex}","redeem_sig":"{redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{a}","challenge":"{c}"}}"#,
+            h = hex_encode(&holder), n = hex_encode(&nk), a = attest, c = challenge.challenge,
+        );
+        let redeem_req = |b: String| {
+            app.clone().oneshot(
+                Request::post("/channel/invite/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(b))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(redeem_req(body.clone()).await.unwrap().status(), StatusCode::OK, "challenge redemption admits");
+        assert_eq!(channels.authorize_holder(&chan, &holder).unwrap(), Some(operator_pk));
+
+        // 3) Replaying the SAME challenge-bound redemption -> the nonce is already consumed
+        // (403 stale/unknown challenge) — non-replayable independent of invitation single-use.
+        assert_eq!(redeem_req(body).await.unwrap().status(), StatusCode::FORBIDDEN, "consumed nonce -> 403");
     }
 
     #[tokio::test]

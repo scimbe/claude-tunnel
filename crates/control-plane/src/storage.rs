@@ -1088,6 +1088,10 @@ impl SqliteChannelStore {
              CREATE TABLE IF NOT EXISTS consumed_invitations (
                  signature  BLOB PRIMARY KEY,
                  expires_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS channel_challenges (
+                 nonce      BLOB PRIMARY KEY,
+                 expires_at INTEGER NOT NULL
              );",
         )?;
         // #72 AF4 (registry carries the key): each member's X25519 Noise static key,
@@ -1242,6 +1246,36 @@ impl SqliteChannelStore {
             params![&signature[..], expires_at as i64],
         )?;
         Ok(inserted > 0)
+    }
+
+    /// Issue a fresh, single-use redemption **challenge** nonce (#108 defense-in-depth),
+    /// valid for `ttl_secs` from `now`. The invitee signs it into its redemption; the CP
+    /// [`consume_challenge`](Self::consume_challenge)s it exactly once, so a captured
+    /// redemption is non-replayable independent of the invitation single-use record.
+    pub fn issue_challenge(&self, now: u64, ttl_secs: u64) -> rusqlite::Result<[u8; 32]> {
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        self.conn.lock_safe().execute(
+            "INSERT INTO channel_challenges (nonce, expires_at) VALUES (?1, ?2)",
+            params![&nonce[..], now.saturating_add(ttl_secs) as i64],
+        )?;
+        Ok(nonce)
+    }
+
+    /// Consume a redemption challenge nonce: returns `true` iff it exists and is unexpired
+    /// (then deletes it, so a replay of the same nonce fails), `false` otherwise. Prunes
+    /// expired nonces so the table stays bounded.
+    pub fn consume_challenge(&self, nonce: &[u8; 32], now: u64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        conn.execute(
+            "DELETE FROM channel_challenges WHERE expires_at <= ?1",
+            params![now as i64],
+        )?;
+        let deleted = conn.execute(
+            "DELETE FROM channel_challenges WHERE nonce = ?1",
+            params![&nonce[..]],
+        )?;
+        Ok(deleted > 0)
     }
 
     /// The holder-signed attestation over `holder`'s Noise key on `channel` (#101), if
@@ -1860,6 +1894,20 @@ mod tests {
         assert!(store.remove_edge("alice", "t1", "b", "a").unwrap(), "owner removes b—a");
         assert!(!store.remove_edge("alice", "t1", "a", "b").unwrap(), "already gone");
         assert_eq!(store.edges("t1").unwrap(), vec![("a".into(), "c".into())]);
+    }
+
+    #[test]
+    fn channel_challenge_is_single_use_and_expires() {
+        // #108: a redemption challenge nonce is fresh once, then consumed; expiry rejects.
+        let store = SqliteChannelStore::open_in_memory().unwrap();
+        let n = store.issue_challenge(1_000, 120).unwrap();
+        assert!(store.consume_challenge(&n, 1_050).unwrap(), "fresh within TTL");
+        assert!(!store.consume_challenge(&n, 1_060).unwrap(), "same nonce again -> false (single-use)");
+        // An unknown nonce is never fresh.
+        assert!(!store.consume_challenge(&[0x9au8; 32], 1_000).unwrap());
+        // An expired nonce is rejected (and pruned).
+        let m = store.issue_challenge(1_000, 60).unwrap();
+        assert!(!store.consume_challenge(&m, 1_061).unwrap(), "past TTL -> false");
     }
 
     #[test]

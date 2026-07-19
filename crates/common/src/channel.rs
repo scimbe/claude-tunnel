@@ -556,6 +556,51 @@ pub fn verify_invitation_redemption(
     }
 }
 
+/// The domain-separated message the invitee signs to redeem an invitation **against a
+/// fresh, single-use CP challenge** (#108 defense-in-depth): like
+/// [`invitation_redeem_bytes`] but also binding the `challenge` nonce the CP issued for
+/// this redemption. Because the nonce is fresh and consumed at the CP, a captured
+/// redemption signature is non-replayable **independent of** the single-use invitation
+/// consumption — belt-and-braces over the [`redeem_invitation`] path. Domain `v2` keeps
+/// it distinct from the static `v1` bytes so one can never be presented as the other.
+pub fn invitation_redeem_challenge_bytes(
+    channel: &ChannelId,
+    invitee_identity: &[u8; 32],
+    holder: &[u8; 32],
+    challenge: &[u8; 32],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(27 + 32 + 32 + 32 + 32);
+    m.extend_from_slice(b"ct-chan-invite-redeem-v2-chal");
+    m.extend_from_slice(&channel.0);
+    m.extend_from_slice(invitee_identity);
+    m.extend_from_slice(holder);
+    m.extend_from_slice(challenge);
+    m
+}
+
+/// Verify a challenge-bound invitation redemption (#108): `signature` must be
+/// `invitee_identity`'s ed25519 signature over [`invitation_redeem_challenge_bytes`].
+/// Returns `false` on a bad key, a wrong `(channel, invitee_identity, holder, challenge)`
+/// binding, or a bad signature — so a redemption signed for one fresh challenge can't be
+/// replayed against another.
+pub fn verify_invitation_redemption_challenge(
+    channel: &ChannelId,
+    invitee_identity: &[u8; 32],
+    holder: &[u8; 32],
+    challenge: &[u8; 32],
+    signature: &[u8; 64],
+) -> bool {
+    match VerifyingKey::from_bytes(invitee_identity) {
+        Ok(vk) => vk
+            .verify(
+                &invitation_redeem_challenge_bytes(channel, invitee_identity, holder, challenge),
+                &Signature::from_bytes(signature),
+            )
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Verify a cross-user invitation **redemption end-to-end** (#72 AF3) and, on success,
 /// return the membership claims the invitee earned. This is the two-proof gate the CP
 /// runs when an invitee's agent presents a redemption:
@@ -922,6 +967,32 @@ mod tests {
             redeem_invitation(&op_pk, &signed, &redeem, &[0xee; 32], 999),
             Err(GrantError::BadSignature)
         );
+    }
+
+    #[test]
+    fn challenge_bound_redemption_is_tied_to_the_nonce_and_domain_separated() {
+        // #108: a redemption signed for one fresh challenge doesn't verify against another
+        // nonce, and the v2 challenge bytes differ from the static v1 bytes.
+        let channel = ChannelId([0xabu8; 32]);
+        let invitee_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder = [0xcdu8; 32];
+        let nonce = [0x77u8; 32];
+
+        let sig = invitee_sk
+            .sign(&invitation_redeem_challenge_bytes(&channel, &invitee, &holder, &nonce))
+            .to_bytes();
+        assert!(verify_invitation_redemption_challenge(&channel, &invitee, &holder, &nonce, &sig));
+        // A different nonce -> fails (non-replayable across challenges).
+        assert!(!verify_invitation_redemption_challenge(&channel, &invitee, &holder, &[0x88; 32], &sig));
+        // The v2 challenge bytes are domain-separated from the v1 static bytes.
+        assert_ne!(
+            invitation_redeem_challenge_bytes(&channel, &invitee, &holder, &nonce),
+            invitation_redeem_bytes(&channel, &invitee, &holder)
+        );
+        // A static v1 signature does not satisfy the challenge check, and vice-versa.
+        let static_sig = invitee_sk.sign(&invitation_redeem_bytes(&channel, &invitee, &holder)).to_bytes();
+        assert!(!verify_invitation_redemption_challenge(&channel, &invitee, &holder, &nonce, &static_sig));
     }
 
     #[test]
