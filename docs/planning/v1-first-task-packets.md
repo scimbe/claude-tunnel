@@ -2582,9 +2582,16 @@ mesh-independent core lands first:
     owner-isolated. Mounted in the `oidc`-gated block of `persistent_control_plane_router`. Frozen test
     `authed_network_api_is_owner_scoped_and_plans_from_the_policy` (no bearer→401; owner PUT→GET round-trips the
     Network; another subject→404; `/plan` compiles exactly the permitted pair from the policy). Gate green.
-  - **#102-broker-enforce** ⏳ next: the edge broker's `authorize` closure consults the compiled policy so a
-    non-conformant join is refused with `NO <reason>` (defense-in-depth with the agent-side grant check).
-    Exercises the live A2A mesh (#99/#98/#100). Then the MCP layer.
+  - **#102-explain** ✅ **`Network::explain(a_id, b_id) -> Decision`** (`ct_common::policy`): the
+    `net.explain(a, b) → allowed? why` decision the acceptance names — resolves both ids to members, then
+    `may_establish_channel`, with a legible reason; an id that isn't a member is a **fail-closed deny**. This is
+    the pure primitive both the MCP `net.explain` tool and the broker-enforce path call. Frozen test
+    `network_explain_answers_allowed_and_why_for_two_agent_ids` (permitted→allowed; no-rule→default-deny;
+    cross-level→MAC write-down; unknown id→"not both members"). Gate green.
+  - **#102-broker-enforce** ⏳ (live-gated): the edge broker's `authorize` closure consults the compiled policy
+    (via `explain`) so a non-conformant join is refused with `NO <reason>` — needs the policy served to the edge
+    + the live A2A mesh (#99/#98/#100) to prove end-to-end. **#102-mcp** ⏳: expose `net.apply/grant/revoke/
+    explain` as agent-native MCP tools (`explain` now has its core). Both exercise the live mesh.
 - **#102-rest** ⏳ then: `PUT /networks/:id` + imperative overrides (`POST /channels`, `/grants/:id/revoke`),
   OpenAPI schema, OIDC-bearer + scoped-API-token authN.
 - **#102-broker-enforce** ⏳: the edge broker's `authorize` closure consults the compiled policy so a

@@ -222,6 +222,22 @@ pub struct Network {
 }
 
 impl Network {
+    /// Explain whether agents `a_id` and `b_id` may establish a channel under this
+    /// network's policy — the **`net.explain(a, b) → allowed? why`** decision (#102 MCP /
+    /// broker-enforce): resolve both ids to members, then
+    /// [`Policy::may_establish_channel`]. An id that is not a member is a **deny** with a
+    /// clear reason (fail-closed) — you can't reason about an agent outside the network.
+    pub fn explain(&self, a_id: &str, b_id: &str) -> Decision {
+        let a = self.agents.iter().find(|x| x.id == a_id);
+        let b = self.agents.iter().find(|x| x.id == b_id);
+        match (a, b) {
+            (Some(a), Some(b)) => self.policy.may_establish_channel(a, b),
+            _ => Decision::deny(format!(
+                "not both members of the network: {a_id} / {b_id}"
+            )),
+        }
+    }
+
     /// The set of agent-pairs that **may** establish a channel under the policy — the
     /// desired connectivity. A pair is included iff
     /// [`Policy::may_establish_channel`] allows it (bidirectional). Self-pairs are
@@ -390,6 +406,31 @@ mod tests {
         assert!(!desired.contains(&Pair::new("dev-1", "fin-i")));
         assert!(!desired.contains(&Pair::new("fin-i", "fin-s")));
         assert_eq!(desired.len(), 3, "exactly the three mutually-permitted pairs");
+    }
+
+    #[test]
+    fn network_explain_answers_allowed_and_why_for_two_agent_ids() {
+        // #102 net.explain: resolve two ids and return the policy decision + reason.
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+                Agent::new("fin-i", "finance", "internal"),
+                Agent::new("fin-s", "finance", "secret"),
+            ],
+            policy: company_policy(),
+        };
+        // A permitted pair -> allowed.
+        assert!(net.explain("dev-1", "ops-1").allowed, "dev<->ops permitted");
+        // No rule -> denied, with a legible reason.
+        let d = net.explain("dev-1", "fin-i");
+        assert!(!d.allowed && d.reason.contains("default-deny"), "reason: {}", d.reason);
+        // A MAC write-down cross-level pair -> denied at the channel (one direction down).
+        let m = net.explain("fin-i", "fin-s");
+        assert!(!m.allowed && m.reason.contains("write-down"), "reason: {}", m.reason);
+        // An unknown agent id -> fail-closed deny.
+        let u = net.explain("dev-1", "ghost");
+        assert!(!u.allowed && u.reason.contains("not both members"), "reason: {}", u.reason);
     }
 
     #[test]
