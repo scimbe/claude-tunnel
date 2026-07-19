@@ -203,6 +203,13 @@ where
     Ok(response)
 }
 
+/// Default bound on streaming-tunnel *setup* (the rendezvous challenge + Noise
+/// handshake), mirroring the one-shot timed tunnels' `deadline` (issue #123). A
+/// stalled edge that accepts the connection but never relays fails fast here
+/// instead of leaking a blocked task holding an open local socket. Matches the
+/// client's default tunnel timeout.
+pub const DEFAULT_STREAM_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A tunnel-operation timeout error (issue #2): the edge accepted the connection
 /// but never relayed, so the client would otherwise block indefinitely.
 fn tunnel_timeout_error(deadline: Duration) -> BoxError {
@@ -270,31 +277,46 @@ pub async fn client_tunnel_stream<P>(
     cap: &Capability,
     client_private: &[u8; 32],
     app: P,
+    setup_deadline: Duration,
 ) -> Result<(), BoxError>
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"C").await?;
 
-    let mut chal = [0u8; 17];
-    recv.read_exact(&mut chal).await?;
-    let challenge = Challenge {
-        nonce: chal[..16].try_into().unwrap(),
-        difficulty: chal[16],
+    // Bound the rendezvous + Noise handshake with `setup_deadline`, mirroring the
+    // one-shot timed tunnels (issue #123): if the edge accepts the connection but
+    // never relays (no agent for the token, or a stalled/hostile edge), setup
+    // fails fast instead of leaving this task blocked forever on a handshake read
+    // while holding the local socket open. The bridge itself runs unbounded once
+    // the session is up.
+    let transport = match tokio::time::timeout(setup_deadline, async {
+        send.write_all(b"C").await?;
+
+        let mut chal = [0u8; 17];
+        recv.read_exact(&mut chal).await?;
+        let challenge = Challenge {
+            nonce: chal[..16].try_into().unwrap(),
+            difficulty: chal[16],
+        };
+        let req = build_request(&challenge, token);
+        send.write_all(&req).await?;
+
+        // Noise_IK initiator handshake over the relayed stream.
+        let mut hs = client_handshake_for(client_private, cap)?;
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf)?;
+        send.write_all(&frame(&buf[..n])).await?;
+        let m2 = read_frame(&mut recv).await?;
+        hs.read_message(&m2, &mut tmp)?;
+        Ok::<_, BoxError>(hs.into_transport_mode()?)
+    })
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => return Err(tunnel_timeout_error(setup_deadline)),
     };
-    let req = build_request(&challenge, token);
-    send.write_all(&req).await?;
-
-    // Noise_IK initiator handshake over the relayed stream.
-    let mut hs = client_handshake_for(client_private, cap)?;
-    let mut buf = vec![0u8; 65535];
-    let mut tmp = vec![0u8; 65535];
-    let n = hs.write_message(&[], &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    let m2 = read_frame(&mut recv).await?;
-    hs.read_message(&m2, &mut tmp)?;
-    let transport = hs.into_transport_mode()?;
 
     // Bridge the local app stream <-> the Origin over the Noise session.
     let cipher = join(recv, send);
@@ -316,6 +338,7 @@ pub async fn client_forward(
     token: RoutingToken,
     cap: Capability,
     client_private: [u8; 32],
+    setup_deadline: Duration,
 ) -> Result<(), BoxError> {
     loop {
         let (sock, _peer) = listener.accept().await?;
@@ -326,7 +349,8 @@ pub async fn client_forward(
             match dial_edge(edge_addr, edge_cert).await {
                 Ok(conn) => {
                     if let Err(e) =
-                        client_tunnel_stream(&conn, &token, &cap, &client_private, sock).await
+                        client_tunnel_stream(&conn, &token, &cap, &client_private, sock, setup_deadline)
+                            .await
                     {
                         eprintln!("ct-client: forwarded connection ended: {e}");
                     }
@@ -602,6 +626,60 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "must return near the deadline, took {elapsed:?}"
+        );
+        edge.abort();
+    }
+
+    /// issue #123 regression: the live local-forward path (`client_forward` →
+    /// `client_tunnel_stream`) must bound its setup like the one-shot timed
+    /// tunnels. Against a stalled edge that accepts the QUIC connection but never
+    /// sends the rendezvous challenge, the streaming setup returns a timeout error
+    /// promptly instead of hanging forever and leaking the blocked task's socket.
+    #[tokio::test]
+    async fn client_forward_setup_times_out_against_a_stalled_edge() {
+        let token = RoutingToken([9u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // A stalled edge: accept the client's connection, then go silent — never
+        // send the challenge, never relay. The client would block on read_exact.
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let _conn = server.accept().await.unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+
+        // The forwarded local socket, stubbed by an in-memory duplex.
+        let (app, _peer) = tokio::io::duplex(4096);
+
+        let start = Instant::now();
+        let r = client_tunnel_stream(
+            &conn,
+            &token,
+            &cap,
+            &client_kp.private,
+            app,
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "must error, not hang, when the edge never relays");
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "error should name the timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return near the setup deadline, took {elapsed:?}"
         );
         edge.abort();
     }

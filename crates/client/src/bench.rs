@@ -9,7 +9,10 @@ use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::transport::{client_tunnel_noise, client_tunnel_stream, dial_edge, udp_selftest};
+use crate::transport::{
+    client_tunnel_noise, client_tunnel_stream, dial_edge, udp_selftest,
+    DEFAULT_STREAM_SETUP_DEADLINE,
+};
 use ct_common::Capability;
 use rustls::pki_types::CertificateDer;
 
@@ -147,7 +150,17 @@ async fn run_once_stream(
     let client_private = *client_private;
     let tunnel =
         tokio::spawn(
-            async move { client_tunnel_stream(&conn, &token, &cap_c, &client_private, app_local).await },
+            async move {
+                client_tunnel_stream(
+                    &conn,
+                    &token,
+                    &cap_c,
+                    &client_private,
+                    app_local,
+                    DEFAULT_STREAM_SETUP_DEADLINE,
+                )
+                .await
+            },
         );
 
     // Drive the local app end: send the payload, half-close so the pump sees

@@ -14,7 +14,7 @@ use ct_client::ladder::{
 };
 use ct_client::transport::{
     client_forward, client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed,
-    dial_edge, dial_rung, load_cert, udp_selftest, EdgeConn,
+    dial_edge, dial_rung, load_cert, udp_selftest, EdgeConn, DEFAULT_STREAM_SETUP_DEADLINE,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
@@ -177,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cap.token.clone(),
             cap,
             client_kp.private,
+            DEFAULT_STREAM_SETUP_DEADLINE,
         )
         .await;
     }

@@ -420,7 +420,14 @@ mod tests {
             got
         };
         let (cres, _, got) = tokio::join!(
-            client_tunnel_stream(&conn, &token, &cap, &client_kp.private, app_local),
+            client_tunnel_stream(
+                &conn,
+                &token,
+                &cap,
+                &client_kp.private,
+                app_local,
+                crate::transport::DEFAULT_STREAM_SETUP_DEADLINE,
+            ),
             writer,
             reader,
         );
@@ -554,7 +561,14 @@ mod tests {
         };
 
         let (cres, page) = tokio::join!(
-            client_tunnel_stream(&conn, &token, &cap, &client_kp.private, app_local),
+            client_tunnel_stream(
+                &conn,
+                &token,
+                &cap,
+                &client_kp.private,
+                app_local,
+                crate::transport::DEFAULT_STREAM_SETUP_DEADLINE,
+            ),
             tls_client,
         );
         cres.expect("client tunnel stream ok");
@@ -650,6 +664,7 @@ mod tests {
             token.clone(),
             cap,
             client_kp.private,
+            crate::transport::DEFAULT_STREAM_SETUP_DEADLINE,
         ));
 
         // A plain local TCP client rides the forward port.
