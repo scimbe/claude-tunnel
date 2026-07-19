@@ -2983,6 +2983,20 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
                 `:443` sink paired with a QUIC member on the QUIC broker's pairer) is a separate future concern — the
                 two brokers hold independent pairers today. Also: nothing calls `drain_expired` on the front-door
                 pairer yet, so a lone parked member's stream lives until it drops (a reaper is out of scope here).
+            - **#118** ✅ **`:443` channel leg genuinely negotiates the `ct-edge-channel` ALPN** (`ct_edge`): the
+              `ChannelBroker` arm routed correctly (ClientHello ALPN peek) but TLS-terminated with the **shared**
+              edge acceptor (empty `alpn_protocols`), so it never echoed the ALPN — a readiness probe checking
+              `alpn_protocol()` post-handshake saw `None` (a false-negative that confused the source/sink testers).
+              Fix: a **dedicated** channel acceptor `pki::build_channel_front_door_acceptor(ca, sans)` (a fresh
+              CA-signed leaf whose `ServerConfig.alpn_protocols = [ct-edge-channel]`), carried in
+              `ChannelFrontDoor` (`new(resolver, acceptor)`) and used ONLY by the `ChannelBroker` arm
+              (`ctx.acceptor.accept(joined)`). The shared acceptor keeps its empty ALPN — advertising the channel
+              ALPN there would make rustls fatal-alert (`no_application_protocol`) the `EdgeRelay` leg's `ct-edge`
+              clients (no ALPN overlap). Frozen test (the reworked
+              `front_door_wires_channel_alpn_to_the_admit_pair_relay_broker`): a single `pki::Ca` derives both the
+              client's trusted root and the channel acceptor, and after the handshake asserts
+              `alpn_protocol() == Some(b"ct-edge-channel")` — plus the existing admit→pair→relay byte-crossing.
+              Gate green, 0 warnings.
             - then **N4** ⏳ — local docker-compose A2A e2e over a real `:443` front door (the connection-difficulty proof).
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is

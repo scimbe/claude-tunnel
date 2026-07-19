@@ -444,16 +444,28 @@ pub struct ChannelFrontDoor {
         >,
     >,
     resolver: Arc<dyn ChannelMemberResolver>,
+    /// The DEDICATED TLS acceptor the ChannelBroker arm terminates with (#118): a
+    /// CA-issued leaf whose `ServerConfig` advertises the `ct-edge-channel` ALPN, so the
+    /// `:443` channel leg genuinely negotiates it (a readiness probe reading
+    /// `alpn_protocol()` post-handshake sees `Some("ct-edge-channel")`, not `None`). Kept
+    /// separate from the shared edge acceptor — advertising the channel ALPN there would
+    /// make rustls fatal-alert the `EdgeRelay` leg's `ct-edge` clients on ALPN mismatch.
+    acceptor: tokio_rustls::TlsAcceptor,
 }
 
 impl ChannelFrontDoor {
     /// Build a front-door channel context around a shared membership `resolver` (the
-    /// CP-backed [`crate::channel_authorize::ChannelAuthorizer`] in production). The
+    /// CP-backed [`crate::channel_authorize::ChannelAuthorizer`] in production) and the
+    /// dedicated `acceptor` that advertises the `ct-edge-channel` ALPN (#118). The
     /// pairer starts empty and is shared across every connection this context serves.
-    pub fn new(resolver: Arc<dyn ChannelMemberResolver>) -> Self {
+    pub fn new(
+        resolver: Arc<dyn ChannelMemberResolver>,
+        acceptor: tokio_rustls::TlsAcceptor,
+    ) -> Self {
         Self {
             pairer: Arc::new(std::sync::Mutex::new(crate::channel_broker::ChannelPairer::new())),
             resolver,
+            acceptor,
         }
     }
 }
@@ -555,7 +567,10 @@ pub async fn serve_front_door(
                 pos: 0,
                 inner: inbound,
             };
-            let tls = acceptor.accept(joined).await?;
+            // #118: terminate with the DEDICATED channel acceptor (advertises the
+            // `ct-edge-channel` ALPN) rather than the shared edge acceptor (empty ALPN),
+            // so the channel leg actually negotiates the ALPN a readiness probe checks.
+            let tls = ctx.acceptor.accept(joined).await?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1151,11 +1166,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         (Some(cp_url), Some(admin_tok)) => {
                             let authorizer =
                                 crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                            // #118: dedicated channel acceptor advertising `ct-edge-channel`
+                            // (a CA-signed leaf; the same `ca` that issued the shared edge
+                            // leaf) so the `:443` channel leg negotiates the ALPN. The shared
+                            // `acceptor` keeps its empty ALPN for the `EdgeRelay` leg.
+                            let channel_acceptor = crate::pki::build_channel_front_door_acceptor(
+                                &ca,
+                                vec!["localhost".to_string()],
+                            )
+                            .await?;
                             eprintln!(
                                 "ct-edge: front-door :443 channel broker active \
-                                 (authorize via {cp_url}, #106)"
+                                 (authorize via {cp_url}, #106; ct-edge-channel ALPN #118)"
                             );
-                            Some(ChannelFrontDoor::new(std::sync::Arc::new(authorizer)))
+                            Some(ChannelFrontDoor::new(
+                                std::sync::Arc::new(authorizer),
+                                channel_acceptor,
+                            ))
                         }
                         _ => None,
                     };
@@ -2554,7 +2581,6 @@ mod tests {
             ChannelGrant, ChannelId, ChannelJoinRequest, Direction, Rights, SignedChannelGrant,
         };
         use ed25519_dalek::{Signer, SigningKey};
-        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         crate::transport::install_crypto_provider();
@@ -2615,23 +2641,30 @@ mod tests {
             }
         }
 
-        // The edge leaf the front door terminates channel TLS with (any AsyncRead+Write
-        // acceptor). Clients trust it and connect with server_name "edge.test".
-        let edge = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
-        let edge_der = edge.cert.der().clone();
+        // #118: one internal CA underpins BOTH the client's trusted root AND the
+        // dedicated channel acceptor the ChannelBroker arm terminates with. The channel
+        // acceptor advertises the `ct-edge-channel` ALPN (via build_channel_front_door_
+        // acceptor); clients trust `ca.root_der()` and connect with server_name "edge.test"
+        // (the leaf's SAN), so the CA-signed leaf validates. The SHARED acceptor below is
+        // never touched by the channel arm now — kept only to satisfy the signature.
+        let ca = crate::pki::Ca::new("ct-edge-ca").unwrap();
+        let ca_root = ca.root_der();
+        let channel_acceptor =
+            crate::pki::build_channel_front_door_acceptor(&ca, vec!["edge.test".to_string()])
+                .await
+                .unwrap();
+        let (shared_leaf, shared_key) = ca.issue(vec!["edge.test".to_string()]).unwrap();
         let scfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![edge_der.clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(edge.key_pair.serialize_der())),
-            )
+            .with_single_cert(vec![shared_leaf], shared_key)
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
 
         // The SHARED front-door channel context — one pairer across both connections, so
         // the two independently-arriving members correlate by ChannelId (cloning shares
-        // the same Arc pairer + resolver).
-        let ctx = ChannelFrontDoor::new(Arc::new(MockResolver { operator, channel }));
+        // the same Arc pairer + resolver + dedicated channel acceptor).
+        let ctx =
+            ChannelFrontDoor::new(Arc::new(MockResolver { operator, channel }), channel_acceptor);
 
         let state = Arc::new(EdgeState::<Connection>::new());
         let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2681,6 +2714,15 @@ mod tests {
             let sni = rustls::pki_types::ServerName::try_from("edge.test").unwrap();
             let mut tls = connector.connect(sni, tcp).await.expect("channel TLS terminates at :443");
 
+            // #118: the dedicated channel acceptor NEGOTIATES `ct-edge-channel`, so the
+            // client sees it echoed post-handshake (previously `None` — a readiness-probe
+            // false-negative). This is the assertion the fix exists for.
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(b"ct-edge-channel".as_ref()),
+                "the :443 channel leg negotiates the ct-edge-channel ALPN (#118)"
+            );
+
             let rb = req.encode();
             tls.write_all(&(rb.len() as u16).to_be_bytes()).await.unwrap();
             tls.write_all(&rb).await.unwrap();
@@ -2697,10 +2739,10 @@ mod tests {
             got[0]
         }
 
-        let c1 = edge_der.clone();
+        let c1 = ca_root.clone();
         let src_task =
             tokio::spawn(async move { channel_member(fd_addr, c1, req_src, src, 0x11).await });
-        let c2 = edge_der.clone();
+        let c2 = ca_root.clone();
         let snk_task =
             tokio::spawn(async move { channel_member(fd_addr, c2, req_snk, snk, 0x22).await });
 

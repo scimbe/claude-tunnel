@@ -170,6 +170,34 @@ pub async fn build_dual_edge_from_ca(
     Ok((endpoint, listener, acceptor, ca.root_der()))
 }
 
+/// Build a dedicated TLS acceptor for the `:443` front door's **channel** leg (#118).
+///
+/// Like [`build_dual_edge_from_ca`] this terminates with a fresh CA-issued leaf for
+/// `sans` (clients trust the CA *root*, so any leaf it signs validates), but its
+/// `ServerConfig` advertises the `ct-edge-channel` ALPN. The shared edge acceptor
+/// carries an EMPTY ALPN list and MUST stay that way: rustls answers an ALPN mismatch
+/// with a fatal `no_application_protocol` alert, so advertising `ct-edge-channel` on the
+/// shared acceptor would break the `EdgeRelay` leg's clients (which offer `ct-edge`, no
+/// overlap). This dedicated acceptor is used ONLY by the ChannelBroker arm, so the
+/// channel leg genuinely *negotiates* `ct-edge-channel` and a readiness probe reading
+/// `alpn_protocol()` post-handshake sees `Some("ct-edge-channel")` instead of `None`.
+///
+/// The resulting stream type is identical to the shared acceptor's
+/// (`tokio_rustls::server::TlsStream<Prepend<TcpStream>>`), so the front-door pairer
+/// keying is unchanged.
+pub async fn build_channel_front_door_acceptor(
+    ca: &Ca,
+    sans: Vec<String>,
+) -> Result<TlsAcceptor, BoxError> {
+    install_crypto_provider();
+    let (cert, key) = ca.issue(sans)?;
+    let mut tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    tls_cfg.alpn_protocols = vec![crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(tls_cfg)))
+}
+
 /// Build a QUIC client [`Endpoint`] that trusts a **CA root** — and therefore
 /// any leaf that CA signs (enabling Edge cert rotation without re-pinning).
 pub fn build_client_endpoint_trusting_ca(
