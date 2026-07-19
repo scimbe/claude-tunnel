@@ -610,6 +610,60 @@ async fn finish_relay_pair(
     }
 }
 
+/// A channel member admitted over a **generic byte stream** (not a `quinn::Connection`)
+/// — e.g. a `:443` TLS-over-TCP front-door member whose network blocks the channel
+/// UDP/TCP ports (#106). Unlike [`AdmittedMember`] it carries no `quinn::Connection`:
+/// its data path is the **same** duplex the join was admitted over (there is no separate
+/// bi-stream to open), so the relay splice reads/writes the Noise ciphertext directly on
+/// `stream`. Only the relay path needs this (a member that can't be dialed can't use
+/// rendezvous), so it carries just what the relay completer uses — `stream` + the
+/// verified request + the operator key its grant verified under. `pub` like the rest of
+/// the transport-generic seam ([`admit_channel_join_on_duplex`]); the `:443` front-door
+/// wiring (#106-complete-wire443) constructs it from an admitted stream + its keys.
+pub struct AdmittedStreamMember<S> {
+    stream: S,
+    req: ChannelJoinRequest,
+    operator: [u8; 32],
+}
+
+/// Complete a **relay** pairing for two members admitted over generic byte streams
+/// (#106 relay-splice-generic) — the transport-agnostic sibling of [`finish_relay_pair`].
+/// Authorize the pair under member A's operator key, ack `OK` on each stream, then splice
+/// the two duplexes through the edge via [`crate::relay::relay_streams`] so the Noise_IK
+/// tunnel flows end-to-end as ciphertext (the edge sees only opaque bytes). Because each
+/// member's data path is the **same** stream it joined on (no separate bi-stream to
+/// open/accept, unlike the quinn path), the splice is a plain symmetric bidirectional
+/// pump — no initiator/acceptor stream-role dance. This is what lets two `:443`/TLS-TCP
+/// members (which cannot be dialed, so rendezvous is useless to them) be relay-paired.
+/// Returns the decided pairing when either side closes; an unpairable pair gets `NO`.
+pub async fn finish_relay_pair_over_streams<A, B>(
+    mut a: AdmittedStreamMember<A>,
+    mut b: AdmittedStreamMember<B>,
+    now: UnixSeconds,
+) -> Result<ChannelPairing, BoxError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
+        Ok(pairing) => {
+            a.stream.write_all(b"OK").await?;
+            a.stream.flush().await?;
+            b.stream.write_all(b"OK").await?;
+            b.stream.flush().await?;
+            crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443").await?;
+            Ok(pairing)
+        }
+        Err(e) => {
+            let _ = a.stream.write_all(b"NO").await;
+            let _ = b.stream.write_all(b"NO").await;
+            let _ = a.stream.shutdown().await;
+            let _ = b.stream.shutdown().await;
+            Err(format!("channel relay pair refused: {e}").into())
+        }
+    }
+}
+
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
 /// channel-joins for the same channel, pair them via [`authorize_channel_pair`],
 /// and reply to each side with the *peer's* advertised endpoint (`OK <endpoint>`)
@@ -1349,6 +1403,76 @@ mod tests {
         assert!(ack_a.contains("203.0.113.2:7052"), "A learns B's endpoint via the finisher, got {ack_a:?}");
         assert!(ack_b.contains("203.0.113.1:7051"), "B learns A's endpoint via the finisher, got {ack_b:?}");
         assert_eq!(paired, (ia, ib), "the finisher decides roles from the grants, same as the monolithic broker");
+    }
+
+    #[tokio::test]
+    async fn finish_relay_pair_over_streams_splices_two_non_quinn_members() {
+        // #106 relay-splice-generic (frozen): a `:443`/TLS-TCP member can't be dialed, so
+        // rendezvous (direct endpoint exchange) is useless to it — it needs the RELAY.
+        // Prove the transport-generic relay finisher works over NON-quinn streams: two
+        // members admitted over plain in-memory duplexes are acked `OK` and their data
+        // streams spliced end-to-end (the Noise_IK ciphertext would flow exactly this
+        // way), with roles decided from the grants — the same completion the quinn
+        // `finish_relay_pair` gives, but with no `quinn::Connection` anywhere.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let pk = operator_pubkey();
+        let channel = [0x77u8; 32];
+        let holder_a = holder_sk(0xa1);
+        let holder_b = holder_sk(0xb2);
+        let ia = holder_a.verifying_key().to_bytes()[0];
+        let ib = holder_b.verifying_key().to_bytes()[0];
+
+        let (mut member_a, broker_a) = tokio::io::duplex(1024);
+        let (mut member_b, broker_b) = tokio::io::duplex(1024);
+        let a = AdmittedStreamMember {
+            stream: broker_a,
+            req: ChannelJoinRequest {
+                grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
+                endpoint: "203.0.113.1:7051".to_string(),
+            },
+            operator: pk,
+        };
+        let b = AdmittedStreamMember {
+            stream: broker_b,
+            req: ChannelJoinRequest {
+                grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
+                endpoint: "203.0.113.2:7052".to_string(),
+            },
+            operator: pk,
+        };
+
+        let splice = tokio::spawn(async move {
+            finish_relay_pair_over_streams(a, b, 500)
+                .await
+                .map(|p| (p.initiator_holder[0], p.acceptor_holder[0]))
+                .map_err(|e| e.to_string())
+        });
+
+        // Each member reads its `OK` ack, then the relay carries bytes both ways.
+        let mut ok = [0u8; 2];
+        member_a.read_exact(&mut ok).await.expect("a ok");
+        assert_eq!(&ok, b"OK", "member A is acked OK over its plain stream");
+        member_b.read_exact(&mut ok).await.expect("b ok");
+        assert_eq!(&ok, b"OK", "member B is acked OK over its plain stream");
+
+        // A -> B through the edge splice (A keeps its stream open, like a Noise msg1).
+        member_a.write_all(b"noise-msg1-from-a").await.expect("a writes");
+        let mut on_b = [0u8; 17];
+        member_b.read_exact(&mut on_b).await.expect("b reads a");
+        assert_eq!(&on_b, b"noise-msg1-from-a", "A's ciphertext reaches B via the generic relay");
+
+        // B -> A with the forward leg still open — the reply must not be starved.
+        member_b.write_all(b"noise-msg2-from-b").await.expect("b writes");
+        let mut on_a = [0u8; 17];
+        member_a.read_exact(&mut on_a).await.expect("a reads b");
+        assert_eq!(&on_a, b"noise-msg2-from-b", "B's reply reaches A via the generic relay");
+
+        // Both close -> the splice tears down and returns the decided pairing (no hang).
+        member_a.shutdown().await.expect("a shutdown");
+        member_b.shutdown().await.expect("b shutdown");
+        let paired = splice.await.expect("join").expect("paired");
+        assert_eq!(paired, (ia, ib), "roles follow the grants, same as the quinn relay finisher");
     }
 
     #[tokio::test]

@@ -133,9 +133,62 @@ pub async fn relay_initiator_to_acceptor(
     relay_quic(send_i, recv_i, send_a, recv_a, label).await
 }
 
+/// Splice two **generic** duplex byte streams through the edge relay (#106
+/// relay-splice-generic). Unlike [`relay_quic`] / [`relay_initiator_to_acceptor`],
+/// which relay over a *separate* quinn bi-stream opened after admission, a member
+/// admitted over a non-quinn transport (e.g. a `:443` TLS-over-TCP front-door stream,
+/// for a member whose network blocks the channel UDP/TCP ports) carries its data on the
+/// **same** duplex it joined on — there is no second stream to open/accept, so a
+/// symmetric split-and-pump is exactly right. Each stream is `tokio::io::split` into
+/// halves and pumped through the same per-direction, per-chunk-flushed core as
+/// [`relay_quic`] (so a Noise handshake reply isn't stranded behind an idle forward
+/// direction). The Noise_IK session stays end-to-end; the edge sees only ciphertext.
+/// Returns `(bytes a→b, bytes b→a)` when either side closes.
+pub async fn relay_streams<A, B>(a: A, b: B, label: &str) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (a_recv, a_send) = tokio::io::split(a);
+    let (b_recv, b_send) = tokio::io::split(b);
+    relay_pair(a_recv, a_send, b_recv, b_send, label).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_streams_splices_two_generic_duplexes_both_directions() {
+        // #106 relay-splice-generic: two members admitted over non-quinn streams (the
+        // `:443`/TLS-TCP fallback) must be relay-paired end-to-end. Drive two in-memory
+        // duplexes through `relay_streams` and prove bytes cross both ways with a
+        // per-direction flush (the reverse leg isn't starved by an idle forward leg).
+        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+        let (mut member_a, broker_a) = duplex(1024);
+        let (mut member_b, broker_b) = duplex(1024);
+        let relay_task =
+            tokio::spawn(async move { relay_streams(broker_a, broker_b, "test-443").await });
+
+        // A -> B while A keeps its stream open (mimics a Noise msg1 awaiting msg2).
+        member_a.write_all(b"a->b").await.unwrap();
+        let mut on_b = [0u8; 4];
+        member_b.read_exact(&mut on_b).await.unwrap();
+        assert_eq!(&on_b, b"a->b", "A's bytes reach B via the generic splice");
+
+        // B -> A with the forward leg still open — the reply must not be starved.
+        member_b.write_all(b"b->a").await.unwrap();
+        let mut on_a = [0u8; 4];
+        member_a.read_exact(&mut on_a).await.unwrap();
+        assert_eq!(&on_a, b"b->a", "B's reply reaches A with the forward leg still open");
+
+        // Both close -> the splice tears down and reports byte counts (no hang).
+        member_a.shutdown().await.unwrap();
+        member_b.shutdown().await.unwrap();
+        let (a2b, b2a) = relay_task.await.unwrap().unwrap();
+        assert_eq!((a2b, b2a), (4, 4), "one message each direction");
+    }
 
     #[tokio::test]
     async fn relay_two_connections_splices_two_channel_members_and_tears_down_cleanly() {

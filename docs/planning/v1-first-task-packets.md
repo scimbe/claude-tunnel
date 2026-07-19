@@ -2776,12 +2776,34 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
         `build_tcp_tls_listener_at`/`tcp_tls_connect`) and drives the full handshake (framed request →
         possession challenge → OK) over it, asserting the same OK ack + advertised endpoint as the QUIC path.
         Gate green.
-      - **#106-dispatch-complete** ⏳ next: drive the pairing (`broker_channel_rendezvous`/`_relay`) over the
-        admitted TLS-TCP stream. Blocked on a seam: `AdmittedMember` + `finish_rendezvous_pair`/`finish_relay_pair`
-        are quinn-specific (they hold a `quinn::Connection`; the relay splice runs `relay_initiator_to_acceptor`
-        over quinn). Generalise the finishers past quinn first — a transport-generic `AdmittedMember` (write half
-        + the peer key material, no `quinn::Connection`) for rendezvous endpoint-swap, and a relay splice that
-        works over a plain duplex — *then* wire completion over `:443`.
+      - **#106-dispatch-complete** — drive the pairing over the admitted TLS-TCP stream. Was blocked on a seam:
+        `AdmittedMember` + `finish_rendezvous_pair`/`finish_relay_pair` are quinn-specific (they hold a
+        `quinn::Connection`; the relay splice runs `relay_initiator_to_acceptor` over quinn). Too big for one
+        cycle — decomposed into (relay first, since a `:443`-only member which can't be dialed *needs* the relay,
+        not rendezvous):
+        - **#106-complete-relay-splice** ✅ **Transport-agnostic channel relay splice** (`ct_edge`): the relay
+          completer generalised past quinn. New `relay::relay_streams<A,B: AsyncRead+AsyncWrite>(a, b, label)` —
+          `tokio::io::split`s each generic duplex and reuses the same per-direction, per-chunk-flushed `relay_pair`
+          core as `relay_quic` (a member admitted over a non-quinn transport carries its data on the *same* stream
+          it joined on — no separate bi-stream to open/accept, so a symmetric split-and-pump is exactly right, no
+          initiator/acceptor role dance). New `channel_broker::AdmittedStreamMember<S>` (stream + verified request +
+          operator key, **no** `quinn::Connection`) and `finish_relay_pair_over_streams<A,B>` — authorize the pair,
+          ack `OK` on each stream, splice via `relay_streams`; the Noise_IK tunnel flows end-to-end as ciphertext.
+          Additive: the working quinn `finish_relay_pair` is left untouched (unifying the two call sites is deferred
+          — see below). Two frozen tests: `relay_streams` over two in-memory duplexes (bytes both ways, reverse leg
+          not starved by an idle forward leg, clean teardown, byte counts) and `finish_relay_pair_over_streams`
+          over two plain `tokio::io::duplex` members (both `OK` acks + bidirectional splice + roles from grants —
+          the same completion as the quinn `finish_relay_pair`, with no `quinn::Connection` anywhere). Gate green.
+        - **#106-complete-rendezvous-generic** ⏳ next: the rendezvous sibling of the relay slice — a
+          transport-generic rendezvous finisher (endpoint-swap + attested-key `member_ack_suffix` over a plain
+          duplex write half, no `quinn::Connection`), so a `:443` member that *can* be reached can also be
+          rendezvous-paired. Optional-after-relay for the `:443`-only sink but needed for symmetry.
+        - **#106-complete-wire443** ⏳: thread the admitted **read half** through the accept leg so an admitted
+          `:443` stream can be reunited into a full duplex `AdmittedStreamMember` (`admit_channel_join_on_duplex`
+          currently drops the read half inside `read_channel_join_on_stream`), then drive
+          `finish_relay_pair_over_streams` over a genuine admitted TLS-over-TCP stream end-to-end. Consider
+          adapting the quinn `finish_relay_pair` onto the same seam here only if it stays trivially clean; otherwise
+          leave the quinn path as-is (it works) and keep the two completers parallel.
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
       what lets a `:443`-only host (the #103 sink) reach the broker/relay end-to-end.
