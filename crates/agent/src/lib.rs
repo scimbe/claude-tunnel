@@ -11,6 +11,7 @@ pub mod identity;
 pub mod observe;
 pub mod onboard;
 pub mod origin;
+pub mod p2p;
 pub mod reconnect;
 pub mod serve;
 pub mod transport;

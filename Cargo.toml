@@ -13,3 +13,14 @@ members = [
 version = "0.0.0"
 edition = "2021"
 license = "MIT"
+
+[workspace.dependencies]
+# libp2p connectivity substrate (#121 B2-libp2p-seam). Minimal in-memory feature set:
+# tokio runtime, noise (connection security) + yamux (muxer), and the stream protocol
+# for raw substreams. MemoryTransport lives in libp2p-core (no feature gate).
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux"] }
+# Raw-substream protocol handler (the `stream::Behaviour`); a sibling crate, not an
+# umbrella feature. Gives us an `AsyncRead + AsyncWrite` stream out of the swarm.
+libp2p-stream = "0.4.0-alpha"
+# Bridges libp2p's `futures` async-IO streams to Tokio's AsyncRead/AsyncWrite.
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
