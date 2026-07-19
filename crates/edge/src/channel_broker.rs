@@ -367,6 +367,43 @@ where
     }
 }
 
+/// Admit a channel join over an already-TLS-accepted `:443` front-door stream —
+/// the broker's **TLS-TCP accept leg** (#106 dispatch-transport). The broker speaks
+/// QUIC, but `:443` is TLS-over-TCP; a member whose restrictive network blocks the
+/// channel UDP/TCP ports reaches the same admission through the front door, which
+/// terminates TLS over TCP. `stream` is the already-TLS-accepted duplex (a
+/// `tokio_rustls` server stream — any `AsyncRead + AsyncWrite + Unpin`); this splits
+/// it into read/write halves with [`tokio::io::split`] and runs the identical
+/// [`read_channel_join_on_stream`] admission (length-framed [`ChannelJoinRequest`],
+/// membership + grant verification, single-use holder-possession challenge) over
+/// them — so a real TLS-over-TCP stream is admitted exactly as a QUIC bi-stream is.
+/// On success the write half is returned alongside the admitted request/keys so the
+/// caller can drive the pairing.
+///
+/// Scope (bounded): this lands **admission** over TLS-TCP only. Driving the pairing
+/// completion (`broker_channel_rendezvous` / `broker_channel_relay`) over the same
+/// stream is a later sub-packet — [`AdmittedMember`] and the `finish_*_pair`
+/// completers are still quinn-specific (they hold a `quinn::Connection` and the relay
+/// splice runs `relay_initiator_to_acceptor` over quinn), so they must be generalised
+/// past quinn before a `:443` stream can be paired end-to-end.
+pub async fn admit_channel_join_on_duplex<S, F, Fut>(
+    stream: S,
+    now: UnixSeconds,
+    join_timeout: std::time::Duration,
+    authorize: &F,
+) -> Result<
+    (tokio::io::WriteHalf<S>, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>),
+    BoxError,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    let (recv, send) = tokio::io::split(stream);
+    read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await
+}
+
 /// The bound on a single connection's join read (#105). A legitimate join completes
 /// in one CP `authorize` HTTP round-trip plus a local possession exchange; anything
 /// slower is a slow/broken/hostile client whose stalled connection would otherwise
@@ -999,6 +1036,74 @@ mod tests {
             server_task.await.expect("join"),
             "203.0.113.9:6021",
             "the handler receives the advertised endpoint over a non-QUIC transport",
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_channel_join_over_tls_tcp_matches_the_quic_path() {
+        // #106 dispatch-transport (accept leg, frozen): the `:443` front-door channel
+        // admission runs over a REAL TLS-over-TCP stream, not just an in-memory duplex.
+        // Stand up a genuine rustls TLS-over-TCP server+client over loopback (the
+        // `transport.rs` fallback helpers the classic edge uses for its `:443` leg) and
+        // drive the full admission handshake — length-framed request → possession
+        // challenge → OK — through `admit_channel_join_on_duplex`. The admitted member
+        // must match the QUIC path exactly (same OK ack, same advertised endpoint), so a
+        // member whose network blocks the channel ports is admitted identically via `:443`.
+        use crate::transport::{build_tcp_tls_listener_at, tcp_tls_connect};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let pk = operator_pubkey();
+        let channel = [0xF4u8; 32];
+        let holder = holder_sk(0x0a);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6041".to_string(),
+        };
+
+        let (listener, acceptor, cert) = build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into())
+            .await
+            .expect("tls-tcp listener");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("tcp accept");
+            // A real TLS handshake terminates here — `tls` is a tokio_rustls server
+            // stream, the exact transport the `:443` front door yields.
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut send, req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+                tls,
+                500,
+                std::time::Duration::from_secs(5),
+                &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) },
+            )
+            .await
+            .expect("admitted over a real TLS-TCP stream");
+            send.write_all(b"OK").await.expect("ack");
+            send.shutdown().await.expect("shutdown");
+            req.endpoint
+        });
+
+        // Client: connect over TLS-TCP and drive the same handshake `present_join` drives
+        // over QUIC (framed request, then answer the edge's possession challenge).
+        let mut client = tcp_tls_connect(addr, cert).await.expect("tls-tcp connect");
+        let req_bytes = req.encode();
+        client
+            .write_all(&(req_bytes.len() as u16).to_be_bytes())
+            .await
+            .expect("write length");
+        client.write_all(&req_bytes).await.expect("write request");
+        let mut challenge = [0u8; 32];
+        client.read_exact(&mut challenge).await.expect("read challenge");
+        let sig = holder.sign(&challenge).to_bytes();
+        client.write_all(&sig).await.expect("write possession sig");
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.expect("read ack");
+        assert_eq!(&ack, b"OK", "TLS-TCP admission returns the same OK ack as QUIC");
+
+        assert_eq!(
+            server_task.await.expect("join"),
+            "203.0.113.9:6041",
+            "the admitted member's advertised endpoint matches the QUIC path",
         );
     }
 

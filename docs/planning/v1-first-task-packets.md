@@ -2760,9 +2760,24 @@ Same problem the classic tunnel had before #31/#46 — fix by multiplexing the c
       identically to a QUIC stream — no QUIC assumption left in the admission path. Frozen test drives the full
       handshake (framed request → possession challenge → OK ack) over an in-memory `tokio::io::duplex` (the
       `:443`/TLS-TCP stand-in), asserting the same OK ack + advertised endpoint as the QUIC path. Gate green.
-    - **#106-dispatch-transport** ⏳ next: a **TLS-TCP accept leg** for the broker (it speaks QUIC; `:443` is
-      TLS-TCP — mirror the ADR-0004 relay's TLS-TCP fallback) that hands the accepted (read, write) halves to
-      `read_channel_join_on_stream` and then drives `broker_channel_rendezvous`/`_relay` over the same stream.
+    - **#106-dispatch-transport** — the broker speaks QUIC; `:443` is TLS-TCP. Admitting *and* pairing over a
+      non-quinn stream is too big for one cycle (the pair-completers are quinn-bound), so decomposed into:
+      - **#106-dispatch-accept** ✅ **TLS-TCP accept leg** (`ct_edge::channel_broker::admit_channel_join_on_duplex`):
+        takes an already-TLS-accepted `:443` stream (any `AsyncRead + AsyncWrite + Unpin` duplex — a
+        `tokio_rustls` server stream), `tokio::io::split`s it and runs the identical
+        `read_channel_join_on_stream` admission (length-framed `ChannelJoinRequest` + membership/grant verify
+        + single-use possession challenge), returning the write half + admitted request/keys for the caller to
+        pair. Proves a real TLS-over-TCP `:443` stream is admitted IDENTICALLY to a QUIC bi-stream. Frozen test
+        stands up a genuine rustls TLS-over-TCP server+client over loopback (the `transport.rs` fallback helpers
+        `build_tcp_tls_listener_at`/`tcp_tls_connect`) and drives the full handshake (framed request →
+        possession challenge → OK) over it, asserting the same OK ack + advertised endpoint as the QUIC path.
+        Gate green.
+      - **#106-dispatch-complete** ⏳ next: drive the pairing (`broker_channel_rendezvous`/`_relay`) over the
+        admitted TLS-TCP stream. Blocked on a seam: `AdmittedMember` + `finish_rendezvous_pair`/`finish_relay_pair`
+        are quinn-specific (they hold a `quinn::Connection`; the relay splice runs `relay_initiator_to_acceptor`
+        over quinn). Generalise the finishers past quinn first — a transport-generic `AdmittedMember` (write half
+        + the peer key material, no `quinn::Connection`) for rendezvous endpoint-swap, and a relay splice that
+        works over a plain duplex — *then* wire completion over `:443`.
     - **#106-dispatch-frontdoor** ⏳: wire `serve_front_door`'s `ChannelBroker` arm to hand the buffered
       ClientHello + stream to the TLS-TCP accept leg, and route the channel ALPN on `:443` in the deploy. This is
       what lets a `:443`-only host (the #103 sink) reach the broker/relay end-to-end.
