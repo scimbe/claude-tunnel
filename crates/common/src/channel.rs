@@ -302,6 +302,92 @@ impl ChannelJoinRequest {
     }
 }
 
+/// Whether `addr` is a **global-unicast** socket address — a real, publicly-routable
+/// host a peer can dial (#121). The single source of truth for "is this reachable from
+/// the outside": it rejects loopback, unspecified, and multicast, plus every private /
+/// internal range a NAT hides behind — RFC1918, link-local (`169.254/16`, `fe80::/10`),
+/// shared/CGNAT (`100.64/10`), and IPv6 unique-local (`fc00::/7`). Only a global-unicast
+/// address returns `true`. `ct_edge`'s `safe_endpoint` admission filter is defined in
+/// terms of this helper, so the reachability classifier and the edge's SSRF filter agree
+/// by construction on exactly which addresses count as externally reachable.
+pub fn is_global_unicast(addr: std::net::SocketAddr) -> bool {
+    use std::net::IpAddr;
+    let ip = addr.ip();
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            // RFC1918 private + link-local (169.254/16) + shared/CGNAT (100.64/10).
+            if v4.is_private() || v4.is_link_local() {
+                return false;
+            }
+            let o = v4.octets();
+            if o[0] == 100 && (64..=127).contains(&o[1]) {
+                return false; // 100.64.0.0/10
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            let s0 = v6.segments()[0];
+            if (s0 & 0xfe00) == 0xfc00 {
+                return false; // unique-local fc00::/7
+            }
+            if (s0 & 0xffc0) == 0xfe80 {
+                return false; // link-local fe80::/10
+            }
+            true
+        }
+    }
+}
+
+/// How a channel member can be reached, classified from what it **advertised** and the
+/// **reflexive** (post-NAT) source address the edge observed on its already-authenticated
+/// join connection (#121 Phase B1 — the AutoNAT analog). This is the input the later
+/// hole-punch (B2) punches toward and the superpeer election (Phase C) classifies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reachability {
+    /// The advertised address is global-unicast **and** equals the reflexive address:
+    /// the member is directly reachable with no NAT rewrite (a public host).
+    Public,
+    /// The member is behind a NAT (it advertised a private/loopback address or the
+    /// relay-only sentinel), but its reflexive address is global-unicast — so it is
+    /// punchable at that reflexive address.
+    Nat { reflexive: std::net::SocketAddr },
+    /// No usable reflexive: the edge-observed source is itself private/loopback, so the
+    /// member is behind symmetric / CGNAT double-NAT and is reachable only via the relay.
+    RelayOnly,
+}
+
+/// Classify a member's reachability from its `advertised` endpoint string and the
+/// `reflexive` address the edge observed on its authenticated join (#121 Phase B1).
+/// Pure — no I/O. See [`Reachability`]:
+/// - a non-global-unicast reflexive → [`Reachability::RelayOnly`] (symmetric/CGNAT);
+/// - a global-unicast reflexive that the member also advertised verbatim →
+///   [`Reachability::Public`] (no NAT rewrite);
+/// - otherwise (private/loopback or relay-only advertised, but a global-unicast
+///   reflexive) → [`Reachability::Nat`], punchable at the reflexive address.
+pub fn reachability_class(advertised: &str, reflexive: std::net::SocketAddr) -> Reachability {
+    // The edge saw a private/loopback source: symmetric/CGNAT double-NAT — relay only,
+    // there is no reflexive address a peer could punch toward.
+    if !is_global_unicast(reflexive) {
+        return Reachability::RelayOnly;
+    }
+    // The reflexive is globally routable. If the member advertised that exact global
+    // address it is a directly-reachable public host; otherwise it is NAT'd but punchable
+    // at the reflexive (a private/loopback or relay-only advertised address never parses
+    // to a global-unicast match, so it always falls through to `Nat`).
+    if advertised
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .filter(|a| is_global_unicast(*a))
+        == Some(reflexive)
+    {
+        return Reachability::Public;
+    }
+    Reachability::Nat { reflexive }
+}
+
 /// Verify a signed grant against the channel `operator_pubkey` at time `now`.
 /// Confirms the operator signature over the claims and that the grant has not
 /// expired. Does NOT check holder possession — that is a connect-time proof in a
@@ -868,6 +954,66 @@ mod tests {
         assert!(!direct.is_relay_only());
         // The sentinel round-trips through the join-request wire form (a normal non-empty tail).
         assert_eq!(ChannelJoinRequest::decode(&relay_only.encode()), Ok(relay_only));
+    }
+
+    #[test]
+    fn reachability_class_maps_advertised_and_reflexive_to_a_class() {
+        // #121 Phase B1 (frozen): the pure reachability classifier — the AutoNAT verdict the
+        // edge computes from what a member advertised and the reflexive (post-NAT) source it
+        // observed on the authenticated join. Five cases pin the whole matrix.
+        use std::net::SocketAddr;
+        let public: SocketAddr = "203.0.113.7:7001".parse().unwrap();
+        let other_public: SocketAddr = "198.51.100.9:8008".parse().unwrap();
+        let private_reflexive: SocketAddr = "192.168.1.5:5000".parse().unwrap();
+        let loopback_reflexive: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // public advertised == reflexive → directly reachable, no NAT rewrite.
+        assert_eq!(
+            reachability_class("203.0.113.7:7001", public),
+            Reachability::Public,
+            "a global-unicast address that equals the reflexive is Public",
+        );
+        // private advertised + global-unicast reflexive → NAT'd but punchable at the reflexive.
+        assert_eq!(
+            reachability_class("192.168.1.5:5000", public),
+            Reachability::Nat { reflexive: public },
+            "a private advertised address behind a global reflexive is punchable Nat",
+        );
+        // relay-only sentinel + global-unicast reflexive → still Nat (the reflexive is usable).
+        assert_eq!(
+            reachability_class(CHANNEL_ENDPOINT_RELAY_ONLY, other_public),
+            Reachability::Nat { reflexive: other_public },
+            "the relay-only sentinel with a global reflexive is punchable Nat at the reflexive",
+        );
+        // public advertised + private reflexive → the observed source is not routable: relay only.
+        assert_eq!(
+            reachability_class("203.0.113.7:7001", private_reflexive),
+            Reachability::RelayOnly,
+            "a private reflexive (symmetric/CGNAT) is RelayOnly even if the advertised addr is public",
+        );
+        // relay-only sentinel + loopback reflexive → double-NAT, pure relay.
+        assert_eq!(
+            reachability_class(CHANNEL_ENDPOINT_RELAY_ONLY, loopback_reflexive),
+            Reachability::RelayOnly,
+            "the relay-only sentinel with a non-global reflexive is RelayOnly",
+        );
+    }
+
+    #[test]
+    fn is_global_unicast_matches_the_edge_ssrf_filter_ranges() {
+        // #121 Phase B1: the shared global-unicast test `ct_edge::safe_endpoint` is now defined
+        // in terms of — it must reject every private/internal range and accept only public unicast.
+        use std::net::SocketAddr;
+        for bad in [
+            "127.0.0.1:22", "0.0.0.0:80", "224.0.0.1:80", "10.0.0.5:22", "172.16.0.1:22",
+            "192.168.1.1:22", "169.254.169.254:80", "100.64.0.1:22", "[::1]:22", "[fe80::1]:22",
+            "[fc00::1]:22", "[fd12:3456::1]:22",
+        ] {
+            assert!(!is_global_unicast(bad.parse::<SocketAddr>().unwrap()), "{bad} must not be global-unicast");
+        }
+        for ok in ["203.0.113.10:7001", "8.8.8.8:443", "[2001:4860:4860::8888]:443"] {
+            assert!(is_global_unicast(ok.parse::<SocketAddr>().unwrap()), "{ok} must be global-unicast");
+        }
     }
 
     #[test]

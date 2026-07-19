@@ -3195,10 +3195,38 @@ after Phase A (a hole-punch needs a joined member + the relay as its symmetric-N
 opportunistic relay→direct **upgrade** (start relayed per Phase A, upgrade when NAT type allows). Follow-on
 slices:
 
-- **#121-reflexive-observe** ⏳: the edge observes each member's **post-NAT reflexive** source `ip:port` (edge-
-  OBSERVED, NOT self-reported — so #94's SSRF concern differs, but still sanity-check the punch target).
-- **#121-punch-signal** ⏳: broker punch-coordination signalling — relay the peer's reflexive address + a
-  synchronized instant to both members.
-- **#121-simultaneous-open** ⏳: client simultaneous-open at the agreed instant.
-- **#121-symmetric-fallback** ⏳: symmetric-NAT (no consistent reflexive mapping) stays on the relay; this is the
-  #104 upgrade **trigger** — promote to direct only when the NAT type allows, else remain relayed.
+- **#121-reflexive-observe (Phase B1) ✅** landed this cycle — the AutoNAT primitive + reachability classifier.
+  The edge observes each member's **post-NAT reflexive** source `ip:port` on its ALREADY-AUTHENTICATED channel
+  connection (edge-OBSERVED, NOT self-reported — no separate STUN server, no new trust: the member is already
+  grant-authenticated), reports it back in the OK ack, and the joining member learns it. What B1 is:
+  - **ct-edge observation at the accept seam**: `read_join_on_connection` captures `conn.remote_address()` (the
+    same primitive the classic tunnel uses in `serve.rs`); the `:443`/duplex path `admit_channel_join_on_duplex`
+    takes an added `observed: SocketAddr` param its front-door caller (`serve_front_door`) fills from the accepted
+    `TcpStream`'s `peer_addr()`. Both thread it through the transport-agnostic core `read_channel_join_on_stream`
+    (which takes `observed` in — it never calls `remote_address()` itself) and echo it as the last returned tuple
+    element. `serve_front_door` now captures `inbound.peer_addr()` before the socket is consumed.
+  - **report-in-ack (backward-additive wire)**: `ChannelJoinOutcome::Admitted` gains `observed_reflexive:
+    Option<SocketAddr>`; the OK ack carries it as a **tagged `r=<addr>` token** the client pulls out first
+    (self-addressed, order-independent, absent on older acks → `None`; the relay leg's bare 2-byte `OK` carries
+    none — a relay-only member is `RelayOnly` and has no punchable reflexive). Frozen e2e (ct-agent), proving BOTH
+    transports carry it: `member_learns_its_edge_observed_reflexive_over_quic` and
+    `member_learns_its_edge_observed_reflexive_over_tls_tcp_443` — each asserts the learned reflexive equals what
+    the edge observed AND (QUIC) the loopback source the client actually connected from.
+  - **pure reachability classifier (ct-common)**: `reachability_class(advertised: &str, reflexive: SocketAddr) ->
+    Reachability { Public | Nat { reflexive } | RelayOnly }`, plus a shared `is_global_unicast(SocketAddr) -> bool`
+    that `ct_edge::safe_endpoint` is now defined in terms of (behaviour-preserving — the frozen
+    `safe_endpoint_rejects_private_and_internal_ranges` still passes; the SSRF filter and the classifier now agree
+    by construction). Frozen `reachability_class_maps_advertised_and_reflexive_to_a_class` (the 5-case matrix) and
+    `is_global_unicast_matches_the_edge_ssrf_filter_ranges`.
+  - **Deferred to a trivial B1-follow slice** (not built here): wiring the `r=<addr>` token into the **live**
+    pair-completion acks (`finish_rendezvous_pair`/`finish_relay_pair`/`resolve_channel_join`) so a member learns
+    its reflexive during production rendezvous/relay pairing — the observed address is captured + returned at the
+    admission seam and the client-side parse is done, so this is just emitting the token in the finisher acks (the
+    relay 2-byte-ack path needs the open ADR wire decision). B1 proves the full observe→report→learn round trip
+    end-to-end at the admission seam today.
+- **#121-punch-signal (Phase B2) ⏳**: broker punch-coordination signalling — relay the peer's reflexive address +
+  a synchronized instant to both members (the hole-punch/DCUtR; punches toward the B1 reflexive).
+- **#121-simultaneous-open (Phase B2) ⏳**: client simultaneous-open at the agreed instant.
+- **#121-symmetric-fallback (Phase B2) ⏳**: symmetric-NAT (`RelayOnly`, no consistent reflexive mapping) stays on
+  the relay; this is the #104 upgrade **trigger** — promote to direct only when `reachability_class` allows.
+- **Phase C (superpeer election) / D (DHT) / E (fail-static) ⏳**: later, classify on the B1 `Reachability`.

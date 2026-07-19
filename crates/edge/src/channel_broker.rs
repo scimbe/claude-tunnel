@@ -196,34 +196,12 @@ impl<T> ChannelPairer<T> {
 /// link-local (`169.254/16`, `fe80::/10`), CGNAT (`100.64/10`) and IPv6 unique-local
 /// (`fc00::/7`). Only global unicast passes. Returns the parsed address when acceptable.
 fn safe_endpoint(ep: &str) -> Option<std::net::SocketAddr> {
-    use std::net::IpAddr;
-    let addr: std::net::SocketAddr = ep.parse().ok()?;
-    let ip = addr.ip();
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return None;
-    }
-    match ip {
-        IpAddr::V4(v4) => {
-            // RFC1918 private + link-local (169.254/16) + shared/CGNAT (100.64/10).
-            if v4.is_private() || v4.is_link_local() {
-                return None;
-            }
-            let o = v4.octets();
-            if o[0] == 100 && (64..=127).contains(&o[1]) {
-                return None; // 100.64.0.0/10
-            }
-        }
-        IpAddr::V6(v6) => {
-            let s0 = v6.segments()[0];
-            if (s0 & 0xfe00) == 0xfc00 {
-                return None; // unique-local fc00::/7
-            }
-            if (s0 & 0xffc0) == 0xfe80 {
-                return None; // link-local fe80::/10
-            }
-        }
-    }
-    Some(addr)
+    // Behaviour-preserving (#121 Phase B1): the private/internal-range test is factored into
+    // the shared `ct_common::channel::is_global_unicast`, so the edge's SSRF filter and the
+    // reflexive-reachability classifier agree by construction on what counts as reachable.
+    ep.parse::<std::net::SocketAddr>()
+        .ok()
+        .filter(|addr| ct_common::channel::is_global_unicast(*addr))
 }
 
 /// Admission predicate for a join's advertised endpoint (#121): admit the explicit
@@ -262,13 +240,25 @@ pub async fn read_join_on_connection<F, Fut>(
     join_timeout: std::time::Duration,
     authorize: &F,
 ) -> Result<
-    (quinn::SendStream, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>),
+    (
+        quinn::SendStream,
+        ChannelJoinRequest,
+        [u8; 32],
+        Option<[u8; 32]>,
+        Option<[u8; 64]>,
+        std::net::SocketAddr,
+    ),
     BoxError,
 >
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
+    // #121 Phase B1: the reflexive (post-NAT) address the QUIC transport observed as this
+    // authenticated connection's source — the AutoNAT primitive, the same `remote_address()`
+    // the classic tunnel uses (see `serve.rs`). Captured here where the whole connection
+    // exists and passed into the stream-generic admission so it can travel back in the ack.
+    let observed = conn.remote_address();
     // #105: bound `accept_bi` itself — a connection that completes the QUIC handshake
     // but never opens a stream can't wedge the broker's serial round loop. The framed
     // request + possession round-trip is then bounded a second time inside
@@ -284,9 +274,9 @@ where
     };
     // The quinn broker pairs over the `quinn::Connection` (rendezvous endpoint swap /
     // relay bi-stream), not over this join stream, so the returned read half is dropped.
-    let (send, _recv, req, operator, member_noise, member_attest) =
-        read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await?;
-    Ok((send, req, operator, member_noise, member_attest))
+    let (send, _recv, req, operator, member_noise, member_attest, observed) =
+        read_channel_join_on_stream(send, recv, observed, now, join_timeout, authorize).await?;
+    Ok((send, req, operator, member_noise, member_attest, observed))
 }
 
 /// Admit a channel join over an already-established bidirectional byte stream —
@@ -300,13 +290,25 @@ where
 /// the read half) so the caller can reunite them into the full duplex and drive the
 /// pairing (rendezvous endpoint exchange or relay splice) on the same stream — the
 /// read half is not consumed by admission (#106 complete-wire443).
+///
+/// `observed` is the member's **reflexive** (post-NAT) source address as seen on this
+/// already-authenticated connection (#121 Phase B1 — the AutoNAT primitive): the
+/// transport-aware caller supplies it (`conn.remote_address()` for QUIC, the accepted
+/// `TcpStream`'s `peer_addr()` for the `:443` front door), keeping this stream-generic
+/// core transport-agnostic, and it is echoed back as the last returned element so the
+/// caller can report it to the member and classify reachability
+/// ([`ct_common::channel::reachability_class`]).
 pub async fn read_channel_join_on_stream<W, R, F, Fut>(
     mut send: W,
     mut recv: R,
+    observed: std::net::SocketAddr,
     now: UnixSeconds,
     join_timeout: std::time::Duration,
     authorize: &F,
-) -> Result<(W, R, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>), BoxError>
+) -> Result<
+    (W, R, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>, std::net::SocketAddr),
+    BoxError,
+>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -378,7 +380,7 @@ where
         let _ = send.shutdown().await;
         return Err("holder possession proof failed".into());
     }
-    Ok((send, recv, req, operator, member_noise, member_attest))
+    Ok((send, recv, req, operator, member_noise, member_attest, observed))
     };
     match tokio::time::timeout(join_timeout, read).await {
         Ok(r) => r,
@@ -404,22 +406,29 @@ where
 /// end-to-end (#106 complete-wire443).
 pub async fn admit_channel_join_on_duplex<S, F, Fut>(
     stream: S,
+    observed: std::net::SocketAddr,
     now: UnixSeconds,
     join_timeout: std::time::Duration,
     authorize: &F,
-) -> Result<(S, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>), BoxError>
+) -> Result<
+    (S, ChannelJoinRequest, [u8; 32], Option<[u8; 32]>, Option<[u8; 64]>, std::net::SocketAddr),
+    BoxError,
+>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
+    // #121 Phase B1: the `:443` front door terminates TLS over TCP, so its accept loop knows
+    // the member's reflexive source from the accepted `TcpStream`'s `peer_addr()` and passes
+    // it as `observed` — this stream-generic core never calls `remote_address()` itself.
     let (recv, send) = tokio::io::split(stream);
-    let (send, recv, req, operator, member_noise, member_attest) =
-        read_channel_join_on_stream(send, recv, now, join_timeout, authorize).await?;
+    let (send, recv, req, operator, member_noise, member_attest, observed) =
+        read_channel_join_on_stream(send, recv, observed, now, join_timeout, authorize).await?;
     // Reunite the split halves back into the original stream (`ReadHalf::unsplit`), so
     // the post-admission data path is the whole duplex — the read half is no longer
     // trapped inside admission and the caller can relay-splice it.
-    Ok((recv.unsplit(send), req, operator, member_noise, member_attest))
+    Ok((recv.unsplit(send), req, operator, member_noise, member_attest, observed))
 }
 
 /// The bound on a single connection's join read (#105). A legitimate join completes
@@ -444,6 +453,7 @@ async fn accept_and_read_join<F, Fut>(
         [u8; 32],
         Option<[u8; 32]>,
         Option<[u8; 64]>,
+        std::net::SocketAddr,
     ),
     BoxError,
 >
@@ -456,9 +466,9 @@ where
         .await
         .ok_or("endpoint closed with no incoming")?;
     let conn = incoming.await?;
-    let (send, req, operator, noise, attest) =
+    let (send, req, operator, noise, attest, observed) =
         read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await?;
-    Ok((conn, send, req, operator, noise, attest))
+    Ok((conn, send, req, operator, noise, attest, observed))
 }
 
 /// Accept one channel-join over QUIC (AF2d-transport-a): read the presented
@@ -475,7 +485,8 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    let (conn, mut send, req, _op, _noise, _attest) = accept_and_read_join(endpoint, now, &authorize).await?;
+    let (conn, mut send, req, _op, _noise, _attest, _observed) =
+        accept_and_read_join(endpoint, now, &authorize).await?;
     send.write_all(b"OK").await?;
     send.finish()?;
     conn.closed().await; // hold the connection so the peer reads the ack
@@ -534,7 +545,12 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    let (conn, send, req, operator, noise, attest) =
+    // #121 Phase B1: the observed reflexive address is captured at admission and returned by
+    // `accept_and_read_join`; wiring it into the pair-completion ack (so a member learns its
+    // reflexive during live rendezvous/relay) is the deferred B1 follow slice, so it is not
+    // carried on `AdmittedMember` yet — the primitive's edge-observe→report→client-parse round
+    // trip is proven end-to-end at the admission seam by the reflexive round-trip tests.
+    let (conn, send, req, operator, noise, attest, _observed) =
         accept_and_read_join(endpoint, now, authorize).await?;
     Ok(AdmittedMember { conn, send, req, operator, noise, attest })
 }
@@ -699,6 +715,7 @@ where
 /// drives; wiring it into `serve_front_door` is the follow slice.
 pub async fn admit_and_pair_on_stream<S, F, Fut>(
     stream: S,
+    observed: std::net::SocketAddr,
     now: UnixSeconds,
     join_timeout: std::time::Duration,
     authorize: &F,
@@ -710,8 +727,12 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    let (stream, req, operator, _noise, _attest) =
-        admit_channel_join_on_duplex(stream, now, join_timeout, authorize).await?;
+    // #121 Phase B1: `observed` is this member's reflexive source (the front door fills it from
+    // the accepted `TcpStream`'s `peer_addr()`). It is captured through admission; carrying it
+    // into the relay-pair ack for a `:443` member is the deferred B1 follow slice (a `:443`-only
+    // member is behind symmetric/CGNAT NAT — `RelayOnly` — so it needs no reflexive to punch).
+    let (stream, req, operator, _noise, _attest, _observed) =
+        admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let channel = req.grant.grant.channel;
     let holder = req.grant.grant.holder;
     let member = AdmittedStreamMember { stream, req, operator };
@@ -1200,7 +1221,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             // Accept the connection first (as the live edge loop does), then read the join.
             let conn = server.accept().await.expect("incoming").await.expect("conn");
-            let (mut send, req, _op, _noise, _attest) = read_join_on_connection(&conn, 500, std::time::Duration::from_secs(5), &move |c, _h| async move {
+            let (mut send, req, _op, _noise, _attest, _observed) = read_join_on_connection(&conn, 500, std::time::Duration::from_secs(5), &move |c, _h| async move {
                 (c.0 == channel).then_some((pk, None, None))
             })
             .await
@@ -1240,9 +1261,11 @@ mod tests {
         let server_task = tokio::spawn(async move {
             // Note: read/write halves are passed as distinct AsyncRead/AsyncWrite, not a
             // quinn connection — no QUIC anywhere in this path.
-            let (mut send, _recv, req, _op, _noise, _attest) = read_channel_join_on_stream(
+            let observed: std::net::SocketAddr = "203.0.113.50:40001".parse().unwrap();
+            let (mut send, _recv, req, _op, _noise, _attest, _observed) = read_channel_join_on_stream(
                 srv_w,
                 srv_r,
+                observed,
                 500,
                 std::time::Duration::from_secs(5),
                 &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) },
@@ -1304,12 +1327,13 @@ mod tests {
         let addr: SocketAddr = listener.local_addr().expect("addr");
 
         let server_task = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.expect("tcp accept");
+            let (tcp, peer) = listener.accept().await.expect("tcp accept");
             // A real TLS handshake terminates here — `tls` is a tokio_rustls server
             // stream, the exact transport the `:443` front door yields.
             let tls = acceptor.accept(tcp).await.expect("tls accept");
-            let (mut stream, req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+            let (mut stream, req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
                 tls,
+                peer,
                 500,
                 std::time::Duration::from_secs(5),
                 &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) },
@@ -1395,16 +1419,16 @@ mod tests {
         let server = tokio::spawn(async move {
             let authorize =
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
-            let (t1, _) = listener.accept().await.expect("accept 1");
+            let (t1, peer1) = listener.accept().await.expect("accept 1");
             let tls1 = acceptor.accept(t1).await.expect("tls 1");
-            let (s1, r1, op1, _n1, _a1) =
-                admit_channel_join_on_duplex(tls1, 500, std::time::Duration::from_secs(5), &authorize)
+            let (s1, r1, op1, _n1, _a1, _o1) =
+                admit_channel_join_on_duplex(tls1, peer1, 500, std::time::Duration::from_secs(5), &authorize)
                     .await
                     .expect("admit 1");
-            let (t2, _) = listener.accept().await.expect("accept 2");
+            let (t2, peer2) = listener.accept().await.expect("accept 2");
             let tls2 = acceptor.accept(t2).await.expect("tls 2");
-            let (s2, r2, op2, _n2, _a2) =
-                admit_channel_join_on_duplex(tls2, 500, std::time::Duration::from_secs(5), &authorize)
+            let (s2, r2, op2, _n2, _a2, _o2) =
+                admit_channel_join_on_duplex(tls2, peer2, 500, std::time::Duration::from_secs(5), &authorize)
                     .await
                     .expect("admit 2");
             finish_relay_pair_over_streams(
@@ -1535,15 +1559,20 @@ mod tests {
         let authorize =
             move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
 
+        // In-memory duplexes have no socket peer; a dummy reflexive addr stands in (the observed
+        // address isn't asserted here — the front-door wiring test covers real `peer_addr()`).
+        let obs1: std::net::SocketAddr = "203.0.113.1:8001".parse().unwrap();
+        let obs2: std::net::SocketAddr = "203.0.113.2:8002".parse().unwrap();
+
         // First holder → parked (no partner yet).
-        let r1 = admit_and_pair_on_stream(s1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+        let r1 = admit_and_pair_on_stream(s1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
             .await
             .expect("admit 1");
         assert!(r1.is_none(), "first holder of the channel parks in the pairer");
         assert_eq!(pairer.lock().unwrap().len(), 1, "one member waiting");
 
         // Second holder → paired with exactly the parked first.
-        let r2 = admit_and_pair_on_stream(s2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+        let r2 = admit_and_pair_on_stream(s2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
             .await
             .expect("admit 2");
         let (a, b) = r2.expect("second holder pairs with the parked first");

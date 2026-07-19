@@ -492,6 +492,10 @@ pub async fn serve_front_door(
     challenge: &Challenge,
     channel: Option<&ChannelFrontDoor>,
 ) -> Result<(), BoxError> {
+    // #121 Phase B1: the member's reflexive (post-NAT) source, captured from the accepted TCP
+    // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
+    // (the TLS-TCP analog of QUIC's `conn.remote_address()`).
+    let observed = inbound.peer_addr()?;
     let hello = crate::sni::read_client_hello_bytes(&mut inbound)
         .await
         .ok_or("front door: not a TLS ClientHello")?;
@@ -584,6 +588,7 @@ pub async fn serve_front_door(
             };
             let paired = crate::channel_broker::admit_and_pair_on_stream(
                 tls,
+                observed,
                 now,
                 CHANNEL_JOIN_TIMEOUT,
                 &authorize,

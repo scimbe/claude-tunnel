@@ -204,7 +204,7 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let (peer_endpoint, peer_noise) = match admission {
-        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation } => {
+        ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive: _ } => {
             let noise = peer_noise_pubkey
                 .ok_or("broker admitted the join but relayed no peer Noise key (registry has none)")?;
             // #101 SEC101c-ii: verify the peer's Noise key is attested by its
@@ -1547,10 +1547,11 @@ mod tests {
         // Edge: accept one TLS-TCP connection, admit the channel join over the duplex, then
         // ack `OK <peer_endpoint>` and close the write half so the client reads the ack to EOF.
         let edge = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.expect("accept tcp");
+            let (tcp, peer) = listener.accept().await.expect("accept tcp");
             let tls = acceptor.accept(tcp).await.expect("tls accept");
-            let (mut stream, _req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+            let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
                 tls,
+                peer,
                 500u64, // now < expires_at (1_000)
                 std::time::Duration::from_secs(5),
                 &move |c: ChannelId, _h: [u8; 32]| {
@@ -1997,10 +1998,11 @@ mod tests {
             build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.expect("tls-tcp listener");
         let fd_addr = fd_listener.local_addr().expect("front-door addr");
         let edge = tokio::spawn(async move {
-            let (tcp, _) = fd_listener.accept().await.expect("accept tcp");
+            let (tcp, peer) = fd_listener.accept().await.expect("accept tcp");
             let tls = acceptor.accept(tcp).await.expect("tls accept");
-            let (mut stream, _req, _op, _noise, _attest) = admit_channel_join_on_duplex(
+            let (mut stream, _req, _op, _noise, _attest, _observed) = admit_channel_join_on_duplex(
                 tls,
+                peer,
                 500u64, // now < expires_at (1_000)
                 std::time::Duration::from_secs(5),
                 &move |c: ChannelId, _h: [u8; 32]| {
@@ -2221,10 +2223,11 @@ mod tests {
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((op_pub, None, None)) };
             let mut paired = None;
             for _ in 0..2 {
-                let (tcp, _) = listener.accept().await.expect("accept tcp");
+                let (tcp, peer) = listener.accept().await.expect("accept tcp");
                 let tls = acceptor.accept(tcp).await.expect("tls accept");
                 if let Some((x, y)) = admit_and_pair_on_stream(
                     tls,
+                    peer,
                     500u64, // now < expires_at (1_000)
                     Duration::from_secs(5),
                     &authorize,
@@ -2663,6 +2666,7 @@ mod tests {
                 peer_noise_pubkey: Some(nbpub),
                 peer_holder: Some(hb_pub),
                 peer_attestation: Some(b_att),
+                observed_reflexive: None,
             };
             run_channel_join_with_admission(
                 admission,
@@ -2691,6 +2695,7 @@ mod tests {
                 peer_noise_pubkey: Some(napub),
                 peer_holder: Some(ha_pub),
                 peer_attestation: Some(a_att),
+                observed_reflexive: None,
             };
             run_channel_join_with_admission(
                 admission,

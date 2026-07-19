@@ -31,6 +31,13 @@ pub enum ChannelJoinOutcome {
         /// The peer's holder-signed attestation over `peer_noise_pubkey` (#101), which
         /// the initiator verifies before pinning the key.
         peer_attestation: Option<[u8; 64]>,
+        /// This member's own **reflexive** (post-NAT) address as the edge observed it on
+        /// the authenticated join, when the ack carried it (#121 Phase B1 — the AutoNAT
+        /// primitive). `None` on an older ack that omits it or on the relay leg (a
+        /// relay-only member is behind symmetric NAT, so it has no punchable reflexive).
+        /// This is the address the later hole-punch (B2) punches toward and the input to
+        /// [`ct_common::channel::reachability_class`].
+        observed_reflexive: Option<std::net::SocketAddr>,
     },
     /// Refused: a bad/expired grant, a non-member holder, an unsafe advertised
     /// endpoint, or a failed possession proof.
@@ -89,18 +96,29 @@ where
     // generic stream. Lenient: on a refusal the edge may already have closed.
     let _ = send.shutdown().await;
 
-    // The ack can carry endpoint + noise(64) + holder(64) + attestation(128) hex plus
-    // separators — well over 256 bytes; cap at 512 so the attestation isn't truncated
-    // (the `take` bound is the generic-stream equivalent of quinn `read_to_end(512)`).
+    // The ack can carry endpoint + noise(64) + holder(64) + attestation(128) hex plus the
+    // #121 `r=<reflexive>` token and separators — well over 256 bytes; cap at 512 so nothing
+    // is truncated (the `take` bound is the generic-stream equivalent of quinn `read_to_end`).
     let mut ack = Vec::new();
     let _ = recv.take(512).read_to_end(&mut ack).await;
     let ack = String::from_utf8_lossy(&ack);
     match ack.strip_prefix("OK") {
-        // `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]]` — the broker
-        // appends the peer's attested Noise key, its holder, and the holder-signed
-        // attestation (#101) when the registry has them (all-or-nothing).
+        // `OK[ <endpoint>[ <noise_hex> <holder_hex> <attest_hex>]][ r=<reflexive>]` — the
+        // broker appends the peer's attested Noise key, its holder, and the holder-signed
+        // attestation (#101) when the registry has them (all-or-nothing), plus (#121 Phase
+        // B1) the joining member's OWN edge-observed reflexive address as a tagged `r=<addr>`
+        // token. The `r=` token is pulled out first (it is self-addressed, not peer material,
+        // and order-independent); its absence on an older ack yields `None` — backward-additive.
         Some(rest) => {
-            let mut parts = rest.split_whitespace();
+            let mut observed_reflexive = None;
+            let mut fields: Vec<&str> = Vec::new();
+            for tok in rest.split_whitespace() {
+                match tok.strip_prefix("r=") {
+                    Some(addr) => observed_reflexive = addr.parse().ok(),
+                    None => fields.push(tok),
+                }
+            }
+            let mut parts = fields.into_iter();
             let peer_endpoint = parts.next().unwrap_or_default().to_string();
             let peer_noise_pubkey = parts.next().and_then(decode_hex_32);
             let peer_holder = parts.next().and_then(decode_hex_32);
@@ -110,6 +128,7 @@ where
                 peer_noise_pubkey,
                 peer_holder,
                 peer_attestation,
+                observed_reflexive,
             })
         }
         None => Ok(ChannelJoinOutcome::Refused),
@@ -162,6 +181,10 @@ where
             peer_noise_pubkey: None,
             peer_holder: None,
             peer_attestation: None,
+            // The relay leg acks a bare 2-byte `OK` and the Noise session follows immediately
+            // on this same stream — there is no room for a reflexive token, and a relay-only
+            // member has no punchable reflexive anyway (#121 Phase B1).
+            observed_reflexive: None,
         }),
         _ => Ok(ChannelJoinOutcome::Refused),
     }
@@ -295,7 +318,7 @@ mod tests {
         let outcome = present_channel_join(&conn, &request, &holder).await.expect("join drives");
         assert_eq!(
             outcome,
-            ChannelJoinOutcome::Admitted { peer_endpoint: String::new(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None },
+            ChannelJoinOutcome::Admitted { peer_endpoint: String::new(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None, observed_reflexive: None },
             "the genuine holder proves possession and is admitted"
         );
         conn.close(0u32.into(), b"done");
@@ -363,12 +386,12 @@ mod tests {
         let _ = srv.await;
         assert_eq!(
             out_a,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None, observed_reflexive: None },
             "agent A learns B's endpoint"
         );
         assert_eq!(
             out_b,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None },
+            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None, observed_reflexive: None },
             "agent B learns A's endpoint"
         );
     }
@@ -440,6 +463,7 @@ mod tests {
                 peer_noise_pubkey: Some(noise_b),
                 peer_holder: Some(hkey_b),
                 peer_attestation: Some(attest_b),
+                observed_reflexive: None,
             },
             "agent A learns B's endpoint, Noise key, holder, AND attestation"
         );
@@ -450,6 +474,7 @@ mod tests {
                 peer_noise_pubkey: Some(noise_a),
                 peer_holder: Some(hkey_a),
                 peer_attestation: Some(attest_a),
+                observed_reflexive: None,
             },
             "agent B learns A's endpoint, Noise key, holder, AND attestation"
         );
@@ -497,5 +522,129 @@ mod tests {
         assert_eq!(ack, b"ack from agent B", "agent A decrypts agent B's encrypted reply");
         conn.close(0u32.into(), b"done");
         srv.await.expect("responder task");
+    }
+
+    #[tokio::test]
+    async fn member_learns_its_edge_observed_reflexive_over_quic() {
+        // #121 Phase B1 (frozen): the AutoNAT round-trip over REAL QUIC. A member joins over the
+        // authenticated channel connection; the edge observes its reflexive (post-NAT) source
+        // via `read_join_on_connection` (`conn.remote_address()`) and reports it back in the OK
+        // ack as the `r=<addr>` token; the joining member parses it into
+        // `Admitted { observed_reflexive: Some(..) }`. The learned address MUST equal both what
+        // the edge observed AND the loopback source the client actually connected from.
+        use ct_edge::channel_broker::read_join_on_connection;
+
+        let pk = operator().verifying_key().to_bytes();
+        let channel = [0x5Bu8; 32];
+        let holder = SigningKey::from_bytes(&[0x0au8; 32]);
+        let request = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder, Direction::Initiate),
+            endpoint: "203.0.113.9:6011".to_string(),
+        };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        // The edge task: admit the join, then ack `OK r=<observed reflexive>` — the exact
+        // primitive the B2 hole-punch and Phase C superpeer election consume.
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let (mut send, _req, _op, _noise, _attest, observed) =
+                read_join_on_connection(&conn, 500, std::time::Duration::from_secs(5), &move |c, _h| async move {
+                    (c.0 == channel).then_some((pk, None, None))
+                })
+                .await
+                .expect("admitted");
+            send.write_all(format!("OK r={observed}").as_bytes()).await.expect("ack");
+            send.finish().expect("finish");
+            conn.closed().await; // hold the connection so the member reads the ack to EOF
+            observed
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let client_source = client.local_addr().expect("client local addr");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let outcome = present_channel_join(&conn, &request, &holder).await.expect("join drives");
+        conn.close(0u32.into(), b"done");
+        let observed = srv.await.expect("edge task");
+
+        match outcome {
+            ChannelJoinOutcome::Admitted { observed_reflexive, .. } => {
+                assert_eq!(
+                    observed_reflexive,
+                    Some(observed),
+                    "the member learns exactly the reflexive address the edge observed",
+                );
+                assert_eq!(
+                    observed_reflexive,
+                    Some(client_source),
+                    "the observed reflexive equals the loopback source the client connected from",
+                );
+                assert!(observed.ip().is_loopback(), "the test's source is loopback");
+            }
+            ChannelJoinOutcome::Refused => panic!("a valid join must be Admitted, not Refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn member_learns_its_edge_observed_reflexive_over_tls_tcp_443() {
+        // #121 Phase B1 (frozen): the same AutoNAT round-trip over a REAL TLS-over-TCP `:443`
+        // front-door stream — the fallback path for a member whose network blocks the channel
+        // ports. The edge takes the reflexive from the accepted `TcpStream`'s `peer_addr()`,
+        // threads it through `admit_channel_join_on_duplex`, and reports it in the `r=<addr>`
+        // token; the member parses it into `Admitted { observed_reflexive: Some(..) }` via the
+        // transport-agnostic `present_channel_join_on_stream`. Proves BOTH transports carry it.
+        use ct_edge::channel_broker::admit_channel_join_on_duplex;
+        use ct_edge::transport::{build_tcp_tls_listener_at, tcp_tls_connect};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use tokio::io::split;
+
+        let pk = operator().verifying_key().to_bytes();
+        let channel = [0xF4u8; 32];
+        let holder = SigningKey::from_bytes(&[0x0au8; 32]);
+        let request = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder, Direction::Initiate),
+            endpoint: "203.0.113.9:6041".to_string(),
+        };
+
+        let (listener, acceptor, cert) = build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into())
+            .await
+            .expect("tls-tcp listener");
+        let listen_addr: SocketAddr = listener.local_addr().expect("addr");
+
+        let srv = tokio::spawn(async move {
+            let (tcp, peer) = listener.accept().await.expect("tcp accept");
+            let tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (mut stream, _req, _op, _noise, _attest, observed) = admit_channel_join_on_duplex(
+                tls,
+                peer,
+                500,
+                std::time::Duration::from_secs(5),
+                &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) },
+            )
+            .await
+            .expect("admitted over a real TLS-TCP stream");
+            stream.write_all(format!("OK r={observed}").as_bytes()).await.expect("ack");
+            stream.shutdown().await.expect("shutdown");
+            observed
+        });
+
+        let client_tls = tcp_tls_connect(listen_addr, cert).await.expect("tls-tcp connect");
+        let (cli_r, cli_w) = split(client_tls);
+        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder)
+            .await
+            .expect("join drives over the :443 duplex");
+        let observed = srv.await.expect("edge task");
+
+        match outcome {
+            ChannelJoinOutcome::Admitted { observed_reflexive, .. } => {
+                assert_eq!(
+                    observed_reflexive,
+                    Some(observed),
+                    "the :443 member learns exactly the reflexive the edge observed on the TCP peer",
+                );
+                assert!(observed.ip().is_loopback(), "the test's TCP source is loopback");
+            }
+            ChannelJoinOutcome::Refused => panic!("a valid :443 join must be Admitted, not Refused"),
+        }
     }
 }
