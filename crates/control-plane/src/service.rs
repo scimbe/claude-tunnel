@@ -1621,8 +1621,10 @@ async fn ca_handler(State(path): State<Arc<String>>) -> axum::response::Response
 
 /// Build the full persistent control-plane router: enrollment + registry +
 /// billing + health, all backed by durable SQLite stores opened on **one**
-/// database file (`db_path`). The three stores share the file via separate
-/// connections; each owns its own tables. This is what a real deployment serves.
+/// database file (`db_path`). The stores share the file via separate
+/// connections — each owns its own tables, and each is opened with WAL +
+/// `busy_timeout` (#110) so concurrent writers queue instead of hitting
+/// `SQLITE_BUSY`. This is what a real deployment serves.
 /// Fixed window (seconds) for the unauthenticated-writer rate limit (#87 SEC87b-rl).
 const UNAUTH_WRITE_WINDOW_SECS: u64 = 60;
 

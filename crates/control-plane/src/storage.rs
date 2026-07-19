@@ -49,6 +49,24 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ru
     Ok(())
 }
 
+/// Open a file-backed SQLite connection tuned for concurrent control-plane
+/// writers (#110). Every control-plane store opens the **same** database file
+/// through its own `Connection`, and SQLite's default rollback journal takes a
+/// whole-file exclusive lock per write: a second connection touching the file
+/// gets an immediate `SQLITE_BUSY` error instead of waiting. WAL lets readers
+/// run alongside a single writer, and `busy_timeout` makes a contending writer
+/// wait-and-retry (up to 5s) rather than failing outright. The `open_in_memory`
+/// variants skip this — WAL and file locking are moot for a `:memory:` database.
+fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    // `PRAGMA journal_mode` returns the resulting mode as a row, so it must be
+    // set via `query_row` — `execute`/`pragma_update` reject row-returning
+    // statements. The returned value is the mode SQLite actually applied.
+    let _mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// Why a persisted redemption failed: an enrollment rule or the database.
 #[derive(Debug)]
 pub enum RedeemError {
@@ -83,7 +101,7 @@ pub struct SqliteEnrollment {
 impl SqliteEnrollment {
     /// Open (creating if needed) a durable store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory store (for tests / stateless runs).
@@ -258,7 +276,7 @@ pub struct SqliteBootstrap {
 impl SqliteBootstrap {
     /// Open (creating if needed) a durable store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory store (for tests / stateless runs).
@@ -343,7 +361,7 @@ pub struct SqliteRegistry {
 impl SqliteRegistry {
     /// Open (creating if needed) a durable registry at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory registry (for tests / stateless runs).
@@ -465,7 +483,7 @@ pub struct SqliteLedger {
 impl SqliteLedger {
     /// Open (creating if needed) a durable ledger at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory ledger (for tests / stateless runs).
@@ -753,7 +771,7 @@ pub struct SqliteTunnelStore {
 impl SqliteTunnelStore {
     /// Open (creating if needed) a durable tunnel store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory store (for tests / stateless runs).
@@ -1065,7 +1083,7 @@ pub struct SqliteChannelStore {
 impl SqliteChannelStore {
     /// Open (creating if needed) a durable channel store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory channel store (for tests / stateless runs).
@@ -1376,7 +1394,7 @@ pub struct SqliteNetworkStore {
 impl SqliteNetworkStore {
     /// Open (creating if needed) a durable store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory store (for tests / stateless runs).
@@ -1498,7 +1516,7 @@ pub struct SqliteTopologyStore {
 impl SqliteTopologyStore {
     /// Open (creating if needed) a durable store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(open_tuned(path)?)
     }
 
     /// Open an ephemeral in-memory store (for tests / stateless runs).
@@ -1980,6 +1998,34 @@ mod tests {
             .join(format!("ct_enroll_{name}.db"))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn open_tunes_the_connection_for_wal_and_busy_timeout() {
+        // #110: every file-backed store `open()` routes through `open_tuned`,
+        // which must leave the connection in WAL mode with a non-zero
+        // `busy_timeout` so concurrent control-plane writers queue instead of
+        // getting an immediate `SQLITE_BUSY`. Deterministic: assert the pragmas
+        // the fix sets, rather than racing two writers.
+        let path = temp_db_path();
+        let store = SqliteEnrollment::open(&path).expect("open a file-backed store");
+
+        let conn = store.conn.lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal", "journal_mode is WAL");
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+            .unwrap();
+        assert!(busy_timeout > 0, "busy_timeout is set (got {busy_timeout})");
+        drop(conn);
+        drop(store);
+
+        // Clean up the DB plus the WAL/SHM sidecars WAL mode creates.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
     #[test]
