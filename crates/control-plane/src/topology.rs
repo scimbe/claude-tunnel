@@ -23,6 +23,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A topology (#107): a named overlay-network container owned by a subject, addressed
+/// by a generated unique `net_uuid` that keys its live-status subdomain
+/// (`<net_uuid>.<zone>`). Agents are wired into it via [`AgentAssignment`] (exclusive
+/// membership); the edge-list (who connects to whom) is a follow packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Topology {
+    /// Owner-chosen id (unique per store), used to address the topology in the API.
+    pub id: String,
+    /// The owning subject.
+    pub owner: String,
+    /// Generated unique id keying the topology's live-status subdomain.
+    pub net_uuid: String,
+}
+
 /// Why an assignment transition was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AssignError {

@@ -2662,8 +2662,14 @@ with **no prior art** and **no dependency on those open questions** lands first:
   (owner-reclaim or topology-release), `assignment(agent)`, `agents_in(topology)`. `TopologyError` wraps
   `AssignError`/DB. Frozen test `topology_store_enforces_exclusivity_across_a_restart` (assign; AlreadyAssigned
   blocks a second topology; a non-owner can neither reassign nor revoke; **reopen on the same file → state
-  persisted, still exclusive**; revoke→owner control→reassign; revoke-unassigned errors). Gate green. The
-  `Topology` entity (id/owner/`net-uuid`) + the edge-list are the next durable pieces.
+  persisted, still exclusive**; revoke→owner control→reassign; revoke-unassigned errors). Gate green.
+  - **#107-topology-entity** ✅ **The `Topology` container** (`topology::Topology` + `SqliteTopologyStore`): a
+    named overlay owned by a subject, keyed by a unique `net_uuid` (its live-status subdomain).
+    `create_topology(owner, id, net_uuid)` (no-op `false` on a duplicate id **or** net_uuid — both stay
+    unique), `topology(id)`, `topology_by_uuid(net_uuid)` (the `<net_uuid>.<zone>` resolver),
+    `list_topologies(owner)`, `delete_topology(owner, id)` (owner-scoped). Frozen test
+    `topology_entity_has_unique_id_and_net_uuid_and_is_owner_scoped`. Gate green. **Next:** the edge-list
+    (who-connects-to-whom), then `/me/topologies*` REST, then the subdomain live page (reuse #38 DL2).
 - **#107-rest** ⏳: `/me/topologies`, `/me/topologies/:id/agents`, … following the `/me/*` OIDC-bearer,
   subject-scoped conventions.
 - **#107-subdomain** ⏳: `<net-uuid>.<zone>` live-status page reusing the #38 DL2 DNS + authorize-host pipeline

@@ -1443,11 +1443,91 @@ impl SqliteTopologyStore {
                  agent    TEXT PRIMARY KEY,
                  owner    TEXT NOT NULL,
                  topology TEXT
+             );
+             CREATE TABLE IF NOT EXISTS topologies (
+                 id       TEXT PRIMARY KEY,
+                 owner    TEXT NOT NULL,
+                 net_uuid TEXT NOT NULL UNIQUE
              );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Create a topology `id` owned by `owner`, addressed by the unique `net_uuid`.
+    /// Returns `false` (no-op) if the `id` is already taken or the `net_uuid` collides —
+    /// so ids and subdomains stay unique.
+    pub fn create_topology(&self, owner: &str, id: &str, net_uuid: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let clash: bool = conn
+            .query_row(
+                "SELECT 1 FROM topologies WHERE id = ?1 OR net_uuid = ?2",
+                params![id, net_uuid],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if clash {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO topologies (id, owner, net_uuid) VALUES (?1, ?2, ?3)",
+            params![id, owner, net_uuid],
+        )?;
+        Ok(true)
+    }
+
+    fn row_to_topology(id: String, owner: String, net_uuid: String) -> crate::topology::Topology {
+        crate::topology::Topology { id, owner, net_uuid }
+    }
+
+    /// The topology with `id`, if it exists.
+    pub fn topology(&self, id: &str) -> rusqlite::Result<Option<crate::topology::Topology>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT id, owner, net_uuid FROM topologies WHERE id = ?1",
+                params![id],
+                |r| Ok(Self::row_to_topology(r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+    }
+
+    /// Resolve a topology by its `net_uuid` — the lookup the `<net_uuid>.<zone>`
+    /// live-status subdomain uses (UUID-only access for now, #107).
+    pub fn topology_by_uuid(&self, net_uuid: &str) -> rusqlite::Result<Option<crate::topology::Topology>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT id, owner, net_uuid FROM topologies WHERE net_uuid = ?1",
+                params![net_uuid],
+                |r| Ok(Self::row_to_topology(r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+    }
+
+    /// Every topology `owner` owns (by id, sorted).
+    pub fn list_topologies(&self, owner: &str) -> rusqlite::Result<Vec<crate::topology::Topology>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn
+            .prepare("SELECT id, owner, net_uuid FROM topologies WHERE owner = ?1 ORDER BY id")?;
+        let rows = stmt
+            .query_map(params![owner], |r| {
+                Ok(Self::row_to_topology(r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete `owner`'s topology `id` (owner-scoped); returns whether a row was removed.
+    /// A non-owner's delete is a no-op (`false`), so one subject can't drop another's.
+    pub fn delete_topology(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "DELETE FROM topologies WHERE id = ?1 AND owner = ?2",
+            params![id, owner],
+        )?;
+        Ok(n > 0)
     }
 
     /// Load the current assignment for `agent`, reconstructed from its row.
@@ -1617,6 +1697,36 @@ mod tests {
             ));
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn topology_entity_has_unique_id_and_net_uuid_and_is_owner_scoped() {
+        // #107: a Topology is a named container keyed by a unique net_uuid (its
+        // live-status subdomain); ids + uuids are unique, delete is owner-scoped.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+
+        assert!(store.create_topology("alice", "corp", "uuid-abc").unwrap(), "first create");
+        assert!(!store.create_topology("alice", "corp", "uuid-xyz").unwrap(), "dup id -> no-op");
+        assert!(!store.create_topology("bob", "team", "uuid-abc").unwrap(), "dup net_uuid -> no-op");
+        assert!(store.create_topology("bob", "team", "uuid-xyz").unwrap(), "distinct id + uuid ok");
+
+        // Lookup by id and by net_uuid (the subdomain resolver).
+        let t = store.topology("corp").unwrap().unwrap();
+        assert_eq!((t.owner.as_str(), t.net_uuid.as_str()), ("alice", "uuid-abc"));
+        assert_eq!(store.topology_by_uuid("uuid-abc").unwrap().unwrap().id, "corp");
+        assert!(store.topology_by_uuid("nope").unwrap().is_none());
+
+        // Listing is owner-scoped.
+        assert_eq!(
+            store.list_topologies("alice").unwrap().iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            vec!["corp".to_string()]
+        );
+
+        // Delete is owner-scoped.
+        assert!(!store.delete_topology("bob", "corp").unwrap(), "non-owner delete -> no-op");
+        assert!(store.topology("corp").unwrap().is_some(), "still there");
+        assert!(store.delete_topology("alice", "corp").unwrap(), "owner deletes");
+        assert!(store.topology("corp").unwrap().is_none());
     }
 
     #[test]
