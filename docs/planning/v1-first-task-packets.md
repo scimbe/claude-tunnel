@@ -2545,8 +2545,18 @@ mesh-independent core lands first:
   Firma" fixture (dev/ops/finance × internal/secret) — RBAC allow + default-deny, MAC blocks write-down /
   allows write-up even with a matching rule, MAC fails closed on an unknown label, channel establishment needs
   both directions + refuses cross-level, and a serde round-trip. Gate green (full `cargo test --workspace -D warnings`).
-- **#102-network-model** ⏳ next: the declarative objects (`Network → Segments → Agents`, groups, labels,
-  policy) as durable CP state + a `reconcile(desired) -> {mint, revoke}` diff against the live grants.
+- **#102-network-model** ✅ **Declarative `Network` + reconcile diff** (`ct_common::policy`, pure): the
+  desired-state layer the SDN controller reconciles the mesh toward, built on the policy core. `Network {
+  agents, policy }` (wire-serializable for the REST surface); `Network::desired_channels() -> BTreeSet<Pair>`
+  compiles the connectivity the policy permits — the canonical unordered agent-`Pair`s where
+  `may_establish_channel` is allowed (self-pairs excluded, cross-segment/MAC-write-down pairs excluded).
+  `reconcile(desired, current) -> Reconciliation { to_establish, to_revoke }` is the pure set diff
+  (`desired − current` / `current − desired`) the controller applies to make the live mesh match the
+  declaration (the actual grant minting / teardown is the caller's job). Frozen tests: `Pair` canonical
+  regardless of order; `desired_channels` compiles exactly the policy-permitted pairs on the "verteilte Firma"
+  fixture (dev↔dev, dev↔ops in; dev↔finance + finance internal↔secret out); `reconcile` establishes the
+  missing allowed channels + revokes a stale one + is a no-op when converged. Gate green. *(The durable
+  `SqliteNetworkStore` persisting a Network is the small follow wrapper; the pure model + diff are the core.)*
 - **#102-rest** ⏳ then: `PUT /networks/:id` + imperative overrides (`POST /channels`, `/grants/:id/revoke`),
   OpenAPI schema, OIDC-bearer + scoped-API-token authN.
 - **#102-broker-enforce** ⏳: the edge broker's `authorize` closure consults the compiled policy so a

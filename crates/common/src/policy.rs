@@ -18,6 +18,8 @@
 //!   never initiate a flow to a lower-level `to`, so sensitive data cannot leak down a
 //!   level even if an allow-rule would otherwise permit it.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 /// An agent's policy attributes: its RBAC `group` and its security `label`.
@@ -188,6 +190,87 @@ impl Policy {
     }
 }
 
+/// An unordered pair of agent ids — a channel is between two agents, so `(a, b)` and
+/// `(b, a)` are the same pair. Canonicalized (sorted) on construction so it dedups and
+/// compares regardless of argument order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Pair(pub String, pub String);
+
+impl Pair {
+    /// Build the canonical (sorted) pair of two agent ids.
+    pub fn new(a: impl Into<String>, b: impl Into<String>) -> Self {
+        let (a, b) = (a.into(), b.into());
+        if a <= b {
+            Pair(a, b)
+        } else {
+            Pair(b, a)
+        }
+    }
+}
+
+/// A tenant's declared network (#102): the member agents and the [`Policy`] governing
+/// who may talk to whom. The declarative desired state the SDN-style controller
+/// reconciles the live mesh toward.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Network {
+    /// The agents that are members of this network.
+    #[serde(default)]
+    pub agents: Vec<Agent>,
+    /// The policy governing channel establishment between them.
+    #[serde(default)]
+    pub policy: Policy,
+}
+
+impl Network {
+    /// The set of agent-pairs that **may** establish a channel under the policy — the
+    /// desired connectivity. A pair is included iff
+    /// [`Policy::may_establish_channel`] allows it (bidirectional). Self-pairs are
+    /// excluded; the result is canonicalized (each pair once, order-independent).
+    pub fn desired_channels(&self) -> BTreeSet<Pair> {
+        let mut out = BTreeSet::new();
+        for (i, a) in self.agents.iter().enumerate() {
+            for b in &self.agents[i + 1..] {
+                if a.id == b.id {
+                    continue;
+                }
+                if self.policy.may_establish_channel(a, b).allowed {
+                    out.insert(Pair::new(&a.id, &b.id));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The diff between a network's desired connectivity and what is live now (#102): the
+/// channels to **establish** (compile grants for + bring up) and to **revoke** (tear
+/// down), so the controller makes the live mesh match the declaration. A pure set diff —
+/// the actual grant minting / teardown is the caller's job.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reconciliation {
+    /// In desired but not live — bring these channels up.
+    pub to_establish: Vec<Pair>,
+    /// Live but no longer desired — tear these channels down.
+    pub to_revoke: Vec<Pair>,
+}
+
+impl Reconciliation {
+    /// Whether the live mesh already matches the desired state (nothing to do).
+    pub fn is_empty(&self) -> bool {
+        self.to_establish.is_empty() && self.to_revoke.is_empty()
+    }
+}
+
+/// Compute the reconciliation from `desired` (e.g. [`Network::desired_channels`]) against
+/// the `current` live channel set: `to_establish = desired − current`,
+/// `to_revoke = current − desired`. Deterministic (sorted) output.
+pub fn reconcile(desired: &BTreeSet<Pair>, current: &BTreeSet<Pair>) -> Reconciliation {
+    Reconciliation {
+        to_establish: desired.difference(current).cloned().collect(),
+        to_revoke: current.difference(desired).cloned().collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +360,62 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: Policy = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back, "policy survives a JSON round-trip (REST/OpenAPI surface)");
+    }
+
+    #[test]
+    fn pair_is_canonical_regardless_of_order() {
+        assert_eq!(Pair::new("b", "a"), Pair::new("a", "b"));
+        assert_eq!(Pair::new("a", "b"), Pair("a".into(), "b".into()));
+    }
+
+    #[test]
+    fn network_desired_channels_compiles_only_policy_permitted_pairs() {
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("dev-2", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+                Agent::new("fin-i", "finance", "internal"),
+                Agent::new("fin-s", "finance", "secret"),
+            ],
+            policy: company_policy(),
+        };
+        let desired = net.desired_channels();
+        // dev<->dev and dev<->ops (rules both ways, same level) are allowed…
+        assert!(desired.contains(&Pair::new("dev-1", "dev-2")));
+        assert!(desired.contains(&Pair::new("dev-1", "ops-1")));
+        assert!(desired.contains(&Pair::new("dev-2", "ops-1")));
+        // …dev<->finance has no rule, and finance internal<->secret is a MAC write-down,
+        // so neither is a desired channel.
+        assert!(!desired.contains(&Pair::new("dev-1", "fin-i")));
+        assert!(!desired.contains(&Pair::new("fin-i", "fin-s")));
+        assert_eq!(desired.len(), 3, "exactly the three mutually-permitted pairs");
+    }
+
+    #[test]
+    fn reconcile_diffs_desired_against_the_live_mesh() {
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("dev-2", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+            ],
+            policy: company_policy(),
+        };
+        let desired = net.desired_channels(); // {dev1-dev2, dev1-ops1, dev2-ops1}
+
+        // Live now: dev1-dev2 is already up; dev1-fin-i is stale (policy no longer
+        // permits it — the agent left / the rule changed).
+        let current: BTreeSet<Pair> =
+            [Pair::new("dev-1", "dev-2"), Pair::new("dev-1", "fin-i")].into_iter().collect();
+
+        let r = reconcile(&desired, &current);
+        // Establish the two missing allowed channels; revoke the stale one.
+        assert_eq!(r.to_establish, vec![Pair::new("dev-1", "ops-1"), Pair::new("dev-2", "ops-1")]);
+        assert_eq!(r.to_revoke, vec![Pair::new("dev-1", "fin-i")]);
+        assert!(!r.is_empty());
+
+        // Reconciling the desired state against itself is a no-op.
+        assert!(reconcile(&desired, &desired).is_empty(), "converged mesh needs no changes");
     }
 }
