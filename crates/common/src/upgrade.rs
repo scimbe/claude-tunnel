@@ -434,6 +434,130 @@ where
     }
 }
 
+/// **#104 direct-P2P orchestration (initiator side).** Run the relayed A2A session on the
+/// multiplexed pump while, in the background, opportunistically upgrading it to a direct link.
+/// First handshakes the relay Noise_IK session, then runs the pump; concurrently it advertises our
+/// reachable endpoint (`discover_direct`) via the in-band driver, and on the peer's `Ready` accepts
+/// the incoming direct dial + handshakes it (`accept_and_establish`, which returns the pump-ready
+/// `(TransportState, read, write)`), installs it into the pump's late-bind one-shot, and triggers
+/// the cutover. If either the negotiation or the establishment fails, the session simply stays on
+/// the relay. The pump alone decides when the session ends. **The direct Noise handshake happens
+/// only AFTER `Ready` is exchanged** — the responder replies `Ready` on reachability, not on a
+/// completed handshake — so the two sides handshake concurrently and neither blocks the other.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_upgradable_session_initiator<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
+    mut relay_send: RW,
+    mut relay_recv: RR,
+    local: P,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    mut coord: UpgradeCoordinator,
+    now: u64,
+    discover_direct: DF,
+    accept_and_establish: EF,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    DF: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Option<String>>,
+    EF: FnOnce() -> EFut,
+    EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    let relay_ts =
+        crate::a2a::a2a_initiate(&mut relay_send, &mut relay_recv, own_noise_private, peer_noise_public).await?;
+    let (plain_r, plain_w) = tokio::io::split(local);
+    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
+
+    let coordinator = async move {
+        let mut dir_tx = Some(dir_tx);
+        if let Ok(Some(_ep)) =
+            drive_initiator_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, discover_direct).await
+        {
+            if let Some(session) = accept_and_establish().await {
+                if let Some(tx) = dir_tx.take() {
+                    let _ = tx.send(session);
+                }
+                let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
+            }
+        }
+        // Drop an un-sent `dir_tx` so the pump's installer unblocks (stay on relay), then PARK:
+        // the coordinator must never resolve, or `select!` would drop the pump future when it does.
+        drop(dir_tx.take());
+        std::future::pending::<()>().await
+    };
+    let pump = crate::noise::noise_pump_multiplexed(
+        relay_ts, relay_recv, relay_send, plain_r, plain_w, ctl_rx, in_tx, dir_rx,
+    );
+    tokio::select! {
+        res = pump => res,
+        _ = coordinator => unreachable!("the upgrade coordinator parks after its one-shot work"),
+    }
+}
+
+/// **#104 direct-P2P orchestration (responder side).** The mirror of
+/// [`run_upgradable_session_initiator`]: handshake the relay session, run the pump, and
+/// concurrently answer the peer's `Offer` — `dial_probe` checks the offered endpoint is reachable
+/// (the driver replies `Ready` on success), then `dial_and_establish` dials it + handshakes the
+/// direct Noise session, which is installed into the pump and cut over to. Establishment is done
+/// only after `Ready`, concurrently with the initiator's accept, so neither handshake blocks.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_upgradable_session_responder<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
+    mut relay_send: RW,
+    mut relay_recv: RR,
+    local: P,
+    own_noise_private: &[u8; 32],
+    mut coord: UpgradeCoordinator,
+    now: u64,
+    dial_probe: DF,
+    dial_and_establish: EF,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    DF: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = bool>,
+    EF: FnOnce(String) -> EFut,
+    EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    let relay_ts = crate::a2a::a2a_respond(&mut relay_send, &mut relay_recv, own_noise_private).await?;
+    let (plain_r, plain_w) = tokio::io::split(local);
+    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
+
+    let coordinator = async move {
+        let mut dir_tx = Some(dir_tx);
+        if let Ok(Some(ep)) =
+            drive_responder_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, dial_probe).await
+        {
+            if let Some(session) = dial_and_establish(ep).await {
+                if let Some(tx) = dir_tx.take() {
+                    let _ = tx.send(session);
+                }
+                let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
+            }
+        }
+        drop(dir_tx.take());
+        std::future::pending::<()>().await
+    };
+    let pump = crate::noise::noise_pump_multiplexed(
+        relay_ts, relay_recv, relay_send, plain_r, plain_w, ctl_rx, in_tx, dir_rx,
+    );
+    tokio::select! {
+        res = pump => res,
+        _ = coordinator => unreachable!("the upgrade coordinator parks after its one-shot work"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +792,87 @@ mod tests {
         assert_eq!(m.direct_bytes(), 900);
         assert_eq!(m.total_bytes(), 1_200);
         assert!((m.direct_fraction() - 0.75).abs() < 1e-9, "75% offloaded to direct");
+    }
+
+    #[tokio::test]
+    async fn upgradable_session_upgrades_a_relayed_transfer_to_direct_byte_exact() {
+        // #104 direct-P2P (frozen): the full orchestration — two peers run the relayed A2A session
+        // on the multiplexed pump, negotiate the upgrade in-band, install a direct session, and cut
+        // over — and a payload spanning the seam arrives byte-exact. The direct link is injected
+        // (pre-handshaked) so this is a deterministic unit proof of the COMPOSITION; the live dial +
+        // NAT hole-punch is H4.
+        use crate::a2a::establish_direct_session;
+        use crate::noise::generate_static_keypair;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let a = generate_static_keypair(); // initiator (channel role)
+        let b = generate_static_keypair(); // responder
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+
+        // Pre-handshake the DIRECT session over a duplex pair; its halves become the direct data
+        // path. The dialer (responder) is the direct-Noise initiator, matching who-dials-first.
+        let (hd_r2i_w, hd_r2i_r) = tokio::io::duplex(1 << 16); // responder→initiator direct
+        let (hd_i2r_w, hd_i2r_r) = tokio::io::duplex(1 << 16); // initiator→responder direct
+        let resp_est = tokio::spawn(async move {
+            establish_direct_session(hd_r2i_w, hd_i2r_r, true, &b_priv, &a_pub).await
+        });
+        let (ini_ts, ini_dr, ini_dw) =
+            establish_direct_session(hd_i2r_w, hd_r2i_r, false, &a_priv, &[0u8; 32])
+                .await
+                .expect("initiator direct handshake");
+        let (resp_ts, resp_dr, resp_dw) = resp_est.await.expect("join").expect("responder direct handshake");
+
+        // Relay stream halves between the two peers.
+        let (ra2b_w, ra2b_r) = tokio::io::duplex(1 << 16);
+        let (rb2a_w, rb2a_r) = tokio::io::duplex(1 << 16);
+
+        // App endpoints: test → initiator's source; responder's sink → test.
+        let (ini_app, ini_test) = tokio::io::duplex(1 << 16);
+        let (_ini_test_r, mut ini_feed) = tokio::io::split(ini_test); // write payload to the WriteHalf
+        let (resp_app, resp_test) = tokio::io::duplex(1 << 16);
+        // Keep the responder's app-source write half open during negotiation (its outbound must
+        // stay open to send Ready); we shut it down after the assertion so both pumps wind down.
+        let (mut resp_out, resp_test_w) = tokio::io::split(resp_test); // read delivered from ReadHalf
+
+        let coord_i = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+        let coord_r = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+        const EP: &str = "203.0.113.9:7000";
+
+        let init_task = tokio::spawn(async move {
+            run_upgradable_session_initiator(
+                ra2b_w, rb2a_r, ini_app, &a_priv, &b_pub, coord_i, 5,
+                || async { Some(EP.to_string()) },
+                move || async move { Some((ini_ts, ini_dr, ini_dw)) },
+            )
+            .await
+        });
+        let resp_task = tokio::spawn(async move {
+            run_upgradable_session_responder(
+                rb2a_w, ra2b_r, resp_app, &b_priv, coord_r, 5,
+                |ep| async move { ep == EP },
+                move |_ep| async move { Some((resp_ts, resp_dr, resp_dw)) },
+            )
+            .await
+        });
+
+        // Stream a 2000-byte payload: some rides the relay, then the cutover, then the rest rides
+        // direct — all through the ONE app stream, transparently to the caller.
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        ini_feed.write_all(&payload).await.unwrap();
+        ini_feed.flush().await.unwrap();
+        ini_feed.shutdown().await.unwrap(); // EOF the source (drop alone won't, split shares the stream)
+
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(10), resp_out.read_exact(&mut got))
+            .await
+            .expect("the responder receives the whole payload within 10s")
+            .expect("read_exact");
+        assert_eq!(got, payload, "relayed transfer upgraded to direct with a byte-exact stream (#104)");
+
+        // The delivery is the assertion; tear the background sessions down without waiting on
+        // graceful relay/direct shutdown (which is a live-teardown concern, covered by #134/H4).
+        drop(resp_test_w);
+        init_task.abort();
+        resp_task.abort();
     }
 }
