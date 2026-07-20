@@ -119,13 +119,23 @@ where
     R: AsyncRead + Unpin,
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    let session = match role {
-        ChannelRole::Initiate => {
-            a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+    // #126: bound the post-pairing Noise_IK handshake. Every dial/accept step around this
+    // is already timed (DIRECT_DIAL_TIMEOUT / accept_timeout), but the handshake exchange
+    // itself was unbounded — a paired peer that never sends its message (crash, partition,
+    // a peer that admits then stalls) would block `read_frame` forever, hanging the session.
+    const A2A_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let handshake = async {
+        match role {
+            ChannelRole::Initiate => {
+                a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await
+            }
+            ChannelRole::Accept => a2a_respond(&mut send, &mut recv, own_noise_private).await,
         }
-        ChannelRole::Accept => a2a_respond(&mut send, &mut recv, own_noise_private).await,
-    }
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    };
+    let session = tokio::time::timeout(A2A_HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "a2a Noise_IK handshake timed out (#126)"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     noise_pump(session, BiStream { send, recv }, local).await
 }
@@ -1592,6 +1602,36 @@ mod tests {
             ChannelJoinOutcome::Refused => panic!("a valid join over :443 must be Admitted, not Refused"),
         }
         edge.await.expect("edge task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_channel_session_times_out_a_stalled_handshake() {
+        // #126 (frozen): if the paired peer never sends its Noise_IK handshake message
+        // (crash, partition, admit-then-stall), the session must TIME OUT — not block
+        // `read_frame` forever. Hold the transport's peer end OPEN but silent; the
+        // initiator writes m1 then blocks reading m2, so the #126 handshake timeout must
+        // fire (virtual time auto-advances under start_paused, so the test is instant).
+        use ct_common::noise::generate_static_keypair;
+        use tokio::io::{duplex, split};
+
+        let a = generate_static_keypair();
+        let b = generate_static_keypair();
+        let (transport, peer_transport) = duplex(16 * 1024);
+        let (_local_app, local) = duplex(16 * 1024);
+        let session = tokio::spawn(async move {
+            let (r, w) = split(transport);
+            run_channel_session_on_stream(w, r, ChannelRole::Initiate, &a.private, &b.public, local).await
+        });
+        let err = session
+            .await
+            .unwrap()
+            .expect_err("a stalled handshake must time out, not hang forever");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "must be the #126 handshake timeout, got: {err}"
+        );
+        drop(peer_transport);
     }
 
     #[tokio::test]

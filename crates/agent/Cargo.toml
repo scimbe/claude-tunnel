@@ -23,6 +23,8 @@ libp2p-stream = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+# test-util enables `#[tokio::test(start_paused = true)]` for deterministic timeout tests (#126).
+tokio = { version = "1", features = ["test-util"] }
 ct-edge = { path = "../edge" }
 ct-client = { path = "../client" }
 tower = { version = "0.5", features = ["util"] }
