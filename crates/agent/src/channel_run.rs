@@ -320,6 +320,12 @@ pub enum RelayFallback<'a> {
     /// A pre-dialed QUIC relay connection (the original relay leg): present the join over
     /// it and run the session over a fresh bi-stream ([`join_via_relay`]).
     Quic(&'a Connection),
+    /// A relay endpoint to dial **lazily** — only if the direct path fails and the relay
+    /// fallback actually fires (#103 fix). The eager variant held an idle QUIC connection
+    /// open through admission + the whole direct-dial/accept wait; the edge's accept loop
+    /// reaped that idle connection as a spurious `closed by peer: 0` (a `[quic-bistream]`
+    /// drop) before any join, masking the real outcome. Dialing on demand removes it.
+    QuicLazy(std::net::SocketAddr),
     /// Walk the relay ladder (direct QUIC → the `:443` front door) via
     /// [`join_via_relay_ladder`]. `rungs` is [`ChannelJoinCliConfig::relay_ladder`];
     /// `edge_cert` is the trust anchor the front-door TLS dial needs; `direct_timeout`
@@ -352,6 +358,14 @@ where
     match relay {
         RelayFallback::Quic(conn) => {
             join_via_relay(conn, request, holder, role, own_noise_private, peer_noise_public, local).await
+        }
+        RelayFallback::QuicLazy(addr) => {
+            // #103 fix: dial the relay only now, when the fallback has actually fired —
+            // no idle connection is held during admission/direct-dial for the edge to reap.
+            let conn = crate::transport::build_channel_dialer()?
+                .connect(addr, "localhost")?
+                .await?;
+            join_via_relay(&conn, request, holder, role, own_noise_private, peer_noise_public, local).await
         }
         RelayFallback::Ladder { rungs, edge_cert, direct_timeout } => {
             join_via_relay_ladder(
@@ -934,19 +948,15 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // port, then the `:443` front door — so a member whose relay port is ALSO filtered
     // (a fully `:443`-only network) can still relay. Without a cert, keep the eager
     // direct-QUIC relay dial unchanged (nothing regresses for members that reach the port).
-    let relay_conn;
     let relay = match &front_door_cert {
         Some(edge_cert) => RelayFallback::Ladder {
             rungs: &relay_ladder,
             edge_cert: edge_cert.clone(),
             direct_timeout: DIRECT_DIAL_TIMEOUT,
         },
-        None => {
-            relay_conn = crate::transport::build_channel_dialer()?
-                .connect(cfg.relay_addr, "localhost")?
-                .await?;
-            RelayFallback::Quic(&relay_conn)
-        }
+        // #103 fix: dial the relay LAZILY (only on direct-dial failure) instead of eagerly
+        // holding an idle connection the edge reaps as a spurious pre-admission close.
+        None => RelayFallback::QuicLazy(cfg.relay_addr),
     };
     // #121: a relay-only member skips binding the direct listener even in the Accept role —
     // it can't be dialed, so `run_channel_join_with_admission` relays it directly.
@@ -2646,6 +2656,109 @@ mod tests {
         a.abort();
         b.abort();
         rdv_task.abort();
+        relay_task.abort();
+        drop(blackhole);
+    }
+
+    #[tokio::test]
+    async fn quic_lazy_relay_dials_only_on_fallback_and_forms_the_tunnel() {
+        // #103 fix (frozen): RelayFallback::QuicLazy holds NO idle relay connection during
+        // admission/direct-dial — it dials the relay only when the direct path fails. Prove
+        // the lazily-dialed relay still forms the tunnel end to end. (The eager Quic variant
+        // held an idle connection the edge reaped as a spurious pre-admission close.)
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ct_common::noise::generate_static_keypair;
+        use ct_edge::channel_broker::broker_channel_relay;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ed25519_dalek::Signer;
+
+        let op = SigningKey::from_bytes(&[7u8; 32]);
+        let op_pub = op.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x31u8; 32]);
+        let holder_b = SigningKey::from_bytes(&[0x32u8; 32]);
+        let channel = [0xE4u8; 32];
+        let noise_a = generate_static_keypair();
+        let noise_b = generate_static_keypair();
+        let signed = |h: &SigningKey, dir| {
+            let g = ChannelGrant {
+                channel: ChannelId(channel),
+                holder: SigningKey::verifying_key(h).to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 1_000,
+            };
+            SignedChannelGrant { grant: g.clone(), signature: op.sign(&g.signing_bytes()).to_bytes() }
+        };
+        let req_a = ChannelJoinRequest { grant: signed(&holder_a, Direction::Initiate), endpoint: "203.0.113.1:7001".to_string() };
+        let req_b = ChannelJoinRequest { grant: signed(&holder_b, Direction::Accept), endpoint: "203.0.113.2:7002".to_string() };
+
+        // Blackhole direct peer -> the Initiate direct dial times out (Unreachable) -> relay.
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").expect("blackhole");
+        let blackhole_addr = blackhole.local_addr().expect("bh addr");
+        let hb_pub = holder_b.verifying_key().to_bytes();
+        let b_att = holder_b
+            .sign(&ct_common::channel::member_noise_attest_bytes(&ChannelId(channel), &hb_pub, &noise_b.public))
+            .to_bytes();
+        // Pre-computed admission (blackhole peer + B's attested Noise key) — no rendezvous stub.
+        let admission = ChannelJoinOutcome::Admitted {
+            peer_endpoint: blackhole_addr.to_string(),
+            peer_noise_pubkey: Some(noise_b.public),
+            peer_holder: Some(hb_pub),
+            peer_attestation: Some(b_att),
+            observed_reflexive: None,
+        };
+
+        // Real relay endpoint.
+        let (relay_ep, relay_cert) = build_server_endpoint_with_cert().expect("relay");
+        let relay_addr = relay_ep.local_addr().expect("relay addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&relay_ep, 500, move |c, _h| async move {
+                (c.0 == channel).then_some((op_pub, None, None))
+            })
+            .await
+            .map(|_| ())
+        });
+
+        // Initiator: run_channel_join_with_admission with the LAZY relay — direct blackhole
+        // -> Unreachable -> QuicLazy dials relay_addr on demand.
+        let (mut a_local_test, a_local_run) = tokio::io::duplex(8192);
+        let na = noise_a.private;
+        let a = tokio::spawn(async move {
+            run_channel_join_with_admission(
+                admission,
+                RelayFallback::QuicLazy(relay_addr),
+                &req_a,
+                &holder_a,
+                ChannelRole::Initiate,
+                &na,
+                None,
+                std::time::Duration::from_millis(400),
+                std::time::Duration::from_secs(2),
+                a_local_run,
+            )
+            .await
+        });
+
+        // Responder waits on the relay.
+        let (mut b_local_test, b_local_run) = tokio::io::duplex(8192);
+        let nb = noise_b.private;
+        let nap = noise_a.public;
+        let b = tokio::spawn(async move {
+            let rc = build_client_endpoint(relay_cert).expect("rc b");
+            let relay_conn = rc.connect(relay_addr, "localhost").expect("cfg").await.expect("rconn b");
+            join_via_relay(&relay_conn, &req_b, &holder_b, ChannelRole::Accept, &nb, &nap, b_local_run).await
+        });
+
+        let payload = b"lazily-dialed relay carries the tunnel (#103)";
+        a_local_test.write_all(payload).await.expect("write");
+        a_local_test.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        b_local_test.read_exact(&mut got).await.expect("read");
+        assert_eq!(got, payload, "the lazily-dialed relay formed the tunnel");
+
+        a.abort();
+        b.abort();
         relay_task.abort();
         drop(blackhole);
     }
