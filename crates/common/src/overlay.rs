@@ -259,12 +259,112 @@ where
     add_shortcuts(&nodes, &links, base, shortcut_budget)
 }
 
+/// Why a topology was rejected before optimization (#113 preventive). The overlay optimizer is
+/// **O(`shortcut_budget` · n³)** — `add_shortcuts` runs Floyd–Warshall over the n agents once
+/// per shortcut round — so an unbounded topology is a DoS vector against the control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopologyTooLarge {
+    /// More agents than the caller's `max_agents` policy allows.
+    TooManyAgents { agents: usize, max: usize },
+    /// A larger shortcut budget than the caller's `max_shortcut_budget` policy allows.
+    ShortcutBudgetTooHigh { budget: usize, max: usize },
+}
+
+impl std::fmt::Display for TopologyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TopologyTooLarge::TooManyAgents { agents, max } => {
+                write!(f, "topology has {agents} agents, exceeding the limit of {max}")
+            }
+            TopologyTooLarge::ShortcutBudgetTooHigh { budget, max } => {
+                write!(f, "shortcut budget {budget} exceeds the limit of {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TopologyTooLarge {}
+
+/// **Size-checked entry point** to [`plan_network_overlay`] (#113 precondition). A live handler
+/// MUST call this — not the raw optimizer — so an oversized request can't wedge the control
+/// plane: planning is O(`shortcut_budget` · n³), so a large agent count or budget is a DoS
+/// vector. Rejects a topology whose agent count exceeds `max_agents`, or whose `shortcut_budget`
+/// exceeds `max_shortcut_budget`, **before** any O(n³) work; on acceptance it delegates to
+/// [`plan_network_overlay`]. The limits are **parameters** — the caller supplies them as a
+/// product policy decided in its request-auth context, deliberately not hardcoded into the pure
+/// library fn (both bounds are inclusive).
+pub fn plan_network_overlay_bounded<F>(
+    network: &crate::policy::Network,
+    latency: F,
+    shortcut_budget: usize,
+    max_agents: usize,
+    max_shortcut_budget: usize,
+) -> Result<OverlayPlan, TopologyTooLarge>
+where
+    F: FnMut(&str, &str) -> Option<u64>,
+{
+    let agents = network.agents.len();
+    if agents > max_agents {
+        return Err(TopologyTooLarge::TooManyAgents { agents, max: max_agents });
+    }
+    if shortcut_budget > max_shortcut_budget {
+        return Err(TopologyTooLarge::ShortcutBudgetTooHigh {
+            budget: shortcut_budget,
+            max: max_shortcut_budget,
+        });
+    }
+    Ok(plan_network_overlay(network, latency, shortcut_budget))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn nodes(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_network_overlay_bounded_rejects_oversized_topologies_before_optimizing() {
+        // #113 (frozen): the optimizer is O(budget·n³), so the live entry point must reject an
+        // oversized topology BEFORE running it. `plan_network_overlay_bounded` enforces
+        // caller-supplied inclusive limits on agent count and shortcut budget.
+        use crate::policy::{Agent, AllowRule, Levels, Network, Policy, Selector};
+
+        // A network of `n` all-`dev` agents (dev↔dev permitted, so links exist).
+        let net = |n: usize| Network {
+            agents: (0..n).map(|i| Agent::new(format!("dev-{i}"), "dev", "internal")).collect(),
+            policy: Policy {
+                levels: Levels::new(["internal"]),
+                rules: vec![AllowRule { from: Selector::group("dev"), to: Selector::group("dev") }],
+                mac_flow_control: true,
+            },
+        };
+        let lat = |_a: &str, _b: &str| Some(1u64);
+
+        // Within both limits -> Ok, and it really planned (delegated to plan_network_overlay).
+        let ok = plan_network_overlay_bounded(&net(4), lat, 2, 8, 5).expect("within limits");
+        assert!(ok.connected, "4 all-permitted dev agents form a connected overlay");
+
+        // Too many agents -> rejected before any O(n³) work, with the offending counts.
+        assert_eq!(
+            plan_network_overlay_bounded(&net(10), lat, 2, 8, 5),
+            Err(TopologyTooLarge::TooManyAgents { agents: 10, max: 8 }),
+            "an over-limit agent count is refused"
+        );
+
+        // Budget over the cap -> rejected.
+        assert_eq!(
+            plan_network_overlay_bounded(&net(4), lat, 9, 8, 5),
+            Err(TopologyTooLarge::ShortcutBudgetTooHigh { budget: 9, max: 5 }),
+            "an over-limit shortcut budget is refused"
+        );
+
+        // Both limits are INCLUSIVE: exactly-at-max is accepted.
+        assert!(
+            plan_network_overlay_bounded(&net(8), lat, 5, 8, 5).is_ok(),
+            "agent count == max and budget == max are both allowed (inclusive bounds)"
+        );
     }
 
     #[test]
