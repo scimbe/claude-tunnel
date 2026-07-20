@@ -249,6 +249,95 @@ pub async fn run_bench_udp(
     samples
 }
 
+/// One bulk transfer over the streaming tunnel (#76 OV2, #57): dial →
+/// `client_tunnel_stream` bridging a local duplex to the Origin, write the whole
+/// `payload`, half-close so the echo Origin drains it, and read every echoed byte
+/// back — timed end-to-end. Returns the elapsed wall-clock **seconds** for the
+/// round-trip of `payload.len()` application bytes. The throughput analogue of
+/// [`run_once_stream`]: for the overlay-under-rate-limit dimension the metric is
+/// bytes/second, not RTT.
+///
+/// The write side runs on its own task so the echo can be drained concurrently: a
+/// bulk payload larger than the socket buffers would otherwise deadlock (the
+/// return path fills before the reader starts).
+async fn run_once_throughput(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+) -> Result<f64, BoxError> {
+    let start = Instant::now();
+    let conn = dial_edge(edge_addr, edge_cert).await?;
+    let (app_local, app_remote) = tokio::io::duplex(256 * 1024);
+
+    let token = cap.token.clone();
+    let cap_c = cap.clone();
+    let client_private = *client_private;
+    let tunnel =
+        tokio::spawn(
+            async move {
+                client_tunnel_stream(
+                    &conn,
+                    &token,
+                    &cap_c,
+                    &client_private,
+                    app_local,
+                    DEFAULT_STREAM_SETUP_DEADLINE,
+                )
+                .await
+            },
+        );
+
+    let (mut r, mut w) = tokio::io::split(app_remote);
+    let payload_owned = payload.to_vec();
+    let writer = tokio::spawn(async move {
+        w.write_all(&payload_owned).await?;
+        w.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let mut got = Vec::with_capacity(payload.len());
+    r.read_to_end(&mut got).await?;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    writer.await??;
+    let _ = tunnel.await;
+    if got.len() == payload.len() && got == payload {
+        Ok(elapsed)
+    } else {
+        Err("throughput bench response mismatch".into())
+    }
+}
+
+/// Run `iterations` bulk transfers of `payload` over the streaming tunnel and
+/// return the aggregate [`Throughput`] over the total bytes moved and total
+/// wall-clock elapsed (a sustained-transfer estimate; failed iterations are
+/// skipped). `None` when no transfer succeeds. The `bytes` reported are the
+/// one-way application payload summed across successful iterations; the elapsed
+/// time is the full echo round-trip, so the rate is an echo-goodput figure the
+/// evaluation interprets against the netem rate cap (#57).
+pub async fn run_bench_throughput(
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    iterations: usize,
+) -> Option<Throughput> {
+    let mut total_bytes: u64 = 0;
+    let mut total_secs: f64 = 0.0;
+    for _ in 0..iterations {
+        if let Ok(secs) =
+            run_once_throughput(edge_addr, edge_cert.clone(), cap, client_private, payload).await
+        {
+            total_bytes += payload.len() as u64;
+            total_secs += secs;
+        }
+    }
+    throughput(total_bytes, total_secs)
+}
+
 /// Format a CSV row for a netem condition and its latency [`Summary`]. Column
 /// order matches [`CSV_HEADER`]: the M16 stats are appended after `p95_ms`, and
 /// the raw per-iteration `samples` (#52) form the trailing `samples_ms` field —
@@ -602,6 +691,110 @@ mod tests {
         let samples = run_bench_stream(addr, cert, &cap, &client_kp.private, b"ping-stream", 3).await;
         assert_eq!(samples.len(), 3, "three streaming round-trips measured");
         assert!(summarize(&samples).is_some());
+
+        agent_task.abort();
+        edge.abort();
+        origin.abort();
+    }
+
+    #[tokio::test]
+    async fn run_bench_throughput_measures_transfer() {
+        // The throughput-mode bench (#57): the agent serves the streaming
+        // serve_noise_stream path and run_bench_throughput moves a bulk payload
+        // (larger than one socket buffer, to exercise the concurrent drain) over
+        // the tunnel, returning a Throughput over the bytes actually transferred.
+        use ct_agent::serve::serve_noise_stream;
+        use ct_common::metrics::TunnelMetrics;
+        use ct_common::noise::generate_static_keypair;
+        use ct_common::pow::Challenge;
+        use ct_common::{OriginIdentity, RoutingToken};
+        use ct_edge::serve::serve_connection;
+        use ct_edge::state::EdgeState;
+        use ct_edge::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use quinn::Connection;
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let token = RoutingToken([9u8; 32]);
+        let challenge = Challenge {
+            nonce: [0x11; 16],
+            difficulty: 6,
+        };
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // Multi-accept streaming echo Origin (one connection per iteration).
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = origin_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            }
+        });
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+
+        let state_e = state.clone();
+        let chal_e = challenge.clone();
+        let edge = tokio::spawn(async move {
+            while let Some(inc) = server.accept().await {
+                let state = state_e.clone();
+                let chal = chal_e.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = inc.await {
+                        let _ = serve_connection(&conn, &state, &chal).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut rs, mut rr) = agent_conn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+        let origin_priv = origin_kp.private;
+        let metrics = Arc::new(TunnelMetrics::new());
+        let agent_task = tokio::spawn(async move {
+            while let Ok((s, r)) = agent_conn.accept_bi().await {
+                let priv_ = origin_priv;
+                let m = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    let _ = serve_noise_stream(s, r, origin_addr, &[priv_], m).await;
+                });
+            }
+        });
+
+        // 256 KiB per transfer × 2 iterations = 512 KiB aggregated.
+        let payload = vec![0x5au8; 256 * 1024];
+        let t = run_bench_throughput(addr, cert, &cap, &client_kp.private, &payload, 2)
+            .await
+            .expect("bulk transfer produced a throughput");
+        assert_eq!(t.bytes, 2 * 256 * 1024, "aggregate bytes over 2 transfers");
+        assert!(t.secs > 0.0, "positive elapsed time");
+        assert!(t.mbps > 0.0 && t.mib_s > 0.0, "positive throughput");
 
         agent_task.abort();
         edge.abort();

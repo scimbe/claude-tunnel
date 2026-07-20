@@ -7,7 +7,10 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use ct_client::bench::{csv_row, run_bench, run_bench_stream, run_bench_udp, summarize};
+use ct_client::bench::{
+    csv_row, run_bench, run_bench_stream, run_bench_throughput, run_bench_udp, summarize,
+    throughput_csv_row,
+};
 use ct_client::config::ClientConfig;
 use ct_client::ladder::{
     connect_via_ladder, filtered_ladder, network_signature, LadderCache, Rung,
@@ -180,6 +183,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             DEFAULT_STREAM_SETUP_DEADLINE,
         )
         .await;
+    }
+
+    // Throughput (bulk-transfer) bench mode (#57): move a fixed CT_BENCH_BYTES
+    // payload over the streaming tunnel and emit a throughput RESULT row
+    // (delay,loss,rate,bytes,secs,mbps,mib_s) — the bandwidth dimension under the
+    // netem rate cap (CT_NETEM_RATE), distinct from the latency modes that report
+    // RTT. CT_BENCH_BYTES sizes the payload (default 8 MiB); CT_CLIENT_ITERATIONS
+    // (>=1) aggregates that many transfers into a sustained-throughput estimate.
+    if matches!(
+        std::env::var("CT_BENCH_MODE").as_deref(),
+        Ok("throughput") | Ok("bulk")
+    ) {
+        let bytes: usize = std::env::var("CT_BENCH_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(8 * 1024 * 1024);
+        let bulk = vec![0u8; bytes];
+        let t = run_bench_throughput(
+            edge_addr,
+            edge_cert,
+            &cap,
+            &client_kp.private,
+            &bulk,
+            iterations.max(1),
+        )
+        .await
+        .ok_or("throughput bench produced no successful transfer")?;
+        let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();
+        let loss = std::env::var("CT_BENCH_LOSS").unwrap_or_default();
+        let rate = std::env::var("CT_BENCH_RATE").unwrap_or_default();
+        println!("RESULT {}", throughput_csv_row(&delay, &loss, &rate, &t));
+        eprintln!(
+            "ct-client: throughput {} bytes in {:.3}s = {:.3} mbit/s ({:.3} MiB/s)",
+            t.bytes, t.secs, t.mbps, t.mib_s
+        );
+        return Ok(());
     }
 
     // Bench mode: run N round-trips and emit a labeled CSV row. CT_BENCH_MODE

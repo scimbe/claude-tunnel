@@ -30,12 +30,70 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use ct_client::bench::{csv_row, summarize};
+use ct_client::bench::{csv_row, summarize, throughput, throughput_csv_row};
 use ct_client::transport::{dial_edge, load_cert};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A bulk transfer larger than one socket buffer must be drained concurrently with
+/// the write, or the return path fills and deadlocks. Cap on the echoed read so a
+/// runaway peer can't allocate unbounded memory (256 MiB — well above any smoke
+/// payload).
+const MAX_BULK_BYTES: usize = 256 * 1024 * 1024;
+
+/// One direct-TCP bulk transfer: connect → write the whole `payload` on a task,
+/// half-close, drain the echo concurrently. Returns the elapsed **seconds** for
+/// the round-trip of `payload.len()` bytes (the direct-baseline analogue of the
+/// tunnel `run_once_throughput`, #57).
+async fn tcp_throughput_once(target: SocketAddr, payload: &[u8]) -> Result<f64, BoxError> {
+    let start = Instant::now();
+    let stream = TcpStream::connect(target).await?;
+    let (mut r, mut w) = stream.into_split();
+    let payload_owned = payload.to_vec();
+    let writer = tokio::spawn(async move {
+        w.write_all(&payload_owned).await?;
+        w.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+    let mut got = Vec::with_capacity(payload.len());
+    r.read_to_end(&mut got).await?;
+    let elapsed = start.elapsed().as_secs_f64();
+    writer.await??;
+    if got.len() == payload.len() {
+        Ok(elapsed)
+    } else {
+        Err("tcp bulk echo length mismatch".into())
+    }
+}
+
+/// One direct-QUIC bulk transfer: dial → open_bi → write the whole `payload` on a
+/// task, finish, drain the echo concurrently (large read cap for the bulk path).
+async fn quic_throughput_once(
+    target: SocketAddr,
+    cert: rustls::pki_types::CertificateDer<'static>,
+    payload: &[u8],
+) -> Result<f64, BoxError> {
+    let start = Instant::now();
+    let conn = dial_edge(target, cert).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let payload_owned = payload.to_vec();
+    let writer = tokio::spawn(async move {
+        send.write_all(&payload_owned).await?;
+        send.finish()?;
+        Ok::<(), BoxError>(())
+    });
+    let got = recv.read_to_end(MAX_BULK_BYTES).await?;
+    let elapsed = start.elapsed().as_secs_f64();
+    writer.await??;
+    conn.close(0u32.into(), b"done");
+    if got.len() == payload.len() {
+        Ok(elapsed)
+    } else {
+        Err("quic bulk echo length mismatch".into())
+    }
+}
 
 /// One fresh-connection TCP round-trip: connect → write → half-close → read echo.
 async fn tcp_once(target: SocketAddr, payload: &[u8]) -> Result<f64, BoxError> {
@@ -108,6 +166,50 @@ async fn main() -> Result<(), BoxError> {
         None
     };
 
+    let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();
+    let loss = std::env::var("CT_BENCH_LOSS").unwrap_or_default();
+    let rate = std::env::var("CT_BENCH_RATE").unwrap_or_default();
+
+    // Throughput (bulk-transfer) baseline (#57): move a fixed CT_BENCH_BYTES
+    // payload over the direct TCP/QUIC path and emit a throughput RESULT row
+    // (delay,loss,rate,bytes,secs,mbps,mib_s) in the same format the tunnel
+    // throughput bench prints — the direct QUIC-vs-TCP bandwidth comparison the
+    // rate-limited sweep diffs against. Selected by CT_BENCH_MODE=throughput|bulk.
+    if matches!(
+        std::env::var("CT_BENCH_MODE").as_deref(),
+        Ok("throughput") | Ok("bulk")
+    ) {
+        let bytes: usize = std::env::var("CT_BENCH_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&b| b > 0 && b <= MAX_BULK_BYTES)
+            .unwrap_or(8 * 1024 * 1024);
+        let bulk = vec![0u8; bytes];
+        let mut total_bytes: u64 = 0;
+        let mut total_secs: f64 = 0.0;
+        for _ in 0..iterations.max(1) {
+            let r = match proto.as_str() {
+                "quic" => quic_throughput_once(target, cert.clone().unwrap(), &bulk).await,
+                _ => tcp_throughput_once(target, &bulk).await,
+            };
+            match r {
+                Ok(secs) => {
+                    total_bytes += bulk.len() as u64;
+                    total_secs += secs;
+                }
+                Err(e) => eprintln!("direct_bench: throughput iteration failed: {e}"),
+            }
+        }
+        let t = throughput(total_bytes, total_secs)
+            .ok_or("direct throughput bench produced no successful transfer")?;
+        println!("RESULT {}", throughput_csv_row(&delay, &loss, &rate, &t));
+        eprintln!(
+            "direct_bench: proto={} throughput {} bytes in {:.3}s = {:.3} mbit/s ({:.3} MiB/s)",
+            proto, t.bytes, t.secs, t.mbps, t.mib_s
+        );
+        return Ok(());
+    }
+
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let r = match proto.as_str() {
@@ -121,9 +223,6 @@ async fn main() -> Result<(), BoxError> {
     }
 
     let summary = summarize(&samples).ok_or("direct bench produced no samples")?;
-    let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();
-    let loss = std::env::var("CT_BENCH_LOSS").unwrap_or_default();
-    let rate = std::env::var("CT_BENCH_RATE").unwrap_or_default();
     println!("RESULT {}", csv_row(&delay, &loss, &rate, &summary, &samples));
     eprintln!(
         "direct_bench: proto={} {}/{} iterations, mean {:.2}ms p95 {:.2}ms",

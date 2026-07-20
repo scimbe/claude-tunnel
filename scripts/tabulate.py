@@ -40,8 +40,13 @@ BOOTSTRAP_RESAMPLES = 10000
 BOOTSTRAP_SEED = 52
 
 CSV = os.environ.get("TABLE_CSV", "docs/thesis/data/latency.csv")
-OUT_MD = os.environ.get("TABLE_MD", "docs/thesis/data/results-table.md")
-OUT_TEX = os.environ.get("TABLE_TEX", "docs/thesis/data/results-table.tex")
+# When an explicit TABLE_MD/TABLE_TEX is given it wins; otherwise the output name
+# depends on the CSV schema (latency → results-table.*, throughput → throughput-table.*),
+# resolved in main() once the rows are loaded.
+_MD_ENV = os.environ.get("TABLE_MD")
+_TEX_ENV = os.environ.get("TABLE_TEX")
+OUT_MD = _MD_ENV or "docs/thesis/data/results-table.md"
+OUT_TEX = _TEX_ENV or "docs/thesis/data/results-table.tex"
 
 
 def num(s):
@@ -281,6 +286,81 @@ def annotate_ci(rows):
         r["_ci_lo"], r["_ci_hi"] = ci if ci else (None, None)
 
 
+def has_throughput(rows):
+    """True when the CSV carries the bulk-transfer throughput schema (#57) — i.e.
+    at least one row has a non-empty ``mbps`` cell. Absent → the latency tables
+    render exactly as before (backward-compatible, like the #52 overhead column)."""
+    return any((r.get("mbps") or "").strip() for r in rows)
+
+
+def mib_cell(r):
+    """Payload size in MiB from the ``bytes`` column; ``-`` when absent."""
+    b = r.get("bytes")
+    if b in (None, ""):
+        return "-"
+    try:
+        return f"{float(b) / (1024.0 * 1024.0):.1f}"
+    except ValueError:
+        return "-"
+
+
+def write_throughput_md(rows, mode_col, rate_col):
+    head = (["Modus"] if mode_col else []) + ["Verzögerung", "Verlust"]
+    if rate_col:
+        head.append("Rate")
+    head += ["Nutzlast (MiB)", "Dauer (s)", "Durchsatz (Mbit/s)", "Durchsatz (MiB/s)"]
+    align = ["---"] * len(head)
+    lines = ["| " + " | ".join(head) + " |", "| " + " | ".join(align) + " |"]
+    for r in rows:
+        cells = ([mode_of(r)] if mode_col else []) + [r["delay"] or "0ms", r["loss"] or "0%"]
+        if rate_col:
+            cells.append(r["rate"] or "—")
+        cells += [mib_cell(r), f1(r, "secs"), f1(r, "mbps"), f1(r, "mib_s")]
+        lines.append("| " + " | ".join(cells) + " |")
+    with open(OUT_MD, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("tabulate: wrote", OUT_MD)
+
+
+def write_throughput_tex(rows, mode_col, rate_col):
+    cols = ("l" if mode_col else "") + "ll" + ("l" if rate_col else "") + "rrrr"
+    head = (["Modus"] if mode_col else []) + ["Verzögerung", "Verlust"]
+    if rate_col:
+        head.append("Rate")
+    head += ["Nutzlast", "Dauer", "Durchsatz", "Durchsatz"]
+    lead = 3 if rate_col else 2
+    lead += 1 if mode_col else 0
+    unit = [""] * lead + ["(MiB)", "(s)", "(Mbit/s)", "(MiB/s)"]
+    caption = (
+        r"Bulk-Transfer-Durchsatz je Betriebsart unter emulierter "
+        r"Bandbreitenbegrenzung (\texttt{tc netem rate}); der Durchsatz ist der "
+        r"End-zu-Ende-Goodput eines Echo-Transfers der angegebenen Nutzlast (die "
+        r"Zeit umfasst Hin- und R\"uckweg)."
+    )
+    out = [
+        r"\begin{table}[t]",
+        r"  \centering",
+        r"  \caption{" + caption + r"}",
+        r"  \label{tab:throughput}",
+        r"  \begin{tabular}{" + cols + "}",
+        r"    \toprule",
+        "    " + " & ".join(head) + r" \\",
+        "    " + " & ".join(unit) + r" \\",
+        r"    \midrule",
+    ]
+    for r in rows:
+        cells = ([tex_esc(mode_of(r))] if mode_col else [])
+        cells += [tex_esc(r["delay"] or "0ms"), tex_esc(r["loss"] or "0%")]
+        if rate_col:
+            cells.append(tex_esc(r["rate"] or "--"))
+        cells += [mib_cell(r), f1(r, "secs"), f1(r, "mbps"), f1(r, "mib_s")]
+        out.append("    " + " & ".join(cells) + r" \\")
+    out += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+    with open(OUT_TEX, "w") as f:
+        f.write("\n".join(out) + "\n")
+    print("tabulate: wrote", OUT_TEX)
+
+
 def selftest():
     """Validate the bootstrap estimator against a synthetic right-skewed sample.
 
@@ -308,11 +388,24 @@ def selftest():
 
 
 def main():
+    global OUT_MD, OUT_TEX
     rows = load()
-    annotate_ci(rows)
-    show_ci = has_samples(rows)
     mode_col = has_mode(rows)
     rate_col = has_rate(rows)
+    # Throughput CSV (#57): render a bandwidth table instead of the latency ones.
+    # Its rows have a different schema (bytes/secs/mbps/mib_s, no per-iteration
+    # samples), so it lives in a separate CSV and gets its own table files unless
+    # TABLE_MD/TABLE_TEX pin an explicit path.
+    if has_throughput(rows):
+        if _MD_ENV is None:
+            OUT_MD = "docs/thesis/data/throughput-table.md"
+        if _TEX_ENV is None:
+            OUT_TEX = "docs/thesis/data/throughput-table.tex"
+        write_throughput_md(rows, mode_col, rate_col)
+        write_throughput_tex(rows, mode_col, rate_col)
+        return
+    annotate_ci(rows)
+    show_ci = has_samples(rows)
     # FF2 (#51): when direct-baseline rows are present, annotate tunnel rows with
     # their overhead vs. the chosen direct baseline (default direct-tcp). Absent
     # baseline rows → oh is None → output is byte-identical to a tunnel-only run.

@@ -45,6 +45,8 @@ services:
     environment:
       CT_QUIC_ECHO_LISTEN: "0.0.0.0:4433"
       CT_QUIC_ECHO_CERT_OUT: "/shared/quic-echo-cert.der"
+      # Echo read cap; blank → binary default (256 MiB, enough for the bulk #57 payload).
+      CT_QUIC_ECHO_MAX_BYTES: "${QUIC_ECHO_MAX_BYTES:-}"
       CT_NETEM_DELAY: "${EDGE_DELAY:-}"
       CT_NETEM_LOSS: "${EDGE_LOSS:-}"
       CT_NETEM_RATE: "${EDGE_RATE:-}"
@@ -68,6 +70,10 @@ services:
       CT_DIRECT_CERT: "/shared/quic-echo-cert.der"
       CT_CLIENT_ITERATIONS: "${CLIENT_ITERATIONS:-30}"
       CT_CLIENT_PAYLOAD: "hello-direct"
+      # Bulk-transfer throughput baseline (#57): BENCH_MODE=throughput drives a
+      # direct bulk transfer instead of the latency round-trips; BENCH_BYTES sizes it.
+      CT_BENCH_MODE: "${BENCH_MODE:-}"
+      CT_BENCH_BYTES: "${BENCH_BYTES:-}"
       # Condition labels for the CSV row — the same knobs the server is shaped with.
       CT_BENCH_DELAY: "${EDGE_DELAY:-}"
       CT_BENCH_LOSS: "${EDGE_LOSS:-}"

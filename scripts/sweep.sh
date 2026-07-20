@@ -29,11 +29,15 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# --baseline selects the direct-connection (no-tunnel) measurement path.
+# --baseline selects the direct-connection (no-tunnel) measurement path;
+# --throughput selects the bulk-transfer bandwidth dimension (#57) instead of the
+# latency round-trips, emitting mode=throughput rows to a separate throughput CSV.
 BASELINE=0
+THROUGHPUT=0
 for arg in "$@"; do
     case "$arg" in
         --baseline) BASELINE=1 ;;
+        --throughput) THROUGHPUT=1 ;;
         *) echo "sweep: unknown arg '$arg'" >&2; exit 2 ;;
     esac
 done
@@ -44,14 +48,26 @@ else
     COMPOSE=(docker compose -f "$REPO_ROOT/docker/docker-compose.yml")
 fi
 
-# The baseline path defaults to its own file so it never clobbers tunnel rows;
-# SWEEP_APPEND=1 instead appends into the (existing) tunnel CSV for a combined diff.
-if [ "$BASELINE" = "1" ]; then
+# Default output file. The throughput dimension writes a SEPARATE CSV (its rows
+# have a different schema than the latency rows) so it never clobbers or misaligns
+# the latency table; the baseline path likewise defaults to its own file so it
+# never clobbers tunnel rows. SWEEP_APPEND=1 appends into the (existing) file.
+if [ "$THROUGHPUT" = "1" ] && [ "$BASELINE" = "1" ]; then
+    OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/throughput-baseline.csv}"
+elif [ "$THROUGHPUT" = "1" ]; then
+    OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/throughput.csv}"
+elif [ "$BASELINE" = "1" ]; then
     OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/latency-baseline.csv}"
 else
     OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/latency.csv}"
 fi
-ITER="${SWEEP_ITERATIONS:-30}"
+# A bulk transfer per iteration is expensive, so the throughput sweep defaults to
+# a handful of transfers per grid point rather than 30 latency round-trips.
+if [ "$THROUGHPUT" = "1" ]; then
+    ITER="${SWEEP_ITERATIONS:-3}"
+else
+    ITER="${SWEEP_ITERATIONS:-30}"
+fi
 # Space-separated matrix axes. An empty RATES axis means "unlimited bandwidth".
 # MODES selects the client bench path: "single" (one-shot) or "stream"
 # (full-duplex). "udp" needs its own overlay + bench variant (M16.2c).
@@ -59,13 +75,26 @@ MODES="${SWEEP_MODES:-single}"
 POWS="${SWEEP_POWS:-8}"
 DELAYS="${SWEEP_DELAYS:-0ms 20ms 50ms 100ms}"
 LOSSES="${SWEEP_LOSSES:-0% 1% 5%}"
-RATES="${SWEEP_RATES:-}"
+# The throughput dimension is defined by the rate cap, so its RATES axis defaults
+# to a couple of caps rather than "unlimited"; the latency sweep defaults to none.
+if [ "$THROUGHPUT" = "1" ]; then
+    RATES="${SWEEP_RATES:-10mbit 50mbit}"
+else
+    RATES="${SWEEP_RATES:-}"
+fi
+# Bulk payload size (bytes) per throughput transfer; drives CT_BENCH_BYTES.
+BYTES="${SWEEP_BYTES:-8388608}"
 # Baseline protocols: direct TCP (to the socat origin) and direct QUIC (to quic_echo).
 BASELINE_PROTOS="${SWEEP_BASELINE_PROTOS:-tcp quic}"
 
-# mode,pow prepended to the client's 13-column csv_row (delay..p99_ms plus the
-# trailing space-separated raw samples_ms field, #52, for the bootstrap CI).
-HEADER="mode,pow,delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms,samples_ms"
+# mode,pow prepended to the per-condition RESULT row. The throughput row carries
+# the bulk-transfer columns (bytes,secs,mbps,mib_s); the latency row carries the
+# client's 13-column csv_row (delay..p99_ms plus the trailing samples_ms, #52).
+if [ "$THROUGHPUT" = "1" ]; then
+    HEADER="mode,pow,delay,loss,rate,bytes,secs,mbps,mib_s"
+else
+    HEADER="mode,pow,delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms,samples_ms"
+fi
 
 mkdir -p "$(dirname "$OUT")"
 # Append mode keeps existing rows (e.g. tunnel rows) and reuses their header; a
@@ -88,7 +117,7 @@ run_condition() {
         compose+=(-f "$REPO_ROOT/docker/docker-compose.udpbench.yml")
     fi
     local out row
-    out=$(BENCH_MODE="$mode" EDGE_POW_DIFFICULTY="$pow" \
+    out=$(BENCH_MODE="$mode" BENCH_BYTES="$BYTES" EDGE_POW_DIFFICULTY="$pow" \
           EDGE_DELAY="$delay" EDGE_LOSS="$loss" EDGE_RATE="$rate" \
           CLIENT_ITERATIONS="$ITER" \
           "${compose[@]}" up --no-build --abort-on-container-exit --exit-code-from client 2>&1 || true)
@@ -111,6 +140,7 @@ run_baseline_condition() {
     echo "sweep: baseline proto=$proto delay=${delay:-none} loss=${loss:-none} rate=${rate:-none} (${ITER} iters)"
     local out row
     out=$(DIRECT_PROTO="$proto" DIRECT_TARGET="$target" \
+          BENCH_MODE="$BASELINE_BENCH_MODE" BENCH_BYTES="$BYTES" \
           EDGE_DELAY="$delay" EDGE_LOSS="$loss" EDGE_RATE="$rate" \
           CLIENT_ITERATIONS="$ITER" \
           "${COMPOSE[@]}" up --no-build --abort-on-container-exit --exit-code-from client 2>&1 || true)
@@ -123,6 +153,15 @@ run_baseline_condition() {
         echo "  !! no RESULT row — condition failed, skipping"
     fi
 }
+
+# The throughput dimension reuses the same run/baseline drivers: the tunnel sweep
+# drives the client's throughput bench mode (MODES=throughput), and the baseline
+# sweep drives direct_bench's throughput mode (BASELINE_BENCH_MODE=throughput).
+BASELINE_BENCH_MODE=""
+if [ "$THROUGHPUT" = "1" ]; then
+    BASELINE_BENCH_MODE="throughput"
+    MODES="throughput"
+fi
 
 if [ "$BASELINE" = "1" ]; then
     for proto in $BASELINE_PROTOS; do

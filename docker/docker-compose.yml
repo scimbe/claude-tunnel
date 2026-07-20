@@ -77,6 +77,8 @@ services:
       CT_CLIENT_PAYLOAD: "hello-tunnel"
       CT_CLIENT_ITERATIONS: "${CLIENT_ITERATIONS:-1}"
       CT_BENCH_MODE: "${BENCH_MODE:-}"
+      # Bulk payload size for the throughput bench mode (#57); blank → binary default.
+      CT_BENCH_BYTES: "${BENCH_BYTES:-}"
       CT_BENCH_DELAY: "${EDGE_DELAY:-}"
       CT_BENCH_LOSS: "${EDGE_LOSS:-}"
       CT_BENCH_RATE: "${EDGE_RATE:-}"
