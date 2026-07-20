@@ -997,6 +997,20 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         let channel = member.req.grant.grant.channel;
         let holder = member.req.grant.grant.holder;
 
+        // #103 blanket trace (round 3, central-requested 2026-07-20): round-2 proved BOTH
+        // members reach `[bi-open]` then go silent — individual admission is silent on success,
+        // so the dark span is now whether each member's admission actually COMPLETED and whether
+        // the pairer matched them. `[admitted]` firing here proves `accept_member` returned (the
+        // full join read + possession round-trip succeeded) — a `[bi-open]` with no following
+        // `[admitted]` means that member hung inside the read/possession instead. Then log the
+        // `offer()` outcome so we see definitively whether both members are recognized as the
+        // same channel and Paired, or each Parked (never matched — central's leading theory).
+        eprintln!(
+            "ct-edge: channel-accept [admitted] channel={} holder={} (#103) — offering to pairer",
+            hex_of(&channel.0),
+            hex_of(&holder)
+        );
+
         // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
         let outcome = pairer.lock().unwrap().offer(WaitingMember {
             channel,
@@ -1006,10 +1020,22 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         });
         match outcome {
             // First holder of this channel — parked, waiting for its partner.
-            PairOutcome::Parked => {}
+            PairOutcome::Parked => {
+                eprintln!(
+                    "ct-edge: channel-accept [offer:parked] channel={} holder={} (#103) — first holder, awaiting partner",
+                    hex_of(&channel.0),
+                    hex_of(&holder)
+                );
+            }
             // Its partner met it: complete the pair on its OWN task so the accept loop stays
             // free to admit the next member. This is the fix for the single-slot wedge (#1).
             PairOutcome::Paired(a, b) => {
+                eprintln!(
+                    "ct-edge: channel-accept [offer:paired] channel={} holders={}/{} (#103) — matched, spawning pair completion",
+                    hex_of(&channel.0),
+                    hex_of(&a.holder),
+                    hex_of(&b.holder)
+                );
                 let fut = complete(a.payload, b.payload, now);
                 tokio::spawn(async move {
                     if let Err(e) = fut.await {
@@ -1020,6 +1046,11 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             // Same holder re-presented before its partner arrived: the fresh offer stays
             // parked; close the stale connection (pairing a holder with itself is refused).
             PairOutcome::Superseded(stale) => {
+                eprintln!(
+                    "ct-edge: channel-accept [offer:superseded] channel={} holder={} (#103) — same holder re-presented, closing stale",
+                    hex_of(&channel.0),
+                    hex_of(&holder)
+                );
                 stale.payload.conn.close(0u32.into(), b"superseded by newer join");
             }
         }
