@@ -2788,8 +2788,7 @@ mesh-independent core lands first:
     (via `explain`) so a non-conformant join is refused with `NO <reason>` — needs the policy served to the edge
     + the live A2A mesh (#99/#98/#100) to prove end-to-end. **#102-mcp** ⏳: expose `net.apply/grant/revoke/
     explain` as agent-native MCP tools (`explain` now has its core). Both exercise the live mesh.
-- **#102-rest** ⏳ then: `PUT /networks/:id` + imperative overrides (`POST /channels`, `/grants/:id/revoke`),
-  OpenAPI schema, OIDC-bearer + scoped-API-token authN.
+- **#102-rest** ✅ (mostly — verified 2026-07-20): `PUT /me/networks/:id` + `GET` + `/plan` are built and owner-scoped (`authed_network_router`, tested `authed_network_api_is_owner_scoped_and_plans_from_the_policy`); the imperative overrides are also built as `authed_channel_router` — `POST /me/channels` (register), `POST /me/channels/:channel/members` (add), `POST /me/channels/:channel/members/:holder/remove` (**revocation**); all under OIDC-bearer authN. **Remaining (low-priority, not blocking):** an OpenAPI/schema document (no `utoipa` dep today) and an *optional* scoped-API-token authN alongside OIDC — the OIDC-bearer gate already covers every writer (#87), so this is a convenience, not a gap. *(Corrected a stale ⏳ marker: PUT + imperative overrides + revocation were already landed.)*
 - **#102-broker-enforce** ⏳: the edge broker's `authorize` closure consults the compiled policy so a
   non-conformant join is refused with `NO <reason>` (defense-in-depth with the agent-side grant check).
 - **#102-mcp** ⏳: the same operations as agent-native MCP tools (`net.apply`, `net.grant`, `net.revoke`,
