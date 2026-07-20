@@ -85,13 +85,32 @@ where
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&bytes).await?;
 
-    // Answer the possession challenge if the edge issues one; a refusal before the
-    // possession step finishes the stream early, so read_exact then errors.
-    let mut challenge = [0u8; 32];
-    if recv.read_exact(&mut challenge).await.is_ok() {
-        let sig = holder.sign(&challenge).to_bytes();
-        send.write_all(&sig).await?;
+    // The edge's response is one of: a 32-byte possession challenge (proceed), a short
+    // "NO" (a pre-challenge validation refusal), a genuinely-malformed partial (a broken
+    // connection), or nothing. #129: the old `read_exact(challenge).is_ok()` silently fell
+    // through on ANY read failure and let it all become a generic `Refused`. We now read
+    // enough to react to what actually arrived. NOTE: over QUIC an *empty* response is
+    // wire-ambiguous — an explicit `NO` can race the connection teardown and arrive empty,
+    // so empty stays `Refused` (turning a raced refusal into an error would be worse); the
+    // server-side reason logs (#124-#128) are the authoritative diagnostic. Only a partial
+    // response that is neither a full challenge nor `NO` is *unambiguously* a broken stream.
+    let mut resp = Vec::new();
+    let _ = (&mut recv).take(32).read_to_end(&mut resp).await;
+    if resp.len() != 32 {
+        let text = String::from_utf8_lossy(&resp);
+        if resp.is_empty() || text.starts_with("NO") {
+            return Ok(ChannelJoinOutcome::Refused); // explicit NO, or an ambiguous empty (raced-NO/closed)
+        }
+        return Err(format!(
+            "channel join: the edge sent a malformed {}-byte response before the possession \
+             challenge — a broken connection, not a clean OK/NO (#129)",
+            resp.len()
+        )
+        .into());
     }
+    let challenge: [u8; 32] = resp.try_into().expect("length checked == 32");
+    let sig = holder.sign(&challenge).to_bytes();
+    send.write_all(&sig).await?;
     // Close the write half (EOF to the edge) — the QUIC `finish()` equivalent over a
     // generic stream. Lenient: on a refusal the edge may already have closed.
     let _ = send.shutdown().await;
@@ -303,6 +322,77 @@ mod tests {
                 "the client learns the peer endpoint over a non-QUIC stream",
             ),
             ChannelJoinOutcome::Refused => panic!("a valid join over the duplex must be Admitted, not Refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_reports_a_malformed_partial_response_as_a_distinct_error() {
+        // #129 (frozen): a partial pre-challenge response that is neither a full 32-byte
+        // challenge nor an explicit "NO" is UNAMBIGUOUSLY a broken stream — the client must
+        // return a DISTINCT Err, not silently conflate it into a generic Refused. (An *empty*
+        // response stays Refused: over QUIC an explicit NO can race the teardown to empty, so
+        // erroring on empty would misreport genuine refusals — see the fn comment.)
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+        let channel = [0x3Du8; 32];
+        let holder = SigningKey::from_bytes(&[0x22u8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.7:7007".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder).await
+        });
+        // "edge": read the framed request, then send a malformed partial (neither 32 bytes
+        // nor "NO") and close — a broken stream.
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let n = u16::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; n];
+        er.read_exact(&mut body).await.expect("request");
+        ew.write_all(b"XYZ").await.expect("partial"); // 3 bytes: not a challenge, not "NO"
+        let _ = ew.shutdown().await;
+        drop(ew);
+        drop(er);
+
+        let err = client
+            .await
+            .expect("client task")
+            .expect_err("a malformed partial response must be a DISTINCT error, not Refused");
+        assert!(
+            err.to_string().contains("#129") && err.to_string().contains("broken connection"),
+            "the error must name the broken-connection case, got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn present_channel_join_treats_an_explicit_pre_challenge_no_as_refused() {
+        // #129: an explicit pre-challenge "NO" (a policy refusal the edge writes before the
+        // challenge) stays Refused — distinct from a dropped connection.
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+        let channel = [0x3Eu8; 32];
+        let holder = SigningKey::from_bytes(&[0x23u8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.7:7007".to_string() };
+
+        let (client_end, edge_end) = tokio::io::duplex(4096);
+        let (cli_r, cli_w) = split(client_end);
+        let client = tokio::spawn(async move {
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder).await
+        });
+        let (mut er, mut ew) = split(edge_end);
+        let mut len_buf = [0u8; 2];
+        er.read_exact(&mut len_buf).await.expect("len");
+        let n = u16::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; n];
+        er.read_exact(&mut body).await.expect("request");
+        ew.write_all(b"NO").await.expect("no");
+        let _ = ew.shutdown().await;
+
+        match client.await.expect("client task").expect("an explicit NO is a clean Refused, not an error") {
+            ChannelJoinOutcome::Refused => {}
+            ChannelJoinOutcome::Admitted { .. } => panic!("an explicit NO must be Refused"),
         }
     }
 
