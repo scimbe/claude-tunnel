@@ -26,7 +26,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && mkdir -p /build/bin \
     && cp target/release/ct-edge target/release/ct-agent target/release/ct-client \
           target/release/ct-control-plane target/release/cp_selftest \
-          target/release/metrics_probe target/release/udp_echo /build/bin/
+          target/release/metrics_probe target/release/udp_echo \
+          target/release/quic_echo target/release/direct_bench /build/bin/
 
 FROM debian:bookworm-slim AS runtime
 # iproute2 for tc/netem inside the node containers; ca-certificates is harmless.
@@ -40,6 +41,8 @@ COPY --from=builder /build/bin/ct-control-plane /usr/local/bin/ct-control-plane
 COPY --from=builder /build/bin/cp_selftest /usr/local/bin/cp_selftest
 COPY --from=builder /build/bin/metrics_probe /usr/local/bin/metrics_probe
 COPY --from=builder /build/bin/udp_echo /usr/local/bin/udp_echo
+COPY --from=builder /build/bin/quic_echo /usr/local/bin/quic_echo
+COPY --from=builder /build/bin/direct_bench /usr/local/bin/direct_bench
 COPY docker/netem-entrypoint.sh /usr/local/bin/netem-entrypoint.sh
 RUN chmod +x /usr/local/bin/netem-entrypoint.sh
 CMD ["ct-edge"]

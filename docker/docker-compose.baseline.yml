@@ -1,0 +1,91 @@
+# Direct-connection baseline topology for the thesis FF2 measurement (#51).
+#
+# Answers "overhead vs. a direct connection" by measuring a client talking
+# STRAIGHT to a server over the SAME `tc netem` path the tunnel sweep uses — with
+# NO ct-edge / NO tunnel hop. The link impairment is applied on the SERVER hop via
+# the same EDGE_DELAY/EDGE_LOSS/EDGE_RATE knobs the tunnel run shapes the edge with
+# (netem-entrypoint.sh), so the netem path matches; the client is unshaped, exactly
+# as in the tunnel compose. `direct_bench` prints a `RESULT <csv_row>` line in the
+# same 12-column format the tunnel bench emits, so scripts/tabulate.py can diff
+# tunnel − baseline into an overhead column.
+#
+# Two protocols, selected by DIRECT_PROTO / DIRECT_TARGET (driven by
+# scripts/sweep.sh --baseline):
+#   DIRECT_PROTO=tcp  DIRECT_TARGET=10.5.0.3:8080   → direct TCP  to the socat origin
+#   DIRECT_PROTO=quic DIRECT_TARGET=10.5.0.2:4433   → direct QUIC to quic_echo
+#
+# Run one condition manually (30 iters, 20ms one-hop delay, direct TCP):
+#   EDGE_DELAY=20ms DIRECT_PROTO=tcp DIRECT_TARGET=10.5.0.3:8080 CLIENT_ITERATIONS=30 \
+#     docker compose -f docker/docker-compose.baseline.yml up --build \
+#       --abort-on-container-exit --exit-code-from client
+# Expected: the client logs "RESULT 20ms,,,30,..." and exits 0.
+
+name: ct-baseline
+
+services:
+  # Direct TCP echo origin (same image as the tunnel testbed's socat origin),
+  # netem-shaped on its egress with the same knobs the tunnel shapes the edge.
+  origin:
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:8080,reuseaddr,fork", "EXEC:/bin/cat"]
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.3
+
+  # Direct QUIC echo server, netem-shaped on its egress (the edge's hop analogue).
+  quic-echo:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ct-testbed
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
+    command: ["quic_echo"]
+    environment:
+      CT_QUIC_ECHO_LISTEN: "0.0.0.0:4433"
+      CT_QUIC_ECHO_CERT_OUT: "/shared/quic-echo-cert.der"
+      CT_NETEM_DELAY: "${EDGE_DELAY:-}"
+      CT_NETEM_LOSS: "${EDGE_LOSS:-}"
+      CT_NETEM_RATE: "${EDGE_RATE:-}"
+    volumes:
+      - shared:/shared
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.2
+
+  # Direct-baseline bench client (unshaped, like the tunnel client). Dials either
+  # the TCP origin or the QUIC echo, whichever DIRECT_PROTO/DIRECT_TARGET select.
+  client:
+    image: ct-testbed
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
+    command: ["direct_bench"]
+    environment:
+      CT_DIRECT_PROTO: "${DIRECT_PROTO:-tcp}"
+      CT_DIRECT_TARGET: "${DIRECT_TARGET:-10.5.0.3:8080}"
+      CT_DIRECT_CERT: "/shared/quic-echo-cert.der"
+      CT_CLIENT_ITERATIONS: "${CLIENT_ITERATIONS:-30}"
+      CT_CLIENT_PAYLOAD: "hello-direct"
+      # Condition labels for the CSV row — the same knobs the server is shaped with.
+      CT_BENCH_DELAY: "${EDGE_DELAY:-}"
+      CT_BENCH_LOSS: "${EDGE_LOSS:-}"
+      CT_BENCH_RATE: "${EDGE_RATE:-}"
+    volumes:
+      - shared:/shared
+    depends_on:
+      - origin
+      - quic-echo
+    networks:
+      ct-net:
+        ipv4_address: 10.5.0.5
+
+volumes:
+  shared:
+
+networks:
+  ct-net:
+    ipam:
+      config:
+        - subnet: 10.5.0.0/24
