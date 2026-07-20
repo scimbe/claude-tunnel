@@ -1004,6 +1004,15 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
 {
     let pairer: std::sync::Mutex<ChannelPairer<AdmittedMember>> =
         std::sync::Mutex::new(ChannelPairer::new());
+    // #103 (round 4, central-requested 2026-07-20): round-3 exposed the "impossible" case —
+    // two members admit with a byte-identical channel + distinct holders, yet BOTH `[offer:parked]`
+    // (offer() is provably correct, so the 2nd offer must not be seeing the 1st in the map). The
+    // stable address of THIS loop's pairer distinguishes the two live hypotheses: if the two
+    // offers log the SAME `pairer=` but the 2nd sees `size_before=0`, the map lost the 1st entry;
+    // if they log DIFFERENT `pairer=`, the two connections are being served by TWO accept loops
+    // (an endpoint split / double-spawn) — separate maps that can never pair. `size_before` is
+    // the map occupancy the instant before each offer.
+    let pairer_id = &pairer as *const _ as usize;
     loop {
         let now = now_fn();
 
@@ -1035,10 +1044,13 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         // `[admitted]` means that member hung inside the read/possession instead. Then log the
         // `offer()` outcome so we see definitively whether both members are recognized as the
         // same channel and Paired, or each Parked (never matched — central's leading theory).
+        let size_before = pairer.lock().unwrap().len();
         eprintln!(
-            "ct-edge: channel-accept [admitted] channel={} holder={} (#103) — offering to pairer",
+            "ct-edge: channel-accept [admitted] channel={} holder={} pairer={:x} size_before={} (#103) — offering to pairer",
             hex_of(&channel.0),
-            hex_of(&holder)
+            hex_of(&holder),
+            pairer_id,
+            size_before
         );
 
         // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
