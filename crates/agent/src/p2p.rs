@@ -552,20 +552,43 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
     // The circuit addresses (identical shape to `connected_relayed_stream_pair`): `relay_circuit`
     // is what A reserves + listens on; `a_via_relay` appends `/p2p/<A>` — the address B dials to
     // reach A through the relay. The `PeerId`s only name/route the hop, never authorize.
-    let mut client_a = build_dcutr_relay_client_swarm()?;
+    let client_a = build_dcutr_relay_client_swarm()?;
     let a_peer = *client_a.local_peer_id();
     let relay_circuit = relay_addr
         .with(Protocol::P2p(relay_peer))
         .with(Protocol::P2pCircuit);
     let a_via_relay = relay_circuit.clone().with(Protocol::P2p(a_peer));
 
-    // Client A accepts inbound `/ct/channel/1.0.0` substreams and makes its reservation.
-    let mut a_incoming = client_a.behaviour().stream.new_control().accept(CT_CHANNEL_PROTOCOL)?;
-    client_a.listen_on(relay_circuit)?;
+    // Client A reserves + accepts inbound substreams — via the production reserve/accept primitive
+    // (#136 N136.1), extracted so the LIVE relay-only agent can call the identical logic against a
+    // REAL relay. Awaiting it gates B's dial on A's reservation being live end to end.
+    let inbound_rx = dcutr_reserve_and_accept(client_a, relay_circuit).await?;
 
-    // A driver: signal once the reservation is accepted (so B doesn't dial before the relay knows
-    // how to reach A), then keep pumping the swarm — routing DCUtR's upgrade coordination too —
-    // and hand back the first inbound stream once B's circuit opens one.
+    // Client B dials A **through the relay** and opens the substream — via the production dialer
+    // primitive (#136 N136.1), extracted so the LIVE agent path can call the identical logic
+    // against a REAL relay instead of this in-process one.
+    let client_b = build_dcutr_relay_client_swarm()?;
+    let dialer_stream = dcutr_dial_via_relay(client_b, a_via_relay, a_peer).await?;
+    let listener_stream = inbound_rx.await?;
+    Ok((dialer_stream, listener_stream))
+}
+
+/// Reserve a slot on a **Circuit-Relay v2 relay** and accept the first inbound `/ct/channel/1.0.0`
+/// substream a peer opens through it (#136 N136.1 — the reserve/accept side of NAT-to-NAT, the
+/// relay-only peer's half). `relay_circuit` is `<relay>/p2p-circuit`; the caller advertises its own
+/// via-relay address (`relay_circuit.with(P2p(own_peer))`) so a peer can dial it. Awaits the
+/// reservation being accepted (so a dial can't race ahead of it), then drives the swarm forever on a
+/// detached task — routing DCUtR's upgrade coordination — and delivers the first inbound stream on
+/// the returned channel. Extracted from [`connected_dcutr_stream_pair`] so the live relay-only agent
+/// uses the identical logic against the real edge relay. Callers layer
+/// [`crate::a2a::establish_direct_over_duplex`] on top for auth + encryption (invariant #2); the
+/// `PeerId` only names/routes the hop, never authorizes (invariant #1).
+pub(crate) async fn dcutr_reserve_and_accept(
+    mut client: Swarm<DcutrRelayClientBehaviour>,
+    relay_circuit: Multiaddr,
+) -> Result<tokio::sync::oneshot::Receiver<P2pDuplex>, BoxError> {
+    let mut incoming = client.behaviour().stream.new_control().accept(CT_CHANNEL_PROTOCOL)?;
+    client.listen_on(relay_circuit)?;
     let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
     let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -573,7 +596,7 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
         let mut inbound_tx = Some(inbound_tx);
         loop {
             tokio::select! {
-                ev = client_a.next() => {
+                ev = client.next() => {
                     if let Some(SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
                         relay::client::Event::ReservationReqAccepted { .. },
                     ))) = ev
@@ -583,27 +606,18 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
                         }
                     }
                 }
-                Some((_peer, stream)) = a_incoming.next() => {
+                Some((_peer, stream)) = incoming.next() => {
                     if let Some(tx) = inbound_tx.take() {
-                        let _ = tx.send(stream);
+                        let _ = tx.send(stream.compat());
                     }
                 }
             }
         }
     });
-
-    // Gate B's dial on A's reservation being live end to end (reservation → dial → substream).
     reserved_rx
         .await
-        .map_err(|_| "client A driver ended before its relay reservation was accepted")?;
-
-    // Client B dials A **through the relay** and opens the substream — via the production dialer
-    // primitive (#136 N136.1), extracted so the LIVE agent path can call the identical logic
-    // against a REAL relay instead of this in-process one.
-    let client_b = build_dcutr_relay_client_swarm()?;
-    let dialer_stream = dcutr_dial_via_relay(client_b, a_via_relay, a_peer).await?;
-    let listener_stream = inbound_rx.await?;
-    Ok((dialer_stream, listener_stream.compat()))
+        .map_err(|_| "client driver ended before its relay reservation was accepted")?;
+    Ok(inbound_rx)
 }
 
 /// Dial a DCUtR-enabled peer **through a Circuit-Relay v2 relay** and open the `/ct/channel/1.0.0`
