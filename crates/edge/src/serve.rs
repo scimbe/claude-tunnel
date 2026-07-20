@@ -1027,6 +1027,35 @@ fn resolve_flood_limit(raw: Option<&str>, default: u32) -> Option<u32> {
     }
 }
 
+/// Resolve the Agent-Fabric channel **relay** listen address from the rendezvous
+/// `chan_addr` and an optional `CT_EDGE_CHANNEL_RELAY_LISTEN` override — refusing a
+/// collision with the rendezvous port. The relay MUST be a distinct endpoint: if the relay
+/// and rendezvous `run_channel_broker_loop`s bind the **same** address, the OS load-balances
+/// incoming channel connections across the two sockets (SO_REUSEADDR), so two members of one
+/// channel can land on different loops' pairers and **never match** — silently breaking all
+/// pairing (#103). Returns the default `chan_port + 1` when unset, the override when it
+/// parses AND is distinct, or `Err` on a collision (an override equal to the rendezvous, or
+/// the `port + 1` default saturating back onto `chan_addr` at port 65535).
+fn resolve_channel_relay_addr(
+    chan_addr: std::net::SocketAddr,
+    relay_override: Option<&str>,
+) -> Result<std::net::SocketAddr, String> {
+    let relay = relay_override
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+        .unwrap_or_else(|| {
+            std::net::SocketAddr::new(chan_addr.ip(), chan_addr.port().saturating_add(1))
+        });
+    if relay == chan_addr {
+        return Err(format!(
+            "channel relay address {relay} collides with the rendezvous address {chan_addr} — \
+             the relay must be a distinct endpoint (set CT_EDGE_CHANNEL_RELAY_LISTEN to a free \
+             port); refusing to bind two accept loops on one port (#103)"
+        ));
+    }
+    Ok(relay)
+}
+
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
     // Issue the Edge's leaf from an internal CA (M20.3b) and listen on both QUIC
     // (primary) and TLS-TCP (fallback) with that one shared leaf. Persist the CA
@@ -1371,13 +1400,19 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         // which authorizes both joins and splices their streams through the
                         // edge (ciphertext; the Noise_IK session stays end-to-end). Without
                         // this spawn, a NAT'd agent's relay connection has nowhere to go.
-                        let relay_addr = std::env::var("CT_EDGE_CHANNEL_RELAY_LISTEN")
-                            .ok()
-                            .filter(|s| !s.is_empty())
-                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
-                            .unwrap_or_else(|| {
-                                std::net::SocketAddr::new(chan_addr.ip(), chan_addr.port().saturating_add(1))
-                            });
+                        // #103 guard: the relay MUST be a distinct endpoint from the
+                        // rendezvous. If the configured relay addr collides with `chan_addr`,
+                        // two accept loops would bind one port and silently break all pairing
+                        // — so we refuse to start the relay (loud warning) and keep only the
+                        // rendezvous loop, which then owns a single pairer and pairs correctly.
+                        let relay_addr = resolve_channel_relay_addr(
+                            chan_addr,
+                            std::env::var("CT_EDGE_CHANNEL_RELAY_LISTEN").ok().as_deref(),
+                        );
+                        if let Err(e) = &relay_addr {
+                            eprintln!("ct-edge: NOT starting the channel relay — {e}");
+                        }
+                        if let Ok(relay_addr) = relay_addr {
                         match build_server_endpoint_from_ca(&ca, relay_addr, vec!["localhost".to_string()]) {
                             Ok((relay_ep, _)) => {
                                 let relay_az = authorizer.clone();
@@ -1417,6 +1452,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 });
                             }
                             Err(e) => eprintln!("ct-edge: cannot bind channel relay {relay_addr}: {e}"),
+                        }
                         }
 
                         eprintln!(
@@ -1509,6 +1545,49 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    #[test]
+    fn channel_relay_addr_refuses_to_collide_with_the_rendezvous_port() {
+        // #103 (frozen): the relay endpoint must be DISTINCT from the rendezvous — two accept
+        // loops on one port silently break pairing (each member parks in a separate pairer).
+        use std::net::SocketAddr;
+        let chan: SocketAddr = "0.0.0.0:4435".parse().unwrap();
+
+        // Default (unset / empty) -> chan_port + 1, distinct.
+        assert_eq!(
+            resolve_channel_relay_addr(chan, None),
+            Ok("0.0.0.0:4436".parse().unwrap()),
+            "default relay is the rendezvous port + 1"
+        );
+        assert_eq!(resolve_channel_relay_addr(chan, Some("")), Ok("0.0.0.0:4436".parse().unwrap()));
+
+        // A distinct, valid override is honoured.
+        assert_eq!(
+            resolve_channel_relay_addr(chan, Some("0.0.0.0:9444")),
+            Ok("0.0.0.0:9444".parse().unwrap()),
+            "a distinct override is used as-is"
+        );
+
+        // An override EQUAL to the rendezvous is refused (the #103 collision).
+        assert!(
+            resolve_channel_relay_addr(chan, Some("0.0.0.0:4435")).is_err(),
+            "a relay override colliding with the rendezvous port is refused"
+        );
+
+        // An unparseable override falls back to the distinct default (not an error).
+        assert_eq!(
+            resolve_channel_relay_addr(chan, Some("not-an-addr")),
+            Ok("0.0.0.0:4436".parse().unwrap()),
+            "an unparseable override falls back to the default port+1"
+        );
+
+        // Edge case: at port 65535 the `+1` default saturates back onto the rendezvous -> refused.
+        let hi: SocketAddr = "0.0.0.0:65535".parse().unwrap();
+        assert!(
+            resolve_channel_relay_addr(hi, None).is_err(),
+            "the port+1 default saturating onto the rendezvous port is refused, not silently bound"
+        );
+    }
 
     #[test]
     fn host_auth_fail_closes_under_a_front_door_by_default() {
