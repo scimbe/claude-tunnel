@@ -269,15 +269,13 @@ pub enum PumpControl {
 #[allow(clippy::too_many_arguments)]
 pub async fn noise_pump_multiplexed<RR, RW, DR, DW, PR, PW>(
     relay_transport: snow::TransportState,
-    direct_transport: snow::TransportState,
     relay_read: RR,
     mut relay_write: RW,
-    mut direct_read: DR,
-    mut direct_write: DW,
     mut plain_read: PR,
     mut plain_write: PW,
     mut control_out: tokio::sync::mpsc::UnboundedReceiver<PumpControl>,
     control_in: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    direct: tokio::sync::oneshot::Receiver<(snow::TransportState, DR, DW)>,
 ) -> io::Result<()>
 where
     RR: AsyncRead + Unpin,
@@ -289,9 +287,29 @@ where
 {
     const CHUNK: usize = 16 * 1024;
     let relay_ts = Mutex::new(relay_transport);
-    let direct_ts = Mutex::new(direct_transport);
     let mut relay_read = relay_read;
     let noise_err = |e: snow::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+
+    // The direct session is **late-bound** (#104): the relay pump starts with only the relay
+    // transport, and the freshly-handshaked direct session is delivered on `direct` once a
+    // background dial + direct Noise_IK handshake completes — which in the live flow is *after*
+    // the relay pump is already moving bytes. When it arrives, its shared transport (an `Arc<Mutex>`
+    // so both directions can use it) plus the two stream halves are routed to the outbound and
+    // inbound loops via the internal one-shots below; each loop installs its half at the moment it
+    // cuts over. If `direct` is dropped without a session (the dial failed), the halves never
+    // arrive and a `Cutover` — which the driver only enqueues once the direct session exists — is
+    // treated as a no-op, so the pump simply stays on the relay.
+    let (dir_out_tx, dir_out_rx) =
+        tokio::sync::oneshot::channel::<(std::sync::Arc<Mutex<snow::TransportState>>, DW)>();
+    let (dir_in_tx, dir_in_rx) =
+        tokio::sync::oneshot::channel::<(std::sync::Arc<Mutex<snow::TransportState>>, DR)>();
+    let installer = async move {
+        if let Ok((ts, dr, dw)) = direct.await {
+            let arc = std::sync::Arc::new(Mutex::new(ts));
+            let _ = dir_out_tx.send((arc.clone(), dw));
+            let _ = dir_in_tx.send((arc, dr));
+        }
+    };
 
     // Encrypt `[tag ‖ payload]` with `ts` and frame it into `ct` (2-byte len prefix reserved at
     // the front, as `noise_pump`); returns the total framed length.
@@ -308,28 +326,36 @@ where
     let outbound = async {
         let mut buf = vec![0u8; CHUNK];
         let mut ct = vec![0u8; 2 + 1 + CHUNK + 256];
-        let mut switched = false;
         let mut control_open = true;
+        let mut dir_out_rx = Some(dir_out_rx); // moved into this loop; taken at cutover
+        let mut direct: Option<(std::sync::Arc<Mutex<snow::TransportState>>, DW)> = None;
         loop {
             tokio::select! {
                 biased;
                 ctl = control_out.recv(), if control_open => match ctl {
                     None => control_open = false, // driver done; keep pumping app bytes
                     Some(PumpControl::Cutover) => {
-                        // The CUTOVER marker itself must travel on the RELAY cipher (the peer is
-                        // still decrypting the relay), then subsequent frames go direct.
-                        let total = seal(&relay_ts, PUMP_TAG_CUTOVER, &[], &mut ct)?;
-                        relay_write.write_all(&ct[..total]).await?;
-                        relay_write.flush().await?;
-                        switched = true;
+                        // Install the direct send side (the driver only enqueues Cutover once the
+                        // background handshake delivered it). If it never arrives — the dial failed
+                        // and `direct` was dropped — stay on the relay. The CUTOVER marker itself
+                        // travels on the RELAY cipher (the peer still decrypts the relay); only
+                        // subsequent frames go direct.
+                        if let Some(rx) = dir_out_rx.take() {
+                            if let Ok(entry) = rx.await {
+                                let total = seal(&relay_ts, PUMP_TAG_CUTOVER, &[], &mut ct)?;
+                                relay_write.write_all(&ct[..total]).await?;
+                                relay_write.flush().await?;
+                                direct = Some(entry);
+                            }
+                        }
                     }
                     Some(PumpControl::Send(payload)) => {
-                        let ts = if switched { &direct_ts } else { &relay_ts };
-                        let total = seal(ts, PUMP_TAG_CONTROL, &payload, &mut ct)?;
-                        if switched {
-                            direct_write.write_all(&ct[..total]).await?;
-                            direct_write.flush().await?;
+                        if let Some((dts, dw)) = direct.as_mut() {
+                            let total = seal(dts, PUMP_TAG_CONTROL, &payload, &mut ct)?;
+                            dw.write_all(&ct[..total]).await?;
+                            dw.flush().await?;
                         } else {
+                            let total = seal(&relay_ts, PUMP_TAG_CONTROL, &payload, &mut ct)?;
                             relay_write.write_all(&ct[..total]).await?;
                             relay_write.flush().await?;
                         }
@@ -339,15 +365,17 @@ where
                     let n = r?;
                     if n == 0 {
                         let _ = relay_write.shutdown().await;
-                        let _ = direct_write.shutdown().await;
+                        if let Some((_, dw)) = direct.as_mut() {
+                            let _ = dw.shutdown().await;
+                        }
                         return Ok::<(), io::Error>(());
                     }
-                    let ts = if switched { &direct_ts } else { &relay_ts };
-                    let total = seal(ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
-                    if switched {
-                        direct_write.write_all(&ct[..total]).await?;
-                        direct_write.flush().await?;
+                    if let Some((dts, dw)) = direct.as_mut() {
+                        let total = seal(dts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                        dw.write_all(&ct[..total]).await?;
+                        dw.flush().await?;
                     } else {
+                        let total = seal(&relay_ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
                         relay_write.write_all(&ct[..total]).await?;
                         relay_write.flush().await?;
                     }
@@ -356,14 +384,15 @@ where
         }
     };
 
-    // tagged frames -> plaintext / control; switch inbound to `direct_read` on the CUTOVER frame.
+    // tagged frames -> plaintext / control; switch inbound to the direct read side on CUTOVER.
     let inbound = async {
         let mut pt = vec![0u8; 1 + CHUNK + 256];
         let mut fr = Vec::with_capacity(CHUNK + 256);
-        let mut switched = false;
+        let mut dir_in_rx = Some(dir_in_rx); // moved into this loop; taken at cutover
+        let mut direct: Option<(std::sync::Arc<Mutex<snow::TransportState>>, DR)> = None;
         loop {
-            let read_res = if switched {
-                read_frame_into(&mut direct_read, &mut fr).await
+            let read_res = if let Some((_, dr)) = direct.as_mut() {
+                read_frame_into(dr, &mut fr).await
             } else {
                 read_frame_into(&mut relay_read, &mut fr).await
             };
@@ -375,14 +404,25 @@ where
                 }
             };
             let len = {
-                let mut ts = if switched { direct_ts.lock().unwrap() } else { relay_ts.lock().unwrap() };
+                let mut ts = match direct.as_ref() {
+                    Some((dts, _)) => dts.lock().unwrap(),
+                    None => relay_ts.lock().unwrap(),
+                };
                 ts.read_message(&fr[..n], &mut pt).map_err(noise_err)?
             };
             if len == 0 {
                 continue; // a frame must carry at least its tag byte
             }
             match pt[0] {
-                PUMP_TAG_CUTOVER => switched = true,
+                PUMP_TAG_CUTOVER => {
+                    // Install the direct read side, then read subsequent frames from it. The peer
+                    // only sends CUTOVER after both sides handshaked direct, so this is present.
+                    if let Some(rx) = dir_in_rx.take() {
+                        if let Ok(entry) = rx.await {
+                            direct = Some(entry);
+                        }
+                    }
+                }
                 PUMP_TAG_CONTROL => {
                     // Opaque to the pump — hand the payload to the driver (dropped receiver = no-op).
                     let _ = control_in.send(pt[1..len].to_vec());
@@ -395,7 +435,7 @@ where
         }
     };
 
-    let (o, i) = tokio::join!(outbound, inbound);
+    let (o, i, ()) = tokio::join!(outbound, inbound, installer);
     o?;
     i?;
     Ok(())
@@ -430,6 +470,10 @@ where
     // and drop the inbound-control receiver — this side never receives CONTROL frames.
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
     let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // The direct session is known eagerly here — deliver it to the pump's late-bind channel
+    // immediately, so a `Cutover` finds it already installed (this is the non-late-bound case).
+    let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
+    let _ = dir_tx.send((direct_transport, direct_read, direct_write));
     // Structured (no detached task, so the lib needs no tokio "rt" feature): forward the
     // one-shot into the channel, then park forever so the pump is the sole decider of when the
     // session ends — when it returns, this `select!` drops the parked bridge.
@@ -441,15 +485,13 @@ where
     };
     let pump = noise_pump_multiplexed(
         relay_transport,
-        direct_transport,
         relay_read,
         relay_write,
-        direct_read,
-        direct_write,
         plain_read,
         plain_write,
         ctl_rx,
         in_tx,
+        dir_rx,
     );
     tokio::select! {
         res = pump => res,
@@ -564,11 +606,17 @@ mod tests {
         let (ctl_tx_b, ctl_rx_b) = tokio::sync::mpsc::unbounded_channel();
         let (in_tx_b, mut in_rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
+        // Direct session known eagerly here — deliver it to each pump's late-bind channel up front.
+        let (dir_tx_a, dir_rx_a) = tokio::sync::oneshot::channel();
+        dir_tx_a.send((direct_a, bd_r, ad_w)).ok().unwrap();
+        let (dir_tx_b, dir_rx_b) = tokio::sync::oneshot::channel();
+        dir_tx_b.send((direct_b, ad_r, bd_w)).ok().unwrap();
+
         let a = tokio::spawn(noise_pump_multiplexed(
-            relay_a, direct_a, br_r, ar_w, bd_r, ad_w, a_plain_r, a_pw, ctl_rx_a, in_tx_a,
+            relay_a, br_r, ar_w, a_plain_r, a_pw, ctl_rx_a, in_tx_a, dir_rx_a,
         ));
         let b = tokio::spawn(noise_pump_multiplexed(
-            relay_b, direct_b, ar_r, br_w, ad_r, bd_w, b_plain_r, b_plain_w, ctl_rx_b, in_tx_b,
+            relay_b, ar_r, br_w, b_plain_r, b_plain_w, ctl_rx_b, in_tx_b, dir_rx_b,
         ));
 
         let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
@@ -620,6 +668,74 @@ mod tests {
         drop(b_plain_hold);
         drop(ctl_tx_a);
         drop(ctl_tx_b);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), a).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), b).await;
+    }
+
+    #[tokio::test]
+    async fn noise_pump_multiplexed_late_binds_the_direct_session_after_the_pump_is_running() {
+        // #104 late-bind (frozen): the relay pump starts with ONLY the relay transport; the direct
+        // Noise session is delivered on the late-bind one-shot *after* application bytes are already
+        // flowing on the relay — exactly the live flow, where a background dial + direct handshake
+        // completes mid-session. Once installed, the relay→direct cutover still preserves the byte
+        // stream exactly. This is the last pump-level primitive the #104 wire-in needs.
+        let (relay_a, relay_b) = transport_pair();
+        let (direct_a, direct_b) = transport_pair();
+
+        let (ar_w, ar_r) = tokio::io::duplex(1 << 16); // A→B relay
+        let (br_w, br_r) = tokio::io::duplex(1 << 16); // B→A relay
+        let (ad_w, ad_r) = tokio::io::duplex(1 << 16); // A→B direct
+        let (bd_w, bd_r) = tokio::io::duplex(1 << 16); // B→A direct
+
+        let (mut a_plain_feed, a_plain_r) = tokio::io::duplex(1 << 16);
+        let (b_plain_w, mut b_plain_out) = tokio::io::duplex(1 << 16);
+        let (a_pw, _a_pw_drain) = tokio::io::duplex(64);
+        let (b_pr_closed, b_pr) = tokio::io::duplex(64);
+        drop(b_pr_closed); // B outbound EOFs immediately (no B→A data)
+
+        let (ctl_tx_a, ctl_rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_a, _in_rx_a) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ctl_tx_b, ctl_rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_b, _in_rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        // The direct session is NOT delivered at start — the pumps run relay-only until we fire
+        // these one-shots mid-stream (modeling the background dial+handshake finishing later).
+        let (dir_tx_a, dir_rx_a) = tokio::sync::oneshot::channel();
+        let (dir_tx_b, dir_rx_b) = tokio::sync::oneshot::channel();
+
+        let a = tokio::spawn(noise_pump_multiplexed(
+            relay_a, br_r, ar_w, a_plain_r, a_pw, ctl_rx_a, in_tx_a, dir_rx_a,
+        ));
+        let b = tokio::spawn(noise_pump_multiplexed(
+            relay_b, ar_r, br_w, b_pr, b_plain_w, ctl_rx_b, in_tx_b, dir_rx_b,
+        ));
+
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        // First bytes flow while the pump holds ONLY the relay session (direct not yet bound).
+        a_plain_feed.write_all(&payload[..800]).await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // The background handshake "completes": deliver the direct session LATE, then cut over.
+        dir_tx_a.send((direct_a, bd_r, ad_w)).ok().unwrap();
+        dir_tx_b.send((direct_b, ad_r, bd_w)).ok().unwrap();
+        ctl_tx_a.send(PumpControl::Cutover).unwrap();
+
+        a_plain_feed.write_all(&payload[800..]).await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+        drop(a_plain_feed); // EOF → A outbound shuts the direct cipher
+
+        let mut got = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b_plain_out.read_to_end(&mut got))
+            .await
+            .expect("the receiver drains within 5s")
+            .expect("read_to_end");
+        assert_eq!(
+            got, payload,
+            "byte stream intact + in order across a LATE-BOUND direct session and cutover (#104 late-bind)",
+        );
+
+        drop(ctl_tx_a);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), a).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), b).await;
     }
