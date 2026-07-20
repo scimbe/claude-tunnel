@@ -91,11 +91,27 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
-    let (send, recv) = match role {
+    let (mut send, mut recv) = match role {
         ChannelRole::Initiate => conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
         ChannelRole::Accept => conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
     };
-    run_channel_session_on_stream(send, recv, role, own_noise_private, peer_noise_public, local).await
+    // Pass the streams by `&mut` so `send` survives the pump (it moves the halves into a
+    // `BiStream`), letting us drain it afterwards. #134: the pump FINs on plaintext EOF via
+    // `shutdown()` = quinn `SendStream::finish()`, which only QUEUES the FIN — it does NOT wait
+    // for the peer to acknowledge the buffered data. QUIC is userspace, so if the connection is
+    // then dropped (the agent process exits right after the session returns) quinn discards the
+    // unacknowledged tail and the peer receives a silently-truncated prefix of a large transfer.
+    // (The `:443`/TLS-TCP relay path — `run_channel_session_on_stream` called directly — is
+    // unaffected: the OS TCP stack keeps draining a FIN'd socket after close.)
+    run_channel_session_on_stream(&mut send, &mut recv, role, own_noise_private, peer_noise_public, local).await?;
+    // Graceful send-drain: wait until the peer has acknowledged receipt of all our stream data
+    // (`stopped()` resolves after our `finish()` once the peer acks) BEFORE returning — so the
+    // caller can drop the connection / exit without truncating the tail. Bounded so a vanished
+    // peer can never hang teardown; on timeout or a lost connection we've done our best.
+    const SEND_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let _ = send.finish(); // idempotent — the pump already FIN'd on EOF; ignore "already closed"
+    let _ = tokio::time::timeout(SEND_DRAIN_TIMEOUT, send.stopped()).await;
+    Ok(())
 }
 
 /// The transport-agnostic core of [`run_channel_session`] (#106 relay-leg-443): run one
@@ -3120,6 +3136,83 @@ mod tests {
 
         init_task.abort();
         resp_task.abort();
+    }
+
+    #[tokio::test]
+    async fn large_transfer_is_not_truncated_when_the_sender_tears_down_after_the_session(
+    ) {
+        // #134 (frozen): a large A2A transfer must be delivered in FULL even when the sending
+        // agent drops the connection the instant its session returns (the real bug: the process
+        // exits right after the pump FINs). quinn `finish()` only queues the FIN; without waiting
+        // for the peer's acknowledgement, the userspace QUIC driver dies on connection-drop and
+        // the unacked tail is silently lost (the sink saw clean 144/224 KiB prefixes of a 588 KB
+        // payload). `run_channel_session`'s send-drain (`stopped()`) is what closes that hole —
+        // it returns only once the peer has acknowledged every byte, so the drop below is safe.
+        use crate::transport::{build_channel_dialer, build_direct_listener_at};
+        use ct_common::noise::generate_static_keypair;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let initiator = generate_static_keypair();
+        let responder = generate_static_keypair();
+        let (init_priv, resp_priv, resp_pub) = (initiator.private, responder.private, responder.public);
+
+        // ~1 MiB — well past the ~144 KiB first-flight/window where the truncation was observed.
+        let payload: Vec<u8> = (0..(1024u32 * 1024)).map(|i| (i % 251) as u8).collect();
+        let len = payload.len();
+
+        let (server, _cert) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+        let addr = server.local_addr().expect("addr");
+
+        // Responder: accept, run the Accept session, and collect exactly `len` delivered bytes.
+        // Its local read half is closed at once (no responder→initiator app data), so its own
+        // send direction FINs immediately; we read the payload out concurrently to open flow
+        // control. We do NOT await the responder session (its own drain would wait on the
+        // now-gone initiator) — read_exact of the full length is the delivery assertion.
+        let resp_task = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let (resp_run, resp_test) = tokio::io::duplex(64 * 1024);
+            let (mut resp_test_r, resp_test_w) = tokio::io::split(resp_test);
+            drop(resp_test_w); // responder→initiator app source EOF
+            let _sess = tokio::spawn(async move {
+                let _ = run_channel_session(&conn, ChannelRole::Accept, &resp_priv, &[0u8; 32], resp_run).await;
+                // keep `conn` alive for the session's lifetime, then drop
+                drop(conn);
+            });
+            let mut got = vec![0u8; len];
+            let r = resp_test_r.read_exact(&mut got).await;
+            (r.is_ok(), got)
+        });
+
+        // Initiator: dial, feed the whole payload then EOF the source, run the session to
+        // completion (which now blocks on the delivery ack), THEN drop the connection+endpoint
+        // — simulating the process exiting the moment the transfer "finished".
+        let endpoint = build_channel_dialer().expect("dialer");
+        let conn = endpoint.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let (init_run, init_test) = tokio::io::duplex(64 * 1024);
+        let (init_test_r, mut init_test_w) = tokio::io::split(init_test);
+        drop(init_test_r); // no initiator←responder app data
+        let feeder = tokio::spawn(async move {
+            init_test_w.write_all(&payload).await.expect("feed payload");
+            init_test_w.flush().await.expect("flush");
+            drop(init_test_w); // source EOF → initiator outbound FINs
+            payload
+        });
+
+        run_channel_session(&conn, ChannelRole::Initiate, &init_priv, &resp_pub, init_run)
+            .await
+            .expect("initiator session");
+        // The drain has returned → the peer acknowledged every byte. Now tear the sender down
+        // as abruptly as a process exit would.
+        drop(conn);
+        drop(endpoint);
+
+        let expected = feeder.await.expect("feeder");
+        let (ok, got) = tokio::time::timeout(std::time::Duration::from_secs(20), resp_task)
+            .await
+            .expect("responder collected within 20s")
+            .expect("responder task");
+        assert!(ok, "the full {len}-byte payload was delivered (no truncation) despite the abrupt sender teardown (#134)");
+        assert_eq!(got, expected, "delivered bytes are byte-exact and complete");
     }
 
     #[test]
