@@ -1008,19 +1008,29 @@ impl SettleReceipt {
     }
 
     /// The **sender/verifier's settle gate**: the receipt is authentic AND attests delivery of what
-    /// we actually sent — same `channel`, the expected `terms_hash` and `session_nonce`, at least
-    /// `min_bytes`, and a `transfer_digest` byte-equal to our own [`TransferDigest::digest`]. A
-    /// truncated, tampered, or forged delivery claim → `false`. Only a receipt the RECEIVER signed
-    /// over the true delivered bytes passes — no send-side assertion can.
+    /// we actually sent — signed by the **`expected_receiver`** (the peer we delivered to), for the
+    /// same `channel`, the expected `terms_hash` and `session_nonce`, at least `min_bytes`, and a
+    /// `transfer_digest` byte-equal to our own [`TransferDigest::digest`]. A truncated, tampered, or
+    /// forged delivery claim → `false`.
+    ///
+    /// **Binding `expected_receiver` is load-bearing (#138):** [`is_valid`](Self::is_valid) only
+    /// checks the signature against the receipt's *self-declared* `receiver`, so without pinning the
+    /// receiver a malicious **sender** — which also knows the `transfer_digest` (both Noise_IK peers
+    /// fold the same plaintext) — could self-sign a receipt with `receiver` = its own key and pass.
+    /// Pinning the receiver we actually delivered to is exactly what makes "only a receipt the
+    /// RECEIVER signed passes — no send-side assertion can" true; the caller supplies the peer's
+    /// channel-attested holder key as `expected_receiver`.
     pub fn confirms_delivery(
         &self,
         expected_channel: &ChannelId,
+        expected_receiver: &[u8; 32],
         expected_terms_hash: &[u8; 32],
         expected_session_nonce: &[u8; 32],
         min_bytes: u64,
         sender_digest: &[u8; 32],
     ) -> bool {
         self.is_valid()
+            && &self.receiver == expected_receiver
             && &self.channel == expected_channel
             && &self.terms_hash == expected_terms_hash
             && &self.session_nonce == expected_session_nonce
@@ -2164,11 +2174,12 @@ mod tests {
         };
         let receipt = sign(&receiver_id, receiver.bytes(), &receiver.digest(), &recv_sk);
 
-        // (1) Authentic + matches the sender's own digest/terms/session → confirmed.
+        // (1) Authentic + matches the sender's own digest/terms/session + is from the EXPECTED
+        // receiver → confirmed.
         assert!(receipt.is_valid(), "a receiver-signed receipt verifies");
         assert!(
-            receipt.confirms_delivery(&ch, &terms, &nonce, payload.len() as u64, &sender.digest()),
-            "settle gate passes: right channel/terms/session, full byte count, matching digest"
+            receipt.confirms_delivery(&ch, &receiver_id, &terms, &nonce, payload.len() as u64, &sender.digest()),
+            "settle gate passes: right receiver/channel/terms/session, full byte count, matching digest"
         );
 
         // (2) Under-report / truncated delivery: the receiver only got a prefix → its digest and
@@ -2178,25 +2189,40 @@ mod tests {
         let short_receipt = sign(&receiver_id, short.bytes(), &short.digest(), &recv_sk);
         assert!(short_receipt.is_valid(), "the short receipt is itself authentically signed");
         assert!(
-            !short_receipt.confirms_delivery(&ch, &terms, &nonce, payload.len() as u64, &sender.digest()),
+            !short_receipt.confirms_delivery(&ch, &receiver_id, &terms, &nonce, payload.len() as u64, &sender.digest()),
             "a truncated delivery digest does NOT match what was sent → rejected"
         );
 
         // (3) Wrong channel / terms / session / insufficient min_bytes all refuse the gate.
-        assert!(!receipt.confirms_delivery(&ChannelId([0u8; 32]), &terms, &nonce, 1, &sender.digest()), "wrong channel");
-        assert!(!receipt.confirms_delivery(&ch, &[0u8; 32], &nonce, 1, &sender.digest()), "wrong terms");
-        assert!(!receipt.confirms_delivery(&ch, &terms, &[0u8; 32], 1, &sender.digest()), "wrong session nonce (replay)");
-        assert!(!receipt.confirms_delivery(&ch, &terms, &nonce, payload.len() as u64 + 1, &sender.digest()), "below min_bytes");
+        assert!(!receipt.confirms_delivery(&ChannelId([0u8; 32]), &receiver_id, &terms, &nonce, 1, &sender.digest()), "wrong channel");
+        assert!(!receipt.confirms_delivery(&ch, &receiver_id, &[0u8; 32], &nonce, 1, &sender.digest()), "wrong terms");
+        assert!(!receipt.confirms_delivery(&ch, &receiver_id, &terms, &[0u8; 32], 1, &sender.digest()), "wrong session nonce (replay)");
+        assert!(!receipt.confirms_delivery(&ch, &receiver_id, &terms, &nonce, payload.len() as u64 + 1, &sender.digest()), "below min_bytes");
 
         // (4) Tamper: inflate the byte count after signing → the receiver signature breaks.
         let mut forged = receipt.clone();
         forged.bytes_delivered = 1_000_000;
         assert!(!forged.is_valid(), "a tampered byte count breaks the receiver signature");
 
-        // (5) Send-side forgery: an attacker signs a full-delivery receipt with ITS key but stamps
-        // the receiver's id — it can't validate against the claimed receiver.
+        // (5) Send-side forgery, receiver-id spoofed: an attacker signs a full-delivery receipt with
+        // ITS key but stamps the real receiver's id — it can't validate against the claimed receiver.
         let attacker = SigningKey::from_bytes(&[0x99u8; 32]);
         let forged_by_sender = sign(&receiver_id, payload.len() as u64, &sender.digest(), &attacker);
-        assert!(!forged_by_sender.is_valid(), "a receipt not signed by the receiver is rejected (no ambient send-side trust)");
+        assert!(!forged_by_sender.is_valid(), "a receipt not signed by the receiver is rejected");
+
+        // (6) #138 — the load-bearing case: a malicious SENDER self-attests delivery. It also knows
+        // the transfer_digest (both peers fold the same plaintext), so it signs a receipt with
+        // `receiver` = its OWN key over the true digest/terms/session/bytes. That receipt is
+        // `is_valid()` (authentically self-signed!) — but `confirms_delivery` must reject it because
+        // the gate pins the EXPECTED receiver (the peer we delivered to), which the sender's key is
+        // not. Without the receiver binding this would pass → "no ambient send-side trust" would be
+        // false.
+        let sender_id = attacker.verifying_key().to_bytes(); // the send side's own key
+        let self_attested = sign(&sender_id, payload.len() as u64, &sender.digest(), &attacker);
+        assert!(self_attested.is_valid(), "the sender's self-signed receipt is authentic FOR ITS OWN key");
+        assert!(
+            !self_attested.confirms_delivery(&ch, &receiver_id, &terms, &nonce, payload.len() as u64, &sender.digest()),
+            "a send-side self-attested receipt is REFUSED — it is not signed by the expected receiver (#138)"
+        );
     }
 }
