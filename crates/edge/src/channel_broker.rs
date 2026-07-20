@@ -1013,13 +1013,29 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     // (an endpoint split / double-spawn) — separate maps that can never pair. `size_before` is
     // the map occupancy the instant before each offer.
     let pairer_id = &pairer as *const _ as usize;
+    // #103 (round 5, central-requested 2026-07-20): round-4 showed the SAME pairer= address for
+    // both members yet size_before=0 on the 2nd offer. A per-invocation loop-INSTANCE id + a
+    // per-iteration counter proves task continuity — same instance + consecutive iters = one
+    // live loop (rules out a respawned task landing on a coincidentally-reused pairer address);
+    // and the explicit [drain] log shows whether `drain_expired` is what empties the map between
+    // the two offers (code-read says it can't in 3.5ms with a 30s TTL — this proves it live).
+    static BROKER_LOOP_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let loop_instance = BROKER_LOOP_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut loop_iter: u64 = 0;
     loop {
+        loop_iter += 1;
         let now = now_fn();
 
         // Sweep lone waiters past their park deadline (#3) before admitting the next member,
         // so a first-comer with no partner is bounded instead of wedging the endpoint. The
         // guard is dropped before the following `.await`.
         let expired = pairer.lock().unwrap().drain_expired(now);
+        if !expired.is_empty() {
+            eprintln!(
+                "ct-edge: channel-accept [drain] loop={loop_instance}.{loop_iter} removed={} now={now} (#103) — swept park-expired waiters",
+                expired.len()
+            );
+        }
         for m in expired {
             m.payload.conn.close(0u32.into(), b"channel park timeout");
         }
@@ -1046,10 +1062,12 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         // same channel and Paired, or each Parked (never matched — central's leading theory).
         let size_before = pairer.lock().unwrap().len();
         eprintln!(
-            "ct-edge: channel-accept [admitted] channel={} holder={} pairer={:x} size_before={} (#103) — offering to pairer",
+            "ct-edge: channel-accept [admitted] channel={} holder={} pairer={:x} loop={}.{} size_before={} (#103) — offering to pairer",
             hex_of(&channel.0),
             hex_of(&holder),
             pairer_id,
+            loop_instance,
+            loop_iter,
             size_before
         );
 
