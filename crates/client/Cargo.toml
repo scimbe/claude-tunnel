@@ -2,7 +2,7 @@
 name = "ct-client"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 ct-common = { path = "../common" }

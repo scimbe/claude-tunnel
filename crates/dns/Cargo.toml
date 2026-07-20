@@ -2,7 +2,7 @@
 name = "ct-dns"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 # AD1 codec + store are dependency-free; AD2 adds the :53 responder; AD3 adds the

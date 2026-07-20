@@ -2,7 +2,7 @@
 name = "ct-common"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

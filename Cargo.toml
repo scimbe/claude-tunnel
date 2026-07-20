@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 # libp2p connectivity substrate (#121 B2-libp2p-seam / B2-libp2p-tcp / C-circuit-relay /
