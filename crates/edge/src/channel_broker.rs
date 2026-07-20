@@ -502,16 +502,32 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
+    // #103 blanket trace (sink + central agreed, 2026-07-20): the success path through this
+    // accept was previously SILENT — the `[quic-handshake]`/`[quic-bistream]` tags below only
+    // fire on *error*, so a connection that accepts + handshakes and then reads empty left
+    // zero server trace (the exact #103 symptom). Log the peer the INSTANT `accept()` yields,
+    // before any classification/admission, tagged with THIS endpoint's local addr so a
+    // connection landing on the wrong listener (rendezvous :4435 vs relay vs :443) is visible.
+    // Answers the one binary question: does the connection reach this accept loop at all?
+    let local_addr = endpoint.local_addr().ok();
     let incoming = endpoint
         .accept()
         .await
         .ok_or("endpoint closed with no incoming")?;
+    eprintln!(
+        "ct-edge: channel-accept [recv] local={local_addr:?} peer={} (#103 pre-admission trace)",
+        incoming.remote_address()
+    );
     // #128: tag the QUIC connection-handshake phase so a peer that closes here (vs. at the
     // bi-stream open below) is distinguishable in the accept_member catch-all log — the
     // QUIC analog of #127's `:443` TLS-accept tag, to localize #103's pre-admission close.
     let conn = incoming
         .await
         .map_err(|e| format!("[quic-handshake] {e}"))?;
+    eprintln!(
+        "ct-edge: channel-accept [handshaked] local={local_addr:?} peer={} — reading join (#103)",
+        conn.remote_address()
+    );
     match read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await {
         Ok((send, req, operator, noise, attest, observed)) => {
             Ok((conn, send, req, operator, noise, attest, observed))
