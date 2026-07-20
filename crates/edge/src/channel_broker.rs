@@ -264,7 +264,9 @@ where
     // request + possession round-trip is then bounded a second time inside
     // `read_channel_join_on_stream`, so each phase has its own guard.
     let (send, recv) = match tokio::time::timeout(join_timeout, conn.accept_bi()).await {
-        Ok(streams) => streams?,
+        // #128: tag the bi-stream-open phase — a peer that completes the QUIC handshake but
+        // closes before opening its stream (the #103 symptom) surfaces here, not at handshake.
+        Ok(streams) => streams.map_err(|e| format!("[quic-bistream] {e}"))?,
         Err(_) => {
             return Err(
                 "channel join not submitted within the timeout — dropping stalled connection (#105)"
@@ -504,7 +506,12 @@ where
         .accept()
         .await
         .ok_or("endpoint closed with no incoming")?;
-    let conn = incoming.await?;
+    // #128: tag the QUIC connection-handshake phase so a peer that closes here (vs. at the
+    // bi-stream open below) is distinguishable in the accept_member catch-all log — the
+    // QUIC analog of #127's `:443` TLS-accept tag, to localize #103's pre-admission close.
+    let conn = incoming
+        .await
+        .map_err(|e| format!("[quic-handshake] {e}"))?;
     let (send, req, operator, noise, attest, observed) =
         read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await?;
     Ok((conn, send, req, operator, noise, attest, observed))
