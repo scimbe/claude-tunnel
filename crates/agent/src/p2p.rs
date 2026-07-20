@@ -39,14 +39,29 @@
 //! DCUtR does **not** break the relayed `Noise_IK` session (invariants #1/#2 still hold).
 //! The actual *cross-NAT* hole-punch (real NAT'd hosts, no direct reachability) cannot be
 //! exercised on loopback and is verified by a **live** real-NAT test, not the cargo gate.
-//! The remaining Kademlia discovery slice builds on this same seam and is not implemented
-//! here.
+//!
+//! The **Kademlia discovery** slice ([`kademlia_publish_and_resolve`], #121 D-kademlia) layers
+//! a libp2p `kad` DHT onto the same tokio/TCP transport so a peer can *find* another peer's
+//! reachability coordinates by [`ChannelId`] instead of being handed a multiaddr out of band.
+//! The DHT record is a `ChannelId → coordinates` mapping whose **value is holder-signed**
+//! ([`SignedCoordinateRecord`], **invariant #4**): the channel member signs
+//! `domain || channel_id || holder || coordinates` with its ed25519 **holder** key, and a
+//! reader **verifies that signature against the record's holder pubkey before trusting the
+//! coordinates** ([`SignedCoordinateRecord::verified_coordinates`]). A poisoned record —
+//! tampered coordinates or a substituted holder — fails verification and is rejected, so the
+//! DHT (like the libp2p `PeerId`, invariant #1) is untrusted plumbing: trust flows only from
+//! the holder signature, never from the DHT itself. Only the in-process, loopback-only
+//! two-node put/get is exercised by the cargo gate; the real cross-host DHT bootstrap (a
+//! central node seeded as the bootstrap peer) is a **live** step, not the cargo gate.
 
 use std::time::Duration;
 
+use ct_common::channel::ChannelId;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use libp2p::core::transport::MemoryTransport;
 use libp2p::core::upgrade::Version;
 use libp2p::futures::StreamExt;
+use libp2p::kad::{self, store::MemoryStore, Quorum, Record, RecordKey};
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{dcutr, noise, relay, yamux, Multiaddr, StreamProtocol, Swarm, SwarmBuilder, Transport};
@@ -619,6 +634,228 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
     Ok((dialer_stream.compat(), listener_stream.compat()))
 }
 
+/// The domain-separation tag for a DHT coordinate record's signing preimage. A distinct,
+/// versioned prefix keeps this signature from ever being confused with a grant, an
+/// invitation, or the member-Noise attestation (`ct-a2a-noise-attest-v1`) — exactly as the
+/// rest of `ct_common::channel` domain-separates every signed message.
+const COORDINATE_RECORD_DOMAIN: &[u8] = b"ct-a2a-dht-coordinate-v1";
+
+/// A **holder-signed** Kademlia DHT record mapping a [`ChannelId`] to a channel member's
+/// reachability `coordinates` (#121 D-kademlia, **invariant #4**).
+///
+/// Discovery answers "where do I reach the peer for this channel?" — but the DHT that answers
+/// it is untrusted plumbing (any node can inject a record for any key), so the *answer* must
+/// authenticate itself. The channel member signs `domain || channel_id || holder ||
+/// coordinates` with its ed25519 **holder** key (the same key that authorizes its channel
+/// membership and attests its Noise static key, `ct_common::channel::member_noise_attest_bytes`);
+/// a reader **must** call [`verified_coordinates`](Self::verified_coordinates) and trust the
+/// coordinates **only if** the signature verifies against the record's `holder` pubkey. A
+/// poisoned record — tampered `coordinates`, or a `holder` swapped for someone else's key —
+/// fails that check and is rejected, so a DHT node cannot forge a peer's location. Trust flows
+/// from the holder signature, never from the DHT or the libp2p `PeerId` (invariant #1).
+///
+/// The record travels as the *value* of a libp2p [`Record`] keyed by the raw [`ChannelId`]
+/// bytes; [`encode`](Self::encode)/[`decode`](Self::decode) are the wire form:
+/// `holder(32) || signature(64) || coordinates(rest)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedCoordinateRecord {
+    /// The channel member's ed25519 **holder** public key — the identity the signature is
+    /// checked against. NOT a libp2p `PeerId`.
+    pub holder: [u8; 32],
+    /// The reachability coordinates the holder is publishing for the channel (e.g. an
+    /// advertised multiaddr). Opaque bytes here — only their authenticity matters at this seam.
+    pub coordinates: Vec<u8>,
+    /// The holder's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    pub signature: [u8; 64],
+}
+
+impl SignedCoordinateRecord {
+    /// The canonical, domain-separated preimage the holder signs: `domain || channel_id ||
+    /// holder || coordinates`. Binding `channel` and `holder` into the preimage (not just the
+    /// coordinates) means a record can't be replayed onto a different channel and a substituted
+    /// `holder` can't validate — the signature only verifies for the exact `(channel, holder,
+    /// coordinates)` triple.
+    fn signing_bytes(channel: &ChannelId, holder: &[u8; 32], coordinates: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(COORDINATE_RECORD_DOMAIN.len() + 32 + 32 + coordinates.len());
+        m.extend_from_slice(COORDINATE_RECORD_DOMAIN);
+        m.extend_from_slice(&channel.0);
+        m.extend_from_slice(holder);
+        m.extend_from_slice(coordinates);
+        m
+    }
+
+    /// Sign `coordinates` for `channel` with the member's ed25519 **holder** `SigningKey`,
+    /// producing a record a reader can authenticate without trusting the DHT (invariant #4).
+    pub fn sign(channel: &ChannelId, coordinates: &[u8], holder_key: &SigningKey) -> Self {
+        let holder = holder_key.verifying_key().to_bytes();
+        let signature = holder_key
+            .sign(&Self::signing_bytes(channel, &holder, coordinates))
+            .to_bytes();
+        Self {
+            holder,
+            coordinates: coordinates.to_vec(),
+            signature,
+        }
+    }
+
+    /// The wire form stored as the libp2p [`Record`] value:
+    /// `holder(32) || signature(64) || coordinates(rest)`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(32 + 64 + self.coordinates.len());
+        v.extend_from_slice(&self.holder);
+        v.extend_from_slice(&self.signature);
+        v.extend_from_slice(&self.coordinates);
+        v
+    }
+
+    /// Parse a record from its wire form. Returns `None` on a truncated buffer (fewer than the
+    /// fixed `32 + 64` header bytes). Decoding does **not** authenticate — the caller must still
+    /// call [`verified_coordinates`](Self::verified_coordinates); a decodable record can still be
+    /// a poisoned one.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 96 {
+            return None;
+        }
+        let mut holder = [0u8; 32];
+        holder.copy_from_slice(&bytes[..32]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[32..96]);
+        Some(Self {
+            holder,
+            coordinates: bytes[96..].to_vec(),
+            signature,
+        })
+    }
+
+    /// Whether the holder signature verifies for `channel` — i.e. the record is authentic
+    /// (invariant #4). `false` on a malformed `holder` key, a wrong `(channel, holder,
+    /// coordinates)` binding, or a bad signature.
+    pub fn verify(&self, channel: &ChannelId) -> bool {
+        match VerifyingKey::from_bytes(&self.holder) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(channel, &self.holder, &self.coordinates),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// The trusted coordinates — `Some` **only if** the holder signature verifies for `channel`
+    /// (invariant #4), `None` for a poisoned/unauthentic record. This is the single gate a
+    /// reader uses before acting on a discovered location: never read `coordinates` directly.
+    pub fn verified_coordinates(&self, channel: &ChannelId) -> Option<&[u8]> {
+        if self.verify(channel) {
+            Some(&self.coordinates)
+        } else {
+            None
+        }
+    }
+}
+
+/// Build a minimal libp2p **Kademlia** swarm over loopback TCP (noise + yamux), driving a
+/// single `kad::Behaviour` backed by an in-memory record store. Structurally identical to
+/// [`build_tcp_swarm`] except the behaviour is the DHT. The node is put into
+/// [`kad::Mode::Server`] so it actually stores and serves records on our controlled two-node
+/// loopback net (a node otherwise stays a client until it confirms an external address, which
+/// never happens without identify/AutoNAT here). As on every transport, the fresh libp2p
+/// identity is plumbing — it never gates channel admission (invariant #1); the record's holder
+/// signature is the only trust input (invariant #4).
+fn build_kad_swarm() -> Result<Swarm<kad::Behaviour<MemoryStore>>, BoxError> {
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
+            let mut kad = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
+            kad.set_mode(Some(kad::Mode::Server));
+            kad
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+    Ok(swarm)
+}
+
+/// Publish a coordinate record on an in-process Kademlia DHT from node A and **resolve it by
+/// [`ChannelId`] from a second node B** — the discovery counterpart of the connectivity seams
+/// above (#121 D-kademlia). Two in-process nodes run over TCP loopback: node A
+/// ([`build_kad_swarm`]) `put_record`s `record_value` under the key `channel`; node B is
+/// bootstrapped to A (A's listen address added to B's routing table) and issues a
+/// `get_record` for the same `channel`, returning the **raw record bytes** it retrieved from
+/// the DHT. Both swarms are polled together to completion — a common bug is polling only the
+/// querying swarm so A never answers and the query stalls.
+///
+/// This returns *untrusted* plumbing output, exactly like [`connected_tcp_stream_pair`]
+/// returns an untrusted duplex: the caller MUST [`decode`](SignedCoordinateRecord::decode) +
+/// [`verified_coordinates`](SignedCoordinateRecord::verified_coordinates) the bytes and reject
+/// a record whose holder signature does not verify (invariant #4). The libp2p `PeerId`s only
+/// route the queries; none authorizes anything (invariant #1). Loopback-only — the real
+/// cross-host bootstrap (a central node seeded as the bootstrap peer) is a live step.
+pub async fn kademlia_publish_and_resolve(
+    channel: &ChannelId,
+    record_value: Vec<u8>,
+) -> Result<Vec<u8>, BoxError> {
+    let key = RecordKey::new(&channel.0);
+
+    // --- Node A (publisher): bind loopback, learn its concrete listen address, then store the
+    // record locally under `key`. `put_record` inserts into A's own store synchronously, so the
+    // record is resolvable as soon as B can reach A — no put/get race. ---
+    let mut node_a = build_kad_swarm()?;
+    let a_peer = *node_a.local_peer_id();
+    node_a.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    let a_addr: Multiaddr = loop {
+        match node_a.next().await {
+            Some(SwarmEvent::NewListenAddr { address, .. }) => break address,
+            Some(_) => {}
+            None => return Err("kad node A closed before reporting a listen address".into()),
+        }
+    };
+    node_a.behaviour_mut().put_record(
+        Record {
+            key: key.clone(),
+            value: record_value,
+            publisher: Some(a_peer),
+            expires: None,
+        },
+        Quorum::One,
+    )?;
+
+    // --- Node B (resolver): learn A as a peer (bootstrap seed), then query the ChannelId. ---
+    let mut node_b = build_kad_swarm()?;
+    node_b.behaviour_mut().add_address(&a_peer, a_addr);
+    // Bootstrap populates B's routing table from the seed; ignore `NoKnownPeers` — `add_address`
+    // already gave B the one peer it needs, and `get_record` dials A on its own.
+    let _ = node_b.behaviour_mut().bootstrap();
+    node_b.behaviour_mut().get_record(key);
+
+    // Drive BOTH swarms so A answers B's query. Return the first record B resolves; surface a
+    // lookup failure rather than hanging (the test's outer timeout is the last-resort guard).
+    loop {
+        tokio::select! {
+            _ = node_a.next() => {}
+            ev = node_b.next() => {
+                match ev {
+                    Some(SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
+                        ..
+                    })) => {
+                        return Ok(peer_record.record.value);
+                    }
+                    Some(SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::GetRecord(Err(err)),
+                        ..
+                    })) => {
+                        return Err(format!("kad get_record failed: {err:?}").into());
+                    }
+                    None => return Err("kad node B swarm closed before resolving the record".into()),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,5 +1151,93 @@ mod tests {
         })
         .await
         .expect("the DCUtR-enabled relayed Noise round-trip completes within 15s (a hang here is a deadlock)");
+    }
+
+    #[tokio::test]
+    async fn kademlia_resolves_a_holder_signed_coordinate_record() {
+        // #121 D-kademlia (frozen): DISCOVERY, not connectivity. Node A publishes a holder-signed
+        // `ChannelId → coordinates` record on an in-process libp2p Kademlia DHT; node B, bootstrapped
+        // to A, resolves the ChannelId, GETS the record, and VERIFIES the holder signature before
+        // trusting the coordinates. Then the SECURITY property (invariant #4): a poisoned record —
+        // tampered coordinates or a substituted holder — is REJECTED by the verify gate, so a DHT
+        // node cannot forge a peer's location.
+        //
+        // Invariant #1 (authz/trust is NOT the libp2p PeerId): the DHT and its PeerIds are untrusted
+        // plumbing that only route the put/get queries. Invariant #4 (records are holder-signed):
+        // trust flows solely from the channel member's ed25519 holder signature over
+        // `domain || channel_id || holder || coordinates` — never from the DHT itself.
+
+        // A deterministic holder key (no rng in tests) — the channel member's ed25519 holder
+        // identity, exactly the key that authorizes its membership elsewhere in ct_common.
+        let holder_key = SigningKey::from_bytes(&[9u8; 32]);
+        let channel = ChannelId([0x11u8; 32]);
+        let coordinates = b"/ip4/198.51.100.7/tcp/4242".to_vec();
+
+        // The authentic, holder-signed record A will publish.
+        let record = SignedCoordinateRecord::sign(&channel, &coordinates, &holder_key);
+
+        // The multi-step DHT setup (listen → put → bootstrap → get) is fully event-driven, but a
+        // regression that stalled any step — classically polling only the querying swarm so A never
+        // answers — would otherwise hang forever (`cargo test` has no per-test timeout). Bound the
+        // whole path so a deadlock FAILS FAST instead of wedging the gate. 15s is ~orders of
+        // magnitude over the in-process happy path.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            // Node A publishes; node B (bootstrapped to A) resolves the ChannelId and gets the raw
+            // record bytes back out of the DHT — untrusted plumbing output until verified.
+            let fetched = kademlia_publish_and_resolve(&channel, record.encode())
+                .await
+                .expect("node B resolves the ChannelId and gets A's published record from the DHT");
+
+            let decoded = SignedCoordinateRecord::decode(&fetched)
+                .expect("the retrieved DHT record decodes to a coordinate record");
+
+            // The coordinates round-tripped through the DHT unchanged...
+            assert_eq!(
+                decoded.coordinates, coordinates,
+                "the resolved coordinates match what A published"
+            );
+            // ...AND — the whole point (invariant #4) — the holder signature verifies, so B may trust
+            // them: `verified_coordinates` returns exactly the published bytes.
+            assert_eq!(
+                decoded.verified_coordinates(&channel),
+                Some(coordinates.as_slice()),
+                "the resolved record's holder signature verifies, so its coordinates are trusted (#4)"
+            );
+        })
+        .await
+        .expect("the Kademlia publish→resolve completes within 15s (a hang here is a deadlock)");
+
+        // --- Security property (invariant #4): a poisoned record is REJECTED by the verify gate. ---
+
+        // (a) TAMPERED COORDINATES: keep A's valid signature but flip the coordinates the reader
+        // sees. The signature no longer matches the `(channel, holder, coordinates)` preimage, so
+        // `verified_coordinates` returns None — the forged location cannot be trusted.
+        let mut poisoned = record.clone();
+        poisoned.coordinates = b"/ip4/203.0.113.66/tcp/9999".to_vec(); // attacker's endpoint
+        assert!(
+            !poisoned.verify(&channel),
+            "a record with tampered coordinates must fail holder-signature verification (#4)"
+        );
+        assert_eq!(
+            poisoned.verified_coordinates(&channel),
+            None,
+            "a poisoned (tampered-coordinates) record is rejected, not trusted (#4)"
+        );
+
+        // (b) SUBSTITUTED HOLDER: an attacker signs coordinates with its OWN key but stamps the
+        // victim's holder pubkey on the record. The signature can't validate against the claimed
+        // holder, so it is rejected — a DHT operator can't impersonate a member's coordinate record.
+        let attacker_key = SigningKey::from_bytes(&[13u8; 32]);
+        let mut wrong_holder = SignedCoordinateRecord::sign(&channel, &coordinates, &attacker_key);
+        wrong_holder.holder = holder_key.verifying_key().to_bytes(); // claim to be the victim
+        assert!(
+            !wrong_holder.verify(&channel),
+            "a record whose holder pubkey was swapped for the victim's must fail verification (#4)"
+        );
+        assert_eq!(
+            wrong_holder.verified_coordinates(&channel),
+            None,
+            "a poisoned (substituted-holder) record is rejected, not trusted (#4)"
+        );
     }
 }

@@ -16,15 +16,16 @@ license = "MIT"
 
 [workspace.dependencies]
 # libp2p connectivity substrate (#121 B2-libp2p-seam / B2-libp2p-tcp / C-circuit-relay /
-# B2-dcutr). Minimal feature set: tokio runtime, noise (connection security) + yamux (muxer),
-# the stream protocol for raw substreams, `tcp` for the real loopback-TCP transport
-# (dial-by-multiaddr), `relay` for Circuit-Relay v2 (both the server behaviour and the
-# client transport), `dcutr` for the Direct Connection Upgrade through Relay hole-punch
-# (upgrades a relayed connection to direct), and `macros` for the
-# `#[derive(NetworkBehaviour)]` that composes the relay-client + dcutr + stream behaviours on
-# a client swarm. MemoryTransport lives in libp2p-core (no feature gate); no `dns` — we dial
-# raw `/ip4/.../tcp/...` addresses.
-libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp", "relay", "dcutr", "macros"] }
+# B2-dcutr / D-kademlia). Minimal feature set: tokio runtime, noise (connection security) +
+# yamux (muxer), the stream protocol for raw substreams, `tcp` for the real loopback-TCP
+# transport (dial-by-multiaddr), `relay` for Circuit-Relay v2 (both the server behaviour and
+# the client transport), `dcutr` for the Direct Connection Upgrade through Relay hole-punch
+# (upgrades a relayed connection to direct), `kad` for Kademlia discovery (#121 D-kademlia: a
+# `ChannelId → coordinates` DHT whose record VALUE is holder-signed, invariant #4), and
+# `macros` for the `#[derive(NetworkBehaviour)]` that composes the relay-client + dcutr +
+# stream behaviours on a client swarm. MemoryTransport lives in libp2p-core (no feature
+# gate); no `dns` — we dial raw `/ip4/.../tcp/...` addresses.
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp", "relay", "dcutr", "kad", "macros"] }
 # Raw-substream protocol handler (the `stream::Behaviour`); a sibling crate, not an
 # umbrella feature. Gives us an `AsyncRead + AsyncWrite` stream out of the swarm.
 libp2p-stream = "0.4.0-alpha"
