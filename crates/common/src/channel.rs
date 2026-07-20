@@ -25,6 +25,47 @@ pub type UnixSeconds = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelId(pub [u8; 32]);
 
+/// The domain separating a derived per-link channel id from every other hashed object.
+const LINK_CHANNEL_DOMAIN: &[u8] = b"ct-link-channel-v1";
+
+/// Derive the deterministic [`ChannelId`] for the A2A link between two members
+/// (`holder_a`, `holder_b`) under channel operator `operator_pubkey` (#107-nway). A
+/// topology's overlay links (from `min_latency_overlay`/`plan_network_overlay`) each map
+/// to a channel the controller mints per-link grants for — and because the id is
+/// **derived**, both endpoints compute the *same* `ChannelId` locally from their holder
+/// keys with no coordination round-trip.
+///
+/// It is a domain-separated SHA-256 over `domain || operator_pubkey || min(a,b) ||
+/// max(a,b)`, so it is:
+/// - **canonical / order-independent** — the two members derive the same id regardless of
+///   which they call `a` (the pair is sorted before hashing);
+/// - **operator-bound** — binding `operator_pubkey` means two different operators can't
+///   collide onto the same channel id for the same holder pair (cross-operator isolation);
+/// - **collision-resistant** — distinct holder pairs (or operators) yield distinct ids.
+///
+/// This is a channel *address* only (like a `RoutingToken`); it authorizes nothing on its
+/// own — membership still flows from the operator-signed [`SignedChannelGrant`] the
+/// controller issues for this channel to each holder.
+pub fn channel_id_for_link(
+    operator_pubkey: &[u8; 32],
+    holder_a: &[u8; 32],
+    holder_b: &[u8; 32],
+) -> ChannelId {
+    use sha2::{Digest, Sha256};
+    // Canonical order so both endpoints hash the same (lo, hi) regardless of their roles.
+    let (lo, hi) = if holder_a <= holder_b {
+        (holder_a, holder_b)
+    } else {
+        (holder_b, holder_a)
+    };
+    let mut h = Sha256::new();
+    h.update(LINK_CHANNEL_DOMAIN);
+    h.update(operator_pubkey);
+    h.update(lo);
+    h.update(hi);
+    ChannelId(h.finalize().into())
+}
+
 /// The direction a grant authorizes on its channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -1563,5 +1604,48 @@ mod tests {
             Err(GrantError::Malformed),
             "an over-long staple buffer is Malformed"
         );
+    }
+
+    // ---- #107-nway: deterministic per-link channel id derivation --------------------------
+
+    #[test]
+    fn link_channel_id_is_canonical_operator_bound_and_collision_resistant() {
+        // #107-nway (frozen): a topology's overlay link (holder_a, holder_b) under an operator
+        // deterministically maps to a ChannelId both endpoints can derive locally — no round
+        // trip. It must be order-independent, operator-bound (cross-operator isolation), and
+        // collision-resistant across distinct pairs. It's an ADDRESS only; grants still gate.
+        let op = [0x01u8; 32];
+        let a = [0xaau8; 32];
+        let b = [0xbbu8; 32];
+
+        // Deterministic + canonical: both endpoints derive the SAME id regardless of order.
+        let id_ab = channel_id_for_link(&op, &a, &b);
+        assert_eq!(id_ab, channel_id_for_link(&op, &a, &b), "derivation is deterministic");
+        assert_eq!(
+            id_ab,
+            channel_id_for_link(&op, &b, &a),
+            "order-independent — a and b derive the same channel for their link"
+        );
+
+        // Operator-bound: a different operator gets a different id for the same pair, so two
+        // operators can't collide onto one channel (cross-operator isolation).
+        let op2 = [0x02u8; 32];
+        assert_ne!(
+            id_ab,
+            channel_id_for_link(&op2, &a, &b),
+            "binding the operator key isolates channels across operators"
+        );
+
+        // Collision-resistant: a distinct holder pair yields a distinct channel.
+        let c = [0xccu8; 32];
+        assert_ne!(id_ab, channel_id_for_link(&op, &a, &c), "a different link is a different channel");
+        assert_ne!(
+            channel_id_for_link(&op, &a, &c),
+            channel_id_for_link(&op, &b, &c),
+            "distinct pairs sharing one endpoint are still distinct channels"
+        );
+
+        // Sanity: it is a full 32-byte id and not the trivially-zero value.
+        assert_ne!(id_ab.0, [0u8; 32], "a derived id is a real hash, not zero");
     }
 }
