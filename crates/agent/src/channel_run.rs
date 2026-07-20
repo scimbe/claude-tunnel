@@ -411,10 +411,14 @@ where
                 &relay_priv,
                 coord,
                 1,
-                |ep: String| async move { ep.parse::<SocketAddr>().is_ok() },
+                // #137 SSRF guard: the offered endpoint is peer-conveyed and never passed the edge
+                // broker's `safe_endpoint` gate, so apply the identical range filter here — refuse
+                // to even signal Ready for an internal/private/metadata target.
+                |ep: String| async move { upgrade_safe_endpoint(&ep).is_some() },
                 move |ep: String| async move {
-                    // Dial the offered endpoint and handshake as the direct-Noise INITIATOR.
-                    let addr: SocketAddr = ep.parse().ok()?;
+                    // Dial the offered endpoint (SSRF-guarded, #137) and handshake as the
+                    // direct-Noise INITIATOR. A non-global-unicast target is refused → stay on relay.
+                    let addr = upgrade_safe_endpoint(&ep)?;
                     let conn = dial_peer_direct(addr, dial_timeout).await.ok()?;
                     let (s, r) = conn.open_bi().await.ok()?;
                     establish_direct_session(s, r, true, &direct_priv, &direct_peer).await.ok()
@@ -665,6 +669,21 @@ fn is_globally_routable(ip: std::net::IpAddr) -> bool {
             (s0 & 0xfe00) != 0xfc00 && (s0 & 0xffc0) != 0xfe80 // reject fc00::/7 + fe80::/10
         }
     }
+}
+
+/// #137 SSRF guard for the #104 in-band relay→direct upgrade. The responder dials a
+/// **peer-conveyed** `Offer.direct_endpoint`; because the upgrade is negotiated peer-to-peer over
+/// the relay pump, that endpoint **never passed the edge broker's `safe_endpoint` admission gate**
+/// (#94). Apply the IDENTICAL range filter here — the shared [`ct_common::channel::is_global_unicast`],
+/// the exact primitive the edge's `safe_endpoint` is built on — so a malicious/compromised initiator
+/// cannot make the responder dial an internal address: loopback, RFC1918/LAN, cloud metadata
+/// `169.254.169.254`, link-local, CGNAT, IPv6 ULA, unspecified. Returns the parsed address ONLY if
+/// it is safe to dial; `None` (unparseable **or** non-global-unicast) refuses the upgrade and the
+/// session stays on the relay. This is an unconditional security guard — no test bypass.
+fn upgrade_safe_endpoint(ep: &str) -> Option<SocketAddr> {
+    ep.parse::<SocketAddr>()
+        .ok()
+        .filter(|addr| ct_common::channel::is_global_unicast(*addr))
 }
 
 impl ChannelJoinCliConfig {
@@ -3316,12 +3335,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgradable_session_over_quinn_upgrades_relay_to_direct_byte_exact() {
-        // #104 wire-in (frozen, the loopback analog of the H4 NAT proof): two agents run an
-        // UPGRADABLE A2A session over a relay quinn conn; the initiator advertises a real direct
-        // listener, the responder dials it, and the session hole-punches to direct — all with real
-        // quinn dial/accept — while a payload arrives byte-exact. (Loopback, so no NAT; H4 proves
-        // the live cross-NAT punch.)
+    async fn upgradable_session_refuses_a_private_direct_target_and_stays_byte_exact_on_relay() {
+        // #104 wire-in + #137 SSRF guard (frozen): two agents run an UPGRADABLE A2A session over a
+        // relay quinn conn. The initiator advertises a direct listener bound on LOOPBACK
+        // (`127.0.0.1`), so the #137 guard (`upgrade_safe_endpoint` = the edge's `is_global_unicast`
+        // filter) correctly REFUSES the responder's dial of that peer-conveyed internal endpoint —
+        // the session stays on the relay and the payload still arrives byte-exact. This proves the
+        // SSRF guard (a) blocks a private/internal upgrade target and (b) does not break delivery.
+        // (The full relay→direct upgrade over a *global-unicast* target can't run on loopback — that
+        // is H4's live cross-NAT proof; the pure upgrade mechanics are covered by the ct-common
+        // orchestration + DCUtR tests.)
         use crate::transport::{build_channel_dialer, build_direct_listener_at};
         use ct_common::noise::generate_static_keypair;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3419,6 +3442,35 @@ mod tests {
         // A real global-unicast address stays direct-capable (not forced relay-only).
         for routable in ["203.0.113.10:7000", "8.8.8.8:7000", "[2001:4860:4860::8888]:7000"] {
             assert!(!relay_only_mode(false, routable.parse().unwrap()), "{routable} stays direct-capable");
+        }
+    }
+
+    #[test]
+    fn upgrade_safe_endpoint_refuses_ssrf_ranges_and_admits_only_global_unicast() {
+        // #137 (frozen): the responder's SSRF guard for the peer-conveyed #104 Offer.direct_endpoint.
+        // Because the in-band upgrade bypasses the edge broker's `safe_endpoint` gate (#94), the
+        // guard must apply the SAME range filter — an internal / private / metadata / link-local /
+        // CGNAT / ULA / unspecified target (and anything unparseable) is refused; only a
+        // global-unicast address is dialable. Matches the edge's `safe_endpoint` semantics exactly
+        // (both are `parse + ct_common::channel::is_global_unicast`).
+        for bad in [
+            "127.0.0.1:7000",       // loopback
+            "10.0.0.5:7000",        // RFC1918
+            "192.168.1.9:7000",     // RFC1918
+            "172.16.0.1:7000",      // RFC1918
+            "169.254.169.254:80",   // cloud metadata / link-local
+            "100.64.0.1:7000",      // CGNAT
+            "0.0.0.0:7000",         // unspecified
+            "[::1]:7000",           // IPv6 loopback
+            "[fe80::1]:7000",       // IPv6 link-local
+            "[fc00::1]:7000",       // IPv6 ULA
+            "not-an-addr",          // unparseable
+            "example.com:443",      // hostname, not an IP:port
+        ] {
+            assert!(upgrade_safe_endpoint(bad).is_none(), "{bad} must be refused (SSRF / unparseable) — #137");
+        }
+        for ok in ["203.0.113.10:7000", "8.8.8.8:7000", "[2001:4860:4860::8888]:7000"] {
+            assert!(upgrade_safe_endpoint(ok).is_some(), "{ok} must be admitted (global-unicast)");
         }
     }
 
