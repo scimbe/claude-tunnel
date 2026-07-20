@@ -326,6 +326,106 @@ where
         .map_err(Into::into)
 }
 
+/// **#104 direct-P2P wire-in.** Run one side of an A2A channel session over `relay_conn` as an
+/// **upgradable** session: it starts on the relay and, in the background, opportunistically dials a
+/// direct link and cuts the byte stream over to it (offloading the edge) — transparently to the
+/// app, no byte lost at the seam. Composes
+/// [`ct_common::upgrade::run_upgradable_session_initiator`]/`_responder` with the real quinn
+/// dial/accept: the channel **initiator** advertises `own_direct_endpoint` (its `direct_listener`'s
+/// address) in-band and, on the peer's `Ready`, accepts the incoming direct dial; the channel
+/// **responder**, on the `Offer`, dials that endpoint ([`dial_peer_direct`]) and handshakes the
+/// direct Noise session. The direct-Noise role is tied to who-dials (the dialer is the Noise
+/// initiator) so `a2a_initiate`/`a2a_respond` never block each other. If the hole-punch fails, the
+/// session stays on the relay. An initiator with no listener to offer (a relay-only member) runs a
+/// plain [`run_channel_session_on_stream`]. The relay leg stays end-to-end either way; the live
+/// cross-NAT hole-punch is proven on the deploy (#104 H4), this over loopback.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_channel_session_upgradable<P>(
+    relay_conn: &Connection,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    local: P,
+    direct_listener: Option<Endpoint>,
+    own_direct_endpoint: Option<String>,
+    dial_timeout: std::time::Duration,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    use ct_common::a2a::establish_direct_session;
+    use ct_common::upgrade::{
+        run_upgradable_session_initiator, run_upgradable_session_responder, Role, UpgradeCoordinator,
+    };
+
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let (relay_send, relay_recv) = match role {
+        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
+        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
+    };
+    // The relay handshake borrows these; the direct-establishment closures need owned copies.
+    let (relay_priv, relay_peer) = (*own_noise_private, *peer_noise_public);
+    let (direct_priv, direct_peer) = (*own_noise_private, *peer_noise_public);
+
+    match role {
+        ChannelRole::Initiate => {
+            let (listener, endpoint) = match (direct_listener, own_direct_endpoint) {
+                (Some(l), Some(e)) => (l, e),
+                // Relay-only initiator (no dialable direct address): run the plain relay session.
+                _ => {
+                    return run_channel_session_on_stream(
+                        relay_send, relay_recv, ChannelRole::Initiate, &relay_priv, &relay_peer, local,
+                    )
+                    .await
+                    .map_err(Into::into)
+                }
+            };
+            let coord = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+            run_upgradable_session_initiator(
+                relay_send,
+                relay_recv,
+                local,
+                &relay_priv,
+                &relay_peer,
+                coord,
+                1,
+                || async move { Some(endpoint) },
+                move || async move {
+                    // Accept the incoming direct dial (the responder dials us), then handshake as the
+                    // direct-Noise RESPONDER (the dialer is the Noise initiator).
+                    let incoming = tokio::time::timeout(dial_timeout, listener.accept()).await.ok()??;
+                    let conn = incoming.await.ok()?;
+                    let (s, r) = conn.accept_bi().await.ok()?;
+                    establish_direct_session(s, r, false, &direct_priv, &direct_peer).await.ok()
+                },
+            )
+            .await
+            .map_err(Into::into)
+        }
+        ChannelRole::Accept => {
+            let coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+            run_upgradable_session_responder(
+                relay_send,
+                relay_recv,
+                local,
+                &relay_priv,
+                coord,
+                1,
+                |ep: String| async move { ep.parse::<SocketAddr>().is_ok() },
+                move |ep: String| async move {
+                    // Dial the offered endpoint and handshake as the direct-Noise INITIATOR.
+                    let addr: SocketAddr = ep.parse().ok()?;
+                    let conn = dial_peer_direct(addr, dial_timeout).await.ok()?;
+                    let (s, r) = conn.open_bi().await.ok()?;
+                    establish_direct_session(s, r, true, &direct_priv, &direct_peer).await.ok()
+                },
+            )
+            .await
+            .map_err(Into::into)
+        }
+    }
+}
+
 /// Which relay-leg transport [`run_channel_join_with_admission`] falls back to when the
 /// direct dial fails (#106 relay-leg-443). The direct-QUIC relay works for a member that
 /// can still reach the relay port; a member on a truly `:443`-only network (relay port
@@ -3213,6 +3313,81 @@ mod tests {
             .expect("responder task");
         assert!(ok, "the full {len}-byte payload was delivered (no truncation) despite the abrupt sender teardown (#134)");
         assert_eq!(got, expected, "delivered bytes are byte-exact and complete");
+    }
+
+    #[tokio::test]
+    async fn upgradable_session_over_quinn_upgrades_relay_to_direct_byte_exact() {
+        // #104 wire-in (frozen, the loopback analog of the H4 NAT proof): two agents run an
+        // UPGRADABLE A2A session over a relay quinn conn; the initiator advertises a real direct
+        // listener, the responder dials it, and the session hole-punches to direct — all with real
+        // quinn dial/accept — while a payload arrives byte-exact. (Loopback, so no NAT; H4 proves
+        // the live cross-NAT punch.)
+        use crate::transport::{build_channel_dialer, build_direct_listener_at};
+        use ct_common::noise::generate_static_keypair;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let a = generate_static_keypair(); // channel initiator
+        let b = generate_static_keypair(); // channel responder
+        let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+        let dt = std::time::Duration::from_secs(5);
+
+        // Relay leg: the responder is the quinn server, the initiator connects to it.
+        let (relay_server, _rc) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("relay listener");
+        let relay_addr = relay_server.local_addr().expect("relay addr");
+        // The initiator's direct listener (the responder dials this to upgrade).
+        let (direct_listener, _dc) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("direct listener");
+        let direct_addr = direct_listener.local_addr().expect("direct addr").to_string();
+
+        // Responder: accept the relay conn, run the upgradable Accept session, collect the payload.
+        let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let len = payload.len();
+        let resp = tokio::spawn(async move {
+            let relay_conn = relay_server.accept().await.expect("incoming").await.expect("relay conn");
+            let (resp_app, resp_test) = tokio::io::duplex(1 << 16);
+            let (mut resp_out, _w) = tokio::io::split(resp_test);
+            let sess = tokio::spawn(async move {
+                let _ = run_channel_session_upgradable(
+                    &relay_conn, ChannelRole::Accept, &b_priv, &a_pub, resp_app, None, None, dt,
+                )
+                .await;
+                drop(relay_conn);
+            });
+            let mut got = vec![0u8; len];
+            let ok = resp_out.read_exact(&mut got).await.is_ok();
+            sess.abort();
+            (ok, got)
+        });
+
+        // Initiator: dial the relay, run the upgradable Initiate session with its direct listener.
+        let dialer = build_channel_dialer().expect("dialer");
+        let relay_conn = dialer.connect(relay_addr, "localhost").expect("cfg").await.expect("relay conn");
+        let (init_app, init_test) = tokio::io::duplex(1 << 16);
+        let (_r, mut init_feed) = tokio::io::split(init_test);
+        let init = tokio::spawn(async move {
+            run_channel_session_upgradable(
+                &relay_conn,
+                ChannelRole::Initiate,
+                &a_priv,
+                &b_pub,
+                init_app,
+                Some(direct_listener),
+                Some(direct_addr),
+                dt,
+            )
+            .await
+        });
+
+        init_feed.write_all(&payload).await.unwrap();
+        init_feed.flush().await.unwrap();
+        init_feed.shutdown().await.unwrap();
+
+        let (ok, got) = tokio::time::timeout(std::time::Duration::from_secs(20), resp)
+            .await
+            .expect("responder within 20s")
+            .expect("responder task");
+        assert!(ok, "the full {len}-byte payload was delivered across the upgradable session");
+        assert_eq!(got, payload, "relay→direct upgrade over real quinn delivered a byte-exact stream (#104)");
+        init.abort();
     }
 
     #[test]
