@@ -1049,6 +1049,15 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 continue;
             }
         };
+        // #103 FIX (root cause, central-confirmed 2026-07-20): re-sample `now` at ADMISSION
+        // time for the parked member's deadline. The `now` above was sampled at the TOP of the
+        // iteration, BEFORE the possibly long-idle `accept_member().await`; reusing that stale
+        // value for the `deadline` made a member that arrived after an idle period already
+        // past-due, so the very next iteration's `drain_expired` evicted it ~30µs later —
+        // before its partner could pair. That single stale-`now` was the whole ~30-cycle
+        // pairing failure. The park deadline must be TTL from the member's ACTUAL admission
+        // time, not from before the accept wait.
+        let now = now_fn();
         let channel = member.req.grant.grant.channel;
         let holder = member.req.grant.grant.holder;
 
@@ -2360,6 +2369,74 @@ mod tests {
         let ack_x_acc = x_acc.await.expect("x acc task");
         assert!(ack_x_init.contains("203.0.113.2:7002"), "X initiator learns X acceptor's endpoint, got {ack_x_init:?}");
         assert!(ack_x_acc.contains("203.0.113.1:7001"), "X acceptor learns X initiator's endpoint, got {ack_x_acc:?}");
+
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn a_member_parked_after_idle_is_not_evicted_before_its_partner_pairs() {
+        // #103 regression (root cause, central-confirmed): the parked member's deadline must be
+        // TTL from its ADMISSION time, not from the loop-iteration top sampled BEFORE the idle
+        // accept wait. Model the idle with a controllable clock: the loop starts + goes idle
+        // (top-of-iter `now` = 100), THEN the clock jumps far past `park_ttl` before either
+        // member connects (admission `now` = 900). A correct impl dates member 1's deadline at
+        // 900+ttl so the next iteration's drain (now=900) keeps it and the pair forms; the old
+        // stale-`now` dated it at 100+ttl=105 << 900 -> drained ~instantly -> member 2 parks
+        // alone -> no pairing (this test would hang without the fix). Grant expiry is 1_000, so
+        // both admission `now`s (100, 900) stay under it and the grants still verify.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let pk = operator_pubkey();
+        let chan = [0x11u8; 32];
+        let clock = Arc::new(AtomicU64::new(100));
+        let park_ttl = 5u64;
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let clock_loop = clock.clone();
+        let driver = tokio::spawn(async move {
+            run_channel_broker_loop(
+                &server,
+                move || clock_loop.load(Ordering::Relaxed),
+                move |c: ChannelId, _h: [u8; 32]| async move {
+                    (c.0 == chan).then_some((pk, None, None))
+                },
+                park_ttl,
+                |a, b, now| finish_rendezvous_pair(a, b, now),
+            )
+            .await;
+        });
+
+        // Let the loop reach its idle `accept_member().await` (top-of-iter now sampled = 100),
+        // THEN jump the clock far past park_ttl — simulating the idle period before the first
+        // connection that made the old code's parked deadline already-expired.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        clock.store(900, Ordering::Relaxed);
+
+        let m1 = tokio::spawn(run_rendezvous_member(
+            cert.clone(), addr, chan, holder_sk(0xa1), Direction::Initiate, "203.0.113.1:7001", None, None,
+        ));
+        let m2 = tokio::spawn(run_rendezvous_member(
+            cert.clone(), addr, chan, holder_sk(0xb2), Direction::Accept, "203.0.113.2:7002", None, None,
+        ));
+
+        // Both must get their `OK <peer_endpoint>` ack — i.e. they PAIRED. Without the fix,
+        // member 1 is drain-evicted before member 2 offers, so neither pairs and this times out.
+        let ack1 = tokio::time::timeout(std::time::Duration::from_secs(10), m1)
+            .await
+            .expect("member 1 pairs — not evicted by a stale-now drain (#103)")
+            .expect("m1 join");
+        let ack2 = tokio::time::timeout(std::time::Duration::from_secs(10), m2)
+            .await
+            .expect("member 2 pairs (#103)")
+            .expect("m2 join");
+        assert!(ack1.starts_with("OK"), "member 1 got a pairing ack, got {ack1:?}");
+        assert!(ack2.starts_with("OK"), "member 2 got a pairing ack, got {ack2:?}");
+        // And each learned its partner's advertised endpoint (a real rendezvous pairing).
+        assert!(ack1.contains("203.0.113.2:7002"), "m1 learns m2's endpoint: {ack1:?}");
+        assert!(ack2.contains("203.0.113.1:7001"), "m2 learns m1's endpoint: {ack2:?}");
 
         driver.abort();
     }
