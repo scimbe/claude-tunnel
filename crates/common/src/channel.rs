@@ -552,6 +552,57 @@ impl MembershipStaple {
             Err(_) => false,
         }
     }
+
+    /// The exact byte length of [`encode`](Self::encode)'s output — every field is
+    /// fixed-size, so a staple occupies a fixed 144-byte record on the wire (the unit the
+    /// gossip transport ships/refreshes).
+    pub const WIRE_LEN: usize = 64 + 32 + 32 + 8 + 8; // 144
+
+    /// Encode to a fixed-layout binary wire form (all fields fixed size):
+    /// `signature(64) | channel(32) | holder(32) | stapled_at(u64 LE) | expires_at(u64 LE)`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&self.signature);
+        out.extend_from_slice(&self.channel.0);
+        out.extend_from_slice(&self.holder);
+        out.extend_from_slice(&self.stapled_at.to_le_bytes());
+        out.extend_from_slice(&self.expires_at.to_le_bytes());
+        out
+    }
+
+    /// Decode from [`encode`](Self::encode)'s wire form. Rejects a truncated or
+    /// over-long buffer as [`GrantError::Malformed`] (a partial staple is never
+    /// half-trusted). Decoding does NOT authenticate — the caller still gates on
+    /// [`is_valid`](Self::is_valid); a well-formed record can still be forged or lapsed.
+    pub fn decode(bytes: &[u8]) -> Result<Self, GrantError> {
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], GrantError> {
+            if cur.len() < n {
+                return Err(GrantError::Malformed);
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head)
+        }
+        let mut cur = bytes;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(take(&mut cur, 64)?);
+        let mut channel = [0u8; 32];
+        channel.copy_from_slice(take(&mut cur, 32)?);
+        let mut holder = [0u8; 32];
+        holder.copy_from_slice(take(&mut cur, 32)?);
+        let stapled_at = u64::from_le_bytes(take(&mut cur, 8)?.try_into().unwrap());
+        let expires_at = u64::from_le_bytes(take(&mut cur, 8)?.try_into().unwrap());
+        if !cur.is_empty() {
+            return Err(GrantError::Malformed);
+        }
+        Ok(MembershipStaple {
+            channel: ChannelId(channel),
+            holder,
+            stapled_at,
+            expires_at,
+            signature,
+        })
+    }
 }
 
 /// A soft-state cache of the freshest [`MembershipStaple`] per `(channel, holder)` — the
@@ -1474,6 +1525,43 @@ mod tests {
         assert!(
             !cache.is_member(&operator, &ChannelId(ch), &[0xccu8; 32], 2_000),
             "membership is per-(channel,holder) — a different holder is not admitted"
+        );
+    }
+
+    #[test]
+    fn membership_staple_wire_roundtrips_and_rejects_malformed() {
+        // E-staple-wire (frozen): the fixed 144-byte codec the gossip transport ships. A
+        // staple round-trips byte-exact, the decoded copy still verifies (authenticity
+        // survives the wire), and a truncated/over-long buffer is rejected as Malformed —
+        // a partial staple is never half-decoded into a trusted one.
+        let ch = [0x44u8; 32];
+        let holder = [0xd4u8; 32];
+        let (operator, staple) = stapled(7, ch, holder, 1_000, 4_600);
+
+        let wire = staple.encode();
+        assert_eq!(wire.len(), MembershipStaple::WIRE_LEN, "encoded length is the fixed WIRE_LEN");
+        assert_eq!(wire.len(), 144);
+
+        let decoded = MembershipStaple::decode(&wire).expect("a well-formed staple decodes");
+        assert_eq!(decoded, staple, "encode -> decode is the identity");
+        assert!(
+            decoded.is_valid(&operator, 1_100),
+            "the decoded staple still verifies under the operator key (authenticity survives the wire)"
+        );
+
+        // Truncated (one byte short) and over-long (one trailing byte) buffers are both
+        // rejected — the codec never half-trusts a partial or padded record.
+        assert_eq!(
+            MembershipStaple::decode(&wire[..wire.len() - 1]),
+            Err(GrantError::Malformed),
+            "a truncated staple buffer is Malformed"
+        );
+        let mut too_long = wire.clone();
+        too_long.push(0);
+        assert_eq!(
+            MembershipStaple::decode(&too_long),
+            Err(GrantError::Malformed),
+            "an over-long staple buffer is Malformed"
         );
     }
 }
