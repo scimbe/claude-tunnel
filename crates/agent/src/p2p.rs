@@ -56,7 +56,7 @@
 
 use std::time::Duration;
 
-use ct_common::channel::ChannelId;
+use ct_common::channel::{verify, ChannelId, GrantError, SignedChannelGrant, UnixSeconds};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use libp2p::core::transport::MemoryTransport;
 use libp2p::core::upgrade::Version;
@@ -856,6 +856,93 @@ pub async fn kademlia_publish_and_resolve(
     }
 }
 
+/// Why a peer may **not** use a superpeer's Circuit-Relay for a given channel
+/// ([`authorize_relay_circuit`], invariant #3). Distinct variants so a relay can log
+/// *which* containment rule refused a circuit without leaking grant contents.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RelayCircuitError {
+    /// The **relay's own** grant is invalid (bad operator signature, expired, …): a node
+    /// with no authentic membership must never relay at all.
+    RelayGrantInvalid(GrantError),
+    /// The relay's grant is authentic but for a **different channel** than the circuit —
+    /// invariant #3: a superpeer relays ONLY channels it is itself a grant-member of, so
+    /// it can learn nothing beyond membership it already holds.
+    RelayNotMember,
+    /// The **requester's** grant is invalid — a peer with no authentic membership can't
+    /// use the relay.
+    RequesterGrantInvalid(GrantError),
+    /// The requester's grant is authentic but for a **different channel** than the circuit
+    /// it is asking to open — it has not proven co-membership on this channel.
+    RequesterChannelMismatch,
+}
+
+impl std::fmt::Display for RelayCircuitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayCircuitError::RelayGrantInvalid(e) => write!(f, "relay's own grant invalid: {e}"),
+            RelayCircuitError::RelayNotMember => {
+                write!(f, "relay is not a grant-member of the circuit's channel")
+            }
+            RelayCircuitError::RequesterGrantInvalid(e) => {
+                write!(f, "requester grant invalid: {e}")
+            }
+            RelayCircuitError::RequesterChannelMismatch => {
+                write!(f, "requester grant is for a different channel than the circuit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RelayCircuitError {}
+
+/// **Invariant #3 admission gate for a superpeer's Circuit-Relay.** A superpeer (any
+/// member the operator lets relay) must forward a circuit **only** for a channel it is
+/// itself a grant-member of, and only to a peer that proves co-membership on that same
+/// channel — so the relay learns nothing beyond membership it already holds, and an
+/// unguarded open relay can't be abused to forward arbitrary peers' circuits.
+///
+/// The `C-circuit-relay-transport` slice's libp2p relay is deliberately UNGUARDED
+/// (it relays any circuit) and is therefore test-only; this predicate is the check that
+/// makes a live/public relay safe to run. It is the exact analog of the broker's
+/// [`ct_edge`-side `authorize_channel_pair`], applied to relay *use* instead of a direct
+/// pairing.
+///
+/// Enforced, in order:
+/// 1. the **relay's** grant `relay_grant` verifies against `operator_pubkey` at `now`
+///    (authentic + unexpired) — else [`RelayCircuitError::RelayGrantInvalid`];
+/// 2. that grant is for **this** `circuit_channel` — else
+///    [`RelayCircuitError::RelayNotMember`] (invariant #3: relay only your own channels);
+/// 3. the **requester's** grant `requester_grant` verifies — else
+///    [`RelayCircuitError::RequesterGrantInvalid`];
+/// 4. it too is for `circuit_channel` — else [`RelayCircuitError::RequesterChannelMismatch`].
+///
+/// The libp2p `PeerId` is **never** consulted (invariant #1): authorization is purely the
+/// operator-signed grants, exactly as everywhere else. Like [`verify`], this does NOT
+/// check holder *possession* — that is a connect-time challenge (as in the broker's
+/// `admit_channel_join_on_duplex`) layered on when this predicate is wired to the live
+/// relayed substream; here it establishes both grants are authentic and co-membership on
+/// the circuit's channel.
+pub fn authorize_relay_circuit(
+    operator_pubkey: &[u8; 32],
+    relay_grant: &SignedChannelGrant,
+    requester_grant: &SignedChannelGrant,
+    circuit_channel: &ChannelId,
+    now: UnixSeconds,
+) -> Result<(), RelayCircuitError> {
+    // 1–2. The relay must itself hold an authentic grant FOR THIS channel (invariant #3).
+    verify(operator_pubkey, relay_grant, now).map_err(RelayCircuitError::RelayGrantInvalid)?;
+    if relay_grant.grant.channel != *circuit_channel {
+        return Err(RelayCircuitError::RelayNotMember);
+    }
+    // 3–4. The requester must prove co-membership on the same channel.
+    verify(operator_pubkey, requester_grant, now)
+        .map_err(RelayCircuitError::RequesterGrantInvalid)?;
+    if requester_grant.grant.channel != *circuit_channel {
+        return Err(RelayCircuitError::RequesterChannelMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,6 +1325,97 @@ mod tests {
             wrong_holder.verified_coordinates(&channel),
             None,
             "a poisoned (substituted-holder) record is rejected, not trusted (#4)"
+        );
+    }
+
+    // ---- C-membership-gate: invariant #3 relay authorization ------------------------------
+
+    /// Sign a grant for `channel`/`holder` under the deterministic operator key `op` (byte
+    /// fill), returning the operator pubkey and the signed grant. Pure — no rng in tests.
+    fn grant_for(op: u8, channel: [u8; 32], holder: [u8; 32]) -> ([u8; 32], SignedChannelGrant) {
+        use ct_common::channel::{ChannelGrant, Direction, Rights};
+        let sk = SigningKey::from_bytes(&[op; 32]);
+        let grant = ChannelGrant {
+            channel: ChannelId(channel),
+            holder,
+            direction: Direction::Both,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000,
+        };
+        let signature = sk.sign(&grant.signing_bytes()).to_bytes();
+        (sk.verifying_key().to_bytes(), SignedChannelGrant { grant, signature })
+    }
+
+    #[test]
+    fn relay_circuit_authz_enforces_invariant_3_membership_containment() {
+        // #121 C-membership-gate (frozen): a superpeer's Circuit-Relay admits a circuit ONLY
+        // for a channel it is itself a grant-member of, and only for a requester that proves
+        // co-membership on that same channel (invariant #3 — the relay learns nothing beyond
+        // membership it already holds, and an open relay can't be abused). Authorization is
+        // purely the operator-signed grants; the libp2p PeerId is never an input (invariant
+        // #1 — structurally, `authorize_relay_circuit` has no PeerId parameter).
+        let now = 1_000;
+        let ch_a = [0x11u8; 32]; // the circuit's channel
+        let ch_b = [0x22u8; 32]; // a DIFFERENT channel
+        let relay_holder = [0xa1u8; 32];
+        let requester_holder = [0xb2u8; 32];
+
+        // Operator `op=7` runs channel A; both the relay and the requester hold grants for A.
+        let (operator, relay_grant) = grant_for(7, ch_a, relay_holder);
+        let (_op2, requester_grant) = grant_for(7, ch_a, requester_holder);
+
+        // (1) HAPPY PATH: relay is an A-member, requester proves A-co-membership → admitted.
+        assert_eq!(
+            authorize_relay_circuit(&operator, &relay_grant, &requester_grant, &ChannelId(ch_a), now),
+            Ok(()),
+            "an A-member relay admits an A-co-member's circuit for channel A"
+        );
+
+        // (2) RELAY NOT A MEMBER (invariant #3 core): the relay's authentic grant is for
+        // channel B, but the circuit is for A → refuse. A superpeer must not relay a channel
+        // it doesn't itself belong to (it would learn membership metadata it has no claim to).
+        let (op_b, relay_grant_b) = grant_for(7, ch_b, relay_holder);
+        assert_eq!(op_b, operator, "same operator key across channels in this test");
+        assert_eq!(
+            authorize_relay_circuit(&operator, &relay_grant_b, &requester_grant, &ChannelId(ch_a), now),
+            Err(RelayCircuitError::RelayNotMember),
+            "a relay holding only a channel-B grant must not relay a channel-A circuit (#3)"
+        );
+
+        // (3) REQUESTER NOT A CO-MEMBER: the requester's authentic grant is for channel B, not
+        // the circuit's channel A → refuse. Proving membership of *some* channel is not enough.
+        let (_opb, requester_grant_b) = grant_for(7, ch_b, requester_holder);
+        assert_eq!(
+            authorize_relay_circuit(&operator, &relay_grant, &requester_grant_b, &ChannelId(ch_a), now),
+            Err(RelayCircuitError::RequesterChannelMismatch),
+            "a requester with only a channel-B grant can't open a channel-A circuit"
+        );
+
+        // (4) FORGED RELAY GRANT: the relay presents a grant signed by a DIFFERENT operator key
+        // (op=8) — it doesn't verify against channel A's operator → refuse before anything else.
+        let (_wrong_op, forged_relay) = grant_for(8, ch_a, relay_holder);
+        assert_eq!(
+            authorize_relay_circuit(&operator, &forged_relay, &requester_grant, &ChannelId(ch_a), now),
+            Err(RelayCircuitError::RelayGrantInvalid(GrantError::BadSignature)),
+            "a relay grant not signed by the channel operator is rejected"
+        );
+
+        // (5) FORGED REQUESTER GRANT: relay is a valid A-member, but the requester's grant is
+        // signed by a foreign operator → refuse. A stranger can't use an honest relay.
+        let (_wrong_op2, forged_requester) = grant_for(9, ch_a, requester_holder);
+        assert_eq!(
+            authorize_relay_circuit(&operator, &relay_grant, &forged_requester, &ChannelId(ch_a), now),
+            Err(RelayCircuitError::RequesterGrantInvalid(GrantError::BadSignature)),
+            "a requester grant not signed by the channel operator is rejected"
+        );
+
+        // (6) EXPIRED RELAY GRANT: authentic but past `expires_at` (10_000) → refuse. Fail-static
+        // is bounded by grant/staple TTL (invariant #7); an expired membership can't relay.
+        assert_eq!(
+            authorize_relay_circuit(&operator, &relay_grant, &requester_grant, &ChannelId(ch_a), 10_000),
+            Err(RelayCircuitError::RelayGrantInvalid(GrantError::Expired)),
+            "an expired relay grant may not relay (TTL-bounded, invariant #7)"
         );
     }
 }
