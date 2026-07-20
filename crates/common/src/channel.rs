@@ -758,6 +758,103 @@ impl StapleCache {
     }
 }
 
+/// The domain separating a billing-commitment preimage from every other signed object.
+const BILLING_COMMITMENT_DOMAIN: &[u8] = b"ct-billing-commitment-v1";
+
+/// An **optional, agent-verifiable A2A billing coupling** for a channel (#132). It does **not**
+/// move funds — settlement stays external (the classic tunnel-token billing lives in
+/// `ct-control-plane::billing`; multi-hop path-transit *receipts* are a #121 follow) — it is
+/// the cryptographic commitment a member can **require and verify at channel setup**: the
+/// committing (paying) `holder` commits, for `channel`, to the off-band billing `terms_hash`,
+/// payable to `payee`, up to `max_amount` (opaque units), until `expires_at`, signed with its
+/// ed25519 **holder** key (the same key family as grants/attestations). The peer verifies it
+/// against that holder pubkey before proceeding. **Opt-in**: a channel that doesn't require
+/// billing never uses it — exactly like [`ChannelAdmissionPolicy`], so the core tunnel stays
+/// payment-free and this can never *weaken* admission (it only adds a requirement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingCommitment {
+    pub channel: ChannelId,
+    /// The committing (paying) member — the signature is checked against this holder pubkey.
+    pub holder: [u8; 32],
+    /// The settlement payee identity (opaque; a settlement pubkey/handle the external layer resolves).
+    pub payee: [u8; 32],
+    /// Hash of the off-band billing terms (price/unit, currency, metering rule …) — the terms
+    /// themselves stay out-of-band; only their hash is committed on the wire.
+    pub terms_hash: [u8; 32],
+    /// The upper bound (opaque units) the payer commits to for this channel/session.
+    pub max_amount: u64,
+    pub expires_at: UnixSeconds,
+    /// The holder's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    pub signature: [u8; 64],
+}
+
+impl BillingCommitment {
+    /// Domain-separated preimage: `domain ‖ channel ‖ holder ‖ payee ‖ terms_hash ‖
+    /// max_amount(LE) ‖ expires_at(LE)`. Binding every field means the commitment can't be
+    /// replayed onto another channel/payee nor have its amount/terms/TTL altered without
+    /// re-signing.
+    pub fn signing_bytes(
+        channel: &ChannelId,
+        holder: &[u8; 32],
+        payee: &[u8; 32],
+        terms_hash: &[u8; 32],
+        max_amount: u64,
+        expires_at: UnixSeconds,
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(BILLING_COMMITMENT_DOMAIN.len() + 32 * 4 + 8 + 8);
+        m.extend_from_slice(BILLING_COMMITMENT_DOMAIN);
+        m.extend_from_slice(&channel.0);
+        m.extend_from_slice(holder);
+        m.extend_from_slice(payee);
+        m.extend_from_slice(terms_hash);
+        m.extend_from_slice(&max_amount.to_le_bytes());
+        m.extend_from_slice(&expires_at.to_le_bytes());
+        m
+    }
+
+    /// Whether this commitment is authentic AND still current at `now`: the holder signature
+    /// verifies for its exact `(channel, holder, payee, terms_hash, max_amount, expires_at)`
+    /// binding and `now < expires_at`. A forged/tampered/expired commitment returns `false`.
+    pub fn is_valid(&self, now: UnixSeconds) -> bool {
+        if now >= self.expires_at {
+            return false;
+        }
+        match VerifyingKey::from_bytes(&self.holder) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.channel,
+                        &self.holder,
+                        &self.payee,
+                        &self.terms_hash,
+                        self.max_amount,
+                        self.expires_at,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// The **requiring agent's setup gate**: does this commitment authentically cover what the
+    /// requirer demands — signed + unexpired ([`is_valid`](Self::is_valid)), for the expected
+    /// `required_payee` and `required_terms_hash`, with a `max_amount` of at least `min_amount`?
+    /// A channel that requires billing calls this at setup; `false` refuses the tunnel.
+    pub fn satisfies(
+        &self,
+        now: UnixSeconds,
+        required_payee: &[u8; 32],
+        required_terms_hash: &[u8; 32],
+        min_amount: u64,
+    ) -> bool {
+        self.is_valid(now)
+            && &self.payee == required_payee
+            && &self.terms_hash == required_terms_hash
+            && self.max_amount >= min_amount
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -1740,5 +1837,88 @@ mod tests {
 
         // Sanity: it is a full 32-byte id and not the trivially-zero value.
         assert_ne!(id_ab.0, [0u8; 32], "a derived id is a real hash, not zero");
+    }
+
+    // ---- #132: optional agent-verifiable A2A billing commitment --------------------------
+
+    /// Sign a billing commitment for `channel` under holder key `h` (byte fill).
+    fn commit(
+        h: u8,
+        channel: [u8; 32],
+        payee: [u8; 32],
+        terms: [u8; 32],
+        max_amount: u64,
+        expires_at: UnixSeconds,
+    ) -> BillingCommitment {
+        let sk = SigningKey::from_bytes(&[h; 32]);
+        let holder = sk.verifying_key().to_bytes();
+        let sig = sk
+            .sign(&BillingCommitment::signing_bytes(
+                &ChannelId(channel),
+                &holder,
+                &payee,
+                &terms,
+                max_amount,
+                expires_at,
+            ))
+            .to_bytes();
+        BillingCommitment {
+            channel: ChannelId(channel),
+            holder,
+            payee,
+            terms_hash: terms,
+            max_amount,
+            expires_at,
+            signature: sig,
+        }
+    }
+
+    #[test]
+    fn billing_commitment_verifies_and_gates_setup_only_on_matching_terms() {
+        // #132 (frozen): the OPTIONAL, agent-verifiable billing coupling. A holder-signed
+        // commitment is authentic + current only for its exact binding; the requiring agent's
+        // `satisfies` gate at setup accepts it only for the demanded payee + terms and a
+        // sufficient amount. It moves no funds — it is the verifiable coupling, not settlement.
+        let ch = [0x11u8; 32];
+        let payee = [0xa5u8; 32];
+        let terms = [0x7eu8; 32];
+        let c = commit(9, ch, payee, terms, 1_000, 5_000);
+
+        // (1) Authentic + unexpired → valid; and satisfies the exact demanded terms with amount.
+        assert!(c.is_valid(1_000), "an authentic, unexpired commitment verifies");
+        assert!(
+            c.satisfies(1_000, &payee, &terms, 500),
+            "setup gate passes: right payee + terms, max_amount(1000) >= min(500)"
+        );
+
+        // (2) Expiry: at expires_at it is dead (#7-style TTL) — refuses setup.
+        assert!(!c.is_valid(5_000), "expired commitment is invalid");
+        assert!(!c.satisfies(5_000, &payee, &terms, 500), "expired → setup refused");
+
+        // (3) Wrong payee / wrong terms / insufficient amount all refuse the setup gate.
+        assert!(!c.satisfies(1_000, &[0xbbu8; 32], &terms, 500), "wrong payee refused");
+        assert!(!c.satisfies(1_000, &payee, &[0xccu8; 32], 500), "wrong terms refused");
+        assert!(!c.satisfies(1_000, &payee, &terms, 2_000), "amount below the demanded minimum refused");
+
+        // (4) Tamper: flip a field after signing → the holder signature no longer verifies.
+        let mut forged = c.clone();
+        forged.max_amount = 1_000_000; // attacker inflates the committed cap
+        assert!(!forged.is_valid(1_000), "a tampered max_amount breaks the signature (#132)");
+        let mut wrong_payee = c.clone();
+        wrong_payee.payee = [0xbbu8; 32];
+        assert!(!wrong_payee.is_valid(1_000), "a swapped payee breaks the signature");
+
+        // (5) Forged holder: an attacker signs with its own key but stamps the victim's holder
+        // pubkey — the signature can't validate against the claimed holder.
+        let victim = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        let attacker = SigningKey::from_bytes(&[13u8; 32]);
+        let sig = attacker
+            .sign(&BillingCommitment::signing_bytes(&ChannelId(ch), &victim, &payee, &terms, 1_000, 5_000))
+            .to_bytes();
+        let impersonated = BillingCommitment {
+            channel: ChannelId(ch), holder: victim, payee, terms_hash: terms,
+            max_amount: 1_000, expires_at: 5_000, signature: sig,
+        };
+        assert!(!impersonated.is_valid(1_000), "a commitment not signed by its holder is rejected");
     }
 }
