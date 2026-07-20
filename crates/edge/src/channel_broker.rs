@@ -868,15 +868,45 @@ where
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let channel = req.grant.grant.channel;
     let holder = req.grant.grant.holder;
+    // #103 (:443 path, source-requested 2026-07-20): the success-path traces mirroring the
+    // `:4435` `run_channel_broker_loop` instrumentation, so the NAT'd-source `:443` fallback is
+    // equally visible. `[admitted]` proves `admit_channel_join_on_duplex` returned (full join
+    // read + possession succeeded over the TLS-TCP stream); the `[offer:*]` outcome shows
+    // whether two `:443` members are recognized as the same channel and Paired, or each Parked.
+    eprintln!(
+        "ct-edge: channel-accept [admitted] channel={} holder={} peer={observed} (#103 :443 path) — offering to pairer",
+        hex_of(&channel.0),
+        hex_of(&holder)
+    );
     let member = AdmittedStreamMember { stream, req, operator, noise, attest };
     let outcome = pairer
         .lock()
         .unwrap()
         .offer(WaitingMember { channel, holder, deadline, payload: member });
     match outcome {
-        PairOutcome::Parked => Ok(None),
-        PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
+        PairOutcome::Parked => {
+            eprintln!(
+                "ct-edge: channel-accept [offer:parked] channel={} holder={} (#103 :443 path) — first holder, awaiting partner",
+                hex_of(&channel.0),
+                hex_of(&holder)
+            );
+            Ok(None)
+        }
+        PairOutcome::Paired(a, b) => {
+            eprintln!(
+                "ct-edge: channel-accept [offer:paired] channel={} holders={}/{} (#103 :443 path) — matched, relay-splicing",
+                hex_of(&channel.0),
+                hex_of(&a.holder),
+                hex_of(&b.holder)
+            );
+            Ok(Some((a.payload, b.payload)))
+        }
         PairOutcome::Superseded(stale) => {
+            eprintln!(
+                "ct-edge: channel-accept [offer:superseded] channel={} holder={} (#103 :443 path) — same holder re-presented, closing stale",
+                hex_of(&channel.0),
+                hex_of(&holder)
+            );
             // A retry from the same holder arrived before its partner; the fresh offer is
             // now parked, so close the stale stream and report "parked" (nothing to pair).
             let mut stale = stale.payload;
