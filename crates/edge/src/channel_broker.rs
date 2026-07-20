@@ -315,6 +315,30 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
+    // #124 observability: refuse an admission by logging the per-checkpoint reason
+    // server-side with a stable, greppable tag (`ct-edge: channel-join NO [<tag>]`), then
+    // sending the OPAQUE `b"NO"` on the wire. The client ack is deliberately the bare `NO`
+    // and never carries the reason: telling an unauthenticated presenter *which* check
+    // failed is an admission oracle, so the diagnosis lives only in the operator's edge
+    // logs. `context` (empty for the framing checks) carries the public grant fields
+    // (channel/holder hex, advertised endpoint) that let a live operator pin a refusal —
+    // never a private key or the possession challenge/signature bytes.
+    async fn refuse<W: AsyncWrite + Unpin>(
+        send: &mut W,
+        tag: &str,
+        context: &str,
+        reason: BoxError,
+    ) -> BoxError {
+        if context.is_empty() {
+            eprintln!("ct-edge: channel-join NO [{tag}]: {reason}");
+        } else {
+            eprintln!("ct-edge: channel-join NO [{tag}] {context}: {reason}");
+        }
+        let _ = send.write_all(b"NO").await;
+        let _ = send.shutdown().await;
+        reason
+    }
+
     // #105: bound the framed request + possession round-trip so a peer that opens the
     // stream but never submits a valid join can't wedge the broker's serial round loop.
     let read = async {
@@ -324,9 +348,7 @@ where
     recv.read_exact(&mut len_buf).await?;
     let len = u16::from_be_bytes(len_buf) as usize;
     if len == 0 || len > 1024 {
-        let _ = send.write_all(b"NO").await;
-        let _ = send.shutdown().await;
-        return Err("channel join request length out of range".into());
+        return Err(refuse(&mut send, "len-oob", "", "channel join request length out of range".into()).await);
     }
     let mut bytes = vec![0u8; len];
     recv.read_exact(&mut bytes).await?;
@@ -334,19 +356,30 @@ where
     let req = match ChannelJoinRequest::decode(&bytes) {
         Ok(r) => r,
         Err(_) => {
-            let _ = send.write_all(b"NO").await;
-            let _ = send.shutdown().await;
-            return Err("malformed channel join request".into());
+            return Err(refuse(&mut send, "malformed", "", "malformed channel join request".into()).await);
         }
     };
+    // The public grant fields that identify a live refusal to the operator: the channel
+    // id + holder key hex (both public grant bytes — never a secret). Reused verbatim in
+    // every post-decode refusal log below so a `[not-member]`/`[grant-verify]`/`[possession]`
+    // line can be pinned to a specific channel + holder.
+    let grant_ctx = format!(
+        "channel={} holder={}",
+        hex_of(&req.grant.grant.channel.0),
+        hex_of(&req.grant.grant.holder),
+    );
     // #81 gap 3 / #121: the advertised endpoint must be a safe, dialable socket address —
     // OR the explicit relay-only sentinel for a NAT-only member that joins via relay only.
     // A private/loopback address is still refused (the sentinel is not an address, so it
     // can't smuggle a LAN SSRF target; `safe_endpoint` is untouched).
     if !admissible_endpoint(&req) {
-        let _ = send.write_all(b"NO").await;
-        let _ = send.shutdown().await;
-        return Err("unsafe advertised endpoint".into());
+        return Err(refuse(
+            &mut send,
+            "endpoint",
+            &format!("endpoint={}", req.endpoint),
+            "unsafe advertised endpoint".into(),
+        )
+        .await);
     }
     // #81 gap 2: the holder must be a current member; `authorize` yields the
     // operator key only then, so a revoked member is refused here.
@@ -354,15 +387,11 @@ where
         match authorize(req.grant.grant.channel, req.grant.grant.holder).await {
             Some(t) => t,
             None => {
-                let _ = send.write_all(b"NO").await;
-                let _ = send.shutdown().await;
-                return Err("unknown channel or holder not a member".into());
+                return Err(refuse(&mut send, "not-member", &grant_ctx, "unknown channel or holder not a member".into()).await);
             }
         };
     if let Err(e) = verify(&operator, &req.grant, now) {
-        let _ = send.write_all(b"NO").await;
-        let _ = send.shutdown().await;
-        return Err(format!("channel grant rejected: {e}").into());
+        return Err(refuse(&mut send, "grant-verify", &grant_ctx, format!("channel grant rejected: {e}").into()).await);
     }
     // #81 gap 1: a signed grant is bearer bytes until the presenter proves it holds
     // the `holder` private key. The edge picks a fresh single-use challenge; the
@@ -376,15 +405,16 @@ where
     if recv.read_exact(&mut sig).await.is_err()
         || !verify_holder_possession(&req.grant.grant.holder, &challenge, &sig)
     {
-        let _ = send.write_all(b"NO").await;
-        let _ = send.shutdown().await;
-        return Err("holder possession proof failed".into());
+        return Err(refuse(&mut send, "possession", &grant_ctx, "holder possession proof failed".into()).await);
     }
     Ok((send, recv, req, operator, member_noise, member_attest, observed))
     };
     match tokio::time::timeout(join_timeout, read).await {
         Ok(r) => r,
         Err(_) => {
+            // #124: the timeout drops the stalled connection without a wire ack (as before);
+            // log it under the same greppable scheme so an operator sees the stall too.
+            eprintln!("ct-edge: channel-join NO [timeout]: join not submitted within {join_timeout:?} — dropping stalled connection (#105)");
             Err("channel join not submitted within the timeout — dropping stalled connection (#105)".into())
         }
     }
@@ -1357,6 +1387,129 @@ mod tests {
             "203.0.113.9:6021",
             "the handler receives the advertised endpoint over a non-QUIC transport",
         );
+    }
+
+    #[tokio::test]
+    async fn channel_join_refusal_reason_is_distinct_per_checkpoint() {
+        // #124 observability contract (frozen): `read_channel_join_on_stream` sends the
+        // opaque `b"NO"` at six admission checkpoints, but each must return a DISTINCT,
+        // checkpoint-identifying `Err` so the operator's server-side `[<tag>]` log can pin
+        // a live refusal (e.g. the #103 :443 sink↔source stall) to the exact check that
+        // fired. Drive each checkpoint by mutating one thing off the happy path and assert
+        // the returned reason names it. (The wire ack stays the bare opaque `NO`; only the
+        // Err/log carries the reason — telling the presenter which check failed is an oracle.)
+        use std::future::Future;
+        use std::time::Duration;
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+        // Run one crafted admission attempt to completion and return the refusal reason.
+        // `authorize` supplies the membership verdict; `client` drives the presenter side
+        // (writing the crafted request, answering the possession challenge, etc.).
+        async fn refusal<F, Fut, C, CFut>(now: UnixSeconds, authorize: F, client: C) -> String
+        where
+            F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send,
+            C: FnOnce(DuplexStream) -> CFut,
+            CFut: Future<Output = ()>,
+        {
+            let (client_end, server_end) = tokio::io::duplex(4096);
+            let (srv_r, srv_w) = split(server_end);
+            let observed: std::net::SocketAddr = "203.0.113.50:40001".parse().unwrap();
+            let server = tokio::spawn(async move {
+                read_channel_join_on_stream(
+                    srv_w,
+                    srv_r,
+                    observed,
+                    now,
+                    Duration::from_secs(5),
+                    &authorize,
+                )
+                .await
+            });
+            client(client_end).await;
+            server
+                .await
+                .expect("server task")
+                .expect_err("admission must be refused")
+                .to_string()
+        }
+
+        // Present a length-framed request, then answer the possession challenge with the
+        // supplied 64-byte signature (`None` = never reach/answer possession).
+        async fn present(mut c: DuplexStream, req_bytes: Vec<u8>, sig: Option<[u8; 64]>) {
+            c.write_all(&(req_bytes.len() as u16).to_be_bytes()).await.unwrap();
+            c.write_all(&req_bytes).await.unwrap();
+            if let Some(sig) = sig {
+                let mut challenge = [0u8; 32];
+                if c.read_exact(&mut challenge).await.is_ok() {
+                    c.write_all(&sig).await.unwrap();
+                }
+            }
+        }
+
+        let channel = [0x7Au8; 32];
+        let holder = holder_sk(0x0a);
+        let pk = operator_pubkey();
+        // A well-formed, member, public-endpoint, unexpired request — the single fixture we
+        // mutate one field of per case to hit each checkpoint.
+        let good = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6021".to_string(),
+        };
+        // authorize verdicts: a member (yields the real operator key) vs. a non-member.
+        let member = move |c: ChannelId, _h: [u8; 32]| async move {
+            (c.0 == channel).then_some((pk, None, None))
+        };
+        let non_member = move |_c: ChannelId, _h: [u8; 32]| async move { None };
+
+        // 1) len-oob: a length prefix of 0 (before any request bytes).
+        let r1 = refusal(500, member, |mut c| async move {
+            c.write_all(&0u16.to_be_bytes()).await.unwrap();
+        })
+        .await;
+        assert_eq!(r1, "channel join request length out of range", "len-oob");
+
+        // 2) malformed: a valid length prefix over undecodable bytes.
+        let r2 = refusal(500, member, |mut c| async move {
+            let junk = [0xFFu8; 4];
+            c.write_all(&(junk.len() as u16).to_be_bytes()).await.unwrap();
+            c.write_all(&junk).await.unwrap();
+        })
+        .await;
+        assert_eq!(r2, "malformed channel join request", "malformed");
+
+        // 3) endpoint: a well-formed request advertising a private (SSRF) address.
+        let mut bad_ep = good.clone();
+        bad_ep.endpoint = "10.0.0.5:22".to_string();
+        let bytes3 = bad_ep.encode();
+        let r3 = refusal(500, member, move |c| present(c, bytes3, None)).await;
+        assert_eq!(r3, "unsafe advertised endpoint", "endpoint");
+
+        // 4) not-member: a fully valid request, but authorize yields no membership.
+        let bytes4 = good.encode();
+        let r4 = refusal(500, non_member, move |c| present(c, bytes4, None)).await;
+        assert_eq!(r4, "unknown channel or holder not a member", "not-member");
+
+        // 5) grant-verify: a member, but the grant is expired (now >= expires_at).
+        let bytes5 = good.encode();
+        let r5 = refusal(2_000, member, move |c| present(c, bytes5, None)).await;
+        assert!(
+            r5.starts_with("channel grant rejected"),
+            "grant-verify reason must name the grant check, got: {r5}",
+        );
+
+        // 6) possession: valid up to the challenge, then a wrong 64-byte signature.
+        let bytes6 = good.encode();
+        let r6 = refusal(500, member, move |c| present(c, bytes6, Some([0u8; 64]))).await;
+        assert_eq!(r6, "holder possession proof failed", "possession");
+
+        // The six reasons must all be distinct so each maps to exactly one checkpoint.
+        let reasons = [r1, r2, r3, r4, r5, r6];
+        for i in 0..reasons.len() {
+            for j in (i + 1)..reasons.len() {
+                assert_ne!(reasons[i], reasons[j], "checkpoint reasons must be distinct");
+            }
+        }
     }
 
     #[tokio::test]
