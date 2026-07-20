@@ -351,7 +351,7 @@ fn build_relay_client_swarm() -> Result<Swarm<RelayClientBehaviour>, BoxError> {
 /// authorization input (invariant #1) — they only route/upgrade bytes; our `Noise_IK` still
 /// runs end-to-end inside the `/ct/channel/1.0.0` substream (invariant #2).
 #[derive(NetworkBehaviour)]
-struct DcutrRelayClientBehaviour {
+pub(crate) struct DcutrRelayClientBehaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     stream: stream::Behaviour,
@@ -597,29 +597,53 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
         .await
         .map_err(|_| "client A driver ended before its relay reservation was accepted")?;
 
-    // Client B dials A **through the relay**, waits for the relayed connection to A (not the hop
-    // to the relay), then opens the substream while continuing to pump the swarm (so DCUtR's
-    // upgrade attempt, if any, makes progress alongside).
-    let mut client_b = build_dcutr_relay_client_swarm()?;
-    let mut b_control = client_b.behaviour().stream.new_control();
+    // Client B dials A **through the relay** and opens the substream — via the production dialer
+    // primitive (#136 N136.1), extracted so the LIVE agent path can call the identical logic
+    // against a REAL relay instead of this in-process one.
+    let client_b = build_dcutr_relay_client_swarm()?;
+    let dialer_stream = dcutr_dial_via_relay(client_b, a_via_relay, a_peer).await?;
+    let listener_stream = inbound_rx.await?;
+    Ok((dialer_stream, listener_stream.compat()))
+}
+
+/// Dial a DCUtR-enabled peer **through a Circuit-Relay v2 relay** and open the `/ct/channel/1.0.0`
+/// substream, returning it as an `AsyncRead + AsyncWrite` duplex (#136 N136.1 — the dialer side of
+/// NAT-to-NAT). `client` is a DCUtR relay-client swarm ([`build_dcutr_relay_client_swarm`]);
+/// `peer_via_relay` is the target's circuit address (`<relay>/p2p-circuit/p2p/<target>`);
+/// `target_peer` names the relayed connection to wait for. The swarm is driven forever on a detached
+/// task so the circuit — and any DCUtR **direct upgrade** (the hole-punch) — keeps flowing for the
+/// returned stream's lifetime.
+///
+/// Extracted from the in-process test harness ([`connected_dcutr_stream_pair`]) so the **live** agent
+/// path can dial a relay-only peer through the edge's Circuit-Relay v2 leg (#136, coordination-only,
+/// per central's decision) instead of only in tests. Callers layer
+/// [`crate::a2a::establish_direct_over_duplex`] on top for auth + encryption (invariant #2); no
+/// `PeerId` is ever an authorization input (invariant #1) — it only names the dial/route target.
+pub(crate) async fn dcutr_dial_via_relay(
+    mut client: Swarm<DcutrRelayClientBehaviour>,
+    peer_via_relay: Multiaddr,
+    target_peer: libp2p::PeerId,
+) -> Result<P2pDuplex, BoxError> {
+    let mut control = client.behaviour().stream.new_control();
     let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if client_b.dial(a_via_relay).is_err() {
+        if client.dial(peer_via_relay).is_err() {
             return;
         }
+        // Wait for the RELAYED connection to the target (not the hop to the relay) before opening.
         loop {
-            match client_b.next().await {
-                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) if peer_id == a_peer => break,
+            match client.next().await {
+                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) if peer_id == target_peer => break,
                 Some(_) => {}
                 None => return,
             }
         }
-        let open = b_control.open_stream(a_peer, CT_CHANNEL_PROTOCOL);
+        let open = control.open_stream(target_peer, CT_CHANNEL_PROTOCOL);
         tokio::pin!(open);
         let mut outbound_tx = Some(outbound_tx);
         loop {
             tokio::select! {
-                _ = client_b.next() => {}
+                _ = client.next() => {}
                 res = &mut open, if outbound_tx.is_some() => {
                     if let (Ok(stream), Some(tx)) = (res, outbound_tx.take()) {
                         let _ = tx.send(stream);
@@ -628,10 +652,7 @@ pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), Box
             }
         }
     });
-
-    let dialer_stream = outbound_rx.await?;
-    let listener_stream = inbound_rx.await?;
-    Ok((dialer_stream.compat(), listener_stream.compat()))
+    Ok(outbound_rx.await?.compat())
 }
 
 /// The domain-separation tag for a DHT coordinate record's signing preimage. A distinct,
