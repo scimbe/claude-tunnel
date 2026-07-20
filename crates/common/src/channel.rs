@@ -646,6 +646,22 @@ impl MembershipStaple {
     }
 }
 
+/// A channel's **staple admission policy** (#121 E-fail-static, option A — *staple-optional*,
+/// maintainer decision 2026-07-20). A channel opts into TTL-bounded revocation; those that
+/// don't are unaffected. Consumed by [`StapleCache::admits_under_policy`], always *after* the
+/// operator-grant check — enabling staples can only *add* a freshness requirement, never
+/// weaken the existing grant-based admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelAdmissionPolicy {
+    /// Grant-only admission — today's behaviour and the default: a valid operator-signed
+    /// grant is sufficient. Channels that don't opt into staples use this.
+    #[default]
+    Open,
+    /// The member must also present a fresh cached [`MembershipStaple`], so revocation
+    /// propagates within the staple TTL (invariant #7).
+    RequireStaple,
+}
+
 /// A soft-state cache of the freshest [`MembershipStaple`] per `(channel, holder)` — the
 /// local memory that lets a node keep admitting known members while central is unreachable
 /// (E-fail-static). Gossip/refresh feeds [`refresh`](Self::refresh); admission consults
@@ -708,6 +724,36 @@ impl StapleCache {
                 false
             }
             None => false,
+        }
+    }
+
+    /// Compose the channel's **staple admission policy** on top of an already grant-verified
+    /// member (#121 E-fail-static, option A — *staple-optional*, maintainer decision
+    /// 2026-07-20). The caller has already verified the operator-signed grant (and possession)
+    /// exactly as today; this adds the staple requirement **only when the channel opted in**:
+    /// - [`ChannelAdmissionPolicy::Open`] → always `true`: grant-only admission, byte-for-byte
+    ///   today's behaviour and the default, so nothing changes for channels that don't opt in;
+    /// - [`ChannelAdmissionPolicy::RequireStaple`] → `true` iff a fresh, unexpired,
+    ///   operator-signed staple is cached for `(channel, holder)` (delegates to
+    ///   [`is_member`](Self::is_member)), so revocation propagates within the staple TTL
+    ///   (invariant #7).
+    ///
+    /// This is the single tested chokepoint the edge broker consults *after* its grant check,
+    /// so enabling staples on a channel can never *weaken* admission (a valid grant is still
+    /// required) — it can only add the freshness requirement.
+    pub fn admits_under_policy(
+        &mut self,
+        policy: ChannelAdmissionPolicy,
+        operator_pubkey: &[u8; 32],
+        channel: &ChannelId,
+        holder: &[u8; 32],
+        now: UnixSeconds,
+    ) -> bool {
+        match policy {
+            ChannelAdmissionPolicy::Open => true,
+            ChannelAdmissionPolicy::RequireStaple => {
+                self.is_member(operator_pubkey, channel, holder, now)
+            }
         }
     }
 }
@@ -1603,6 +1649,53 @@ mod tests {
             MembershipStaple::decode(&too_long),
             Err(GrantError::Malformed),
             "an over-long staple buffer is Malformed"
+        );
+    }
+
+    #[test]
+    fn staple_admission_policy_is_optional_and_only_ever_adds_a_requirement() {
+        // #121 E-fail-static, option A (frozen, maintainer decision 2026-07-20): the staple
+        // requirement is OPT-IN per channel. `Open` (default) is byte-for-byte today's
+        // grant-only behaviour — it never consults a staple, so channels that don't opt in are
+        // unaffected. `RequireStaple` additionally demands a fresh cached staple, so revocation
+        // propagates within the TTL (#7). Enabling it can only ADD a requirement, never weaken
+        // admission (the caller has already verified the grant before calling this).
+        let ch = [0x55u8; 32];
+        let holder = [0xd5u8; 32];
+        let (operator, staple) = stapled(7, ch, holder, 1_000, 4_600);
+
+        // Default policy is Open (grant-only) — the opt-out is the zero value.
+        assert_eq!(ChannelAdmissionPolicy::default(), ChannelAdmissionPolicy::Open);
+
+        let mut cache = StapleCache::new();
+
+        // (1) OPEN: admitted with NO staple in the cache at all — grant-only, today's behaviour.
+        assert!(
+            cache.admits_under_policy(ChannelAdmissionPolicy::Open, &operator, &ChannelId(ch), &holder, 2_000),
+            "Open admits a grant-verified member with no staple (backwards-compatible default)"
+        );
+
+        // (2) REQUIRE_STAPLE with no staple cached → denied (the freshness requirement bites).
+        assert!(
+            !cache.admits_under_policy(ChannelAdmissionPolicy::RequireStaple, &operator, &ChannelId(ch), &holder, 2_000),
+            "RequireStaple denies a member with no fresh staple"
+        );
+
+        // (3) REQUIRE_STAPLE with a fresh staple cached → admitted...
+        assert!(cache.refresh(&operator, staple, 1_000));
+        assert!(
+            cache.admits_under_policy(ChannelAdmissionPolicy::RequireStaple, &operator, &ChannelId(ch), &holder, 2_000),
+            "RequireStaple admits once a fresh staple is present"
+        );
+        // ...and denied again once that staple lapses at its TTL (revocation latency = TTL, #7).
+        assert!(
+            !cache.admits_under_policy(ChannelAdmissionPolicy::RequireStaple, &operator, &ChannelId(ch), &holder, 4_600),
+            "RequireStaple denies once the staple lapses (revocation propagates within the TTL)"
+        );
+        // Open still admits at the same instant — it never consults the staple.
+        assert!(
+            cache.admits_under_policy(ChannelAdmissionPolicy::Open, &operator, &ChannelId(ch), &holder, 4_600),
+            "Open is unaffected by staple lapse — grant-only channels are never gated on staples"
         );
     }
 
