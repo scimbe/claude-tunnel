@@ -602,7 +602,14 @@ pub async fn serve_front_door(
             // #118: terminate with the DEDICATED channel acceptor (advertises the
             // `ct-edge-channel` ALPN) rather than the shared edge acceptor (empty ALPN),
             // so the channel leg actually negotiates the ALPN a readiness probe checks.
-            let tls = ctx.acceptor.accept(joined).await?;
+            // #127: a TLS-handshake failure at the dedicated channel-ALPN acceptor happens
+            // BEFORE admission, so #124/#125's per-checkpoint logs never run — tag it so a
+            // silent `Refused` (e.g. #103's) surfaces under `grep 'channel-join NO'`.
+            let tls = ctx
+                .acceptor
+                .accept(joined)
+                .await
+                .map_err(|e| { eprintln!("ct-edge: channel-join NO [tls-accept]: {e}"); e })?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1249,7 +1256,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                                 let challenge = Challenge { nonce, difficulty };
-                                let _ = serve_front_door(
+                                // #127: log any front-door failure (TLS accept, routing,
+                                // every arm) — the whole handler's `Result` was discarded, so
+                                // a connection that reached the edge but failed anywhere in
+                                // serve_front_door was completely invisible to the operator.
+                                if let Err(e) = serve_front_door(
                                     tcp,
                                     &state,
                                     &acceptor,
@@ -1258,7 +1269,10 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     &challenge,
                                     channel_fd.as_ref(),
                                 )
-                                .await;
+                                .await
+                                {
+                                    eprintln!("ct-edge: :443 front-door connection error: {e}");
+                                }
                             });
                         }
                     });
