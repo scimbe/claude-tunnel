@@ -20,7 +20,10 @@
 //! Time is caller-supplied (`now`, unix seconds) for deterministic tests, mirroring
 //! [`crate::replay`] and [`crate::ratelimit`].
 
+use std::io;
+
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Which transport an A2A session's data path is currently riding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,9 +251,163 @@ impl PathMeter {
     }
 }
 
+/// **#104-handover H1 — the relay→direct upgrade coordination handshake (initiator half).**
+/// Runs over the still-open relay **control** stream and drives the existing
+/// [`UpgradeCoordinator`] + [`UpgradeMsg`]; it is **coordination only — no application bytes
+/// move here** (the actual cutover is H2), so it is inert/safe until the cutover is wired.
+///
+/// If `coord` says it's time ([`should_attempt`](UpgradeCoordinator::should_attempt), which
+/// is initiator-only) and the injected `discover_direct` yields our reachable direct endpoint,
+/// send `Offer{endpoint}` and await the responder: `Ready` confirms the upgrade
+/// (`Ok(true)`, `coord` now `Direct`); anything else — `Abort`, a non-`Ready` message, or a
+/// closed stream — keeps the relay (`Ok(false)`, the attempt recorded failed for backoff). A
+/// failed discovery sends nothing and just records the failure. `dial`/discovery is injected
+/// so the live caller passes the real direct-dial and a test passes a mock.
+pub async fn initiator_negotiate_upgrade<W, R, F, Fut>(
+    coord: &mut UpgradeCoordinator,
+    now: u64,
+    send: &mut W,
+    recv: &mut R,
+    discover_direct: F,
+) -> io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    if !coord.should_attempt(now) {
+        return Ok(false);
+    }
+    let endpoint = match discover_direct().await {
+        Some(e) => e,
+        None => {
+            coord.record_attempt_failed(now);
+            return Ok(false);
+        }
+    };
+    send.write_all(&crate::noise::frame(
+        &UpgradeMsg::Offer { direct_endpoint: endpoint }.encode(),
+    ))
+    .await?;
+    let reply = crate::noise::read_frame(recv)
+        .await
+        .ok()
+        .and_then(|b| UpgradeMsg::decode(&b));
+    match reply {
+        Some(UpgradeMsg::Ready) => {
+            coord.confirm_upgraded(now);
+            Ok(true)
+        }
+        _ => {
+            coord.record_attempt_failed(now);
+            Ok(false)
+        }
+    }
+}
+
+/// **#104-handover H1 — the coordination handshake (responder half).** Reads one control
+/// message; on an `Offer{endpoint}` it dials that endpoint via the injected `dial` — on
+/// success it replies `Ready` and `confirm_upgraded`s (`Ok(true)`), on failure it replies
+/// `Abort` and stays on the relay (`Ok(false)`). A non-`Offer` message → `Ok(false)`. Like
+/// the initiator half this is coordination only; no application bytes move (H2 does the swap).
+pub async fn responder_negotiate_upgrade<W, R, F, Fut>(
+    coord: &mut UpgradeCoordinator,
+    now: u64,
+    send: &mut W,
+    recv: &mut R,
+    dial: F,
+) -> io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let msg = crate::noise::read_frame(recv)
+        .await
+        .ok()
+        .and_then(|b| UpgradeMsg::decode(&b));
+    let endpoint = match msg {
+        Some(UpgradeMsg::Offer { direct_endpoint }) => direct_endpoint,
+        _ => return Ok(false),
+    };
+    if dial(endpoint).await {
+        send.write_all(&crate::noise::frame(&UpgradeMsg::Ready.encode())).await?;
+        coord.confirm_upgraded(now);
+        Ok(true)
+    } else {
+        let _ = send
+            .write_all(&crate::noise::frame(&UpgradeMsg::Abort.encode()))
+            .await;
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upgrade_handshake_promotes_both_sides_to_direct_over_the_control_stream() {
+        // #104-handover H1 (frozen): the coordination handshake drives both UpgradeCoordinators
+        // from Relay → Direct over the relay control stream — the initiator offers its
+        // discovered direct endpoint, the responder dials it and replies Ready, both confirm.
+        // NO application bytes move here (that is H2). initiator writes a_w → responder reads
+        // a_r; responder writes b_w → initiator reads b_r.
+        let (mut a_w, mut a_r) = tokio::io::duplex(1024);
+        let (mut b_w, mut b_r) = tokio::io::duplex(1024);
+        let mut init = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+        let mut resp = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+
+        let resp_task = tokio::spawn(async move {
+            let ok = responder_negotiate_upgrade(&mut resp, 5, &mut b_w, &mut a_r, |ep| async move {
+                ep == "203.0.113.9:7000"
+            })
+            .await
+            .unwrap();
+            (ok, resp.is_direct())
+        });
+        let ok_i = initiator_negotiate_upgrade(&mut init, 5, &mut a_w, &mut b_r, || async {
+            Some("203.0.113.9:7000".to_string())
+        })
+        .await
+        .unwrap();
+        let (ok_r, resp_direct) = resp_task.await.unwrap();
+
+        assert!(ok_i, "initiator promoted to direct");
+        assert!(ok_r, "responder promoted to direct");
+        assert!(init.is_direct(), "initiator coordinator is Direct");
+        assert!(resp_direct, "responder coordinator is Direct");
+        assert!(init.time_to_upgrade().is_some(), "the handover time was recorded (offload metric)");
+    }
+
+    #[tokio::test]
+    async fn upgrade_handshake_stays_on_relay_when_the_responder_cannot_dial_direct() {
+        // The responder's direct dial fails → it Aborts; both sides stay on the relay and the
+        // initiator records a failed attempt (so the backoff schedule advances).
+        let (mut a_w, mut a_r) = tokio::io::duplex(1024);
+        let (mut b_w, mut b_r) = tokio::io::duplex(1024);
+        let mut init = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+        let mut resp = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+
+        let resp_task = tokio::spawn(async move {
+            let ok = responder_negotiate_upgrade(&mut resp, 5, &mut b_w, &mut a_r, |_ep| async { false })
+                .await
+                .unwrap();
+            (ok, resp.is_direct())
+        });
+        let ok_i = initiator_negotiate_upgrade(&mut init, 5, &mut a_w, &mut b_r, || async {
+            Some("203.0.113.9:7000".to_string())
+        })
+        .await
+        .unwrap();
+        let (ok_r, resp_direct) = resp_task.await.unwrap();
+
+        assert!(!ok_i && !ok_r, "neither side upgraded");
+        assert!(!init.is_direct() && !resp_direct, "both stay on the relay");
+        assert!(init.attempts() >= 1, "the initiator recorded a failed attempt for backoff");
+    }
 
     #[test]
     fn only_the_initiator_triggers_upgrades_and_respects_the_schedule() {
