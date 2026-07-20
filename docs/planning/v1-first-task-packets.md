@@ -2842,6 +2842,27 @@ offload. Decomposed so the pure, mesh-independent core lands first:
 - **PT2 — user-facing path visibility ⏳ (live/UI):** surface the verified relay chain to the agent/user (which peers carried the session + proof they were authorized). Ties to #107 topology surface.
 **Boundary:** BC1/BC2 are unit-gatable opt-in coupling primitives (payment-free core preserved); PT1/PT2 belong with #121's multi-hop overlay and are design-with-#121, not retrofit; fund settlement stays external throughout.
 
+### The receipt principle — quote → approve → settle (scimbe, 2026-07-20)
+Maintainer framing that unifies the payment design: **an A2A interaction that *closes* without a verifiable receipt settles on *ambient trust* — the send side merely asserts the thing happened.** For a billing coupling that is a *hole*. The fix is one uniform lifecycle — **quote → approve → settle** — where **`settle` is backed by a cryptographic digest signed by the party that can actually *witness* the fact** (never sender-asserted). It appears on three receipt surfaces, each closing a distinct hole scimbe named:
+
+| Hole | Surface | Receipt = witness-signed digest |
+|------|---------|--------------------------------|
+| A2A transfer closes with no delivery-ack / settle-receipt (*peer delivery hole*) | A2A **data path** | **transfer digest** — the **receiver** signs a digest (running hash / Merkle root) over the bytes it actually received; a session can't close "settled" without it → not ambient send-side trust |
+| Agent-Fabric self-coordination has no settle-receipt (*peer mesh hole*, #133) | **fabric** coordination channel | **fabric digest** — the coordinating members attest the round → not ambient channel trust |
+| Relayed A2A is an opaque relay (*receipt surface for relayed sessions*) | **relay path** (#132 PT1) | **path-transit proof** — each in-chain hop attests transit (EC accumulator) → visible routing integrity, not opaque relays |
+
+**Lifecycle ↔ artifacts:**
+- **quote** = the proposed terms (`terms_hash`: what will be delivered/transited + the coupling). Not yet built.
+- **approve** = `BillingCommitment` (**BC1 ✅**) — holder-signed binding of the coupling, required at setup and agent-verified. This *is* the approve step.
+- **settle** = `SettleReceipt` (**new**) — a domain-separated, **witness-signed** digest in one of the three flavors above, verifiable against the approve-time `terms_hash`. The tunnel *emits* the receipt; **fund movement stays external and merely *consumes* it** (boundary unchanged).
+
+New design-intent packets (all opt-in, payment-free core preserved; build order still gated behind #104):
+- **SR1 — transfer-digest settle receipt ⏳ (unit-gatable, no settlement):** a `SettleReceipt` type + a **receiver-attested** digest over the delivered application byte stream (both ends hash the plaintext they pump; at close the receiver signs its hash with its channel holder key; the sender/verifier checks it against the `BillingCommitment` terms). Emitted at A2A session close *only when a billing coupling was required* (opt-in). Digesting hooks cleanly into the `noise_pump*` byte path (hash the plaintext as it flows — no extra round-trips). Frozen test: matching streams → valid receipt; truncated/tampered delivery → receipt fails to verify.
+- **SR2 — fabric-digest settle receipt ⏳ (#133):** the same `SettleReceipt` shape over the fabric's own coordination exchange (members attest the round). Design **with** #133 (source/sink/central dogfooding a real Agent-Fabric channel) so the fabric's coordination is itself receipted.
+- **SR3 ≡ PT1** — the path-transit proof *is* the settle receipt for **relayed** sessions; reframe PT1 under this lifecycle (design-with-#121). Settlement (external) validates the assembled proof before releasing value.
+
+**Reaffirmed boundary:** we build only the *receipt substrate* — verifiable proof-of-delivery / -transit / -coordination, opt-in and required-at-setup — never fund movement. Contract/settlement logic lives outside the tunnel and consumes these receipts.
+
 ## #106 :443 front-door fallback for the Agent-Fabric channel broker + relay (feature, priority:high)
 
 The channel broker listens only on `:4435`; a restrictive/NAT'd network (empirically `:4433` open, **`:4435`
