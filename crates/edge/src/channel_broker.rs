@@ -263,11 +263,25 @@ where
     // but never opens a stream can't wedge the broker's serial round loop. The framed
     // request + possession round-trip is then bounded a second time inside
     // `read_channel_join_on_stream`, so each phase has its own guard.
+    //
+    // #103 blanket trace (round 2, central-requested 2026-07-20): the round-1 traces proved
+    // both connections reach `[handshaked]` on the correct listener, then produce ZERO further
+    // log — the drop is in THIS span, between handshake and the first tagged read checkpoint,
+    // which was previously silent on the success path. Trace all three sub-outcomes of the
+    // `accept_bi` wait so the next live test pinpoints, per connection, whether the client
+    // ever opens its bi-stream: `[awaiting-bi]` (entered the wait) → `[bi-open]` (stream
+    // opened, about to read the join) OR `[bi-timeout]` (client never opened one).
+    eprintln!("ct-edge: channel-accept [awaiting-bi] peer={observed} — waiting for the client bi-stream (#103)");
     let (send, recv) = match tokio::time::timeout(join_timeout, conn.accept_bi()).await {
         // #128: tag the bi-stream-open phase — a peer that completes the QUIC handshake but
         // closes before opening its stream (the #103 symptom) surfaces here, not at handshake.
-        Ok(streams) => streams.map_err(|e| format!("[quic-bistream] {e}"))?,
+        Ok(streams) => {
+            let s = streams.map_err(|e| format!("[quic-bistream] {e}"))?;
+            eprintln!("ct-edge: channel-accept [bi-open] peer={observed} — bi-stream open, reading join (#103)");
+            s
+        }
         Err(_) => {
+            eprintln!("ct-edge: channel-accept [bi-timeout] peer={observed} — client never opened a bi-stream within {join_timeout:?} (#103/#105)");
             return Err(
                 "channel join not submitted within the timeout — dropping stalled connection (#105)"
                     .into(),
