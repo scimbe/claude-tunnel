@@ -855,6 +855,40 @@ impl BillingCommitment {
     }
 }
 
+/// A per-channel **billing requirement** consulted at channel setup (#132 BC2). Opt-in and
+/// default-off, exactly like [`ChannelAdmissionPolicy`]: it can only *add* a requirement, never
+/// weaken admission, so the core tunnel stays payment-free. A channel that requires billing pins
+/// the demanded `payee`, off-band `terms_hash`, and `min_amount`; the joining member must present a
+/// [`BillingCommitment`] that [`satisfies`](BillingCommitment::satisfies) them, or setup is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BillingPolicy {
+    /// No billing coupling required (default) — grant-only, payment-free setup.
+    #[default]
+    None,
+    /// The joining member must present a `BillingCommitment` satisfying these demands at setup.
+    Require {
+        payee: [u8; 32],
+        terms_hash: [u8; 32],
+        min_amount: u64,
+    },
+}
+
+impl BillingPolicy {
+    /// The **setup gate**: does `commitment` satisfy this policy at `now`? [`None`](Self::None) →
+    /// always admits (opt-in, like [`ChannelAdmissionPolicy::Open`]). [`Require`](Self::Require) →
+    /// admits iff a commitment is present and [`satisfies`](BillingCommitment::satisfies) the
+    /// demanded payee/terms with at least the demanded amount. Missing/expired/forged/mismatched →
+    /// refused. Moves no funds — it is purely the setup-time verification of the opt-in coupling.
+    pub fn admits(&self, commitment: Option<&BillingCommitment>, now: UnixSeconds) -> bool {
+        match self {
+            BillingPolicy::None => true,
+            BillingPolicy::Require { payee, terms_hash, min_amount } => {
+                commitment.map_or(false, |c| c.satisfies(now, payee, terms_hash, *min_amount))
+            }
+        }
+    }
+}
+
 /// The domain separating a settle-receipt preimage from every other signed object.
 const SETTLE_RECEIPT_DOMAIN: &[u8] = b"ct-settle-receipt-v1";
 
@@ -2060,6 +2094,37 @@ mod tests {
             max_amount: 1_000, expires_at: 5_000, signature: sig,
         };
         assert!(!impersonated.is_valid(1_000), "a commitment not signed by its holder is rejected");
+    }
+
+    #[test]
+    fn billing_policy_gate_is_opt_in_and_enforces_the_demanded_commitment() {
+        // #132 BC2 (frozen): the per-channel setup gate. `None` is payment-free (admits with or
+        // without a commitment); `Require` admits ONLY a present commitment that satisfies the
+        // demanded payee/terms/min_amount and is still valid — mirroring ChannelAdmissionPolicy.
+        let ch = [0x11u8; 32];
+        let payee = [0xa5u8; 32];
+        let terms = [0x7eu8; 32];
+        let c = commit(9, ch, payee, terms, 1_000, 5_000);
+
+        // Default / None: payment-free — admits regardless of any commitment.
+        assert_eq!(BillingPolicy::default(), BillingPolicy::None);
+        assert!(BillingPolicy::None.admits(None, 1_000), "None admits with no commitment");
+        assert!(BillingPolicy::None.admits(Some(&c), 1_000), "None admits with a commitment too");
+
+        let policy = BillingPolicy::Require { payee, terms_hash: terms, min_amount: 500 };
+        // Present + satisfying → admitted.
+        assert!(policy.admits(Some(&c), 1_000), "a satisfying commitment is admitted");
+        // Missing commitment → refused (the requirement can't be met).
+        assert!(!policy.admits(None, 1_000), "Require refuses when no commitment is presented");
+        // Expired / wrong payee / wrong terms / insufficient amount → refused.
+        assert!(!policy.admits(Some(&c), 5_000), "expired commitment refused");
+        assert!(!BillingPolicy::Require { payee: [0xbbu8; 32], terms_hash: terms, min_amount: 500 }.admits(Some(&c), 1_000), "wrong payee refused");
+        assert!(!BillingPolicy::Require { payee, terms_hash: [0xccu8; 32], min_amount: 500 }.admits(Some(&c), 1_000), "wrong terms refused");
+        assert!(!BillingPolicy::Require { payee, terms_hash: terms, min_amount: 2_000 }.admits(Some(&c), 1_000), "amount below the demanded minimum refused");
+        // A forged commitment (tampered after signing) never satisfies.
+        let mut forged = c.clone();
+        forged.max_amount = 1_000_000;
+        assert!(!policy.admits(Some(&forged), 1_000), "a tampered commitment fails the gate");
     }
 
     #[test]
