@@ -344,6 +344,96 @@ where
     }
 }
 
+/// **#104 H3-wire — the upgrade negotiation driven *in-band* over the running relay pump.**
+/// H1 ([`initiator_negotiate_upgrade`]) speaks `UpgradeMsg` over a *separate* control stream; but
+/// the live relay path has exactly one stream (a `:443`-only member can't open a second), so the
+/// negotiation must ride the [`crate::noise::noise_pump_multiplexed`] control channels instead:
+/// `ctl` enqueues outbound control on the pump (delivered to the peer as in-band `CONTROL` frames),
+/// and `inbound` yields the peer's control payloads the pump decoded for us. This is the
+/// initiator half — the same coordinator/backoff logic as H1, only the transport differs (discrete
+/// pump messages, no framing).
+///
+/// If `coord` says it's time and `discover_direct` yields our reachable endpoint, send `Offer` and
+/// await the peer: `Ready` → `Ok(Some(endpoint))` — the caller then establishes the direct Noise
+/// session and enqueues [`crate::noise::PumpControl::Cutover`]; anything else (`Abort`, an
+/// unexpected message, or a closed channel = the pump/session ended) → `Ok(None)`, relay kept and
+/// the attempt recorded failed for backoff. **No `Cutover` is sent here** — installing the direct
+/// session into the pump and triggering the swap is the caller's next step (its correctness is
+/// proven live, H4). Bounding the reply wait is the caller's concern, as in H1.
+pub async fn drive_initiator_upgrade<F, Fut>(
+    coord: &mut UpgradeCoordinator,
+    now: u64,
+    ctl: &tokio::sync::mpsc::UnboundedSender<crate::noise::PumpControl>,
+    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    discover_direct: F,
+) -> io::Result<Option<String>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    if !coord.should_attempt(now) {
+        return Ok(None);
+    }
+    let endpoint = match discover_direct().await {
+        Some(e) => e,
+        None => {
+            coord.record_attempt_failed(now);
+            return Ok(None);
+        }
+    };
+    if ctl
+        .send(crate::noise::PumpControl::Send(
+            UpgradeMsg::Offer { direct_endpoint: endpoint.clone() }.encode(),
+        ))
+        .is_err()
+    {
+        // The pump is gone — the session ended; nothing to upgrade.
+        coord.record_attempt_failed(now);
+        return Ok(None);
+    }
+    match inbound.recv().await.and_then(|b| UpgradeMsg::decode(&b)) {
+        Some(UpgradeMsg::Ready) => {
+            coord.confirm_upgraded(now);
+            Ok(Some(endpoint))
+        }
+        _ => {
+            coord.record_attempt_failed(now);
+            Ok(None)
+        }
+    }
+}
+
+/// **#104 H3-wire — the in-band negotiation (responder half).** Mirrors
+/// [`responder_negotiate_upgrade`] but over the [`crate::noise::noise_pump_multiplexed`] control
+/// channels. Reads one inbound control message; on an `Offer{endpoint}` it dials that endpoint via
+/// the injected `dial` — success → reply `Ready`, `confirm_upgraded`, `Ok(Some(endpoint))` (the
+/// caller installs the direct session; the initiator drives the `Cutover`); failure → reply `Abort`,
+/// stay on the relay (`Ok(None)`). A non-`Offer` (or closed channel) → `Ok(None)`.
+pub async fn drive_responder_upgrade<F, Fut>(
+    coord: &mut UpgradeCoordinator,
+    now: u64,
+    ctl: &tokio::sync::mpsc::UnboundedSender<crate::noise::PumpControl>,
+    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    dial: F,
+) -> io::Result<Option<String>>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let endpoint = match inbound.recv().await.and_then(|b| UpgradeMsg::decode(&b)) {
+        Some(UpgradeMsg::Offer { direct_endpoint }) => direct_endpoint,
+        _ => return Ok(None),
+    };
+    if dial(endpoint.clone()).await {
+        let _ = ctl.send(crate::noise::PumpControl::Send(UpgradeMsg::Ready.encode()));
+        coord.confirm_upgraded(now);
+        Ok(Some(endpoint))
+    } else {
+        let _ = ctl.send(crate::noise::PumpControl::Send(UpgradeMsg::Abort.encode()));
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +495,93 @@ mod tests {
         let (ok_r, resp_direct) = resp_task.await.unwrap();
 
         assert!(!ok_i && !ok_r, "neither side upgraded");
+        assert!(!init.is_direct() && !resp_direct, "both stay on the relay");
+        assert!(init.attempts() >= 1, "the initiator recorded a failed attempt for backoff");
+    }
+
+    // Simulate the multiplexed pump relaying in-band control: drain one side's outbound
+    // `PumpControl` channel and forward each `Send` payload to the peer's inbound sink — exactly
+    // what `noise_pump_multiplexed` does (a `Send(bytes)` becomes a CONTROL frame the peer's pump
+    // decodes into an inbound `Vec<u8>`). `Cutover` is not part of the negotiation, so it's ignored.
+    async fn relay_control(
+        mut ctl_rx: tokio::sync::mpsc::UnboundedReceiver<crate::noise::PumpControl>,
+        peer_inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        while let Some(pc) = ctl_rx.recv().await {
+            if let crate::noise::PumpControl::Send(bytes) = pc {
+                if peer_inbound.send(bytes).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inband_upgrade_driver_promotes_both_sides_over_the_pump_control_channels() {
+        // #104 H3-wire (frozen): the SAME Offer→Ready promotion as H1, but negotiated in-band over
+        // the multiplexed pump's control channels (no separate control stream) — the driver the
+        // live wire-in uses. Two relay tasks stand in for the two pumps forwarding CONTROL frames.
+        let (ctl_tx_i, ctl_rx_i) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_i, mut in_rx_i) = tokio::sync::mpsc::unbounded_channel();
+        let (ctl_tx_r, ctl_rx_r) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_r, mut in_rx_r) = tokio::sync::mpsc::unbounded_channel();
+        // initiator's outbound → responder's inbound, and vice versa.
+        tokio::spawn(relay_control(ctl_rx_i, in_tx_r));
+        tokio::spawn(relay_control(ctl_rx_r, in_tx_i));
+
+        let mut init = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+        let mut resp = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+
+        let resp_task = tokio::spawn(async move {
+            let out = drive_responder_upgrade(&mut resp, 5, &ctl_tx_r, &mut in_rx_r, |ep| async move {
+                ep == "203.0.113.9:7000"
+            })
+            .await
+            .unwrap();
+            (out, resp.is_direct())
+        });
+        let out_i = drive_initiator_upgrade(&mut init, 5, &ctl_tx_i, &mut in_rx_i, || async {
+            Some("203.0.113.9:7000".to_string())
+        })
+        .await
+        .unwrap();
+        let (out_r, resp_direct) = resp_task.await.unwrap();
+
+        assert_eq!(out_i.as_deref(), Some("203.0.113.9:7000"), "initiator agreed on the direct endpoint");
+        assert_eq!(out_r.as_deref(), Some("203.0.113.9:7000"), "responder dialed + agreed the endpoint");
+        assert!(init.is_direct(), "initiator coordinator is Direct");
+        assert!(resp_direct, "responder coordinator is Direct");
+        assert!(init.time_to_upgrade().is_some(), "the handover time was recorded (offload metric)");
+    }
+
+    #[tokio::test]
+    async fn inband_upgrade_driver_stays_on_relay_when_the_responder_cannot_dial() {
+        // The responder's direct dial fails → it sends Abort in-band; both stay on the relay and
+        // the initiator records a failed attempt (backoff advances) — the negative of the above.
+        let (ctl_tx_i, ctl_rx_i) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_i, mut in_rx_i) = tokio::sync::mpsc::unbounded_channel();
+        let (ctl_tx_r, ctl_rx_r) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_r, mut in_rx_r) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(relay_control(ctl_rx_i, in_tx_r));
+        tokio::spawn(relay_control(ctl_rx_r, in_tx_i));
+
+        let mut init = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+        let mut resp = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+
+        let resp_task = tokio::spawn(async move {
+            let out = drive_responder_upgrade(&mut resp, 5, &ctl_tx_r, &mut in_rx_r, |_ep| async { false })
+                .await
+                .unwrap();
+            (out, resp.is_direct())
+        });
+        let out_i = drive_initiator_upgrade(&mut init, 5, &ctl_tx_i, &mut in_rx_i, || async {
+            Some("203.0.113.9:7000".to_string())
+        })
+        .await
+        .unwrap();
+        let (out_r, resp_direct) = resp_task.await.unwrap();
+
+        assert!(out_i.is_none() && out_r.is_none(), "neither side upgraded");
         assert!(!init.is_direct() && !resp_direct, "both stay on the relay");
         assert!(init.attempts() >= 1, "the initiator recorded a failed attempt for backoff");
     }
