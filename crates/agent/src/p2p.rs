@@ -28,9 +28,19 @@
 //! which is safe **only** because it is test-only and in-process. Enforcing invariant #3
 //! (a superpeer relays a circuit only for a channel it is a grant-member of) is the next
 //! slice, `C-membership-gate`. **⚠️ This unguarded relay MUST NOT be wired to a
-//! live/public relay node before the membership gate lands.** Later slices (DCUtR
-//! hole-punch — which upgrades a relayed connection to direct — and Kademlia discovery)
-//! build on this same seam; those are not implemented here.
+//! live/public relay node before the membership gate lands.**
+//!
+//! The DCUtR path ([`connected_dcutr_stream_pair`], #121 B2-dcutr) layers libp2p's
+//! **Direct Connection Upgrade through Relay** ([`dcutr::Behaviour`]) onto the relay-client
+//! swarms: once two peers are connected *through* the relay, DCUtR coordinates a **direct**
+//! connection upgrade (the hole-punch), leaving the relay needed only for setup. This
+//! module wires that machinery and proves — on **loopback**, where both peers are already
+//! directly reachable, so the upgrade completes trivially or is a no-op — that enabling
+//! DCUtR does **not** break the relayed `Noise_IK` session (invariants #1/#2 still hold).
+//! The actual *cross-NAT* hole-punch (real NAT'd hosts, no direct reachability) cannot be
+//! exercised on loopback and is verified by a **live** real-NAT test, not the cargo gate.
+//! The remaining Kademlia discovery slice builds on this same seam and is not implemented
+//! here.
 
 use std::time::Duration;
 
@@ -39,7 +49,7 @@ use libp2p::core::upgrade::Version;
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{noise, relay, yamux, Multiaddr, StreamProtocol, Swarm, SwarmBuilder, Transport};
+use libp2p::{dcutr, noise, relay, yamux, Multiaddr, StreamProtocol, Swarm, SwarmBuilder, Transport};
 use libp2p_stream as stream;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
@@ -318,6 +328,43 @@ fn build_relay_client_swarm() -> Result<Swarm<RelayClientBehaviour>, BoxError> {
     Ok(swarm)
 }
 
+/// The behaviour a **DCUtR-enabled relay client** peer runs: the same Circuit-Relay v2
+/// client + raw-substream [`stream::Behaviour`] as [`RelayClientBehaviour`], plus libp2p's
+/// [`dcutr::Behaviour`] (Direct Connection Upgrade through Relay — the hole-punch). DCUtR
+/// observes the relayed connection and coordinates a **direct** connection upgrade so the
+/// relay is only needed for setup. Neither the relay client, DCUtR, nor any `PeerId` is an
+/// authorization input (invariant #1) — they only route/upgrade bytes; our `Noise_IK` still
+/// runs end-to-end inside the `/ct/channel/1.0.0` substream (invariant #2).
+#[derive(NetworkBehaviour)]
+struct DcutrRelayClientBehaviour {
+    relay_client: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
+    stream: stream::Behaviour,
+}
+
+/// Build a **DCUtR-enabled relay client**'s swarm: identical to [`build_relay_client_swarm`]
+/// (TCP + noise + yamux + the Circuit-Relay v2 client transport) except its behaviour also
+/// carries [`dcutr::Behaviour`], constructed with this peer's own id, so a relayed connection
+/// can be upgraded toward a direct one. The DCUtR machinery is wired here; the *cross-NAT*
+/// hole-punch it enables is only exercised by a live real-NAT test, never on loopback (where
+/// both peers are already directly reachable, so the upgrade is a trivial no-op). As on every
+/// transport, the fresh libp2p identity is plumbing — it never gates channel admission
+/// (invariant #1).
+fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, BoxError> {
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| DcutrRelayClientBehaviour {
+            relay_client,
+            dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
+            stream: stream::Behaviour::new(),
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+    Ok(swarm)
+}
+
 /// Connect two libp2p peers **through a third Circuit-Relay v2 relay node** and open a
 /// single raw stream between them, returning each side as an `AsyncRead + AsyncWrite +
 /// Unpin` duplex (the `(dialer, listener)` pair). Three in-process nodes run over TCP
@@ -412,6 +459,133 @@ pub async fn connected_relayed_stream_pair() -> Result<(P2pDuplex, P2pDuplex), B
     // Client B dials A **through the relay**, waits for the relayed connection to A (not the
     // hop to the relay), then opens the substream while continuing to pump the swarm.
     let mut client_b = build_relay_client_swarm()?;
+    let mut b_control = client_b.behaviour().stream.new_control();
+    let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if client_b.dial(a_via_relay).is_err() {
+            return;
+        }
+        loop {
+            match client_b.next().await {
+                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) if peer_id == a_peer => break,
+                Some(_) => {}
+                None => return,
+            }
+        }
+        let open = b_control.open_stream(a_peer, CT_CHANNEL_PROTOCOL);
+        tokio::pin!(open);
+        let mut outbound_tx = Some(outbound_tx);
+        loop {
+            tokio::select! {
+                _ = client_b.next() => {}
+                res = &mut open, if outbound_tx.is_some() => {
+                    if let (Ok(stream), Some(tx)) = (res, outbound_tx.take()) {
+                        let _ = tx.send(stream);
+                    }
+                }
+            }
+        }
+    });
+
+    let dialer_stream = outbound_rx.await?;
+    let listener_stream = inbound_rx.await?;
+    Ok((dialer_stream.compat(), listener_stream.compat()))
+}
+
+/// Connect two **DCUtR-enabled** libp2p peers through a Circuit-Relay v2 relay node and open
+/// a single raw stream between them, returning each side as an `AsyncRead + AsyncWrite +
+/// Unpin` duplex (the `(dialer, listener)` pair). Structurally identical to
+/// [`connected_relayed_stream_pair`] — a **relay** ([`build_relay_swarm`]) plus clients A and
+/// B — except the two clients run [`build_dcutr_relay_client_swarm`], so their behaviour also
+/// carries [`dcutr::Behaviour`]. A reserves a slot on the relay
+/// (`relay::client::Event::ReservationReqAccepted`), B dials A through the relay
+/// (`<relay>/p2p-circuit/p2p/<A>`), and once the relayed connection is established B opens the
+/// `/ct/channel/1.0.0` substream.
+///
+/// With DCUtR in the behaviour, once the relayed connection forms the peers may attempt a
+/// **direct** connection upgrade (the hole-punch). On loopback both peers are already directly
+/// reachable, so that upgrade completes trivially or is a no-op — it never disturbs the
+/// relayed substream this helper yields. All swarms are driven forever on detached tasks so
+/// the circuit (and any direct upgrade) keeps flowing for the lifetime of the returned
+/// streams. As on the plain relay path, the relay is **unguarded** (test-only, in-process),
+/// and no `PeerId` is ever an authorization input (invariant #1); callers layer
+/// [`crate::channel_run::run_channel_session_on_stream`] on top for auth + encryption
+/// (invariant #2).
+pub async fn connected_dcutr_stream_pair() -> Result<(P2pDuplex, P2pDuplex), BoxError> {
+    // --- Relay node: bind loopback, learn its concrete listen address, then drive it forever
+    // so it can route the circuit (and DCUtR's coordination) for the lifetime of the streams. ---
+    let mut relay = build_relay_swarm()?;
+    let relay_peer = *relay.local_peer_id();
+    relay.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    let relay_addr: Multiaddr = loop {
+        match relay.next().await {
+            Some(SwarmEvent::NewListenAddr { address, .. }) => break address,
+            Some(_) => {}
+            None => return Err("relay swarm closed before reporting a listen address".into()),
+        }
+    };
+    // As on the plain relay path, the Circuit-Relay v2 server must advertise its own external
+    // address or the client rejects the reservation (`NoAddressesInReservation`); on loopback
+    // there is no identify/AutoNAT to discover it, so confirm the bound address explicitly.
+    relay.add_external_address(relay_addr.clone());
+    tokio::spawn(async move {
+        loop {
+            relay.next().await;
+        }
+    });
+
+    // The circuit addresses (identical shape to `connected_relayed_stream_pair`): `relay_circuit`
+    // is what A reserves + listens on; `a_via_relay` appends `/p2p/<A>` — the address B dials to
+    // reach A through the relay. The `PeerId`s only name/route the hop, never authorize.
+    let mut client_a = build_dcutr_relay_client_swarm()?;
+    let a_peer = *client_a.local_peer_id();
+    let relay_circuit = relay_addr
+        .with(Protocol::P2p(relay_peer))
+        .with(Protocol::P2pCircuit);
+    let a_via_relay = relay_circuit.clone().with(Protocol::P2p(a_peer));
+
+    // Client A accepts inbound `/ct/channel/1.0.0` substreams and makes its reservation.
+    let mut a_incoming = client_a.behaviour().stream.new_control().accept(CT_CHANNEL_PROTOCOL)?;
+    client_a.listen_on(relay_circuit)?;
+
+    // A driver: signal once the reservation is accepted (so B doesn't dial before the relay knows
+    // how to reach A), then keep pumping the swarm — routing DCUtR's upgrade coordination too —
+    // and hand back the first inbound stream once B's circuit opens one.
+    let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
+    let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut reserved_tx = Some(reserved_tx);
+        let mut inbound_tx = Some(inbound_tx);
+        loop {
+            tokio::select! {
+                ev = client_a.next() => {
+                    if let Some(SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { .. },
+                    ))) = ev
+                    {
+                        if let Some(tx) = reserved_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+                Some((_peer, stream)) = a_incoming.next() => {
+                    if let Some(tx) = inbound_tx.take() {
+                        let _ = tx.send(stream);
+                    }
+                }
+            }
+        }
+    });
+
+    // Gate B's dial on A's reservation being live end to end (reservation → dial → substream).
+    reserved_rx
+        .await
+        .map_err(|_| "client A driver ended before its relay reservation was accepted")?;
+
+    // Client B dials A **through the relay**, waits for the relayed connection to A (not the hop
+    // to the relay), then opens the substream while continuing to pump the swarm (so DCUtR's
+    // upgrade attempt, if any, makes progress alongside).
+    let mut client_b = build_dcutr_relay_client_swarm()?;
     let mut b_control = client_b.behaviour().stream.new_control();
     let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -656,5 +830,89 @@ mod tests {
         })
         .await
         .expect("the relayed Noise round-trip completes within 15s (a hang here is a deadlock)");
+    }
+
+    #[tokio::test]
+    async fn channel_noise_session_runs_with_dcutr_enabled_over_the_relay() {
+        // #121 B2-dcutr (frozen): the SAME relayed proof as
+        // `channel_noise_session_runs_over_a_libp2p_circuit_relay`, but both clients now carry
+        // libp2p's **DCUtR** (Direct Connection Upgrade through Relay — the hole-punch) in
+        // their behaviour. Relay + A + B run in-process on TCP loopback; A reserves a slot on
+        // the relay, B dials A *via the relay*, opens a raw substream, and each side runs the
+        // EXISTING transport-agnostic `run_channel_session_on_stream` over its half. With DCUtR
+        // wired, once the relayed connection forms the peers may attempt a **direct** upgrade;
+        // on loopback both are already directly reachable, so that upgrade completes trivially
+        // or is a no-op. The POINT of this test is that **enabling DCUtR does not break the
+        // relayed session** — the machinery is wired end to end.
+        //
+        // We do NOT assert a DCUtR upgrade event: on loopback (no NAT, no identify-observed
+        // addresses) whether/when DCUtR fires is timing-dependent, so asserting it would be
+        // flaky. The real *cross-NAT* hole-punch — DCUtR's actual value — needs real NAT'd
+        // hosts and is verified by a LIVE test, not this cargo gate.
+        //
+        // Invariant #1 (authz = the grant, NOT any libp2p PeerId): admission is purely
+        // key-based — each side is keyed *only* by the members' channel-attested Noise static
+        // keys (`a_priv`/`b_pub`, `b_priv`/`a_pub`). The relay's, the clients', and DCUtR's
+        // PeerIds only named/routed/upgraded the hop; none is ever consulted for authorization.
+        // Invariant #2: the Noise tunnel is formed over the relayed stream — a real payload
+        // round-trips in BOTH directions, proving our end-to-end encryption sits on top of the
+        // relay + DCUtR plumbing, which sees only ciphertext.
+
+        // Channel-attested member Noise keys — the ONLY admission input.
+        let a = generate_static_keypair();
+        let b = generate_static_keypair();
+        let (a_priv, a_pub) = (a.private, a.public);
+        let (b_priv, b_pub) = (b.private, b.public);
+
+        // The multi-step relayed setup (reservation → relayed dial → substream) plus DCUtR's
+        // upgrade coordination is fully event-driven, but a regression that stalled any step —
+        // including a DCUtR stall — would otherwise hang forever (`cargo test` has no per-test
+        // timeout). Bound the whole path so a deadlock FAILS FAST instead of wedging the gate.
+        // 15s is ~100x the in-process happy path.
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            // The libp2p relayed stream with DCUtR-enabled clients: untrusted plumbing carrying
+            // our ciphertext. B reached A through the relay.
+            let (dialer_stream, listener_stream) = connected_dcutr_stream_pair()
+                .await
+                .expect("two DCUtR-enabled libp2p peers connect THROUGH a Circuit-Relay v2 relay");
+
+            // Each member's local plaintext side (the CLI's stdio stand-in).
+            let (mut a_app, a_local) = tokio::io::duplex(16 * 1024);
+            let (mut b_app, b_local) = tokio::io::duplex(16 * 1024);
+
+            let a_task = tokio::spawn(async move {
+                let (ar, aw) = split(listener_stream);
+                // Responder: keyed only by its own Noise key. No PeerId is consulted.
+                run_channel_session_on_stream(aw, ar, ChannelRole::Accept, &a_priv, &b_pub, a_local).await
+            });
+            let b_task = tokio::spawn(async move {
+                let (br, bw) = split(dialer_stream);
+                // Initiator: keyed only by its own Noise key + the peer's pinned Noise key.
+                run_channel_session_on_stream(bw, br, ChannelRole::Initiate, &b_priv, &a_pub, b_local).await
+            });
+
+            // B -> A over the Noise tunnel formed inside the relayed stream (DCUtR enabled).
+            b_app.write_all(b"ping-B-to-A").await.expect("b writes");
+            let mut got = [0u8; 11];
+            a_app.read_exact(&mut got).await.expect("a reads B's bytes");
+            assert_eq!(&got, b"ping-B-to-A", "B's plaintext arrives decrypted at A with DCUtR wired");
+
+            // A -> B: prove the tunnel round-trips both directions with DCUtR enabled.
+            a_app.write_all(b"pong-A-to-B").await.expect("a writes");
+            let mut got2 = [0u8; 11];
+            b_app.read_exact(&mut got2).await.expect("b reads A's bytes");
+            assert_eq!(&got2, b"pong-A-to-B", "A's plaintext arrives decrypted at B");
+
+            // Flush + close cleanly before drop so the last frame isn't dropped, then let both
+            // session tasks unwind.
+            a_app.shutdown().await.ok();
+            b_app.shutdown().await.ok();
+            drop(a_app);
+            drop(b_app);
+            let _ = a_task.await;
+            let _ = b_task.await;
+        })
+        .await
+        .expect("the DCUtR-enabled relayed Noise round-trip completes within 15s (a hang here is a deadlock)");
     }
 }
