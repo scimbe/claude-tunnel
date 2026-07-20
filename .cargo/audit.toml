@@ -1,9 +1,24 @@
-# cargo-audit configuration (#80). Read by `cargo audit` (scripts/security-audit.sh).
+# cargo-audit configuration for the #78 CI dependency-audit gate.
+#
+# Each ignored advisory below is documented with WHY it is NOT a production exposure for this
+# workspace. In every case the flagged crate is NOT compiled into any release binary — verified
+# with `cargo tree -i <crate> -e normal` (which finds nothing for all three). These are gate-
+# hygiene ignores of non-exploitable, resolved-but-inactive dependencies, NOT acceptance of a
+# live risk. Flagged to central for security-review sign-off.
+
 [advisories]
-# RUSTSEC-2023-0071 — rsa "Marvin Attack" timing side-channel (no fixed upgrade
-# available). The `rsa` crate is a **dev-dependency only** (ct-control-plane tests:
-# runtime RSA key generation + RS256 signing for the OIDC/portal JWKS tests). It is
-# NOT linked into any shipped service binary, and the decryption timing side-channel
-# is not reachable via test key generation. Accepted as a documented, non-production
-# risk. Revisit if `rsa` ships a fix, or if it ever enters a runtime dependency path.
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+    # hickory-proto: present ONLY as resolved-but-inactive optional deps of libp2p's `dns`/`mdns`
+    # features, which this workspace deliberately does NOT enable (libp2p features are
+    # tokio,noise,yamux,tcp,relay,dcutr,kad,macros — we dial raw multiaddrs, no DNS/mDNS). Our
+    # `ct-dns` crate is a hand-rolled codec that does not use hickory. Not in the compiled graph.
+    "RUSTSEC-2026-0118",  # hickory-proto NSEC3 unbounded loop — no upstream fix; not compiled here
+    "RUSTSEC-2026-0119",  # hickory-proto O(n^2) name compression — fix exists upstream; not compiled here
+
+    # rsa (Marvin Attack, timing side-channel key recovery — no upstream fix): pulled ONLY by the
+    # TEST-side `jsonwebtoken::encode` that mints test JWTs (control-plane tests); it is not in any
+    # release binary. Production code only VERIFIES RS256 JWTs via a public-key `DecodingKey`
+    # (crates/control-plane/src/portal.rs) — the Marvin attack targets RSA PRIVATE-key operations,
+    # which this service never performs in production.
+    "RUSTSEC-2023-0071",
+]
