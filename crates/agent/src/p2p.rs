@@ -669,6 +669,30 @@ pub(crate) async fn dcutr_dial_via_relay(
     Ok(outbound_rx.await?.compat())
 }
 
+/// **#136 N136.3 relay-pinning guard** — validate the peer-conveyed DCUtR upgrade address before the
+/// responder dials it. In the NAT-to-NAT upgrade the initiator advertises its via-relay circuit
+/// address (`<relay>/p2p-circuit/p2p/<initiator>`) in-band over the relay pump, exactly as the
+/// plain-QUIC path advertises a `SocketAddr` — so it is untrusted, and the SSRF concern of #137
+/// recurs in a new shape: a malicious initiator could advertise a circuit routed through an
+/// **attacker-controlled relay**. Pin it: the `offered` address must be EXACTLY the responder's own
+/// `trusted_circuit` (its configured edge Circuit-Relay v2 leg) followed by a single `/p2p/<target>`.
+/// Returns the target [`libp2p::PeerId`] to dial ONLY if the relay prefix matches; `None`
+/// (unparseable, wrong/extra relay, or no trailing target peer) refuses the upgrade → stay on relay.
+// Landed ahead of its caller: the N136.3 relay-only wire-in (run_channel_session_upgradable's DCUtR
+// branch) consumes this; frozen + tested now so the guard exists before the path goes live.
+#[allow(dead_code)]
+pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -> Option<libp2p::PeerId> {
+    let addr: Multiaddr = offered.parse().ok()?;
+    let mut protos: Vec<Protocol> = addr.iter().collect();
+    // The trailing component must name the target peer; everything before it must be our relay.
+    let target = match protos.pop()? {
+        Protocol::P2p(peer) => peer,
+        _ => return None,
+    };
+    let prefix: Multiaddr = protos.into_iter().collect();
+    (&prefix == trusted_circuit).then_some(target)
+}
+
 /// The domain-separation tag for a DHT coordinate record's signing preimage. A distinct,
 /// versioned prefix keeps this signature from ever being confused with a grant, an
 /// invitation, or the member-Noise attestation (`ct-a2a-noise-attest-v1`) — exactly as the
@@ -1495,5 +1519,41 @@ mod tests {
             Err(RelayCircuitError::RelayGrantInvalid(GrantError::Expired)),
             "an expired relay grant may not relay (TTL-bounded, invariant #7)"
         );
+    }
+
+    #[test]
+    fn dcutr_upgrade_target_pins_the_trusted_relay_and_extracts_the_peer() {
+        // #136 N136.3 (frozen): the relay-pinning guard for the peer-conveyed DCUtR upgrade address
+        // (the #137 SSRF analog for NAT-to-NAT). Only an address that is EXACTLY the responder's own
+        // trusted edge circuit + a target peer is accepted; a circuit routed through a different
+        // (attacker-controlled) relay, one with no target peer, or a malformed string is refused.
+        use libp2p::PeerId;
+        let relay = PeerId::random();
+        let target = PeerId::random();
+        let trusted: Multiaddr = "/ip4/127.0.0.1/tcp/4001"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(relay))
+            .with(Protocol::P2pCircuit);
+
+        // Valid: our trusted circuit + the target peer → returns the target to dial.
+        let offered = trusted.clone().with(Protocol::P2p(target));
+        assert_eq!(dcutr_upgrade_target(&offered.to_string(), &trusted), Some(target));
+
+        // Attacker relay: a DIFFERENT relay circuit + the same target → refused (relay not pinned).
+        let evil_relay = PeerId::random();
+        let evil = "/ip4/10.0.0.9/tcp/4001"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(evil_relay))
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(target));
+        assert_eq!(dcutr_upgrade_target(&evil.to_string(), &trusted), None, "a foreign relay must be refused");
+
+        // No trailing target peer (just the bare circuit) → refused.
+        assert_eq!(dcutr_upgrade_target(&trusted.to_string(), &trusted), None, "a circuit with no target peer is refused");
+
+        // Malformed → refused.
+        assert_eq!(dcutr_upgrade_target("not-a-multiaddr", &trusted), None, "an unparseable address is refused");
     }
 }
