@@ -1241,6 +1241,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_establishment_adapter_completes_over_a_dcutr_stream() {
+        // #136 N136.2 (frozen): the #104 upgrade's *direct-establishment adapter*
+        // (`establish_direct_over_duplex` → `establish_direct_session`) completes over a real
+        // DCUtR-hole-punched stream and yields the pump-ready `(TransportState, read, write)` — the
+        // EXACT op the NAT-to-NAT wire-in (N136.3) injects in place of the plain-QUIC
+        // `dial_peer_direct`. Distinct from the full-session test above: this exercises the handshake
+        // adapter that feeds the multiplexed pump's late-bind one-shot. Loopback (punch trivial); the
+        // live cross-NAT punch is N136.4. Bounded so a stall fails fast instead of wedging the gate.
+        use ct_common::a2a::{a2a_recv, a2a_send, establish_direct_over_duplex};
+        use ct_common::noise::generate_static_keypair;
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            let (dialer_stream, listener_stream) = connected_dcutr_stream_pair()
+                .await
+                .expect("two DCUtR-enabled peers connect through the relay");
+            let a = generate_static_keypair();
+            let b = generate_static_keypair();
+            // The dialer (initiator) pins the peer's `b_pub`; the responder needs no peer key.
+            let (a_priv, b_priv, b_pub) = (a.private, b.private, b.public);
+
+            // The dialer opened the substream (writes first), so it is the direct-Noise INITIATOR.
+            let dialer_task = tokio::spawn(async move {
+                establish_direct_over_duplex(dialer_stream, true, &a_priv, &b_pub).await
+            });
+            let (mut lts, mut lr, mut lw) =
+                establish_direct_over_duplex(listener_stream, false, &b_priv, &[0u8; 32])
+                    .await
+                    .expect("listener establishes the direct session over DCUtR");
+            let (mut dts, mut dr, mut dw) = dialer_task
+                .await
+                .expect("join")
+                .expect("dialer establishes the direct session over DCUtR");
+
+            // The returned transports + halves form a working encrypted tunnel in both directions.
+            a2a_send(&mut dw, &mut dts, b"ping-dcutr").await.expect("dialer sends");
+            assert_eq!(a2a_recv(&mut lr, &mut lts).await.expect("listener recv"), b"ping-dcutr");
+            a2a_send(&mut lw, &mut lts, b"pong-dcutr").await.expect("listener sends");
+            assert_eq!(a2a_recv(&mut dr, &mut dts).await.expect("dialer recv"), b"pong-dcutr");
+        })
+        .await
+        .expect("the DCUtR direct-establishment adapter round-trips within 15s (a hang here is a deadlock)");
+    }
+
+    #[tokio::test]
     async fn kademlia_resolves_a_holder_signed_coordinate_record() {
         // #121 D-kademlia (frozen): DISCOVERY, not connectivity. Node A publishes a holder-signed
         // `ChannelId → coordinates` record on an in-process libp2p Kademlia DHT; node B, bootstrapped

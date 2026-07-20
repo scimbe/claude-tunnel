@@ -202,6 +202,24 @@ where
     Ok((session, recv, send))
 }
 
+/// [`establish_direct_session`] over a **single combined duplex** stream (#136 N136.2) — splits it
+/// into halves first. The plain-QUIC upgrade path already has separate `SendStream`/`RecvStream`,
+/// but a **DCUtR** hole-punched link (`ct-agent p2p`) yields one `AsyncRead + AsyncWrite` duplex, so
+/// the NAT-to-NAT wire-in (N136.3) injects *this* as its direct-establishment op in place of
+/// `dial_peer_direct`. Returns the pump-ready `(TransportState, read, write)`.
+pub async fn establish_direct_over_duplex<S>(
+    stream: S,
+    initiator: bool,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+) -> io::Result<(TransportState, tokio::io::ReadHalf<S>, tokio::io::WriteHalf<S>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (recv, send) = tokio::io::split(stream);
+    establish_direct_session(send, recv, initiator, own_noise_private, peer_noise_public).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
