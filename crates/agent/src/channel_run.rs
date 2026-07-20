@@ -707,6 +707,21 @@ impl ChannelIdentity {
     }
 }
 
+/// One overlay link compiled into a concrete A2A channel (#107-nway): the derived
+/// [`ct_common::channel::ChannelId`] and the two operator-signed grants the link's members
+/// present to join it. The initiator holder is the canonically-smaller node id of the link
+/// (the `Initiate`-direction side); the acceptor is the other. Both members independently
+/// derive the same `channel` from their holder keys, so no coordination round-trip is
+/// needed to agree on the channel address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledLink {
+    pub channel: ct_common::channel::ChannelId,
+    pub initiator_holder: [u8; 32],
+    pub acceptor_holder: [u8; 32],
+    pub initiator_grant: ct_common::channel::SignedChannelGrant,
+    pub acceptor_grant: ct_common::channel::SignedChannelGrant,
+}
+
 /// A channel **operator's** signing identity (#117-operator-flow): the ed25519 key that
 /// *authorizes* a channel — its public key is the channel's authority (registered with
 /// the control plane so the edge can verify member grants), and it signs every member's
@@ -749,6 +764,20 @@ impl OperatorIdentity {
         direction: ct_common::channel::Direction,
         expires_at: ct_common::channel::UnixSeconds,
     ) -> String {
+        hex_encode(&self.sign_member_grant(channel, holder_pubkey, direction, expires_at).encode())
+    }
+
+    /// Sign a `ChannelGrant` binding `holder_pubkey` to `channel` with `direction`/
+    /// `expires_at` under the local operator key, returning the structured grant. The
+    /// crypto shared by [`issue_member_grant`](Self::issue_member_grant) (which hex-encodes
+    /// this for the member one-liner) and [`compile_overlay_grants`](Self::compile_overlay_grants).
+    fn sign_member_grant(
+        &self,
+        channel: ct_common::channel::ChannelId,
+        holder_pubkey: [u8; 32],
+        direction: ct_common::channel::Direction,
+        expires_at: ct_common::channel::UnixSeconds,
+    ) -> ct_common::channel::SignedChannelGrant {
         use ct_common::channel::{ChannelGrant, Rights, SignedChannelGrant};
         let g = ChannelGrant {
             channel,
@@ -759,7 +788,53 @@ impl OperatorIdentity {
             expires_at,
         };
         let signature = self.key.sign(&g.signing_bytes()).to_bytes();
-        hex_encode(&SignedChannelGrant { grant: g, signature }.encode())
+        SignedChannelGrant { grant: g, signature }
+    }
+
+    /// Compile a topology's overlay `plan` into per-link A2A channels (#107-nway): each
+    /// link (a canonical pair of agent node-ids) becomes a channel
+    /// ([`ct_common::channel::channel_id_for_link`]) plus the two operator-signed grants its
+    /// members present to join it. `holder_of` maps a node id to that agent's member holder
+    /// pubkey (the controller knows each registered agent's key). The canonically-smaller
+    /// node id of each link is the **Initiate** side — a stable, caller-independent split,
+    /// like the broker's `authorize_channel_pair`. Returns `Err(node_id)` if a link names an
+    /// agent with no holder mapping (the plan can't be wired without every endpoint's key).
+    ///
+    /// Pure given `holder_of`: the operator mints every grant **locally** with its own key
+    /// (invariant #6) — no central round-trip; central only distributes the compiled grants.
+    pub fn compile_overlay_grants(
+        &self,
+        plan: &ct_common::overlay::OverlayPlan,
+        holder_of: impl Fn(&str) -> Option<[u8; 32]>,
+        expires_at: ct_common::channel::UnixSeconds,
+    ) -> Result<Vec<CompiledLink>, String> {
+        use ct_common::channel::{channel_id_for_link, Direction};
+        let op_pub = self.key.verifying_key().to_bytes();
+        let mut out = Vec::with_capacity(plan.links.len());
+        for (a_id, b_id) in &plan.links {
+            let initiator_holder = holder_of(a_id).ok_or_else(|| a_id.clone())?;
+            let acceptor_holder = holder_of(b_id).ok_or_else(|| b_id.clone())?;
+            // channel_id_for_link sorts by holder bytes, so both members derive the same id.
+            let channel = channel_id_for_link(&op_pub, &initiator_holder, &acceptor_holder);
+            out.push(CompiledLink {
+                channel,
+                initiator_holder,
+                acceptor_holder,
+                initiator_grant: self.sign_member_grant(
+                    channel,
+                    initiator_holder,
+                    Direction::Initiate,
+                    expires_at,
+                ),
+                acceptor_grant: self.sign_member_grant(
+                    channel,
+                    acceptor_holder,
+                    Direction::Accept,
+                    expires_at,
+                ),
+            });
+        }
+        Ok(out)
     }
 
     /// Issue a short-lived **membership staple** (E-fail-static, invariant #7): the operator
@@ -1467,6 +1542,77 @@ mod tests {
         assert!(
             !cache2.refresh(&op_pub, forged, 1_000),
             "a staple minted by a different key is rejected — central (keyless) can't forge one (#6)"
+        );
+    }
+
+    #[test]
+    fn operator_compiles_an_overlay_plan_into_verifiable_per_link_grants() {
+        // #107-nway (frozen): the controller compiles a topology's overlay links into
+        // concrete A2A channels — each link becomes a derived ChannelId plus the two
+        // operator-signed grants its members present. The two grants of a link verify under
+        // the operator key, bind distinct holders + the same channel, and split
+        // Initiate/Accept — exactly what the broker's admission pairing expects. An
+        // unmapped node id fails the whole compile (can't wire a link without both keys).
+        use ct_common::channel::{channel_id_for_link, verify, Direction};
+        use ct_common::overlay::OverlayPlan;
+
+        let op = OperatorIdentity::generate();
+        let op_pub = op.key.verifying_key().to_bytes();
+        // Three agents a<b<c with distinct holder keys; a line overlay a—b—c.
+        let holders = |id: &str| -> Option<[u8; 32]> {
+            match id {
+                "a" => Some([0xa1u8; 32]),
+                "b" => Some([0xb2u8; 32]),
+                "c" => Some([0xc3u8; 32]),
+                _ => None,
+            }
+        };
+        let plan = OverlayPlan {
+            links: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
+            total_cost: 0,
+            connected: true,
+        };
+
+        let compiled = op
+            .compile_overlay_grants(&plan, holders, 5_000)
+            .expect("every node id maps to a holder");
+        assert_eq!(compiled.len(), 2, "one compiled channel per overlay link");
+
+        // Link a—b: the derived channel matches channel_id_for_link, both grants verify
+        // under the operator key, bind distinct holders + the SAME channel, and split roles.
+        let ab = &compiled[0];
+        assert_eq!(
+            ab.channel,
+            channel_id_for_link(&op_pub, &[0xa1u8; 32], &[0xb2u8; 32]),
+            "the link's channel is the deterministic per-link derivation"
+        );
+        assert!(verify(&op_pub, &ab.initiator_grant, 1_000).is_ok(), "initiator grant verifies");
+        assert!(verify(&op_pub, &ab.acceptor_grant, 1_000).is_ok(), "acceptor grant verifies");
+        assert_eq!(ab.initiator_grant.grant.channel, ab.channel, "initiator grant is for this channel");
+        assert_eq!(ab.acceptor_grant.grant.channel, ab.channel, "acceptor grant is for this channel");
+        assert_eq!(ab.initiator_grant.grant.holder, [0xa1u8; 32]);
+        assert_eq!(ab.acceptor_grant.grant.holder, [0xb2u8; 32]);
+        assert_ne!(
+            ab.initiator_grant.grant.holder, ab.acceptor_grant.grant.holder,
+            "the two grants bind distinct holders (an agent can't channel to itself)"
+        );
+        assert!(ab.initiator_grant.grant.direction.permits(Direction::Initiate));
+        assert!(ab.acceptor_grant.grant.direction.permits(Direction::Accept));
+
+        // The two links share agent b but are DISTINCT channels (per-link isolation).
+        assert_ne!(compiled[0].channel, compiled[1].channel, "distinct links are distinct channels");
+
+        // A plan naming an unmapped agent can't be wired — the whole compile fails, loudly,
+        // with the offending node id (no partially-wired overlay).
+        let bad = OverlayPlan {
+            links: vec![("a".into(), "z".into())],
+            total_cost: 0,
+            connected: false,
+        };
+        assert_eq!(
+            op.compile_overlay_grants(&bad, holders, 5_000),
+            Err("z".to_string()),
+            "an unmapped node id fails the compile with that id"
         );
     }
 
