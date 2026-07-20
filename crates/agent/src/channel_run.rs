@@ -762,6 +762,46 @@ impl OperatorIdentity {
         hex_encode(&SignedChannelGrant { grant: g, signature }.encode())
     }
 
+    /// Issue a short-lived **membership staple** (E-fail-static, invariant #7): the operator
+    /// re-affirms that `holder_pubkey` is *currently* a member of `channel`, valid for
+    /// `ttl_secs` from `stapled_at`. Unlike [`issue_member_grant`](Self::issue_member_grant)
+    /// — a long-lived capability — a staple is minted **frequently** and gossiped so peers
+    /// keep admitting the member (via [`ct_common::channel::StapleCache`]) while central is
+    /// unreachable, and it dies within one TTL once the operator stops re-issuing it
+    /// (revocation latency = staple TTL).
+    ///
+    /// Minted with the **local** operator key (invariant #6): central never holds the key,
+    /// so it can *distribute/refresh* staples but can never mint — nor forge — one. This is
+    /// why a central compromise degrades to DoS/metadata, never impersonation. Returns the
+    /// staple object (the gossip transport encodes it); the operator runs this locally on a
+    /// refresh timer, no server round-trip.
+    pub fn issue_membership_staple(
+        &self,
+        channel: ct_common::channel::ChannelId,
+        holder_pubkey: [u8; 32],
+        stapled_at: ct_common::channel::UnixSeconds,
+        ttl_secs: u64,
+    ) -> ct_common::channel::MembershipStaple {
+        use ct_common::channel::MembershipStaple;
+        let expires_at = stapled_at.saturating_add(ttl_secs);
+        let signature = self
+            .key
+            .sign(&MembershipStaple::signing_bytes(
+                &channel,
+                &holder_pubkey,
+                stapled_at,
+                expires_at,
+            ))
+            .to_bytes();
+        MembershipStaple {
+            channel,
+            holder: holder_pubkey,
+            stapled_at,
+            expires_at,
+            signature,
+        }
+    }
+
     /// A copy-pasteable, `eval`-safe shell block for `ct-agent channel operator-init`
     /// (#117): the operator private key as the `export` the `channel grant` command
     /// reads, plus the operator public key as a comment (the channel authority to
@@ -1385,6 +1425,49 @@ mod tests {
         // Operator key hex round-trips to 64-hex private + public.
         assert_eq!(op.key_hex().len(), 64);
         assert_eq!(op.pubkey_hex().len(), 64);
+    }
+
+    #[test]
+    fn operator_mints_a_staple_the_cache_accepts_and_only_the_operator_can_mint() {
+        // #121 E-fail-static (frozen): the operator — holding the key LOCALLY (invariant #6)
+        // — mints a short-lived membership staple that a peer's StapleCache accepts under the
+        // operator PUBLIC key, admitting the member offline until the TTL. Central never holds
+        // the key, so a foreign key can neither mint nor forge a staple the cache would trust:
+        // a central compromise degrades to DoS/metadata, never impersonation.
+        use ct_common::channel::{ChannelId, StapleCache};
+
+        let op = OperatorIdentity::generate();
+        let member = ChannelIdentity::generate();
+        let channel = ChannelId([0x77u8; 32]);
+        let holder_pub = member.holder.verifying_key().to_bytes();
+        let op_pub = op.key.verifying_key().to_bytes();
+
+        // Operator mints a staple at t=1000 for a 3600s TTL (→ expires 4600).
+        let staple = op.issue_membership_staple(channel, holder_pub, 1_000, 3_600);
+        assert_eq!(staple.expires_at, 4_600, "expires_at = stapled_at + ttl_secs");
+
+        // A peer caches it under the operator PUBLIC key and admits the member offline...
+        let mut cache = StapleCache::new();
+        assert!(cache.refresh(&op_pub, staple, 1_000), "the cache accepts the operator's staple");
+        assert!(
+            cache.is_member(&op_pub, &channel, &holder_pub, 4_000),
+            "the member is admitted from cache with no central round-trip (fail-static)"
+        );
+        // ...and it lapses at the TTL (revocation latency = TTL, invariant #7).
+        assert!(
+            !cache.is_member(&op_pub, &channel, &holder_pub, 4_600),
+            "the cached staple lapses at expires_at"
+        );
+
+        // Invariant #6: a FOREIGN operator's staple for the same member is not trusted under
+        // this channel's operator key — only the local-key holder can mint an admissible staple.
+        let foreign = OperatorIdentity::generate();
+        let forged = foreign.issue_membership_staple(channel, holder_pub, 1_000, 3_600);
+        let mut cache2 = StapleCache::new();
+        assert!(
+            !cache2.refresh(&op_pub, forged, 1_000),
+            "a staple minted by a different key is rejected — central (keyless) can't forge one (#6)"
+        );
     }
 
     #[test]
