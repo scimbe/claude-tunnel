@@ -4,8 +4,9 @@
 # Runs the Docker testbed across a PoW-difficulty × delay × loss × bandwidth
 # matrix, collecting the tunnel round-trip latency stats (emitted by ct-client
 # bench mode as a "RESULT <csv_row>" line) into a CSV for the thesis evaluation.
-# The client's csv_row carries the M16 statistics (stddev, 95% CI, p99); this
-# script prepends the PoW-difficulty axis it varied.
+# The client's csv_row carries the M16 statistics (stddev, 95% CI, p99) plus the
+# raw per-iteration samples (samples_ms, #52); this script prepends the
+# PoW-difficulty axis it varied.
 #
 # The image is built once; link impairment and PoW difficulty are applied at
 # runtime via env (netem-entrypoint.sh + EDGE_POW_DIFFICULTY), so there is no
@@ -62,8 +63,9 @@ RATES="${SWEEP_RATES:-}"
 # Baseline protocols: direct TCP (to the socat origin) and direct QUIC (to quic_echo).
 BASELINE_PROTOS="${SWEEP_BASELINE_PROTOS:-tcp quic}"
 
-# mode,pow prepended to the client's 12-column csv_row (delay..p99_ms).
-HEADER="mode,pow,delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms"
+# mode,pow prepended to the client's 13-column csv_row (delay..p99_ms plus the
+# trailing space-separated raw samples_ms field, #52, for the bootstrap CI).
+HEADER="mode,pow,delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms,samples_ms"
 
 mkdir -p "$(dirname "$OUT")"
 # Append mode keeps existing rows (e.g. tunnel rows) and reuses their header; a

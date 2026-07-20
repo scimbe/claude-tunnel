@@ -20,9 +20,12 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// CSV header for a sweep result file. The M16 statistical columns
 /// (`stddev_ms`, `ci95_ms`, `p99_ms`) are appended after the original M6 columns
-/// so existing readers that index the first nine columns keep working.
+/// so existing readers that index the first nine columns keep working. The
+/// trailing `samples_ms` column (#52) carries the raw per-iteration latencies
+/// (space-separated) so a bootstrap-percentile CI can be computed downstream on
+/// the right-skewed loss distributions; it is appended last for the same reason.
 pub const CSV_HEADER: &str =
-    "delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms";
+    "delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms,samples_ms";
 
 /// Summary statistics over a set of latency samples (milliseconds).
 #[derive(Debug, Clone, PartialEq)]
@@ -247,10 +250,20 @@ pub async fn run_bench_udp(
 }
 
 /// Format a CSV row for a netem condition and its latency [`Summary`]. Column
-/// order matches [`CSV_HEADER`]: the M16 stats are appended after `p95_ms`.
-pub fn csv_row(delay: &str, loss: &str, rate: &str, s: &Summary) -> String {
+/// order matches [`CSV_HEADER`]: the M16 stats are appended after `p95_ms`, and
+/// the raw per-iteration `samples` (#52) form the trailing `samples_ms` field —
+/// space-separated (so the field stays comma-free) at the same 3-decimal
+/// precision as the summary. Emitting the raw samples lets the thesis tooling
+/// compute a bootstrap-percentile CI, which is valid on the right-skewed loss
+/// distributions where the symmetric normal CI is not.
+pub fn csv_row(delay: &str, loss: &str, rate: &str, s: &Summary, samples: &[f64]) -> String {
+    let samples_field = samples
+        .iter()
+        .map(|v| format!("{v:.3}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
-        "{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
         delay,
         loss,
         rate,
@@ -262,7 +275,8 @@ pub fn csv_row(delay: &str, loss: &str, rate: &str, s: &Summary) -> String {
         s.p95_ms,
         s.stddev_ms,
         s.ci95_ms,
-        s.p99_ms
+        s.p99_ms,
+        samples_field
     )
 }
 
@@ -388,8 +402,17 @@ mod tests {
             p99_ms: 50.0,
         };
         assert_eq!(
-            csv_row("30ms", "1%", "10mbit", &s),
-            "30ms,1%,10mbit,5,30.000,10.000,50.000,30.000,50.000,1.500,2.500,50.000"
+            csv_row("30ms", "1%", "10mbit", &s, &[10.0, 20.0, 30.0, 40.0, 50.0]),
+            "30ms,1%,10mbit,5,30.000,10.000,50.000,30.000,50.000,1.500,2.500,50.000,\
+             10.000 20.000 30.000 40.000 50.000"
+        );
+        // Header and row column counts still agree with the trailing samples field.
+        assert_eq!(
+            CSV_HEADER.split(',').count(),
+            csv_row("30ms", "1%", "10mbit", &s, &[10.0, 20.0, 30.0, 40.0, 50.0])
+                .split(',')
+                .count(),
+            "header and row column counts match"
         );
     }
 

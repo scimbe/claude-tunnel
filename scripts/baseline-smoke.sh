@@ -2,7 +2,7 @@
 # Direct-baseline compose smoke (#51 FF2 harness). Brings up the direct-connection
 # baseline testbed (docker-compose.baseline.yml) over a small netem delay and, for
 # BOTH direct TCP and direct QUIC, asserts the client emitted a well-formed
-# `RESULT <csv_row>` latency sample — non-empty, 12 columns, positive mean — and
+# `RESULT <csv_row>` latency sample — non-empty, 13 columns, positive mean — and
 # that scripts/tabulate.py parses the emitted rows (prepended with mode,pow as the
 # sweep does) into a results table, exercising the overhead column.
 #
@@ -30,7 +30,8 @@ trap cleanup EXIT
 
 command -v docker >/dev/null || fail "docker required"
 
-# One direct-baseline condition → the client's RESULT csv_row (12 columns).
+# One direct-baseline condition → the client's RESULT csv_row (13 columns: the
+# 12 stats columns plus the trailing raw samples_ms field, #52).
 run_proto() {  # $1=proto $2=target
     local proto="$1" target="$2" out row
     out=$(DIRECT_PROTO="$proto" DIRECT_TARGET="$target" \
@@ -39,8 +40,10 @@ run_proto() {  # $1=proto $2=target
     row=$(printf '%s\n' "$out" | grep -m1 'RESULT ' | sed 's/.*RESULT //' | tr -d '\r')
     "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
     [ -n "$row" ] || { printf '%s\n' "$out" | tail -20 >&2; fail "$proto: no RESULT row emitted"; }
+    # NF counts comma fields; the samples_ms field is space-separated so it stays
+    # a single (13th) column regardless of iteration count.
     local ncol; ncol=$(printf '%s' "$row" | awk -F, '{print NF}')
-    [ "$ncol" = "12" ] || fail "$proto: expected 12 columns, got $ncol ($row)"
+    [ "$ncol" = "13" ] || fail "$proto: expected 13 columns, got $ncol ($row)"
     # mean_ms is column 5 (delay,loss,rate,n,mean_ms,...); must be a positive number.
     local mean; mean=$(printf '%s' "$row" | cut -d, -f5)
     awk -v m="$mean" 'BEGIN{exit !(m+0>0)}' || fail "$proto: mean_ms not positive ($row)"
@@ -61,10 +64,12 @@ run_proto quic 10.5.0.2:4433
 step "Asserting the emitted rows parse through tabulate.py (with overhead column)"
 # Prepend the sweep header + a smoke tunnel row so the overhead column is exercised.
 {
-  echo "mode,pow,delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms"
+  echo "mode,pow,delay,loss,rate,n,mean_ms,min_ms,max_ms,p50_ms,p95_ms,stddev_ms,ci95_ms,p99_ms,samples_ms"
   # A synthetic tunnel row (SMOKE VALUE, not a measurement) so tabulate has a row
-  # to annotate with overhead vs. the real direct-tcp baseline just measured.
-  echo "single,8,$DELAY,,,${ITER},999.000,999.000,999.000,999.000,999.000,0.000,0.000,999.000"
+  # to annotate with overhead vs. the real direct-tcp baseline just measured. Its
+  # samples_ms field is left empty (trailing comma) — tabulate degrades the CI
+  # gracefully for rows without raw samples.
+  echo "single,8,$DELAY,,,${ITER},999.000,999.000,999.000,999.000,999.000,0.000,0.000,999.000,"
   cat "$W/rows.csv"
 } > "$W/combined.csv"
 TABLE_CSV="$W/combined.csv" TABLE_MD="$W/out.md" TABLE_TEX="$W/out.tex" python3 "$REPO_ROOT/scripts/tabulate.py" >/dev/null \

@@ -13,6 +13,11 @@ are treated as a single mode. Figures:
                           (only when the sweep covers >1 distinct loss value).
   latency-by-mode.png   — mode comparison: mean round-trip vs edge delay, one
                           series per mode at a fixed loss (only when >1 mode).
+  latency-ecdf.png      — empirical CDF of the raw per-iteration latencies, one
+                          step curve per netem condition of the reference mode
+                          (#52). Shows the full distribution/tail shape rather
+                          than just mean+/-CI; rendered only when the CSV carries
+                          the raw ``samples_ms`` column (older CSVs skip it).
 """
 import csv
 import os
@@ -51,6 +56,26 @@ def modes(rows):
 def reference_mode(rows):
     ms = modes(rows)
     return "single" if "single" in ms else ms[0]
+
+
+def parse_samples(r):
+    """Raw per-iteration latencies (ms) from the space-separated ``samples_ms``
+    field; ``[]`` when the column is absent or empty (older CSVs)."""
+    out = []
+    for tok in (r.get("samples_ms") or "").split():
+        try:
+            out.append(float(tok))
+        except ValueError:
+            pass
+    return out
+
+
+def cond_label(r):
+    """Short netem-condition label for an ECDF series."""
+    lab = f"{r['delay'] or '0ms'}/{r['loss'] or '0%'}"
+    if (r.get("rate") or "").strip():
+        lab += f"/{r['rate']}"
+    return lab
 
 
 def load(path):
@@ -154,12 +179,44 @@ def plot_by_mode(rows, loss="0%"):
     print("plot: wrote", out)
 
 
+def plot_ecdf(rows, mode):
+    """Empirical CDF of the raw per-iteration latencies, one step curve per netem
+    condition of the reference `mode` (#52). Skips when no row carries raw
+    ``samples_ms`` (older summary-only CSVs)."""
+    sub = [(r, parse_samples(r)) for r in rows if mode_of(r) == mode]
+    sub = [(r, s) for r, s in sub if s]
+    if not sub:
+        print("plot: no raw samples_ms, skipping latency-ecdf")
+        return
+    sub.sort(key=lambda rs: (num(rs[0]["delay"]), num(rs[0]["loss"]), num(rs[0].get("rate") or "")))
+
+    plt.figure(figsize=(6, 4))
+    for r, samples in sub:
+        xs = sorted(samples)
+        n = len(xs)
+        # ECDF: fraction of samples <= x, one step per sample (right-continuous).
+        ys = [(i + 1) / n for i in range(n)]
+        plt.step(xs, ys, where="post", marker=".", markersize=4, label=cond_label(r))
+    plt.xlabel("Tunnel-Roundtrip (ms)")
+    plt.ylabel("Kumulierter Anteil")
+    plt.title(f"Empirische Verteilungsfunktion (Modus: {mode})")
+    plt.ylim(0.0, 1.02)
+    plt.legend(title="Verzög./Verlust", fontsize="small")
+    plt.grid(True, alpha=0.3)
+    out = os.path.join(OUTDIR, "latency-ecdf.png")
+    plt.tight_layout()
+    plt.savefig(out, dpi=120)
+    plt.close()
+    print("plot: wrote", out)
+
+
 def main():
     rows = load(DATA)
     ref = reference_mode(rows)
     plot_vs_delay(rows, ref)
     plot_vs_loss(rows, ref)
     plot_by_mode(rows, "0%")
+    plot_ecdf(rows, ref)
 
 
 if __name__ == "__main__":

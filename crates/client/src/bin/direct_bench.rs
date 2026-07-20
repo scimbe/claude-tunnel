@@ -124,7 +124,7 @@ async fn main() -> Result<(), BoxError> {
     let delay = std::env::var("CT_BENCH_DELAY").unwrap_or_default();
     let loss = std::env::var("CT_BENCH_LOSS").unwrap_or_default();
     let rate = std::env::var("CT_BENCH_RATE").unwrap_or_default();
-    println!("RESULT {}", csv_row(&delay, &loss, &rate, &summary));
+    println!("RESULT {}", csv_row(&delay, &loss, &rate, &summary, &samples));
     eprintln!(
         "direct_bench: proto={} {}/{} iterations, mean {:.2}ms p95 {:.2}ms",
         proto, summary.n, iterations, summary.mean_ms, summary.p95_ms
