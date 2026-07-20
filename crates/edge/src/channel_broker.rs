@@ -345,13 +345,20 @@ where
     // Length-framed request so the presenter's send stream stays open for the
     // possession challenge-response below.
     let mut len_buf = [0u8; 2];
-    recv.read_exact(&mut len_buf).await?;
+    // #125: log the bare-I/O failure paths too (no `NO` ack — the stream is already
+    // broken), tagged `io-*` so `grep 'channel-join NO'` surfaces an I/O drop (early
+    // half-close, reset, an ALPN-acceptor stream hiccup) alongside validation refusals.
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| { eprintln!("ct-edge: channel-join NO [io-len]: {e}"); e })?;
     let len = u16::from_be_bytes(len_buf) as usize;
     if len == 0 || len > 1024 {
         return Err(refuse(&mut send, "len-oob", "", "channel join request length out of range".into()).await);
     }
     let mut bytes = vec![0u8; len];
-    recv.read_exact(&mut bytes).await?;
+    recv.read_exact(&mut bytes)
+        .await
+        .map_err(|e| { eprintln!("ct-edge: channel-join NO [io-body]: {e}"); e })?;
 
     let req = match ChannelJoinRequest::decode(&bytes) {
         Ok(r) => r,
@@ -400,7 +407,9 @@ where
     // can't be replayed against a new challenge.
     let mut challenge = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut challenge);
-    send.write_all(&challenge).await?;
+    send.write_all(&challenge)
+        .await
+        .map_err(|e| { eprintln!("ct-edge: channel-join NO [io-challenge]: {e}"); e })?;
     let mut sig = [0u8; 64];
     if recv.read_exact(&mut sig).await.is_err()
         || !verify_holder_possession(&req.grant.grant.holder, &challenge, &sig)
@@ -1510,6 +1519,39 @@ mod tests {
                 assert_ne!(reasons[i], reasons[j], "checkpoint reasons must be distinct");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn channel_join_io_drop_at_read_returns_err_not_a_silent_hang() {
+        // #125 (frozen): the bare I/O points (length read, body read, challenge write) must
+        // return an Err PROMPTLY on an early half-close/reset — logged server-side as
+        // `[io-len]`/`[io-body]`/`[io-challenge]` — not hang and not silently succeed. This
+        // is the suspected cause of #103's "refused, no log" reports (a mid-handshake drop).
+        use std::time::Duration;
+        use tokio::io::{split, AsyncWriteExt};
+        let observed: std::net::SocketAddr = "203.0.113.50:40002".parse().unwrap();
+        let authorize = |_c: ChannelId, _h: [u8; 32]| async move {
+            Option::<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>::None
+        };
+
+        // io-len: half-close before writing the 2-byte length prefix.
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = split(server_end);
+        let s1 = tokio::spawn(async move {
+            read_channel_join_on_stream(srv_w, srv_r, observed, 500, Duration::from_secs(5), &authorize).await
+        });
+        drop(client_end);
+        assert!(s1.await.unwrap().is_err(), "io-len: an early close must error, not hang/succeed");
+
+        // io-body: send a length prefix, then half-close before the body.
+        let (mut client_end, server_end) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = split(server_end);
+        let s2 = tokio::spawn(async move {
+            read_channel_join_on_stream(srv_w, srv_r, observed, 500, Duration::from_secs(5), &authorize).await
+        });
+        client_end.write_all(&10u16.to_be_bytes()).await.unwrap();
+        drop(client_end);
+        assert!(s2.await.unwrap().is_err(), "io-body: a truncated body must error, not hang/succeed");
     }
 
     #[tokio::test]
