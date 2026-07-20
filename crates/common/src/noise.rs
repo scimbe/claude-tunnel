@@ -222,24 +222,52 @@ where
 }
 
 /// Pump-frame tags for the #104-H3 relay→direct cutover: a 1-byte plaintext prefix on every
-/// frame marking application `DATA` vs the in-line `CUTOVER` control. Byte-identical wire to
-/// [`noise_pump`] otherwise (just one extra plaintext byte).
+/// frame marking application `DATA` vs the in-line `CUTOVER` control (and — H3-wire — an
+/// opaque in-band `CONTROL` message). Byte-identical wire to [`noise_pump`] otherwise (just one
+/// extra plaintext byte).
 const PUMP_TAG_DATA: u8 = 0;
 const PUMP_TAG_CUTOVER: u8 = 1;
+/// An in-band **control** frame (#104 H3-wire): its payload is an opaque control message
+/// (e.g. an encoded `UpgradeMsg`) multiplexed on the SAME relay stream as the application byte
+/// stream, and delivered to the pump's `control_in` sink instead of the plaintext side. This is
+/// what lets the relay→direct upgrade coordination (H1's `Offer`/`Ready`) ride in-band, so a
+/// `:443`-only member — which has exactly one stream and cannot open a second control channel —
+/// can still negotiate the cutover.
+const PUMP_TAG_CONTROL: u8 = 2;
 
-/// A [`noise_pump`] whose ciphertext side can be **switched once** from a relay transport+stream
-/// to a direct transport+stream mid-flight (#104-H3), the plaintext byte stream continuous across
-/// the switch — **no byte lost or duplicated** — in both directions. Every frame is tagged
-/// (`DATA`/`CUTOVER`). **Outbound** switches when `cutover` resolves (this side decided to
-/// upgrade, e.g. the initiator after the H1 handshake): it writes a `CUTOVER` frame on the relay,
-/// then encrypts subsequent plaintext with `direct_transport` to `direct_write`. **Inbound**
-/// switches when it reads a `CUTOVER` frame from the peer, reading subsequent frames from
-/// `direct_read` with `direct_transport`. The direct session must be handshaked (both sides agreed
-/// via H1) before `cutover` fires. Runs until either side closes. This is the H3 primitive; wiring
-/// it into `run_channel_session_on_stream` behind the H1 coordination + `dial_peer_direct` (and
-/// closing the relay once both directions cut over) is the live integration.
+/// An outbound instruction to [`noise_pump_multiplexed`], processed **in order** with the
+/// application byte stream. The ordering is the point: a driver that enqueues `Send(Ready)`
+/// then `Cutover` is guaranteed the `Ready` control frame lands on the wire *before* the
+/// `CUTOVER` marker, so the peer processes the ready-to-upgrade signal on the relay cipher and
+/// only then switches — no cross-frame race between coordination and the cipher swap.
+pub enum PumpControl {
+    /// Send an opaque control message in-band (a `CONTROL` frame) on the current ciphertext side.
+    Send(Vec<u8>),
+    /// Switch the ciphertext side relay→direct now (writes a `CUTOVER` frame on the relay first,
+    /// then encrypts subsequent frames — data and control alike — with the direct transport).
+    Cutover,
+}
+
+/// A [`noise_pump`] that multiplexes, over the SAME relay stream, three things (#104 H3-wire):
+/// the application **byte stream** (`DATA` frames), an in-band bidirectional **control** channel
+/// (`CONTROL` frames — the H1 `Offer`/`Ready` upgrade coordination), and a one-way relay→direct
+/// **cipher cutover** (`CUTOVER`). The plaintext byte stream stays continuous across the switch —
+/// **no byte lost, duplicated, or reordered** — in both directions.
+///
+/// Why one stream: a `:443`-only member has exactly one relay stream and cannot open a second
+/// control channel, so the upgrade must be negotiated in-band. `control_out` (driver → pump) is
+/// processed **in order** with the app bytes — enqueue `Send(Ready)` then `Cutover` and the
+/// `Ready` frame is guaranteed on the wire before the `CUTOVER` marker. Inbound `CONTROL` payloads
+/// are delivered opaquely to `control_in` (pump → driver) — the pump does not parse them, keeping
+/// the upgrade-protocol vocabulary out of the crypto layer.
+///
+/// **Outbound** encrypts on the relay transport until a `Cutover` instruction, which writes a
+/// `CUTOVER` frame on the relay and then switches DATA and CONTROL alike to `direct_transport` /
+/// `direct_write`. **Inbound** reads from the relay until it decrypts a `CUTOVER` frame, then reads
+/// from `direct_read` with `direct_transport`. The direct session must be handshaked (both sides
+/// agreed via H1) before `Cutover` is enqueued. Runs until the plaintext or a cipher side closes.
 #[allow(clippy::too_many_arguments)]
-pub async fn noise_pump_switchable<RR, RW, DR, DW, PR, PW>(
+pub async fn noise_pump_multiplexed<RR, RW, DR, DW, PR, PW>(
     relay_transport: snow::TransportState,
     direct_transport: snow::TransportState,
     relay_read: RR,
@@ -248,7 +276,8 @@ pub async fn noise_pump_switchable<RR, RW, DR, DW, PR, PW>(
     mut direct_write: DW,
     mut plain_read: PR,
     mut plain_write: PW,
-    cutover: tokio::sync::oneshot::Receiver<()>,
+    mut control_out: tokio::sync::mpsc::UnboundedReceiver<PumpControl>,
+    control_in: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) -> io::Result<()>
 where
     RR: AsyncRead + Unpin,
@@ -275,39 +304,50 @@ where
         Ok(2 + len)
     };
 
-    // plaintext -> tagged frames, over relay until cutover, then over direct.
+    // app bytes + in-band control -> tagged frames, over relay until cutover, then over direct.
     let outbound = async {
         let mut buf = vec![0u8; CHUNK];
         let mut ct = vec![0u8; 2 + 1 + CHUNK + 256];
-        let mut cutover = cutover;
         let mut switched = false;
+        let mut control_open = true;
         loop {
-            if switched {
-                let n = plain_read.read(&mut buf).await?;
-                if n == 0 {
-                    let _ = direct_write.shutdown().await;
-                    return Ok::<(), io::Error>(());
-                }
-                let total = seal(&direct_ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
-                direct_write.write_all(&ct[..total]).await?;
-                direct_write.flush().await?;
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = &mut cutover => {
+            tokio::select! {
+                biased;
+                ctl = control_out.recv(), if control_open => match ctl {
+                    None => control_open = false, // driver done; keep pumping app bytes
+                    Some(PumpControl::Cutover) => {
+                        // The CUTOVER marker itself must travel on the RELAY cipher (the peer is
+                        // still decrypting the relay), then subsequent frames go direct.
                         let total = seal(&relay_ts, PUMP_TAG_CUTOVER, &[], &mut ct)?;
                         relay_write.write_all(&ct[..total]).await?;
                         relay_write.flush().await?;
                         switched = true;
                     }
-                    r = plain_read.read(&mut buf) => {
-                        let n = r?;
-                        if n == 0 {
-                            let _ = relay_write.shutdown().await;
-                            let _ = direct_write.shutdown().await;
-                            return Ok::<(), io::Error>(());
+                    Some(PumpControl::Send(payload)) => {
+                        let ts = if switched { &direct_ts } else { &relay_ts };
+                        let total = seal(ts, PUMP_TAG_CONTROL, &payload, &mut ct)?;
+                        if switched {
+                            direct_write.write_all(&ct[..total]).await?;
+                            direct_write.flush().await?;
+                        } else {
+                            relay_write.write_all(&ct[..total]).await?;
+                            relay_write.flush().await?;
                         }
-                        let total = seal(&relay_ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                    }
+                },
+                r = plain_read.read(&mut buf) => {
+                    let n = r?;
+                    if n == 0 {
+                        let _ = relay_write.shutdown().await;
+                        let _ = direct_write.shutdown().await;
+                        return Ok::<(), io::Error>(());
+                    }
+                    let ts = if switched { &direct_ts } else { &relay_ts };
+                    let total = seal(ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                    if switched {
+                        direct_write.write_all(&ct[..total]).await?;
+                        direct_write.flush().await?;
+                    } else {
                         relay_write.write_all(&ct[..total]).await?;
                         relay_write.flush().await?;
                     }
@@ -316,7 +356,7 @@ where
         }
     };
 
-    // tagged frames -> plaintext; switch inbound to `direct_read` on the CUTOVER frame.
+    // tagged frames -> plaintext / control; switch inbound to `direct_read` on the CUTOVER frame.
     let inbound = async {
         let mut pt = vec![0u8; 1 + CHUNK + 256];
         let mut fr = Vec::with_capacity(CHUNK + 256);
@@ -343,6 +383,10 @@ where
             }
             match pt[0] {
                 PUMP_TAG_CUTOVER => switched = true,
+                PUMP_TAG_CONTROL => {
+                    // Opaque to the pump — hand the payload to the driver (dropped receiver = no-op).
+                    let _ = control_in.send(pt[1..len].to_vec());
+                }
                 _ => {
                     plain_write.write_all(&pt[1..len]).await?;
                     plain_write.flush().await?;
@@ -355,6 +399,62 @@ where
     o?;
     i?;
     Ok(())
+}
+
+/// The H3 cutover primitive (#104-H3): a [`noise_pump_multiplexed`] with no in-band control
+/// traffic, whose relay→direct cutover is driven by a single `cutover` signal instead of the
+/// ordered control channel. Kept as the focused, frozen proof that the byte stream survives the
+/// cipher switch; the live wire-in uses [`noise_pump_multiplexed`] directly so the H1 `Offer`/
+/// `Ready` coordination can ride in-band on the one relay stream.
+#[allow(clippy::too_many_arguments)]
+pub async fn noise_pump_switchable<RR, RW, DR, DW, PR, PW>(
+    relay_transport: snow::TransportState,
+    direct_transport: snow::TransportState,
+    relay_read: RR,
+    relay_write: RW,
+    direct_read: DR,
+    direct_write: DW,
+    plain_read: PR,
+    plain_write: PW,
+    cutover: tokio::sync::oneshot::Receiver<()>,
+) -> io::Result<()>
+where
+    RR: AsyncRead + Unpin,
+    RW: AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    PR: AsyncRead + Unpin,
+    PW: AsyncWrite + Unpin,
+{
+    // Bridge the one-shot cutover into the ordered control channel (no other outbound control),
+    // and drop the inbound-control receiver — this side never receives CONTROL frames.
+    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // Structured (no detached task, so the lib needs no tokio "rt" feature): forward the
+    // one-shot into the channel, then park forever so the pump is the sole decider of when the
+    // session ends — when it returns, this `select!` drops the parked bridge.
+    let bridge = async move {
+        if cutover.await.is_ok() {
+            let _ = ctl_tx.send(PumpControl::Cutover);
+        }
+        std::future::pending::<()>().await
+    };
+    let pump = noise_pump_multiplexed(
+        relay_transport,
+        direct_transport,
+        relay_read,
+        relay_write,
+        direct_read,
+        direct_write,
+        plain_read,
+        plain_write,
+        ctl_rx,
+        in_tx,
+    );
+    tokio::select! {
+        res = pump => res,
+        _ = bridge => unreachable!("the cutover bridge parks forever after forwarding"),
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +532,96 @@ mod tests {
 
         let _ = a.await;
         let _ = b.await;
+    }
+
+    #[tokio::test]
+    async fn noise_pump_multiplexed_carries_inband_control_and_app_bytes_across_cutover() {
+        // #104 H3-wire (frozen): the relay pump multiplexes, on ONE relay stream, the application
+        // byte stream AND the in-band upgrade coordination (H1 Offer/Ready as CONTROL frames) AND
+        // the relay→direct cipher cutover — proving a :443-only member (one stream, no side
+        // channel) can negotiate the upgrade in-band while its data keeps flowing byte-exact.
+        use crate::upgrade::UpgradeMsg;
+
+        let (relay_a, relay_b) = transport_pair(); // A initiator, B responder (relay session)
+        let (direct_a, direct_b) = transport_pair(); // direct session (handshaked ahead, as after H1)
+
+        let (ar_w, ar_r) = tokio::io::duplex(1 << 16); // A→B relay
+        let (br_w, br_r) = tokio::io::duplex(1 << 16); // B→A relay
+        let (ad_w, ad_r) = tokio::io::duplex(1 << 16); // A→B direct
+        let (bd_w, bd_r) = tokio::io::duplex(1 << 16); // B→A direct
+
+        // A's plaintext source; B's plaintext sink (data flows A→B only).
+        let (mut a_plain_feed, a_plain_r) = tokio::io::duplex(1 << 16);
+        let (b_plain_w, mut b_plain_out) = tokio::io::duplex(1 << 16);
+        let (a_pw, _a_pw_drain) = tokio::io::duplex(64); // A's inbound-plain sink (B sends no data)
+        // B has no app data to send, but its plaintext must stay OPEN so B's outbound keeps
+        // servicing control (the Ready) instead of returning on an immediate EOF.
+        let (b_plain_hold, b_plain_r) = tokio::io::duplex(64);
+
+        // Per-side in-band control channels: `ctl_*` = driver→pump (ordered), `in_*` = pump→driver.
+        let (ctl_tx_a, ctl_rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_a, mut in_rx_a) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (ctl_tx_b, ctl_rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_b, mut in_rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let a = tokio::spawn(noise_pump_multiplexed(
+            relay_a, direct_a, br_r, ar_w, bd_r, ad_w, a_plain_r, a_pw, ctl_rx_a, in_tx_a,
+        ));
+        let b = tokio::spawn(noise_pump_multiplexed(
+            relay_b, direct_b, ar_r, br_w, ad_r, bd_w, b_plain_r, b_plain_w, ctl_rx_b, in_tx_b,
+        ));
+
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        // Pre-cutover application bytes ride the relay cipher.
+        a_plain_feed.write_all(&payload[..800]).await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+
+        // The upgrade coordination, entirely in-band on the same relay stream:
+        // A offers its direct endpoint; B receives it and replies Ready.
+        ctl_tx_a
+            .send(PumpControl::Send(UpgradeMsg::Offer { direct_endpoint: "203.0.113.9:7000".into() }.encode()))
+            .unwrap();
+        let offer = tokio::time::timeout(std::time::Duration::from_secs(5), in_rx_b.recv())
+            .await
+            .expect("B receives the Offer in-band within 5s")
+            .expect("control channel open");
+        assert!(
+            matches!(UpgradeMsg::decode(&offer), Some(UpgradeMsg::Offer { direct_endpoint }) if direct_endpoint == "203.0.113.9:7000"),
+            "the in-band CONTROL frame carried the H1 Offer intact",
+        );
+        ctl_tx_b.send(PumpControl::Send(UpgradeMsg::Ready.encode())).unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), in_rx_a.recv())
+            .await
+            .expect("A receives the Ready in-band within 5s")
+            .expect("control channel open");
+        assert!(
+            matches!(UpgradeMsg::decode(&ready), Some(UpgradeMsg::Ready)),
+            "the reverse-direction CONTROL frame carried the H1 Ready intact",
+        );
+
+        // Both sides ready → A cuts over; ordered channel guarantees the Ready above already
+        // landed on the wire before this CUTOVER marker.
+        ctl_tx_a.send(PumpControl::Cutover).unwrap();
+        a_plain_feed.write_all(&payload[800..]).await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+        drop(a_plain_feed); // EOF A's plaintext → A outbound shuts the direct cipher
+
+        let mut got = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b_plain_out.read_to_end(&mut got))
+            .await
+            .expect("the receiver drains within 5s")
+            .expect("read_to_end");
+        assert_eq!(
+            got, payload,
+            "app byte stream intact + in order across the in-band-negotiated relay→direct cutover (#104 H3-wire)",
+        );
+
+        // Release B's outbound (its held-open plaintext) so both pumps terminate.
+        drop(b_plain_hold);
+        drop(ctl_tx_a);
+        drop(ctl_tx_b);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), a).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), b).await;
     }
 
     #[test]
