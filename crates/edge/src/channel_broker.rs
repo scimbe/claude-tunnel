@@ -264,24 +264,14 @@ where
     // request + possession round-trip is then bounded a second time inside
     // `read_channel_join_on_stream`, so each phase has its own guard.
     //
-    // #103 blanket trace (round 2, central-requested 2026-07-20): the round-1 traces proved
-    // both connections reach `[handshaked]` on the correct listener, then produce ZERO further
-    // log — the drop is in THIS span, between handshake and the first tagged read checkpoint,
-    // which was previously silent on the success path. Trace all three sub-outcomes of the
-    // `accept_bi` wait so the next live test pinpoints, per connection, whether the client
-    // ever opens its bi-stream: `[awaiting-bi]` (entered the wait) → `[bi-open]` (stream
-    // opened, about to read the join) OR `[bi-timeout]` (client never opened one).
-    eprintln!("ct-edge: channel-accept [awaiting-bi] peer={observed} — waiting for the client bi-stream (#103)");
     let (send, recv) = match tokio::time::timeout(join_timeout, conn.accept_bi()).await {
         // #128: tag the bi-stream-open phase — a peer that completes the QUIC handshake but
-        // closes before opening its stream (the #103 symptom) surfaces here, not at handshake.
-        Ok(streams) => {
-            let s = streams.map_err(|e| format!("[quic-bistream] {e}"))?;
-            eprintln!("ct-edge: channel-accept [bi-open] peer={observed} — bi-stream open, reading join (#103)");
-            s
-        }
+        // closes before opening its stream surfaces here, not at handshake.
+        Ok(streams) => streams.map_err(|e| format!("[quic-bistream] {e}"))?,
         Err(_) => {
-            eprintln!("ct-edge: channel-accept [bi-timeout] peer={observed} — client never opened a bi-stream within {join_timeout:?} (#103/#105)");
+            // A peer that completes the QUIC handshake but never opens a bi-stream within the
+            // timeout (#105 stalled connection): log the problem, don't wedge the loop.
+            eprintln!("ct-edge: channel-join NO [bi-timeout] peer={observed}: no bi-stream within {join_timeout:?}");
             return Err(
                 "channel join not submitted within the timeout — dropping stalled connection (#105)"
                     .into(),
@@ -516,32 +506,16 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    // #103 blanket trace (sink + central agreed, 2026-07-20): the success path through this
-    // accept was previously SILENT — the `[quic-handshake]`/`[quic-bistream]` tags below only
-    // fire on *error*, so a connection that accepts + handshakes and then reads empty left
-    // zero server trace (the exact #103 symptom). Log the peer the INSTANT `accept()` yields,
-    // before any classification/admission, tagged with THIS endpoint's local addr so a
-    // connection landing on the wrong listener (rendezvous :4435 vs relay vs :443) is visible.
-    // Answers the one binary question: does the connection reach this accept loop at all?
-    let local_addr = endpoint.local_addr().ok();
     let incoming = endpoint
         .accept()
         .await
         .ok_or("endpoint closed with no incoming")?;
-    eprintln!(
-        "ct-edge: channel-accept [recv] local={local_addr:?} peer={} (#103 pre-admission trace)",
-        incoming.remote_address()
-    );
     // #128: tag the QUIC connection-handshake phase so a peer that closes here (vs. at the
     // bi-stream open below) is distinguishable in the accept_member catch-all log — the
-    // QUIC analog of #127's `:443` TLS-accept tag, to localize #103's pre-admission close.
+    // QUIC analog of #127's `:443` TLS-accept tag.
     let conn = incoming
         .await
         .map_err(|e| format!("[quic-handshake] {e}"))?;
-    eprintln!(
-        "ct-edge: channel-accept [handshaked] local={local_addr:?} peer={} — reading join (#103)",
-        conn.remote_address()
-    );
     match read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await {
         Ok((send, req, operator, noise, attest, observed)) => {
             Ok((conn, send, req, operator, noise, attest, observed))
@@ -868,45 +842,15 @@ where
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let channel = req.grant.grant.channel;
     let holder = req.grant.grant.holder;
-    // #103 (:443 path, source-requested 2026-07-20): the success-path traces mirroring the
-    // `:4435` `run_channel_broker_loop` instrumentation, so the NAT'd-source `:443` fallback is
-    // equally visible. `[admitted]` proves `admit_channel_join_on_duplex` returned (full join
-    // read + possession succeeded over the TLS-TCP stream); the `[offer:*]` outcome shows
-    // whether two `:443` members are recognized as the same channel and Paired, or each Parked.
-    eprintln!(
-        "ct-edge: channel-accept [admitted] channel={} holder={} peer={observed} (#103 :443 path) — offering to pairer",
-        hex_of(&channel.0),
-        hex_of(&holder)
-    );
     let member = AdmittedStreamMember { stream, req, operator, noise, attest };
     let outcome = pairer
         .lock()
         .unwrap()
         .offer(WaitingMember { channel, holder, deadline, payload: member });
     match outcome {
-        PairOutcome::Parked => {
-            eprintln!(
-                "ct-edge: channel-accept [offer:parked] channel={} holder={} (#103 :443 path) — first holder, awaiting partner",
-                hex_of(&channel.0),
-                hex_of(&holder)
-            );
-            Ok(None)
-        }
-        PairOutcome::Paired(a, b) => {
-            eprintln!(
-                "ct-edge: channel-accept [offer:paired] channel={} holders={}/{} (#103 :443 path) — matched, relay-splicing",
-                hex_of(&channel.0),
-                hex_of(&a.holder),
-                hex_of(&b.holder)
-            );
-            Ok(Some((a.payload, b.payload)))
-        }
+        PairOutcome::Parked => Ok(None),
+        PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
         PairOutcome::Superseded(stale) => {
-            eprintln!(
-                "ct-edge: channel-accept [offer:superseded] channel={} holder={} (#103 :443 path) — same holder re-presented, closing stale",
-                hex_of(&channel.0),
-                hex_of(&holder)
-            );
             // A retry from the same holder arrived before its partner; the fresh offer is
             // now parked, so close the stale stream and report "parked" (nothing to pair).
             let mut stale = stale.payload;
@@ -1004,38 +948,13 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
 {
     let pairer: std::sync::Mutex<ChannelPairer<AdmittedMember>> =
         std::sync::Mutex::new(ChannelPairer::new());
-    // #103 (round 4, central-requested 2026-07-20): round-3 exposed the "impossible" case —
-    // two members admit with a byte-identical channel + distinct holders, yet BOTH `[offer:parked]`
-    // (offer() is provably correct, so the 2nd offer must not be seeing the 1st in the map). The
-    // stable address of THIS loop's pairer distinguishes the two live hypotheses: if the two
-    // offers log the SAME `pairer=` but the 2nd sees `size_before=0`, the map lost the 1st entry;
-    // if they log DIFFERENT `pairer=`, the two connections are being served by TWO accept loops
-    // (an endpoint split / double-spawn) — separate maps that can never pair. `size_before` is
-    // the map occupancy the instant before each offer.
-    let pairer_id = &pairer as *const _ as usize;
-    // #103 (round 5, central-requested 2026-07-20): round-4 showed the SAME pairer= address for
-    // both members yet size_before=0 on the 2nd offer. A per-invocation loop-INSTANCE id + a
-    // per-iteration counter proves task continuity — same instance + consecutive iters = one
-    // live loop (rules out a respawned task landing on a coincidentally-reused pairer address);
-    // and the explicit [drain] log shows whether `drain_expired` is what empties the map between
-    // the two offers (code-read says it can't in 3.5ms with a 30s TTL — this proves it live).
-    static BROKER_LOOP_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let loop_instance = BROKER_LOOP_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut loop_iter: u64 = 0;
     loop {
-        loop_iter += 1;
         let now = now_fn();
 
         // Sweep lone waiters past their park deadline (#3) before admitting the next member,
         // so a first-comer with no partner is bounded instead of wedging the endpoint. The
         // guard is dropped before the following `.await`.
         let expired = pairer.lock().unwrap().drain_expired(now);
-        if !expired.is_empty() {
-            eprintln!(
-                "ct-edge: channel-accept [drain] loop={loop_instance}.{loop_iter} removed={} now={now} (#103) — swept park-expired waiters",
-                expired.len()
-            );
-        }
         for m in expired {
             m.payload.conn.close(0u32.into(), b"channel park timeout");
         }
@@ -1049,36 +968,15 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 continue;
             }
         };
-        // #103 FIX (root cause, central-confirmed 2026-07-20): re-sample `now` at ADMISSION
-        // time for the parked member's deadline. The `now` above was sampled at the TOP of the
-        // iteration, BEFORE the possibly long-idle `accept_member().await`; reusing that stale
-        // value for the `deadline` made a member that arrived after an idle period already
-        // past-due, so the very next iteration's `drain_expired` evicted it ~30µs later —
-        // before its partner could pair. That single stale-`now` was the whole ~30-cycle
-        // pairing failure. The park deadline must be TTL from the member's ACTUAL admission
-        // time, not from before the accept wait.
+        // #103 FIX (root cause): re-sample `now` at ADMISSION time for the parked member's
+        // deadline. The `now` above is sampled at the TOP of the iteration, BEFORE the possibly
+        // long-idle `accept_member().await`; reusing that stale value for the `deadline` made a
+        // member that arrived after an idle period already past-due, so the very next iteration's
+        // `drain_expired` evicted it before its partner could pair. The deadline must be TTL from
+        // the member's ACTUAL admission time, not from before the accept wait.
         let now = now_fn();
         let channel = member.req.grant.grant.channel;
         let holder = member.req.grant.grant.holder;
-
-        // #103 blanket trace (round 3, central-requested 2026-07-20): round-2 proved BOTH
-        // members reach `[bi-open]` then go silent — individual admission is silent on success,
-        // so the dark span is now whether each member's admission actually COMPLETED and whether
-        // the pairer matched them. `[admitted]` firing here proves `accept_member` returned (the
-        // full join read + possession round-trip succeeded) — a `[bi-open]` with no following
-        // `[admitted]` means that member hung inside the read/possession instead. Then log the
-        // `offer()` outcome so we see definitively whether both members are recognized as the
-        // same channel and Paired, or each Parked (never matched — central's leading theory).
-        let size_before = pairer.lock().unwrap().len();
-        eprintln!(
-            "ct-edge: channel-accept [admitted] channel={} holder={} pairer={:x} loop={}.{} size_before={} (#103) — offering to pairer",
-            hex_of(&channel.0),
-            hex_of(&holder),
-            pairer_id,
-            loop_instance,
-            loop_iter,
-            size_before
-        );
 
         // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
         let outcome = pairer.lock().unwrap().offer(WaitingMember {
@@ -1089,22 +987,10 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         });
         match outcome {
             // First holder of this channel — parked, waiting for its partner.
-            PairOutcome::Parked => {
-                eprintln!(
-                    "ct-edge: channel-accept [offer:parked] channel={} holder={} (#103) — first holder, awaiting partner",
-                    hex_of(&channel.0),
-                    hex_of(&holder)
-                );
-            }
+            PairOutcome::Parked => {}
             // Its partner met it: complete the pair on its OWN task so the accept loop stays
             // free to admit the next member. This is the fix for the single-slot wedge (#1).
             PairOutcome::Paired(a, b) => {
-                eprintln!(
-                    "ct-edge: channel-accept [offer:paired] channel={} holders={}/{} (#103) — matched, spawning pair completion",
-                    hex_of(&channel.0),
-                    hex_of(&a.holder),
-                    hex_of(&b.holder)
-                );
                 let fut = complete(a.payload, b.payload, now);
                 tokio::spawn(async move {
                     if let Err(e) = fut.await {
@@ -1115,11 +1001,6 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             // Same holder re-presented before its partner arrived: the fresh offer stays
             // parked; close the stale connection (pairing a holder with itself is refused).
             PairOutcome::Superseded(stale) => {
-                eprintln!(
-                    "ct-edge: channel-accept [offer:superseded] channel={} holder={} (#103) — same holder re-presented, closing stale",
-                    hex_of(&channel.0),
-                    hex_of(&holder)
-                );
                 stale.payload.conn.close(0u32.into(), b"superseded by newer join");
             }
         }

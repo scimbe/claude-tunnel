@@ -610,12 +610,6 @@ pub async fn serve_front_door(
                 .accept(joined)
                 .await
                 .map_err(|e| { eprintln!("ct-edge: channel-join NO [tls-accept]: {e}"); e })?;
-            // #103 (:443 path, source-requested 2026-07-20): the NAT'd source that falls back
-            // to :443 dies on THIS path, which the :4435 `accept_bi` traces don't illuminate.
-            // Mirror the `4b583b9` breakthrough here: an unconditional success-path trace the
-            // instant the channel-ALPN TLS handshake completes, before admission — so a silent
-            // `:443` refusal is no longer invisible. The `:443` analog of `[recv]`/`[handshaked]`.
-            eprintln!("ct-edge: channel-accept [443-tls-ok] peer={observed} — channel-ALPN TLS up, admitting join (#103 :443 path)");
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
