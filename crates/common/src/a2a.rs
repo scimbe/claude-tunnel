@@ -171,6 +171,37 @@ pub async fn a2a_drain_relay_until_cutover<R: AsyncRead + Unpin>(
     }
 }
 
+/// **#104 direct-P2P — bring a freshly-connected direct link up as an A2A Noise_IK session.**
+/// Given the two halves of a just-dialed direct byte stream (quinn `SendStream`/`RecvStream`, or
+/// any split duplex), run the same Noise_IK handshake as the relay session and hand back the
+/// established `(TransportState, read_half, write_half)` — exactly the tuple that
+/// [`crate::noise::noise_pump_multiplexed`]'s late-bind one-shot consumes. `initiator` selects the
+/// handshake role (it MUST be the opposite of the peer's and match the channel's original role so
+/// the pinned keys line up). The direct session is independent of the relay session — a fresh
+/// handshake with its own transport — so the two can run side by side until the cutover. The caller
+/// feeds the result into the pump's `direct` one-shot and then triggers the cutover.
+pub async fn establish_direct_session<W, R>(
+    mut send: W,
+    mut recv: R,
+    initiator: bool,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+) -> io::Result<(TransportState, R, W)>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let session = if initiator {
+        a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await?
+    } else {
+        // The responder derives the peer identity from the handshake itself; `peer_noise_public`
+        // is unused here but kept in the signature so both roles share one call shape.
+        a2a_respond(&mut send, &mut recv, own_noise_private).await?
+    };
+    // The pump's late-bind tuple is (transport, read, write).
+    Ok((session, recv, send))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +325,39 @@ mod tests {
             init.is_err() || !responder_ok,
             "a mismatched peer key must not yield a session on either side"
         );
+    }
+
+    #[tokio::test]
+    async fn establish_direct_session_brings_up_a_paired_noise_ik_link_with_usable_halves() {
+        // #104 direct-P2P (frozen): the two halves of a fresh direct link handshake into a paired
+        // Noise_IK session, and the returned (transport, read, write) form a working encrypted
+        // tunnel in both directions — exactly what the pump's late-bind one-shot consumes.
+        let a_kp = generate_static_keypair();
+        let b_kp = generate_static_keypair();
+        let (a_priv, b_priv, b_pub) = (a_kp.private, b_kp.private, b_kp.public);
+
+        // One duplex per direction: a→b and b→a.
+        let (a2b_w, a2b_r) = tokio::io::duplex(1 << 16);
+        let (b2a_w, b2a_r) = tokio::io::duplex(1 << 16);
+
+        // a = initiator (send a→b, recv b→a); b = responder (send b→a, recv a→b).
+        let a_task = tokio::spawn(async move {
+            establish_direct_session(a2b_w, b2a_r, true, &a_priv, &b_pub).await
+        });
+        let (mut b_ts, mut b_recv, mut b_send) =
+            establish_direct_session(b2a_w, a2b_r, false, &b_priv, &[0u8; 32])
+                .await
+                .expect("responder establishes the direct session");
+        let (mut a_ts, mut a_recv, mut a_send) =
+            a_task.await.expect("join").expect("initiator establishes the direct session");
+
+        // Round-trip a message each way over the established direct session + returned halves.
+        a2a_send(&mut a_send, &mut a_ts, b"ping-direct").await.expect("a sends");
+        let got = a2a_recv(&mut b_recv, &mut b_ts).await.expect("b receives");
+        assert_eq!(got, b"ping-direct", "initiator→responder over the established direct session");
+
+        a2a_send(&mut b_send, &mut b_ts, b"pong-direct").await.expect("b sends");
+        let got2 = a2a_recv(&mut a_recv, &mut a_ts).await.expect("a receives");
+        assert_eq!(got2, b"pong-direct", "responder→initiator over the established direct session");
     }
 }
