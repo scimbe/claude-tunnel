@@ -485,6 +485,141 @@ pub fn verify_member_noise_attestation(
     }
 }
 
+/// The domain separating a membership-staple preimage from every other signed object.
+const MEMBERSHIP_STAPLE_DOMAIN: &[u8] = b"ct-membership-staple-v1";
+
+/// A soft-state **membership staple** (E-fail-static, invariant #7): the operator's
+/// short-lived, signed assertion that `holder` is *currently* a member of `channel`,
+/// valid only until `expires_at`. Unlike a [`SignedChannelGrant`] — a long-lived
+/// capability — a staple is refreshed continuously (gossiped) while central is reachable
+/// and **cached locally**, so if central goes away existing channels keep admitting their
+/// known members until the cached staple's TTL lapses: **fail-static, never fail-closed.**
+/// Because it expires, revocation needs no central round-trip either — stop refreshing a
+/// revoked member and its cached staple dies within one TTL (invariant #7: revocation
+/// latency = staple TTL; proposed default 1h staple / 15m gossip refresh).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipStaple {
+    pub channel: ChannelId,
+    pub holder: [u8; 32],
+    /// When the operator minted this staple.
+    pub stapled_at: UnixSeconds,
+    /// When it lapses (`stapled_at + staple_ttl`). After this the staple is dead; a reader
+    /// must fall back to a fresher staple or refuse — this bounds the fail-static window.
+    pub expires_at: UnixSeconds,
+    /// The operator's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    pub signature: [u8; 64],
+}
+
+impl MembershipStaple {
+    /// The domain-separated preimage the operator signs: `domain || channel || holder ||
+    /// stapled_at || expires_at`. Binding **every** field means a staple can't be replayed
+    /// onto another `(channel, holder)` and its TTL can't be extended without re-signing.
+    pub fn signing_bytes(
+        channel: &ChannelId,
+        holder: &[u8; 32],
+        stapled_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(MEMBERSHIP_STAPLE_DOMAIN.len() + 32 + 32 + 8 + 8);
+        m.extend_from_slice(MEMBERSHIP_STAPLE_DOMAIN);
+        m.extend_from_slice(&channel.0);
+        m.extend_from_slice(holder);
+        m.extend_from_slice(&stapled_at.to_le_bytes());
+        m.extend_from_slice(&expires_at.to_le_bytes());
+        m
+    }
+
+    /// Whether this staple is authentic **and** still fresh at `now`: the operator
+    /// signature verifies for its exact `(channel, holder, stapled_at, expires_at)` binding
+    /// and `now < expires_at`. A forged staple (wrong operator key), any tampered field, or
+    /// a lapsed staple all return `false` — the single gate fail-static admission consults.
+    pub fn is_valid(&self, operator_pubkey: &[u8; 32], now: UnixSeconds) -> bool {
+        if now >= self.expires_at {
+            return false;
+        }
+        match VerifyingKey::from_bytes(operator_pubkey) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.channel,
+                        &self.holder,
+                        self.stapled_at,
+                        self.expires_at,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// A soft-state cache of the freshest [`MembershipStaple`] per `(channel, holder)` — the
+/// local memory that lets a node keep admitting known members while central is unreachable
+/// (E-fail-static). Gossip/refresh feeds [`refresh`](Self::refresh); admission consults
+/// [`is_member`](Self::is_member). Keeping only the **latest-expiring** staple means a
+/// stale/out-of-order gossip can never SHORTEN a member's validity, and a revoked member
+/// simply stops being refreshed so its entry lapses within one TTL (invariant #7).
+#[derive(Debug, Default)]
+pub struct StapleCache {
+    fresh: std::collections::HashMap<([u8; 32], [u8; 32]), MembershipStaple>,
+}
+
+impl StapleCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ingest a staple (from gossip or a direct refresh). It is verified against
+    /// `operator_pubkey` at `now` **first** — an invalid or already-lapsed staple is
+    /// ignored, never cached. The entry with the later `expires_at` wins, so out-of-order
+    /// gossip can't regress validity. Returns whether the cache now holds this (or an
+    /// already-fresher) staple for the pair.
+    pub fn refresh(
+        &mut self,
+        operator_pubkey: &[u8; 32],
+        staple: MembershipStaple,
+        now: UnixSeconds,
+    ) -> bool {
+        if !staple.is_valid(operator_pubkey, now) {
+            return false;
+        }
+        let key = (staple.channel.0, staple.holder);
+        match self.fresh.get(&key) {
+            // An existing staple that lasts at least as long already dominates — keep it.
+            Some(existing) if existing.expires_at >= staple.expires_at => true,
+            _ => {
+                self.fresh.insert(key, staple);
+                true
+            }
+        }
+    }
+
+    /// Fail-static admission input: is `holder` a currently-stapled member of `channel` at
+    /// `now`? True iff a cached staple for the pair still verifies against `operator_pubkey`
+    /// and has not lapsed — with **no central round-trip**, which is the whole point:
+    /// existing channels survive a central outage until the TTL. A lapsed entry returns
+    /// `false` and is evicted, so a revoked (no-longer-refreshed) member is gone within one
+    /// TTL (invariant #7).
+    pub fn is_member(
+        &mut self,
+        operator_pubkey: &[u8; 32],
+        channel: &ChannelId,
+        holder: &[u8; 32],
+        now: UnixSeconds,
+    ) -> bool {
+        let key = (channel.0, *holder);
+        match self.fresh.get(&key) {
+            Some(s) if s.is_valid(operator_pubkey, now) => true,
+            Some(_) => {
+                self.fresh.remove(&key); // lapsed — drop it so the map stays bounded
+                false
+            }
+            None => false,
+        }
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -1225,5 +1360,120 @@ mod tests {
             expires_at: inv.invitation.expires_at,
         };
         assert_ne!(inv.invitation.signing_bytes(), grant.signing_bytes());
+    }
+
+    // ---- E-fail-static: soft-state membership staples (invariant #7) ----------------------
+
+    /// Mint a staple for `channel`/`holder` under operator key `op` (byte fill), signed over
+    /// the canonical preimage. Returns the operator pubkey and the staple.
+    fn stapled(
+        op: u8,
+        channel: [u8; 32],
+        holder: [u8; 32],
+        stapled_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> ([u8; 32], MembershipStaple) {
+        let sk = SigningKey::from_bytes(&[op; 32]);
+        let signature = sk
+            .sign(&MembershipStaple::signing_bytes(
+                &ChannelId(channel),
+                &holder,
+                stapled_at,
+                expires_at,
+            ))
+            .to_bytes();
+        (
+            sk.verifying_key().to_bytes(),
+            MembershipStaple {
+                channel: ChannelId(channel),
+                holder,
+                stapled_at,
+                expires_at,
+                signature,
+            },
+        )
+    }
+
+    #[test]
+    fn staple_cache_admits_offline_until_ttl_then_lapses() {
+        // E-fail-static (frozen): a cached, operator-signed membership staple lets a node keep
+        // admitting a known member with NO central round-trip, until the staple's TTL lapses —
+        // fail-static, never fail-closed. Revocation latency is exactly the TTL (invariant #7):
+        // stop refreshing and the cached staple dies within one TTL.
+        let ch = [0x11u8; 32];
+        let holder = [0xa1u8; 32];
+        // Operator (op=7) staples the member at t=1000 for a 3600s TTL → expires at 4600.
+        let (operator, staple) = stapled(7, ch, holder, 1_000, 4_600);
+
+        let mut cache = StapleCache::new();
+        assert!(
+            cache.refresh(&operator, staple, 1_000),
+            "an authentic, unexpired staple is accepted into the cache"
+        );
+
+        // (1) FAIL-STATIC: admission succeeds offline (no central) any time before expiry.
+        assert!(
+            cache.is_member(&operator, &ChannelId(ch), &holder, 1_100),
+            "a known member is admitted from cache while central is unreachable"
+        );
+        assert!(
+            cache.is_member(&operator, &ChannelId(ch), &holder, 4_599),
+            "still admitted right up to the last second before the TTL lapses"
+        );
+
+        // (2) TTL BOUND / revocation latency (invariant #7): at expiry the staple is dead and
+        // the entry is evicted, so a no-longer-refreshed (revoked) member is gone within the TTL.
+        assert!(
+            !cache.is_member(&operator, &ChannelId(ch), &holder, 4_600),
+            "at expires_at the cached staple lapses — admission fails (revocation = TTL, #7)"
+        );
+        // A fresh mint would be needed to re-admit — the lapsed entry was dropped.
+        let (_op, again) = stapled(7, ch, holder, 4_600, 8_200);
+        assert!(cache.refresh(&operator, again, 4_600));
+        assert!(cache.is_member(&operator, &ChannelId(ch), &holder, 5_000));
+    }
+
+    #[test]
+    fn staple_cache_rejects_forged_and_never_regresses_validity() {
+        let ch = [0x22u8; 32];
+        let holder = [0xb2u8; 32];
+        let (operator, long) = stapled(7, ch, holder, 1_000, 9_000); // long-lived, honest
+
+        // (a) FORGED: a staple signed by a foreign operator (op=8) is neither cached nor trusted.
+        let (_foreign, forged) = stapled(8, ch, holder, 1_000, 9_000);
+        let mut cache = StapleCache::new();
+        assert!(
+            !cache.refresh(&operator, forged, 1_000),
+            "a staple not signed by the channel operator is rejected, never cached"
+        );
+        assert!(
+            !cache.is_member(&operator, &ChannelId(ch), &holder, 1_100),
+            "nothing was cached, so the member is not admitted"
+        );
+
+        // (b) TAMPERED FIELD: the operator signed for THIS channel; presenting it under a
+        // different channel breaks the binding, so it doesn't verify.
+        let (_op, mut tampered) = stapled(7, ch, holder, 1_000, 9_000);
+        tampered.channel = ChannelId([0x33u8; 32]);
+        assert!(
+            !tampered.is_valid(&operator, 1_100),
+            "a staple whose channel was swapped after signing fails verification"
+        );
+
+        // (c) KEEP-LATEST: cache the long staple, then feed a SHORTER-lived one — it must not
+        // shrink the member's validity (out-of-order/stale gossip can't regress it).
+        assert!(cache.refresh(&operator, long, 1_000));
+        let (_op2, short) = stapled(7, ch, holder, 1_000, 3_000); // shorter TTL
+        assert!(cache.refresh(&operator, short, 1_000));
+        assert!(
+            cache.is_member(&operator, &ChannelId(ch), &holder, 5_000),
+            "the longer-lived staple still governs at t=5000 — a stale short staple didn't regress it"
+        );
+
+        // (d) SCOPE: a staple for this pair grants nothing for a different holder.
+        assert!(
+            !cache.is_member(&operator, &ChannelId(ch), &[0xccu8; 32], 2_000),
+            "membership is per-(channel,holder) — a different holder is not admitted"
+        );
     }
 }
