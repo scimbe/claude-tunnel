@@ -512,9 +512,23 @@ where
     let conn = incoming
         .await
         .map_err(|e| format!("[quic-handshake] {e}"))?;
-    let (send, req, operator, noise, attest, observed) =
-        read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await?;
-    Ok((conn, send, req, operator, noise, attest, observed))
+    match read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await {
+        Ok((send, req, operator, noise, attest, observed)) => {
+            Ok((conn, send, req, operator, noise, attest, observed))
+        }
+        Err(e) => {
+            // #129-follow: a refusal wrote `NO` to the stream; keep the connection alive
+            // briefly so the peer reads the NO before teardown, instead of it racing to an
+            // empty read the client can't classify (broken-vs-refused). Detached + bounded, so
+            // it does NOT block the concurrent accept loop; a dropped conn's `closed()` returns
+            // at once. This makes the client's #129 empty-vs-NO distinction reliable over QUIC.
+            let held = conn.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), held.closed()).await;
+            });
+            Err(e)
+        }
+    }
 }
 
 /// Accept one channel-join over QUIC (AF2d-transport-a): read the presented
