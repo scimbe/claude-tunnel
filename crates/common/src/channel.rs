@@ -855,6 +855,146 @@ impl BillingCommitment {
     }
 }
 
+/// The domain separating a settle-receipt preimage from every other signed object.
+const SETTLE_RECEIPT_DOMAIN: &[u8] = b"ct-settle-receipt-v1";
+
+/// A rolling digest over an A2A transfer's application byte stream (#132 SR1 — the `settle` step of
+/// `quote → approve → settle`). Both peers fold the SAME plaintext bytes through it as they pump; at
+/// close the **receiver** signs its finalized digest into a [`SettleReceipt`] and the sender/
+/// verifier compares against its own — so "delivered" is *witnessed by the receiver*, never merely
+/// asserted by the send side. sha2 is already a dependency; folding one hash update per pumped chunk
+/// costs no extra round-trips.
+#[derive(Clone)]
+pub struct TransferDigest {
+    hasher: sha2::Sha256,
+    bytes: u64,
+}
+
+impl Default for TransferDigest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransferDigest {
+    pub fn new() -> Self {
+        use sha2::Digest;
+        Self { hasher: sha2::Sha256::new(), bytes: 0 }
+    }
+
+    /// Fold the next chunk of delivered application plaintext into the digest.
+    pub fn update(&mut self, chunk: &[u8]) {
+        use sha2::Digest;
+        self.hasher.update(chunk);
+        self.bytes += chunk.len() as u64;
+    }
+
+    /// Application bytes folded so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The digest of the stream folded so far (clones the hasher — does not consume it).
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&self.hasher.clone().finalize());
+        out
+    }
+}
+
+/// A **receiver-attested transfer receipt** for an A2A session (#132 SR1 — the `settle` step). The
+/// **receiver** signs, with its ed25519 holder key, a digest over the application bytes it actually
+/// received ([`TransferDigest`]), bound to the `channel`, the approve-time billing `terms_hash`
+/// (from the [`BillingCommitment`]), and a per-session `session_nonce` — so the receipt cannot be
+/// replayed onto another session, channel, or terms. It moves **no funds**: external settlement
+/// consumes it; the tunnel only PRODUCES the verifiable proof-of-delivery. The sender/verifier
+/// checks it against its OWN [`TransferDigest`], so the receiver can neither under-report nor forge
+/// what was delivered — this is what defeats *ambient send-side trust*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettleReceipt {
+    pub channel: ChannelId,
+    /// The attesting (delivered-to) member; the signature is checked against this holder pubkey.
+    pub receiver: [u8; 32],
+    /// The approve-time billing terms this delivery settles against (ties the receipt to the coupling).
+    pub terms_hash: [u8; 32],
+    /// Per-session binding (a fresh nonce agreed at setup) — prevents cross-session/channel replay.
+    pub session_nonce: [u8; 32],
+    /// Application bytes the receiver attests it received.
+    pub bytes_delivered: u64,
+    /// Digest over those delivered bytes ([`TransferDigest::digest`]).
+    pub transfer_digest: [u8; 32],
+    /// The receiver's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    pub signature: [u8; 64],
+}
+
+impl SettleReceipt {
+    /// Domain-separated preimage: `domain ‖ channel ‖ receiver ‖ terms_hash ‖ session_nonce ‖
+    /// bytes_delivered(LE) ‖ transfer_digest`. Binding every field means a receipt can't be
+    /// replayed onto another channel/session/terms nor have its byte count or digest altered
+    /// without re-signing (which only the receiver's holder key can do).
+    pub fn signing_bytes(
+        channel: &ChannelId,
+        receiver: &[u8; 32],
+        terms_hash: &[u8; 32],
+        session_nonce: &[u8; 32],
+        bytes_delivered: u64,
+        transfer_digest: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(SETTLE_RECEIPT_DOMAIN.len() + 32 * 4 + 8);
+        m.extend_from_slice(SETTLE_RECEIPT_DOMAIN);
+        m.extend_from_slice(&channel.0);
+        m.extend_from_slice(receiver);
+        m.extend_from_slice(terms_hash);
+        m.extend_from_slice(session_nonce);
+        m.extend_from_slice(&bytes_delivered.to_le_bytes());
+        m.extend_from_slice(transfer_digest);
+        m
+    }
+
+    /// Whether the receipt is authentic: the receiver signature verifies for its exact binding. A
+    /// forged/tampered receipt returns `false`.
+    pub fn is_valid(&self) -> bool {
+        match VerifyingKey::from_bytes(&self.receiver) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.channel,
+                        &self.receiver,
+                        &self.terms_hash,
+                        &self.session_nonce,
+                        self.bytes_delivered,
+                        &self.transfer_digest,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// The **sender/verifier's settle gate**: the receipt is authentic AND attests delivery of what
+    /// we actually sent — same `channel`, the expected `terms_hash` and `session_nonce`, at least
+    /// `min_bytes`, and a `transfer_digest` byte-equal to our own [`TransferDigest::digest`]. A
+    /// truncated, tampered, or forged delivery claim → `false`. Only a receipt the RECEIVER signed
+    /// over the true delivered bytes passes — no send-side assertion can.
+    pub fn confirms_delivery(
+        &self,
+        expected_channel: &ChannelId,
+        expected_terms_hash: &[u8; 32],
+        expected_session_nonce: &[u8; 32],
+        min_bytes: u64,
+        sender_digest: &[u8; 32],
+    ) -> bool {
+        self.is_valid()
+            && &self.channel == expected_channel
+            && &self.terms_hash == expected_terms_hash
+            && &self.session_nonce == expected_session_nonce
+            && self.bytes_delivered >= min_bytes
+            && &self.transfer_digest == sender_digest
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -1920,5 +2060,78 @@ mod tests {
             max_amount: 1_000, expires_at: 5_000, signature: sig,
         };
         assert!(!impersonated.is_valid(1_000), "a commitment not signed by its holder is rejected");
+    }
+
+    #[test]
+    fn settle_receipt_attests_delivery_and_defeats_send_side_forgery() {
+        // #132 SR1 (frozen): the `settle` receipt. Both peers fold the same delivered bytes through
+        // a TransferDigest; the RECEIVER signs a SettleReceipt over its digest; the sender confirms
+        // it against its OWN digest. A short/tampered/forged/replayed claim is rejected — so
+        // "delivered" is witnessed by the receiver, never asserted by the send side.
+        let ch = ChannelId([0x21u8; 32]);
+        let terms = [0x7eu8; 32];
+        let nonce = [0x5au8; 32];
+        let payload = b"the exact application bytes that crossed the tunnel";
+
+        // Both ends fold the identical delivered stream (in the live path, as the pump moves it).
+        let mut sender = TransferDigest::new();
+        let mut receiver = TransferDigest::new();
+        for chunk in payload.chunks(7) {
+            sender.update(chunk);
+            receiver.update(chunk);
+        }
+        assert_eq!(sender.digest(), receiver.digest(), "identical streams → identical digest");
+        assert_eq!(sender.bytes(), payload.len() as u64);
+
+        // The receiver signs a receipt over what it received.
+        let recv_sk = SigningKey::from_bytes(&[0x31u8; 32]);
+        let receiver_id = recv_sk.verifying_key().to_bytes();
+        let sign = |rid: &[u8; 32], bytes: u64, digest: &[u8; 32], sk: &SigningKey| SettleReceipt {
+            channel: ch,
+            receiver: *rid,
+            terms_hash: terms,
+            session_nonce: nonce,
+            bytes_delivered: bytes,
+            transfer_digest: *digest,
+            signature: sk
+                .sign(&SettleReceipt::signing_bytes(&ch, rid, &terms, &nonce, bytes, digest))
+                .to_bytes(),
+        };
+        let receipt = sign(&receiver_id, receiver.bytes(), &receiver.digest(), &recv_sk);
+
+        // (1) Authentic + matches the sender's own digest/terms/session → confirmed.
+        assert!(receipt.is_valid(), "a receiver-signed receipt verifies");
+        assert!(
+            receipt.confirms_delivery(&ch, &terms, &nonce, payload.len() as u64, &sender.digest()),
+            "settle gate passes: right channel/terms/session, full byte count, matching digest"
+        );
+
+        // (2) Under-report / truncated delivery: the receiver only got a prefix → its digest and
+        // byte count differ from the sender's, so the sender's gate rejects the receipt.
+        let mut short = TransferDigest::new();
+        short.update(&payload[..20]);
+        let short_receipt = sign(&receiver_id, short.bytes(), &short.digest(), &recv_sk);
+        assert!(short_receipt.is_valid(), "the short receipt is itself authentically signed");
+        assert!(
+            !short_receipt.confirms_delivery(&ch, &terms, &nonce, payload.len() as u64, &sender.digest()),
+            "a truncated delivery digest does NOT match what was sent → rejected"
+        );
+
+        // (3) Wrong channel / terms / session / insufficient min_bytes all refuse the gate.
+        assert!(!receipt.confirms_delivery(&ChannelId([0u8; 32]), &terms, &nonce, 1, &sender.digest()), "wrong channel");
+        assert!(!receipt.confirms_delivery(&ch, &[0u8; 32], &nonce, 1, &sender.digest()), "wrong terms");
+        assert!(!receipt.confirms_delivery(&ch, &terms, &[0u8; 32], 1, &sender.digest()), "wrong session nonce (replay)");
+        assert!(!receipt.confirms_delivery(&ch, &terms, &nonce, payload.len() as u64 + 1, &sender.digest()), "below min_bytes");
+
+        // (4) Tamper: inflate the byte count after signing → the receiver signature breaks.
+        let mut forged = receipt.clone();
+        forged.bytes_delivered = 1_000_000;
+        assert!(!forged.is_valid(), "a tampered byte count breaks the receiver signature");
+
+        // (5) Send-side forgery: an attacker signs a full-delivery receipt with ITS key but stamps
+        // the receiver's id — it can't validate against the claimed receiver.
+        let attacker = SigningKey::from_bytes(&[0x99u8; 32]);
+        let forged_by_sender = sign(&receiver_id, payload.len() as u64, &sender.digest(), &attacker);
+        assert!(!forged_by_sender.is_valid(), "a receipt not signed by the receiver is rejected (no ambient send-side trust)");
     }
 }
