@@ -221,9 +221,218 @@ where
     Ok(())
 }
 
+/// Pump-frame tags for the #104-H3 relay→direct cutover: a 1-byte plaintext prefix on every
+/// frame marking application `DATA` vs the in-line `CUTOVER` control. Byte-identical wire to
+/// [`noise_pump`] otherwise (just one extra plaintext byte).
+const PUMP_TAG_DATA: u8 = 0;
+const PUMP_TAG_CUTOVER: u8 = 1;
+
+/// A [`noise_pump`] whose ciphertext side can be **switched once** from a relay transport+stream
+/// to a direct transport+stream mid-flight (#104-H3), the plaintext byte stream continuous across
+/// the switch — **no byte lost or duplicated** — in both directions. Every frame is tagged
+/// (`DATA`/`CUTOVER`). **Outbound** switches when `cutover` resolves (this side decided to
+/// upgrade, e.g. the initiator after the H1 handshake): it writes a `CUTOVER` frame on the relay,
+/// then encrypts subsequent plaintext with `direct_transport` to `direct_write`. **Inbound**
+/// switches when it reads a `CUTOVER` frame from the peer, reading subsequent frames from
+/// `direct_read` with `direct_transport`. The direct session must be handshaked (both sides agreed
+/// via H1) before `cutover` fires. Runs until either side closes. This is the H3 primitive; wiring
+/// it into `run_channel_session_on_stream` behind the H1 coordination + `dial_peer_direct` (and
+/// closing the relay once both directions cut over) is the live integration.
+#[allow(clippy::too_many_arguments)]
+pub async fn noise_pump_switchable<RR, RW, DR, DW, PR, PW>(
+    relay_transport: snow::TransportState,
+    direct_transport: snow::TransportState,
+    relay_read: RR,
+    mut relay_write: RW,
+    mut direct_read: DR,
+    mut direct_write: DW,
+    mut plain_read: PR,
+    mut plain_write: PW,
+    cutover: tokio::sync::oneshot::Receiver<()>,
+) -> io::Result<()>
+where
+    RR: AsyncRead + Unpin,
+    RW: AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    PR: AsyncRead + Unpin,
+    PW: AsyncWrite + Unpin,
+{
+    const CHUNK: usize = 16 * 1024;
+    let relay_ts = Mutex::new(relay_transport);
+    let direct_ts = Mutex::new(direct_transport);
+    let mut relay_read = relay_read;
+    let noise_err = |e: snow::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+
+    // Encrypt `[tag ‖ payload]` with `ts` and frame it into `ct` (2-byte len prefix reserved at
+    // the front, as `noise_pump`); returns the total framed length.
+    let seal = |ts: &Mutex<snow::TransportState>, tag: u8, payload: &[u8], ct: &mut [u8]| -> io::Result<usize> {
+        let mut msg = Vec::with_capacity(1 + payload.len());
+        msg.push(tag);
+        msg.extend_from_slice(payload);
+        let len = ts.lock().unwrap().write_message(&msg, &mut ct[2..]).map_err(noise_err)?;
+        ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+        Ok(2 + len)
+    };
+
+    // plaintext -> tagged frames, over relay until cutover, then over direct.
+    let outbound = async {
+        let mut buf = vec![0u8; CHUNK];
+        let mut ct = vec![0u8; 2 + 1 + CHUNK + 256];
+        let mut cutover = cutover;
+        let mut switched = false;
+        loop {
+            if switched {
+                let n = plain_read.read(&mut buf).await?;
+                if n == 0 {
+                    let _ = direct_write.shutdown().await;
+                    return Ok::<(), io::Error>(());
+                }
+                let total = seal(&direct_ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                direct_write.write_all(&ct[..total]).await?;
+                direct_write.flush().await?;
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = &mut cutover => {
+                        let total = seal(&relay_ts, PUMP_TAG_CUTOVER, &[], &mut ct)?;
+                        relay_write.write_all(&ct[..total]).await?;
+                        relay_write.flush().await?;
+                        switched = true;
+                    }
+                    r = plain_read.read(&mut buf) => {
+                        let n = r?;
+                        if n == 0 {
+                            let _ = relay_write.shutdown().await;
+                            let _ = direct_write.shutdown().await;
+                            return Ok::<(), io::Error>(());
+                        }
+                        let total = seal(&relay_ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                        relay_write.write_all(&ct[..total]).await?;
+                        relay_write.flush().await?;
+                    }
+                }
+            }
+        }
+    };
+
+    // tagged frames -> plaintext; switch inbound to `direct_read` on the CUTOVER frame.
+    let inbound = async {
+        let mut pt = vec![0u8; 1 + CHUNK + 256];
+        let mut fr = Vec::with_capacity(CHUNK + 256);
+        let mut switched = false;
+        loop {
+            let read_res = if switched {
+                read_frame_into(&mut direct_read, &mut fr).await
+            } else {
+                read_frame_into(&mut relay_read, &mut fr).await
+            };
+            let n = match read_res {
+                Ok(n) => n,
+                Err(_) => {
+                    let _ = plain_write.shutdown().await;
+                    return Ok::<(), io::Error>(());
+                }
+            };
+            let len = {
+                let mut ts = if switched { direct_ts.lock().unwrap() } else { relay_ts.lock().unwrap() };
+                ts.read_message(&fr[..n], &mut pt).map_err(noise_err)?
+            };
+            if len == 0 {
+                continue; // a frame must carry at least its tag byte
+            }
+            match pt[0] {
+                PUMP_TAG_CUTOVER => switched = true,
+                _ => {
+                    plain_write.write_all(&pt[1..len]).await?;
+                    plain_write.flush().await?;
+                }
+            }
+        }
+    };
+
+    let (o, i) = tokio::join!(outbound, inbound);
+    o?;
+    i?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A completed Noise_IK session as `(initiator_transport, responder_transport)`, handshaked
+    /// in memory (no streams) for the pump tests.
+    fn transport_pair() -> (snow::TransportState, snow::TransportState) {
+        let ini_kp = generate_static_keypair();
+        let resp_kp = generate_static_keypair();
+        let mut ini = client_handshake(&ini_kp.private, &resp_kp.public).unwrap();
+        let mut resp = origin_handshake(&resp_kp.private).unwrap();
+        let (mut b1, mut b2, mut t) = ([0u8; 1024], [0u8; 1024], [0u8; 1024]);
+        let n = ini.write_message(&[], &mut b1).unwrap();
+        resp.read_message(&b1[..n], &mut t).unwrap();
+        let m = resp.write_message(&[], &mut b2).unwrap();
+        ini.read_message(&b2[..m], &mut t).unwrap();
+        (ini.into_transport_mode().unwrap(), resp.into_transport_mode().unwrap())
+    }
+
+    #[tokio::test]
+    async fn noise_pump_switchable_preserves_byte_stream_across_relay_to_direct_cutover() {
+        // #104-H3 (frozen): the live-model byte-stream pump switches its cipher from the relay
+        // to a fresh direct Noise session mid-flight, and the plaintext byte stream is continuous
+        // across the seam — no byte lost, duplicated, or reordered — regardless of how the bytes
+        // happen to split across the two ciphers at the cutover instant.
+        let (relay_a, relay_b) = transport_pair(); // A initiator, B responder (relay session)
+        let (direct_a, direct_b) = transport_pair(); // ditto (direct session)
+
+        // Cipher duplexes (each direction its own): A→B relay/direct, B→A relay/direct.
+        let (ar_w, ar_r) = tokio::io::duplex(1 << 16); // A→B relay
+        let (br_w, br_r) = tokio::io::duplex(1 << 16); // B→A relay
+        let (ad_w, ad_r) = tokio::io::duplex(1 << 16); // A→B direct
+        let (bd_w, bd_r) = tokio::io::duplex(1 << 16); // B→A direct
+
+        // Plaintext endpoints. Test → A's plain (source); B's plain → test (sink).
+        let (mut a_plain_feed, a_plain_r) = tokio::io::duplex(1 << 16);
+        let (b_plain_w, mut b_plain_out) = tokio::io::duplex(1 << 16);
+        // A's plain-write (B→A data, unused) sink; B's plain-read (its own outbound, empty) EOFs.
+        let (a_pw, _a_pw_drain) = tokio::io::duplex(64);
+        let (b_pr_closed, b_pr) = tokio::io::duplex(64);
+        drop(b_pr_closed); // B's outbound sees EOF immediately (no B→A data in this test)
+
+        let (cut_a_tx, cut_a_rx) = tokio::sync::oneshot::channel();
+        let (_cut_b_tx, cut_b_rx) = tokio::sync::oneshot::channel();
+
+        // A: relay(read B→A = br_r, write A→B = ar_w), direct(read bd_r, write ad_w), plain(a_plain_r, a_pw)
+        let a = tokio::spawn(noise_pump_switchable(
+            relay_a, direct_a, br_r, ar_w, bd_r, ad_w, a_plain_r, a_pw, cut_a_rx,
+        ));
+        // B: relay(read A→B = ar_r, write br_w), direct(read ad_r, write bd_w), plain(b_pr, b_plain_w)
+        let b = tokio::spawn(noise_pump_switchable(
+            relay_b, direct_b, ar_r, br_w, ad_r, bd_w, b_pr, b_plain_w, cut_b_rx,
+        ));
+
+        // A monotonic 2000-byte payload: first 800 pushed, then cut over, then the rest.
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        a_plain_feed.write_all(&payload[..800]).await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await; // let some bytes ride the relay
+        cut_a_tx.send(()).unwrap(); // A triggers its outbound cutover
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        a_plain_feed.write_all(&payload[800..]).await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+        drop(a_plain_feed); // EOF A's plaintext → A outbound shuts the direct cipher
+
+        let mut got = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b_plain_out.read_to_end(&mut got))
+            .await
+            .expect("the receiver drains within 5s")
+            .expect("read_to_end");
+        assert_eq!(got, payload, "byte stream intact + in order across the relay→direct cutover (#104-H3)");
+
+        let _ = a.await;
+        let _ = b.await;
+    }
 
     #[test]
     fn origin_handshake_any_selects_the_pinned_identity() {
