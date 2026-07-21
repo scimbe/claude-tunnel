@@ -64,7 +64,7 @@ use libp2p::futures::StreamExt;
 use libp2p::kad::{self, store::MemoryStore, Quorum, Record, RecordKey};
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{dcutr, noise, relay, yamux, Multiaddr, StreamProtocol, Swarm, SwarmBuilder, Transport};
+use libp2p::{dcutr, identify, noise, relay, yamux, Multiaddr, StreamProtocol, Swarm, SwarmBuilder, Transport};
 use libp2p_stream as stream;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
@@ -377,6 +377,11 @@ fn build_relay_client_swarm() -> Result<Swarm<RelayClientBehaviour>, BoxError> {
 pub(crate) struct DcutrRelayClientBehaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
+    // #136: `identify` is what lets each peer learn its own **reflexive** (observed public)
+    // address — the address DCUtR advertises + punches toward. On loopback it is redundant (the
+    // local address is already reachable), but a real cross-NAT hole-punch cannot start without
+    // it: with no observed address there is nothing for the peer to tell the other to punch to.
+    identify: identify::Behaviour,
     stream: stream::Behaviour,
 }
 
@@ -401,6 +406,11 @@ fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, 
         .with_behaviour(|key, relay_client| DcutrRelayClientBehaviour {
             relay_client,
             dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
+            // Advertise/observe addresses so DCUtR can discover the reflexive address to punch.
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ct-dcutr-id/1.0.0".to_string(),
+                key.public(),
+            )),
             stream: stream::Behaviour::new(),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
