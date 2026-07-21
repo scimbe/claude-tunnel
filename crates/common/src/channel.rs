@@ -429,6 +429,20 @@ pub fn reachability_class(advertised: &str, reflexive: std::net::SocketAddr) -> 
     Reachability::Nat { reflexive }
 }
 
+/// The #104 / #121 Phase B2 **direct-upgrade trigger** (`#121-symmetric-fallback`): given
+/// both members' #121-B1 [`Reachability`] classifications, decide whether attempting a
+/// direct hole-punch is worthwhile or whether the pair should stay relayed. A punch needs
+/// **both** sides to have a stable, punchable reflexive — a [`Reachability::RelayOnly`]
+/// member (symmetric / CGNAT double-NAT: no consistent reflexive mapping) can't be punched
+/// toward, so any pair that includes one stays on the relay. `Public`/`Nat` on both sides →
+/// attempt the upgrade. Pure. The relay leg is end-to-end regardless, so a `false` here is
+/// never a failure — just "don't bother punching, the relay is the answer".
+pub fn should_attempt_direct_upgrade(own: Reachability, peer: Reachability) -> bool {
+    // Punchable iff the edge saw a usable reflexive (Public or Nat); RelayOnly has none.
+    let punchable = |r: Reachability| !matches!(r, Reachability::RelayOnly);
+    punchable(own) && punchable(peer)
+}
+
 /// A channel member's identity paired with its edge-observed reachability — the input
 /// row to Phase C superpeer election (#121). `holder` is the member's ed25519 holder
 /// pubkey (the same key family that signs grants/staples); `reachability` is its
@@ -1735,6 +1749,26 @@ mod tests {
         }
         for ok in ["203.0.113.10:7001", "8.8.8.8:443", "[2001:4860:4860::8888]:443"] {
             assert!(is_global_unicast(ok.parse::<SocketAddr>().unwrap()), "{ok} must be global-unicast");
+        }
+    }
+
+    #[test]
+    fn direct_upgrade_is_attempted_only_when_both_sides_are_punchable() {
+        // #121 Phase B2 trigger: a hole-punch needs BOTH members to have a punchable
+        // reflexive; any RelayOnly side (symmetric/CGNAT) stays on the relay.
+        use std::net::SocketAddr;
+        let refl: SocketAddr = "203.0.113.10:7001".parse().unwrap();
+        let public = Reachability::Public;
+        let natd = Reachability::Nat { reflexive: refl };
+        let relay = Reachability::RelayOnly;
+
+        // Both punchable (Public/Nat in any combination) -> attempt the direct upgrade.
+        for (a, b) in [(public, public), (public, natd), (natd, public), (natd, natd)] {
+            assert!(should_attempt_direct_upgrade(a, b), "punchable pair should upgrade");
+        }
+        // Any RelayOnly side -> stay on the relay (never punch).
+        for (a, b) in [(relay, public), (public, relay), (relay, natd), (natd, relay), (relay, relay)] {
+            assert!(!should_attempt_direct_upgrade(a, b), "a RelayOnly side stays relayed");
         }
     }
 

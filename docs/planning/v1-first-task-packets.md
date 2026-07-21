@@ -3269,8 +3269,7 @@ slices:
 - **#121-punch-signal (Phase B2) ⏳**: broker punch-coordination signalling — relay the peer's reflexive address +
   a synchronized instant to both members (the hole-punch/DCUtR; punches toward the B1 reflexive).
 - **#121-simultaneous-open (Phase B2) ⏳**: client simultaneous-open at the agreed instant.
-- **#121-symmetric-fallback (Phase B2) ⏳**: symmetric-NAT (`RelayOnly`, no consistent reflexive mapping) stays on
-  the relay; this is the #104 upgrade **trigger** — promote to direct only when `reachability_class` allows.
+- **#121-symmetric-fallback (Phase B2) ✅ (trigger primitive):** `ct_common::channel::should_attempt_direct_upgrade(own: Reachability, peer: Reachability) -> bool` — the #104/#121-B2 upgrade trigger that consumes the B1 classification: a hole-punch needs **both** sides punchable, so any `RelayOnly` side (symmetric/CGNAT, no consistent reflexive) stays relayed; `Public`/`Nat` on both → attempt. Pure `pub` lib fn; the relay leg is end-to-end regardless, so `false` is never a failure, just "don't bother punching". Frozen test `direct_upgrade_is_attempted_only_when_both_sides_are_punchable` (all 9 `Reachability`² combinations). Gate green, 0 warnings. **Remaining (live):** conveying the peer's reachability at pairing + calling this trigger in the live upgrade path (`run_channel_session_upgradable`/`…_dcutr`) — the deploy-only wiring.
 - **Phase C (superpeer election) / D (DHT) / E (fail-static) ⏳**: later, classify on the B1 `Reachability`.
 
 ### Phase B2→E under the libp2p decision (2026-07-19, maintainer-approved)
