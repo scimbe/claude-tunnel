@@ -429,6 +429,49 @@ pub fn reachability_class(advertised: &str, reflexive: std::net::SocketAddr) -> 
     Reachability::Nat { reflexive }
 }
 
+/// A channel member's identity paired with its edge-observed reachability — the input
+/// row to Phase C superpeer election (#121). `holder` is the member's ed25519 holder
+/// pubkey (the same key family that signs grants/staples); `reachability` is its
+/// #121-B1 classification ([`reachability_class`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberReachability {
+    pub holder: [u8; 32],
+    pub reachability: Reachability,
+}
+
+/// Elect up to `count` superpeers from a channel's members (#121 Phase C) — self-organizing
+/// and coordinator-free: every member computes the **same** result from the same membership
+/// view, so no central authority assigns the role (the central is a replaceable bootstrap,
+/// never in the data path). Policy (maintainer-decided — *any member is eligible*, subject to
+/// two gates):
+///  1. the member must be [`Reachability::Public`] — a superpeer runs the Circuit-Relay v2
+///     server other members dial, so a NAT'd / relay-only member cannot serve inbound circuits
+///     (the election *classifies on* the B1 [`Reachability`]);
+///  2. it must not be in the operator's `veto` set — operator-veto is the only override, and the
+///     operator holds the signing key locally (#117 / invariant #6), never the central.
+///
+/// Winners are chosen deterministically by ascending holder pubkey — a stable, view-independent
+/// tie-break every member agrees on without a coordinator. Returns fewer than `count` (possibly
+/// empty) when too few members are eligible; an **empty** result is the *fail-static* signal —
+/// no superpeer, so the existing grant-gated broker / `:443` relay stays the fallback (absence
+/// degrades to the prior relay path, never fail-closed).
+pub fn elect_superpeers(
+    members: &[MemberReachability],
+    veto: &[[u8; 32]],
+    count: usize,
+) -> Vec<[u8; 32]> {
+    let mut eligible: Vec<[u8; 32]> = members
+        .iter()
+        .filter(|m| m.reachability == Reachability::Public)
+        .map(|m| m.holder)
+        .filter(|h| !veto.contains(h))
+        .collect();
+    eligible.sort_unstable();
+    eligible.dedup();
+    eligible.truncate(count);
+    eligible
+}
+
 /// Verify a signed grant against the channel `operator_pubkey` at time `now`.
 /// Confirms the operator signature over the claims and that the grant has not
 /// expired. Does NOT check holder possession — that is a connect-time proof in a
@@ -1693,6 +1736,47 @@ mod tests {
         for ok in ["203.0.113.10:7001", "8.8.8.8:443", "[2001:4860:4860::8888]:443"] {
             assert!(is_global_unicast(ok.parse::<SocketAddr>().unwrap()), "{ok} must be global-unicast");
         }
+    }
+
+    #[test]
+    fn elect_superpeers_picks_public_unvetoed_members_deterministically_and_fails_static() {
+        // #121 Phase C: superpeer election is coordinator-free — every member computes the
+        // same winners from the same view. Policy: eligible = Public AND not operator-vetoed;
+        // winners are the ascending-holder tie-break; empty result = fail-static (relay stays).
+        use std::net::SocketAddr;
+        let refl: SocketAddr = "203.0.113.10:7001".parse().unwrap();
+        let m = |b: u8, r: Reachability| MemberReachability { holder: [b; 32], reachability: r };
+
+        // A mixed membership: two public hosts, one NAT'd, one relay-only.
+        let public_hi = m(0x30, Reachability::Public);
+        let public_lo = m(0x10, Reachability::Public);
+        let natd = m(0x05, Reachability::Nat { reflexive: refl });
+        let relay_only = m(0x01, Reachability::RelayOnly);
+        let members = [public_hi, natd, public_lo, relay_only];
+
+        // Only the two Public members are eligible, returned ascending by holder — NEVER the
+        // NAT'd (0x05) or relay-only (0x01) members even though their holders sort first.
+        assert_eq!(elect_superpeers(&members, &[], 8), vec![[0x10; 32], [0x30; 32]]);
+
+        // `count` caps the winners at the smallest-holder eligible member.
+        assert_eq!(elect_superpeers(&members, &[], 1), vec![[0x10; 32]]);
+
+        // Deterministic regardless of input order — a permuted view yields the identical result
+        // (self-organizing agreement needs no shared ordering).
+        let permuted = [relay_only, public_lo, public_hi, natd];
+        assert_eq!(
+            elect_superpeers(&permuted, &[], 8),
+            elect_superpeers(&members, &[], 8),
+            "election is order-independent"
+        );
+
+        // Operator veto removes an otherwise-eligible Public member (the only override).
+        assert_eq!(elect_superpeers(&members, &[[0x10; 32]], 8), vec![[0x30; 32]]);
+
+        // Fail-static: no eligible member (all NAT'd/relay-only, or every public one vetoed) →
+        // empty, i.e. no superpeer, so the existing grant-gated relay stays the fallback.
+        assert!(elect_superpeers(&[natd, relay_only], &[], 8).is_empty());
+        assert!(elect_superpeers(&members, &[[0x10; 32], [0x30; 32]], 8).is_empty());
     }
 
     #[test]
