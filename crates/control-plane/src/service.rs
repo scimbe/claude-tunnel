@@ -767,6 +767,7 @@ pub fn authed_topology_router(
     Router::new()
         .route("/me/topologies", post(topology_create).get(topology_list))
         .route("/me/topologies/:id", get(topology_view))
+        .route("/me/topologies/:id/mode", axum::routing::put(topology_set_mode))
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
         .route("/me/topologies/:id/edges", post(topology_add_edge))
@@ -833,6 +834,9 @@ struct TopologyView {
     net_uuid: String,
     agents: Vec<String>,
     edges: Vec<(String, String)>,
+    /// The overlay mode (#107-ui-mode): `baseline` (direct) vs `smart-route`/`shortcut`
+    /// (complex-adaptive). Legacy/absent rows read back as `baseline`.
+    overlay_mode: String,
 }
 
 /// Resolve `id` as a topology owned by `owner`, or a `404` (owner isolation — a topology
@@ -866,7 +870,41 @@ async fn topology_view(
         .topologies
         .edges(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(TopologyView { id: t.id, net_uuid: t.net_uuid, agents, edges }))
+    let overlay_mode = state
+        .topologies
+        .overlay_mode(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or(ct_common::overlay::RoutingApproach::Baseline)
+        .as_str()
+        .to_string();
+    Ok(Json(TopologyView { id: t.id, net_uuid: t.net_uuid, agents, edges, overlay_mode }))
+}
+
+/// `PUT /me/topologies/:id/mode` — set the topology's **overlay mode** (#107-ui-mode):
+/// the owner's choice of *direct* (`baseline`) vs *complex-adaptive* (`smart-route`/
+/// `shortcut`/`random-mesh`). Owner-scoped (`404` on non-owner). An unrecognized mode token
+/// is a `400` — a topology can only ever hold a known `RoutingApproach`.
+async fn topology_set_mode(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ModeReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let mode = ct_common::overlay::RoutingApproach::parse(&req.mode)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    // Owner isolation: a topology the subject doesn't own is a 404 (never a 403).
+    owned_topology(&state, &owner, &id)?;
+    state
+        .topologies
+        .set_overlay_mode(&owner, &id, mode)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct ModeReq {
+    mode: String,
 }
 
 /// `GET /me/topologies/:id/editor` — the owner-scoped, self-contained **Topology
@@ -3179,6 +3217,23 @@ mod tests {
         let v: TopologyView = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.agents, vec!["agent-1", "agent-2"]);
         assert_eq!(v.edges, vec![("agent-1".to_string(), "agent-2".to_string())]);
+        // #107-ui-mode: a fresh topology defaults to the direct overlay mode.
+        assert_eq!(v.overlay_mode, "baseline", "default overlay mode is direct");
+
+        // #107-ui-mode: the owner switches to a complex-adaptive mode; the view reflects it.
+        let set = send("PUT", format!("/me/topologies/{tid}/mode"), Some(&alice), r#"{"mode":"smart-route"}"#.into())
+            .await.unwrap().status();
+        assert_eq!(set, StatusCode::OK, "owner sets overlay mode");
+        let view = send("GET", format!("/me/topologies/{tid}"), Some(&alice), String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<TopologyView>(&body).unwrap().overlay_mode, "smart-route");
+        // An unknown mode token is rejected (400) — a topology only ever holds a known mode.
+        assert_eq!(
+            send("PUT", format!("/me/topologies/{tid}/mode"), Some(&alice), r#"{"mode":"telepathy"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "unknown overlay mode -> 400"
+        );
 
         // Owner isolation: mallory can't see or edit alice's topology.
         assert_eq!(
@@ -3190,6 +3245,13 @@ mod tests {
                 .await.unwrap().status(),
             StatusCode::NOT_FOUND,
             "mallory can't assign into alice's topology"
+        );
+        // #107-ui-mode: mallory can't retune alice's topology either (owner isolation -> 404).
+        assert_eq!(
+            send("PUT", format!("/me/topologies/{tid}/mode"), Some(&mallory), r#"{"mode":"baseline"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "mallory can't set alice's overlay mode"
         );
         // Mallory's own listing is empty.
         let list = send("GET", "/me/topologies".into(), Some(&mallory), String::new()).await.unwrap();

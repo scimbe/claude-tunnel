@@ -1543,9 +1543,53 @@ impl SqliteTopologyStore {
                  PRIMARY KEY (topology, a, b)
              );",
         )?;
+        // #107-ui-mode: the per-topology overlay mode (a RoutingApproach token) the owner
+        // chooses — direct (`baseline`, the default) vs complex-adaptive (`smart-route`/
+        // `shortcut`). Additive (#44): a pre-existing self-host DB gains the column with the
+        // safe direct default, so older topologies keep working unchanged.
+        ensure_column(&conn, "topologies", "overlay_mode", "TEXT NOT NULL DEFAULT 'baseline'")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Set a topology's **overlay mode** (#107-ui-mode) — the owner's choice of *direct*
+    /// (`RoutingApproach::Baseline`) vs *complex-adaptive* (`SmartRoute`/`Shortcut`). Owner-
+    /// scoped: returns `false` (no-op) if `id` doesn't exist or isn't owned by `owner`, so a
+    /// subject can never retune a topology it doesn't own. The canonical token is stored.
+    pub fn set_overlay_mode(
+        &self,
+        owner: &str,
+        id: &str,
+        mode: ct_common::overlay::RoutingApproach,
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "UPDATE topologies SET overlay_mode = ?3 WHERE id = ?1 AND owner = ?2",
+            params![id, owner, mode.as_str()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A topology's overlay mode (#107-ui-mode), or `None` if the topology doesn't exist. A
+    /// legacy/unrecognized stored value degrades to `RoutingApproach::Baseline` (direct) — a
+    /// stored mode never makes the read fail.
+    pub fn overlay_mode(
+        &self,
+        id: &str,
+    ) -> rusqlite::Result<Option<ct_common::overlay::RoutingApproach>> {
+        let raw: Option<String> = self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT overlay_mode FROM topologies WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.map(|s| {
+            ct_common::overlay::RoutingApproach::parse(&s)
+                .unwrap_or(ct_common::overlay::RoutingApproach::Baseline)
+        }))
     }
 
     /// Create a topology `id` owned by `owner`, addressed by the unique `net_uuid`.
@@ -1912,6 +1956,37 @@ mod tests {
         assert!(store.remove_edge("alice", "t1", "b", "a").unwrap(), "owner removes b—a");
         assert!(!store.remove_edge("alice", "t1", "a", "b").unwrap(), "already gone");
         assert_eq!(store.edges("t1").unwrap(), vec![("a".into(), "c".into())]);
+    }
+
+    #[test]
+    fn topology_overlay_mode_persists_owner_scoped_and_defaults_to_direct() {
+        // #107-ui-mode: the owner picks direct (baseline) vs complex-adaptive (smart-route).
+        use ct_common::overlay::RoutingApproach;
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "u1").unwrap();
+
+        // Default is the safe direct mode (the additive column's DEFAULT 'baseline').
+        assert_eq!(store.overlay_mode("t1").unwrap(), Some(RoutingApproach::Baseline));
+        // A topology that doesn't exist -> None.
+        assert_eq!(store.overlay_mode("ghost").unwrap(), None);
+
+        // The owner switches to a complex-adaptive mode; it persists.
+        assert!(store.set_overlay_mode("alice", "t1", RoutingApproach::SmartRoute).unwrap());
+        assert_eq!(store.overlay_mode("t1").unwrap(), Some(RoutingApproach::SmartRoute));
+
+        // Owner-scoped: a non-owner can't retune it (no-op, value unchanged).
+        assert!(!store.set_overlay_mode("mallory", "t1", RoutingApproach::Baseline).unwrap());
+        assert_eq!(store.overlay_mode("t1").unwrap(), Some(RoutingApproach::SmartRoute), "unchanged");
+        // Setting the mode of a non-existent topology is a no-op.
+        assert!(!store.set_overlay_mode("alice", "ghost", RoutingApproach::Shortcut).unwrap());
+
+        // A legacy/garbage stored value degrades to Baseline (direct) — never a read error.
+        store
+            .conn
+            .lock_safe()
+            .execute("UPDATE topologies SET overlay_mode = 'legacy-nonsense' WHERE id = 't1'", [])
+            .unwrap();
+        assert_eq!(store.overlay_mode("t1").unwrap(), Some(RoutingApproach::Baseline), "unknown -> direct");
     }
 
     #[test]
