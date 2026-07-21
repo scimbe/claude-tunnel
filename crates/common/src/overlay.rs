@@ -316,6 +316,35 @@ where
     Ok(plan_network_overlay(network, latency, shortcut_budget))
 }
 
+/// Reduce a link's raw latency **probe samples** (per-sample RTT/one-way costs — opaque
+/// unit, microseconds by convention, the same as [`WeightedLink::cost`]) to the single
+/// robust cost the overlay optimizer consumes (#107-optimize-follow: the pure half of
+/// "edge latency probes feed `plan_network_overlay`'s latency"). Uses the **median**, not
+/// the mean: edge latency is right-skewed — a single slow sample (a scheduling hiccup, a
+/// retransmit) would inflate a mean and mis-rank an otherwise-fast link (#52's caution about
+/// tail samples vs. central tendency), whereas the median is the robust central estimate that
+/// keeps [`min_latency_overlay`]'s edge ordering stable. Returns `None` for an empty sample
+/// set — an *unmeasured* link the controller must omit from the candidate set rather than
+/// wire at an invented cost. Pure and deterministic (it sorts a local copy; input order and
+/// duplicates do not change the result).
+pub fn link_cost_from_probes(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let n = v.len();
+    let mid = n / 2;
+    Some(if n % 2 == 1 {
+        v[mid]
+    } else {
+        // Floor of the two-middle average, computed as lo + (hi-lo)/2 so it never overflows
+        // (a plain (lo+hi)/2 would wrap for costs near u64::MAX).
+        let (lo, hi) = (v[mid - 1], v[mid]);
+        lo + (hi - lo) / 2
+    })
+}
+
 /// The routing-approach factor for the #76 overlay study — the single cleanly-isolated
 /// independent variable a DoE run pins (#76 **OV3**, `CT_OVERLAY_ROUTING`). Each value
 /// selects how the controller wires the agents' A2A channels (#72) for that run, so runs
@@ -646,5 +675,31 @@ mod tests {
         let err = RoutingApproach::parse("mesh-routing").unwrap_err();
         assert_eq!(err, UnknownRoutingApproach("mesh-routing".to_string()));
         assert!(err.to_string().contains("mesh-routing"));
+    }
+
+    #[test]
+    fn link_cost_from_probes_is_the_robust_median_and_none_when_unmeasured() {
+        // #107-optimize-follow (pure half): reduce a link's probe samples to the cost the
+        // optimizer consumes. Empty = unmeasured -> None (omit the link, never invent a cost).
+        assert_eq!(link_cost_from_probes(&[]), None);
+        // Single sample is its own median.
+        assert_eq!(link_cost_from_probes(&[42]), Some(42));
+        // Odd n: the middle order statistic, independent of input order.
+        assert_eq!(link_cost_from_probes(&[30, 10, 20]), Some(20));
+        // Even n: floor of the two-middle midpoint (sorted [10,20,30,40] -> (20+30)/2 = 25).
+        assert_eq!(link_cost_from_probes(&[40, 10, 30, 20]), Some(25));
+        // Robust to a right-tail outlier: one huge sample does NOT move the median the way a
+        // mean would (#52 — tail samples must not distort the central-tendency link cost).
+        assert_eq!(link_cost_from_probes(&[10, 10, 10, 10, 1_000_000]), Some(10));
+        // No overflow for costs near u64::MAX (a plain (lo+hi)/2 would wrap).
+        assert_eq!(
+            link_cost_from_probes(&[u64::MAX, u64::MAX - 1]),
+            Some(u64::MAX - 1)
+        );
+        // Duplicates and order do not change the result.
+        assert_eq!(
+            link_cost_from_probes(&[5, 5, 9, 1]),
+            link_cost_from_probes(&[9, 1, 5, 5])
+        );
     }
 }
