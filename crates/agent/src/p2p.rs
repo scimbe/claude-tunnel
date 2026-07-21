@@ -679,9 +679,7 @@ pub(crate) async fn dcutr_dial_via_relay(
 /// `trusted_circuit` (its configured edge Circuit-Relay v2 leg) followed by a single `/p2p/<target>`.
 /// Returns the target [`libp2p::PeerId`] to dial ONLY if the relay prefix matches; `None`
 /// (unparseable, wrong/extra relay, or no trailing target peer) refuses the upgrade → stay on relay.
-// Landed ahead of its caller: the N136.3 relay-only wire-in (run_channel_session_upgradable's DCUtR
-// branch) consumes this; frozen + tested now so the guard exists before the path goes live.
-#[allow(dead_code)]
+// Live via the N-wire DCUtR join (run_channel_session_upgradable_dcutr's responder relay-pin).
 pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -> Option<libp2p::PeerId> {
     let addr: Multiaddr = offered.parse().ok()?;
     let mut protos: Vec<Protocol> = addr.iter().collect();
@@ -709,7 +707,8 @@ pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -
 /// end-to-end throughout. The live cross-NAT punch is proven on the deploy (#136 N136.4); this over an
 /// in-process relay on loopback.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // consumed by the join-path wire-in (relay-only members); landed with N136.3
+// #136 N-wire: live via `channel_run::join_via_relay_dcutr` (relay-only members with a
+// `CT_CHANNEL_CIRCUIT_RELAY` configured); the cross-NAT punch is proven in the Docker 2-NAT lab.
 pub(crate) async fn run_channel_session_upgradable_dcutr<RW, RR, P>(
     relay_send: RW,
     relay_recv: RR,

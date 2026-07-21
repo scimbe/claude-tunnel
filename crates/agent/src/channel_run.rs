@@ -355,6 +355,54 @@ where
         .map_err(Into::into)
 }
 
+/// **#136 N-wire — DCUtR-upgradable relay join for a NAT-to-NAT (relay-only) member.** Like
+/// [`join_via_relay`], but instead of running a plain edge-relay session it runs the
+/// **upgradable DCUtR** session ([`crate::p2p::run_channel_session_upgradable_dcutr`]): the byte
+/// stream starts on the edge relay (both members are NAT'd, so neither can be dialed directly),
+/// and in the background the pair opportunistically hole-punches to a **direct** link via the
+/// configured libp2p Circuit-Relay v2 `circuit_relay` and cuts the stream over — offloading the
+/// edge. Hole-punch failure stays on the relay; the relay leg is end-to-end throughout. The
+/// peer's Noise key is learned from the relayed admission (no out-of-band exchange). The actual
+/// cross-NAT punch is proven in the Docker 2-NAT lab (N-rig-2) / the live plane (N-rig-3); on
+/// loopback it degrades to the relay.
+pub async fn join_via_relay_dcutr<P>(
+    relay_conn: &Connection,
+    request: &ChannelJoinRequest,
+    holder: &SigningKey,
+    role: ChannelRole,
+    own_noise_private: &[u8; 32],
+    local: P,
+    circuit_relay: libp2p::Multiaddr,
+) -> Result<(), BoxError>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    let peer_noise = match present_channel_join(relay_conn, request, holder).await? {
+        ChannelJoinOutcome::Admitted { peer_noise_pubkey: Some(k), .. } => k,
+        ChannelJoinOutcome::Admitted { .. } => {
+            return Err("DCUtR relay join needs the peer's relayed Noise key (register the member's key, #101)".into())
+        }
+        ChannelJoinOutcome::Refused => return Err("edge relay refused the channel join".into()),
+    };
+    // The DCUtR session runs the Noise_IK over the relay bi-stream as its base leg, punching to
+    // direct in the background. Initiator opens the bi-stream; acceptor accepts the edge-opened one.
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let (relay_send, relay_recv) = match role {
+        ChannelRole::Initiate => relay_conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
+        ChannelRole::Accept => relay_conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
+    };
+    crate::p2p::run_channel_session_upgradable_dcutr(
+        relay_send,
+        relay_recv,
+        local,
+        role,
+        own_noise_private,
+        &peer_noise,
+        circuit_relay,
+    )
+    .await
+}
+
 /// **#104 direct-P2P wire-in.** Run one side of an A2A channel session over `relay_conn` as an
 /// **upgradable** session: it starts on the relay and, in the background, opportunistically dials a
 /// direct link and cuts the byte stream over to it (offloading the edge) — transparently to the
@@ -649,6 +697,26 @@ pub struct ChannelJoinCliConfig {
     /// (direct QUIC → the `:443` front door). Absent ⇒ direct-QUIC-only broker admission,
     /// even if `front_door` is set (a front door you have no root for is unusable).
     pub front_door_cert: Option<CertificateDer<'static>>,
+    /// Optional libp2p **Circuit-Relay v2** multiaddr (`CT_CHANNEL_CIRCUIT_RELAY`, #136 N-wire).
+    /// When set for a **relay-only** member, the join starts on the edge relay and then
+    /// opportunistically hole-punches to a **direct** NAT-to-NAT link via DCUtR through this
+    /// circuit relay ([`join_via_relay_dcutr`]). Absent ⇒ the plain edge-relay session (no punch).
+    pub circuit_relay: Option<libp2p::Multiaddr>,
+}
+
+/// Parse the optional `CT_CHANNEL_CIRCUIT_RELAY` libp2p circuit-relay multiaddr (#136 N-wire):
+/// absent/empty ⇒ `None` (no DCUtR upgrade — plain relay session); set-but-malformed ⇒ an error
+/// (a typo shouldn't silently disable the hole-punch, mirroring the `:443` front-door handling).
+/// Pure — the multiaddr is validated here so a bad value fails config load, not mid-session.
+pub fn parse_circuit_relay(value: Option<String>) -> Result<Option<libp2p::Multiaddr>, String> {
+    match value {
+        Some(s) if !s.trim().is_empty() => s
+            .trim()
+            .parse::<libp2p::Multiaddr>()
+            .map(Some)
+            .map_err(|e| format!("CT_CHANNEL_CIRCUIT_RELAY invalid multiaddr: {e}")),
+        _ => Ok(None),
+    }
 }
 
 /// One rung of the channel dial **fallback ladder** (#106): where + how to reach the edge
@@ -800,7 +868,9 @@ impl ChannelJoinCliConfig {
             })
             .unwrap_or(false);
         let relay_only = relay_only_mode(relay_only_explicit, listen_addr);
-        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, relay_only, front_door, front_door_cert })
+        // #136 N-wire: optional libp2p circuit-relay multiaddr for the DCUtR NAT-to-NAT punch.
+        let circuit_relay = parse_circuit_relay(f("CT_CHANNEL_CIRCUIT_RELAY"))?;
+        Ok(Self { role, broker_addr, relay_addr, grant, holder, own_noise_private, listen_addr, relay_only, front_door, front_door_cert, circuit_relay })
     }
 }
 
@@ -1194,6 +1264,32 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             cfg.listen_addr.to_string()
         },
     };
+    // #136 N-wire: a relay-only (NAT-to-NAT) member with a libp2p circuit relay configured runs
+    // the DCUtR-upgradable relay join — start on the edge relay, then opportunistically hole-punch
+    // to a direct link via the circuit relay. Both members are NAT'd, so this is the only path that
+    // can ever go direct; without a circuit relay it falls through to the plain relay session below.
+    if cfg.relay_only {
+        if let Some(circuit) = cfg.circuit_relay.clone() {
+            let relay_conn = crate::transport::build_channel_dialer()?
+                .connect(cfg.relay_addr, "localhost")?
+                .await?;
+            let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+            eprintln!(
+                "ct-agent channel: relay-only DCUtR-upgradable {:?} (relay {}, circuit {})",
+                cfg.role, cfg.relay_addr, circuit
+            );
+            return join_via_relay_dcutr(
+                &relay_conn,
+                &request,
+                &cfg.holder,
+                cfg.role,
+                &cfg.own_noise_private,
+                local,
+                circuit,
+            )
+            .await;
+        }
+    }
     // Broker admission (the grant + possession proof are the auth; Noise_IK authenticates
     // the peer end-to-end). With a `:443` front-door cert configured, walk the broker
     // ladder — direct QUIC first, then the `:443` TLS-TCP front door — so a network that
@@ -3503,6 +3599,23 @@ mod tests {
         for routable in ["203.0.113.10:7000", "8.8.8.8:7000", "[2001:4860:4860::8888]:7000"] {
             assert!(!relay_only_mode(false, routable.parse().unwrap()), "{routable} stays direct-capable");
         }
+    }
+
+    #[test]
+    fn parse_circuit_relay_is_optional_and_rejects_a_malformed_multiaddr() {
+        // #136 N-wire (frozen): CT_CHANNEL_CIRCUIT_RELAY is the libp2p circuit-relay for the DCUtR
+        // punch. Absent/blank => None (plain relay session, no punch); a valid multiaddr parses;
+        // a malformed value is an error (a typo must not silently disable the hole-punch).
+        assert_eq!(parse_circuit_relay(None), Ok(None));
+        assert_eq!(parse_circuit_relay(Some("   ".to_string())), Ok(None));
+
+        // A valid Circuit-Relay v2 multiaddr (relay TCP addr + /p2p-circuit) parses + round-trips.
+        let ma = "/ip4/203.0.113.1/tcp/4001/p2p-circuit";
+        let parsed = parse_circuit_relay(Some(ma.to_string())).expect("valid multiaddr parses");
+        assert_eq!(parsed.map(|m| m.to_string()), Some(ma.to_string()));
+
+        // A malformed value fails config load (not silently dropped).
+        assert!(parse_circuit_relay(Some("not-a-multiaddr".to_string())).is_err());
     }
 
     #[test]
