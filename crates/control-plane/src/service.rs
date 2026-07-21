@@ -927,7 +927,12 @@ async fn topology_editor(
         .topologies
         .edges(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges)))
+    let mode = state
+        .topologies
+        .overlay_mode(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or(ct_common::overlay::RoutingApproach::Baseline);
+    Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges, mode.as_str())))
 }
 
 /// A caller-supplied candidate link + its measured latency cost, the input to the overlay
@@ -1182,7 +1187,7 @@ body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;b
 header.bar{display:flex;align-items:center;gap:.9rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
 .title{font-size:1rem;font-weight:650;letter-spacing:-.01em}
 .chip{font:500 .78rem/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:.32rem .62rem}
-.hint{margin-left:auto;color:var(--muted);font-size:.82rem}
+.hint{color:var(--muted);font-size:.82rem}
 .stage{flex:1;min-height:0}
 svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var(--bg)}
 .dot{fill:var(--line);opacity:.55}
@@ -1195,6 +1200,11 @@ svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var
 .node .handle{fill:var(--accent2);opacity:.85}
 .node .label{fill:var(--ink);font:600 12px system-ui,sans-serif;pointer-events:none}
 .empty{fill:var(--muted);font:500 15px system-ui,sans-serif}
+.bar label{margin-left:auto;color:var(--muted);font-size:.82rem;display:flex;align-items:center;gap:.4rem}
+.bar select,.bar button{font:inherit;font-size:.82rem;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.35rem .6rem;cursor:pointer}
+.bar button.primary{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
+.bar button.primary:hover{filter:brightness(1.06)}
+#msg{color:var(--muted);font-size:.8rem;min-width:6rem}
 "#;
 
 /// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
@@ -1212,6 +1222,23 @@ const EDITOR_JS: &str = r#"
  svg.addEventListener('pointermove',function(e){if(!sel)return;var p=pt(e),x=p.x-dx,y=p.y-dy;sel.setAttribute('data-cx',x);sel.setAttribute('data-cy',y);sel.setAttribute('transform','translate('+x+','+y+')');redraw();});
  svg.addEventListener('pointerup',function(){sel=null;});
  redraw();
+ // #107-ui: the overlay-mode toggle + suggest button, wired to the owner REST endpoints.
+ var tid=document.body.getAttribute('data-tid');
+ var msg=document.getElementById('msg');
+ function say(t){if(msg)msg.textContent=t;}
+ var modeSel=document.getElementById('mode');
+ if(modeSel){modeSel.addEventListener('change',function(){
+  fetch('/me/topologies/'+encodeURIComponent(tid)+'/mode',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({mode:modeSel.value})})
+   .then(function(r){say(r.ok?'mode: '+modeSel.value:'mode change failed ('+r.status+')');});
+ });}
+ var sug=document.getElementById('suggest');
+ if(sug){sug.addEventListener('click',function(){
+  var links=[];svg.querySelectorAll('.edge').forEach(function(ed){links.push({a:ed.getAttribute('data-a'),b:ed.getAttribute('data-b'),cost:1});});
+  fetch('/me/topologies/'+encodeURIComponent(tid)+'/suggest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({links:links})})
+   .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+   .then(function(p){say('suggested '+p.links.length+' links, cost '+p.total_cost+(p.connected?' (connected)':' (partition)'));})
+   .catch(function(s){say('suggest unavailable ('+s+')');});
+ });}
 })();
 "#;
 
@@ -1219,12 +1246,15 @@ const EDITOR_JS: &str = r#"
 /// (CSP-safe, no external assets), theme-aware, **draggable** SVG node-graph of the
 /// topology — agents as rounded node-cards on a dotted canvas, links as smooth bezier
 /// edges. Server-emitted geometry means it renders correctly without JS (progressive
-/// enhancement); the inline JS only adds drag interactivity. Agent ids are HTML-escaped
-/// (XSS-safe). An empty topology yields a valid page with an empty-state hint.
+/// enhancement); the inline JS only adds drag interactivity + the overlay-mode toggle and
+/// "Suggest overlay" action (wired to the owner REST endpoints). Agent ids are HTML-escaped
+/// (XSS-safe). An empty topology yields a valid page with an empty-state hint. `mode` is the
+/// topology's current [`overlay mode`](topology_set_mode) token, pre-selected in the toggle.
 fn render_topology_editor(
     t: &crate::topology::Topology,
     agents: &[String],
     edges: &[(String, String)],
+    mode: &str,
 ) -> String {
     use std::f64::consts::PI;
     let esc = crate::portal::escape;
@@ -1299,18 +1329,39 @@ fn render_topology_editor(
         format!("{defs}{edge_svg}{node_svg}")
     };
 
+    // The overlay-mode toggle (#107-ui-mode): direct vs the complex-adaptive modes, current
+    // pre-selected. Each option value is a canonical `RoutingApproach` token the `PUT …/mode`
+    // endpoint accepts.
+    let opt = |v: &str, label: &str| {
+        format!(
+            "<option value=\"{v}\"{sel}>{label}</option>",
+            sel = if mode == v { " selected" } else { "" }
+        )
+    };
+    let mode_options = format!(
+        "{}{}{}{}",
+        opt("baseline", "Direct"),
+        opt("smart-route", "Adaptive (min-latency)"),
+        opt("shortcut", "Adaptive + shortcuts"),
+        opt("random-mesh", "Random mesh"),
+    );
+
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Topology Editor — {uuid}</title><style>{css}</style></head><body>\
+         <title>Topology Editor — {uuid}</title><style>{css}</style></head><body data-tid=\"{tid}\">\
          <header class=\"bar\"><span class=\"title\">Topology Editor</span>\
          <span class=\"chip\">net:{uuid}</span>\
          <span class=\"chip\">{na} agents</span><span class=\"chip\">{ne} links</span>\
-         <span class=\"hint\">drag nodes to arrange</span></header>\
+         <span class=\"hint\">drag nodes to arrange</span>\
+         <label>overlay <select id=\"mode\">{mode_options}</select></label>\
+         <button id=\"suggest\" class=\"primary\">Suggest overlay</button>\
+         <span id=\"msg\"></span></header>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
          preserveAspectRatio=\"xMidYMid meet\" role=\"application\" aria-label=\"topology node graph\">\
          {content}</svg></div><script>{js}</script></body></html>",
         uuid = esc(&t.net_uuid),
+        tid = esc(&t.id),
         na = agents.len(),
         ne = edges.len(),
         css = EDITOR_CSS,
@@ -3425,7 +3476,7 @@ mod tests {
             ("agent-2".to_string(), "agent-3".to_string()),
             ("agent-1".to_string(), "agent-3".to_string()),
         ];
-        let html = render_topology_editor(&t, &agents, &edges);
+        let html = render_topology_editor(&t, &agents, &edges, "smart-route");
 
         // A complete, self-contained HTML document.
         assert!(html.starts_with("<!doctype html>") && html.contains("</html>"), "full HTML doc");
@@ -3439,15 +3490,22 @@ mod tests {
         assert_eq!(html.matches("class=\"edge\"").count(), 3, "one bezier edge per link");
         assert!(html.contains("data-node=\"agent-2\"") && html.contains("data-cx="), "draggable node geometry");
         assert!(html.contains("net:uuid-xyz"), "shows the net-uuid");
+        // #107-ui-mode/-suggest controls: the overlay-mode toggle (current pre-selected), the
+        // suggest button, and the topology id for the REST fetches.
+        assert!(html.contains("<select id=\"mode\">"), "overlay-mode toggle present");
+        assert!(html.contains("value=\"baseline\">Direct") && html.contains("value=\"smart-route\" selected"), "current mode pre-selected");
+        assert!(html.contains("id=\"suggest\""), "suggest button present");
+        assert!(html.contains("data-tid=\"t1\""), "topology id embedded for the REST fetches");
+        assert!(html.contains("/mode") && html.contains("/suggest"), "wired to the owner endpoints");
 
         // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
         let evil = vec!["<script>alert(1)</script>".to_string()];
-        let evil_html = render_topology_editor(&t, &evil, &[]);
+        let evil_html = render_topology_editor(&t, &evil, &[], "baseline");
         assert!(!evil_html.contains("<script>alert(1)"), "hostile agent id is escaped");
         assert!(evil_html.contains("&lt;script&gt;alert(1)"), "escaped form is present");
 
         // An empty topology still yields a valid page with an empty-state hint (no panic).
-        let empty = render_topology_editor(&t, &[], &[]);
+        let empty = render_topology_editor(&t, &[], &[], "baseline");
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
     }
 
