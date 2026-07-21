@@ -23,11 +23,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let listen = args.next().unwrap_or_else(|| "/ip4/0.0.0.0/tcp/4001".to_string());
             ct_agent::p2p::nat_lab_relay(&listen).await
         }
+        Some("listen") => {
+            let relay = args.next().ok_or("listen needs <relay-multiaddr>")?;
+            ct_agent::p2p::nat_lab_listen(relay.parse()?).await
+        }
+        Some("dial") => {
+            let peer = args.next().ok_or("dial needs <peer-via-relay-multiaddr>")?;
+            ct_agent::p2p::nat_lab_dial(peer.parse()?).await
+        }
         other => {
             eprintln!(
                 "natlab: test-only #136 DCUtR punch harness (feature nat-lab)\n\
-                 usage: natlab relay [<listen-multiaddr>]\n\
-                 (roles listen/dial land in N-rig-2b part 2)"
+                 usage: natlab relay  [<listen-multiaddr>]\n\
+                        natlab listen <relay-multiaddr>\n\
+                        natlab dial   <peer-via-relay-multiaddr>"
             );
             eprintln!("unknown role: {other:?}");
             std::process::exit(2);

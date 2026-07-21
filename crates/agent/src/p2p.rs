@@ -348,6 +348,68 @@ pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     }
 }
 
+/// #136 N-rig-2b part 2 (**test-only**, `nat-lab` feature): the **listen** punch client — the
+/// relay-only peer that *accepts* a punch. Builds a DCUtR client, listens on QUIC (a punchable
+/// UDP reflexive address), reserves a slot on `relay` (`<relay>/p2p/<relay-id>`), prints its
+/// dialable via-relay address (`LISTEN-ADDR <relay-circuit>/p2p/<self>`) once reserved, then
+/// waits for DCUtR to upgrade the relayed connection to **direct** — printing `PUNCH-OK` and
+/// exiting on `dcutr::Event { result: Ok(_) }`. Times out (non-zero) if no upgrade occurs.
+#[cfg(any(test, feature = "nat-lab"))]
+pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
+    let mut swarm = build_dcutr_relay_client_swarm()?;
+    let me = *swarm.local_peer_id();
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive address
+    let relay_circuit = relay.with(Protocol::P2pCircuit);
+    swarm.listen_on(relay_circuit.clone())?; // reserve on the relay
+    let deadline = tokio::time::sleep(Duration::from_secs(40));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err("nat-lab listen: no direct upgrade within 40s".into()),
+            ev = swarm.select_next_some() => match ev {
+                SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
+                    relay::client::Event::ReservationReqAccepted { .. },
+                )) => println!("LISTEN-ADDR {}/p2p/{}", relay_circuit, me),
+                SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(
+                    dcutr::Event { result: Ok(_), .. },
+                )) => {
+                    println!("PUNCH-OK");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// #136 N-rig-2b part 2 (**test-only**, `nat-lab` feature): the **dial** punch client — dials
+/// the listener through the relay (`peer_via_relay` = `<relay>/p2p-circuit/p2p/<listener>`),
+/// listening on QUIC so it too has a punchable reflexive address, then waits for DCUtR to
+/// upgrade the relayed connection to **direct** — printing `PUNCH-OK` and exiting on
+/// `dcutr::Event { result: Ok(_) }`. Times out (non-zero) if no upgrade occurs.
+#[cfg(any(test, feature = "nat-lab"))]
+pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
+    let mut swarm = build_dcutr_relay_client_swarm()?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive address
+    swarm.dial(peer_via_relay)?; // dial the listener through the relay
+    let deadline = tokio::time::sleep(Duration::from_secs(40));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err("nat-lab dial: no direct upgrade within 40s".into()),
+            ev = swarm.select_next_some() => {
+                if let SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(
+                    dcutr::Event { result: Ok(_), .. },
+                )) = ev
+                {
+                    println!("PUNCH-OK");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 /// Build a **relay client**'s swarm: TCP + noise + yamux, plus the Circuit-Relay v2 client
 /// transport (`with_relay_client`) so this peer can make a reservation on / dial through a
 /// relay, driving the composite [`RelayClientBehaviour`]. As on every transport, the fresh
