@@ -343,6 +343,11 @@ pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     eprintln!("nat-lab relay: peer {peer}, requested listen {listen}");
     loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            // The Circuit-Relay v2 server MUST advertise its own external address or a client's
+            // reservation is refused (`NoAddressesInReservation`) — there is no identify/AutoNAT
+            // in the lab to discover it, so confirm the bound address explicitly (as the
+            // in-process harness does). Without this the punch clients never reserve.
+            swarm.add_external_address(address.clone());
             println!("{address}/p2p/{peer}");
         }
     }
@@ -367,6 +372,14 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
         tokio::select! {
             _ = &mut deadline => return Err("nat-lab listen: no direct upgrade within 40s".into()),
             ev = swarm.select_next_some() => match ev {
+                // Advertise our DIRECT (non-relayed) QUIC listen addresses as external candidates
+                // so DCUtR has something to punch toward — without this the inbound side reports
+                // NoAddresses and the upgrade fails.
+                SwarmEvent::NewListenAddr { address, .. }
+                    if !address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) =>
+                {
+                    swarm.add_external_address(address);
+                }
                 SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { .. },
                 )) => println!("LISTEN-ADDR {}/p2p/{}", relay_circuit, me),
@@ -398,6 +411,16 @@ pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
         tokio::select! {
             _ = &mut deadline => return Err("nat-lab dial: no direct upgrade within 40s".into()),
             ev = swarm.select_next_some() => {
+                // Advertise our direct QUIC listen addresses as external candidates (as the
+                // listener does) so DCUtR can punch in both directions.
+                if let SwarmEvent::NewListenAddr { address, .. } = &ev {
+                    if !address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        swarm.add_external_address(address.clone());
+                    }
+                }
+                if let SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(e)) = &ev {
+                    eprintln!("dial: dcutr event: {e:?}");
+                }
                 if let SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(
                     dcutr::Event { result: Ok(_), .. },
                 )) = ev
