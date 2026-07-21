@@ -28,27 +28,49 @@ cleanup() {
   set +e
   ip netns del nsA 2>/dev/null
   ip netns del nsB 2>/dev/null
+  ip netns del nsR 2>/dev/null
   ip link del vethnsA 2>/dev/null
   ip link del vethnsB 2>/dev/null
-  ip link del pub0 2>/dev/null
+  ip link del pubR 2>/dev/null
   iptables -t nat -F 2>/dev/null
   iptables -F 2>/dev/null
 }
 trap cleanup EXIT
 cleanup # start from a clean slate even if a previous run died
 
-# --- public segment: the relay lives here, in the root namespace -----------------------
-ip link add pub0 type dummy
-ip addr add "${RELAY_PUB}/24" dev pub0
-ip link set pub0 up
-# Enable IPv4 forwarding via /proc (the slim image has no `sysctl`). Forwarding is ON so the
-# ONLY thing isolating the two NATs is the explicit FORWARD DROP below — a faithful "separate
-# NATs" emulation, and the prerequisite for the later punch smoke to traverse reflexively.
+# --- public backbone + a separate relay host (nsR) -------------------------------------
+# The relay lives in its OWN namespace (nsR), NOT colocated with the NAT gateways in root:
+# otherwise NAT egress to the relay is delivered locally (via `lo`) and bypasses SNAT, so the
+# relay would observe the peer's PRIVATE address (unpunchable). With nsR separate, NAT traffic
+# to the relay is routed OUT the public interface and SNAT'd, so the relay observes each peer's
+# distinct PUBLIC reflexive IP — exactly what DCUtR conveys and punches toward.
+#   root  = the "internet" backbone: forwards, owns the two NATs' public IPs + a gateway addr.
+#   nsR   = the relay host at RELAY_PUB.
+NAT_A_PUB=203.0.113.10
+NAT_B_PUB=203.0.113.20
+BACKBONE=203.0.113.254
+ip netns add nsR
+ip link add pubR type veth peer name inR
+ip link set inR netns nsR
+# root's public-side interface owns the backbone gateway addr + the two NATs' SNAT source IPs
+# (so root answers for them + conntrack can reverse-translate the punched/return flows).
+ip addr add "${BACKBONE}/24" dev pubR
+ip addr add "${NAT_A_PUB}/24" dev pubR
+ip addr add "${NAT_B_PUB}/24" dev pubR
+ip link set pubR up
+# The relay host.
+ip netns exec nsR ip addr add "${RELAY_PUB}/24" dev inR
+ip netns exec nsR ip link set inR up
+ip netns exec nsR ip link set lo up
+ip netns exec nsR ip route add default via "${BACKBONE}"
+# Enable IPv4 forwarding via /proc (the slim image has no `sysctl`) so root routes between the
+# private subnets and the relay host; the two NATs stay isolated only by the explicit FORWARD
+# DROP below (a faithful "separate NATs" emulation).
 echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # --- one NAT'd host per private subnet, egress MASQUERADEd to the public segment --------
-setup_nat() { # $1=namespace  $2=third-octet
-  local ns=$1 net=$2
+setup_nat() { # $1=namespace  $2=third-octet  $3=this-NAT's-public-IP
+  local ns=$1 net=$2 pub=$3
   ip netns add "$ns"
   ip link add "veth${ns}" type veth peer name "in${ns}"
   ip link set "in${ns}" netns "$ns"
@@ -58,15 +80,19 @@ setup_nat() { # $1=namespace  $2=third-octet
   ip netns exec "$ns" ip link set "in${ns}" up
   ip netns exec "$ns" ip link set lo up
   ip netns exec "$ns" ip route add default via "10.0.${net}.1"
-  # NAT: this private subnet's egress to the public segment is source-masqueraded, so the
-  # relay (and any reflexive observer) sees the gateway's public address, never 10.0.x.2.
-  iptables -t nat -A POSTROUTING -s "10.0.${net}.0/24" -o pub0 -j MASQUERADE
+  # NAT: source-NAT this private subnet's egress to the public segment to its OWN distinct
+  # public IP (SNAT, not MASQUERADE — MASQUERADE would pick the shared primary). conntrack
+  # tracks the flow (TCP + UDP), so the reverse path of an established/punched flow returns to
+  # the internal host, while unsolicited inbound (no prior outbound) has no mapping and is dropped.
+  iptables -t nat -A POSTROUTING -s "10.0.${net}.0/24" -o pubR -j SNAT --to-source "$pub"
 }
-setup_nat nsA 1
-setup_nat nsB 2
+setup_nat nsA 1 "$NAT_A_PUB"
+setup_nat nsB 2 "$NAT_B_PUB"
 
-# NAT isolation: the two private subnets cannot route to each other — only outbound to the
-# public relay. Unsolicited inbound between them is dropped, exactly as separate NATs behave.
+# NAT isolation: block direct access to the OTHER NAT's PRIVATE space (10.0.x.0/24). This does
+# NOT block a hole-punch: the punch targets the peer's distinct PUBLIC IP (SNAT/conntrack path,
+# source becomes the punching NAT's public IP), never its private 10.0.x.2 — so a session that
+# never upgrades stays relayed, but a real UDP punch toward the reflexive public IP can traverse.
 iptables -A FORWARD -s 10.0.1.0/24 -d 10.0.2.0/24 -j DROP
 iptables -A FORWARD -s 10.0.2.0/24 -d 10.0.1.0/24 -j DROP
 
@@ -96,7 +122,7 @@ expect_blocked "nsB cannot reach nsA directly"     ip netns exec nsB ping -c1 -W
 # receiver nsB), then 9000 (the sender nsA); it accepts one connection each and bridges them.
 relay_splice() {
   local got; got=$(mktemp)
-  socat "TCP-LISTEN:9001,reuseaddr" "TCP-LISTEN:9000,reuseaddr" & local relay=$!
+  ip netns exec nsR socat "TCP-LISTEN:9001,reuseaddr" "TCP-LISTEN:9000,reuseaddr" & local relay=$!
   sleep 0.3
   ip netns exec nsB timeout 4 socat -u "TCP:${RELAY_PUB}:9001" - >"$got" & local rcv=$!
   sleep 0.6 # let nsB connect so socat advances to listening on 9000
@@ -109,6 +135,26 @@ relay_splice() {
   return $r
 }
 expect_ok "payload from nsA reaches nsB THROUGH the public relay (base leg)" relay_splice
+
+# --- distinct reflexive addresses (the punch prerequisite) ------------------------------
+# The whole point of the per-NAT SNAT: each peer must present a DISTINCT public source IP so
+# the other has a real reflexive address to hole-punch toward. A public UDP observer records
+# the source address of a datagram from each namespace; nsA must appear as NAT_A_PUB and nsB as
+# NAT_B_PUB (never a shared IP). This is exactly the address DCUtR conveys + punches toward.
+distinct_reflexive() {
+  local srcs; srcs=$(mktemp)
+  ip netns exec nsR socat -u "UDP4-RECVFROM:9500,fork" SYSTEM:"printf '%s ' \"\$SOCAT_PEERADDR\" >>$srcs" & local obs=$!
+  sleep 0.3
+  ip netns exec nsA bash -c "printf x | socat -u - UDP4-SENDTO:${RELAY_PUB}:9500" || true
+  ip netns exec nsB bash -c "printf x | socat -u - UDP4-SENDTO:${RELAY_PUB}:9500" || true
+  sleep 0.5
+  kill "$obs" 2>/dev/null || true
+  grep -q "$NAT_A_PUB" "$srcs" && grep -q "$NAT_B_PUB" "$srcs"
+  local rc=$?
+  rm -f "$srcs"
+  return $rc
+}
+expect_ok "nsA=${NAT_A_PUB} and nsB=${NAT_B_PUB}: distinct public reflexive IPs (punchable)" distinct_reflexive
 
 echo "== nat-lab: ${pass} passed, ${fail} failed =="
 [ "$fail" -eq 0 ]
