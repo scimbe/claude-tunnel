@@ -534,16 +534,26 @@ mod tests {
         let out_a = a.await.expect("a");
         let out_b = b.await.expect("b");
         let _ = srv.await;
-        assert_eq!(
-            out_a,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.2:7002".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None, observed_reflexive: None },
-            "agent A learns B's endpoint"
-        );
-        assert_eq!(
-            out_b,
-            ChannelJoinOutcome::Admitted { peer_endpoint: "203.0.113.1:7001".to_string(), peer_noise_pubkey: None, peer_holder: None, peer_attestation: None, observed_reflexive: None },
-            "agent B learns A's endpoint"
-        );
+        // Each side learns the PEER's endpoint AND (#121 B1-follow) its OWN edge-observed
+        // reflexive from the live rendezvous finisher — previously `None`, now the loopback
+        // source it connected from.
+        for (out, peer_ep, who) in [(out_a, "203.0.113.2:7002", "A"), (out_b, "203.0.113.1:7001", "B")] {
+            match out {
+                ChannelJoinOutcome::Admitted {
+                    peer_endpoint,
+                    peer_noise_pubkey,
+                    peer_holder,
+                    peer_attestation,
+                    observed_reflexive,
+                } => {
+                    assert_eq!(peer_endpoint, peer_ep, "agent {who} learns the peer endpoint");
+                    assert_eq!((peer_noise_pubkey, peer_holder, peer_attestation), (None, None, None));
+                    let r = observed_reflexive.expect("learns its reflexive via the live rendezvous finisher");
+                    assert!(r.ip().is_loopback(), "agent {who} reflexive is the loopback source it dialed from");
+                }
+                other => panic!("expected Admitted, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -606,28 +616,30 @@ mod tests {
         let out_a = a.await.expect("a");
         let out_b = b.await.expect("b");
         let _ = srv.await;
-        assert_eq!(
-            out_a,
-            ChannelJoinOutcome::Admitted {
-                peer_endpoint: "203.0.113.2:7002".to_string(),
-                peer_noise_pubkey: Some(noise_b),
-                peer_holder: Some(hkey_b),
-                peer_attestation: Some(attest_b),
-                observed_reflexive: None,
-            },
-            "agent A learns B's endpoint, Noise key, holder, AND attestation"
-        );
-        assert_eq!(
-            out_b,
-            ChannelJoinOutcome::Admitted {
-                peer_endpoint: "203.0.113.1:7001".to_string(),
-                peer_noise_pubkey: Some(noise_a),
-                peer_holder: Some(hkey_a),
-                peer_attestation: Some(attest_a),
-                observed_reflexive: None,
-            },
-            "agent B learns A's endpoint, Noise key, holder, AND attestation"
-        );
+        // A learns B's endpoint + attested Noise key/holder/attestation, plus its OWN
+        // reflexive from the live finisher (#121 B1-follow — loopback source here).
+        for (out, peer_ep, pn, ph, pa, who) in [
+            (out_a, "203.0.113.2:7002", noise_b, hkey_b, attest_b, "A"),
+            (out_b, "203.0.113.1:7001", noise_a, hkey_a, attest_a, "B"),
+        ] {
+            match out {
+                ChannelJoinOutcome::Admitted {
+                    peer_endpoint,
+                    peer_noise_pubkey,
+                    peer_holder,
+                    peer_attestation,
+                    observed_reflexive,
+                } => {
+                    assert_eq!(peer_endpoint, peer_ep, "agent {who} learns the peer endpoint");
+                    assert_eq!(peer_noise_pubkey, Some(pn), "agent {who} learns the peer Noise key");
+                    assert_eq!(peer_holder, Some(ph), "agent {who} learns the peer holder");
+                    assert_eq!(peer_attestation, Some(pa), "agent {who} learns the peer attestation");
+                    let r = observed_reflexive.expect("learns its reflexive via the live rendezvous finisher");
+                    assert!(r.ip().is_loopback(), "agent {who} reflexive is the loopback source");
+                }
+                other => panic!("expected Admitted, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

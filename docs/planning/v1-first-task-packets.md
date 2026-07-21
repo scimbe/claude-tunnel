@@ -3265,12 +3265,7 @@ slices:
     `safe_endpoint_rejects_private_and_internal_ranges` still passes; the SSRF filter and the classifier now agree
     by construction). Frozen `reachability_class_maps_advertised_and_reflexive_to_a_class` (the 5-case matrix) and
     `is_global_unicast_matches_the_edge_ssrf_filter_ranges`.
-  - **Deferred to a trivial B1-follow slice** (not built here): wiring the `r=<addr>` token into the **live**
-    pair-completion acks (`finish_rendezvous_pair`/`finish_relay_pair`/`resolve_channel_join`) so a member learns
-    its reflexive during production rendezvous/relay pairing — the observed address is captured + returned at the
-    admission seam and the client-side parse is done, so this is just emitting the token in the finisher acks (the
-    relay 2-byte-ack path needs the open ADR wire decision). B1 proves the full observe→report→learn round trip
-    end-to-end at the admission seam today.
+  - **B1-follow ✅ (reflexive token wired into the live rendezvous finisher):** `AdmittedMember` now carries the edge-observed `observed` reflexive (previously discarded as `_observed` in `accept_member`), and `finish_rendezvous_pair` appends each member's OWN reflexive as the ` r=<addr>` token to its `OK` ack — so a member learns its punch address during **live rendezvous pairing**, not just at the isolated admission seam. The client parse was already in place (`present_channel_join` → `Admitted { observed_reflexive: Some(..) }`). Frozen via the two rendezvous e2e tests (`two_agent_clients_learn_each_others_endpoint`, `rendezvous_relays_each_peers_attested_noise_key`) which now assert each member learns its reflexive (the loopback source), previously `None`. Gate green, 0 warnings. **Still deferred:** the relay bare-`OK` acks (`finish_relay_pair` / `finish_relay_pair_over_streams`) — a relay member is `RelayOnly` with no punchable reflexive, and the 2-byte-ack path needs the open ADR wire decision; `resolve_channel_join`'s single-join ack is likewise unchanged (not a paired-punch path).
 - **#121-punch-signal (Phase B2) ⏳**: broker punch-coordination signalling — relay the peer's reflexive address +
   a synchronized instant to both members (the hole-punch/DCUtR; punches toward the B1 reflexive).
 - **#121-simultaneous-open (Phase B2) ⏳**: client simultaneous-open at the agreed instant.

@@ -594,6 +594,10 @@ pub(crate) struct AdmittedMember {
     operator: [u8; 32],
     noise: Option<[u8; 32]>,
     attest: Option<[u8; 64]>,
+    /// #121 Phase B1: this member's **reflexive** (post-NAT) source as the edge observed it
+    /// on the admitted connection — echoed back to the member as the `r=<addr>` ack token so
+    /// it learns its punch address during live rendezvous pairing (the B1-follow slice).
+    observed: std::net::SocketAddr,
 }
 
 /// Accept one QUIC connection and admit its channel-join, returning it as an
@@ -609,14 +613,13 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    // #121 Phase B1: the observed reflexive address is captured at admission and returned by
-    // `accept_and_read_join`; wiring it into the pair-completion ack (so a member learns its
-    // reflexive during live rendezvous/relay) is the deferred B1 follow slice, so it is not
-    // carried on `AdmittedMember` yet — the primitive's edge-observe→report→client-parse round
-    // trip is proven end-to-end at the admission seam by the reflexive round-trip tests.
-    let (conn, send, req, operator, noise, attest, _observed) =
+    // #121 Phase B1-follow: the observed reflexive address is captured at admission and now
+    // carried on `AdmittedMember` so `finish_rendezvous_pair` can echo it back as the
+    // `r=<addr>` ack token — the member learns its punch address during live rendezvous
+    // pairing (not only at the isolated admission seam).
+    let (conn, send, req, operator, noise, attest, observed) =
         accept_and_read_join(endpoint, now, authorize).await?;
-    Ok(AdmittedMember { conn, send, req, operator, noise, attest })
+    Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed })
 }
 
 /// Complete a **rendezvous** pairing for two already-admitted members: authorize the
@@ -634,12 +637,17 @@ pub(crate) async fn finish_rendezvous_pair(
 ) -> Result<ChannelPairing, BoxError> {
     match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
         Ok(pairing) => {
+            // Each side's ack carries the PEER's endpoint/keys plus its OWN edge-observed
+            // reflexive as the trailing `r=<addr>` token (#121 B1-follow) — so a member learns
+            // its punch address during live rendezvous pairing. The client parses `r=` as a
+            // self-addressed, order-independent token (absent on legacy acks → `None`).
             a.send
                 .write_all(
                     format!(
-                        "OK {}{}",
+                        "OK {}{} r={}",
                         b.req.endpoint,
-                        member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest)
+                        member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
+                        a.observed
                     )
                     .as_bytes(),
                 )
@@ -647,9 +655,10 @@ pub(crate) async fn finish_rendezvous_pair(
             b.send
                 .write_all(
                     format!(
-                        "OK {}{}",
+                        "OK {}{} r={}",
                         a.req.endpoint,
-                        member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest)
+                        member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
+                        b.observed
                     )
                     .as_bytes(),
                 )
