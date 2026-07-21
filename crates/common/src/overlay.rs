@@ -316,6 +316,92 @@ where
     Ok(plan_network_overlay(network, latency, shortcut_budget))
 }
 
+/// The routing-approach factor for the #76 overlay study — the single cleanly-isolated
+/// independent variable a DoE run pins (#76 **OV3**, `CT_OVERLAY_ROUTING`). Each value
+/// selects how the controller wires the agents' A2A channels (#72) for that run, so runs
+/// differ in exactly this one factor:
+///
+/// - [`Baseline`](RoutingApproach::Baseline) — no overlay optimization: every pair relays
+///   through the edge (today's path); the control the overlay approaches are measured against.
+/// - [`SmartRoute`](RoutingApproach::SmartRoute) — the minimum-latency spanning tree
+///   ([`min_latency_overlay`]): a connected `N-1`-link backbone of least total latency.
+/// - [`Shortcut`](RoutingApproach::Shortcut) — the spanning tree plus latency-reducing
+///   shortcut links ([`add_shortcuts`]): extra links for lower worst-case path latency.
+/// - [`RandomMesh`](RoutingApproach::RandomMesh) — a random set of allowed links (the mesh
+///   control): connectivity without latency-awareness, isolating what latency-directed
+///   wiring actually buys.
+///
+/// This packet is the factor *selector* only (the enum + its `CT_OVERLAY_ROUTING` parse);
+/// threading a pinned value into the live N-agent run + emulator sweep is OV4/OV5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RoutingApproach {
+    /// No overlay optimization — relay through the edge (the study's control).
+    #[default]
+    Baseline,
+    /// Minimum-latency spanning tree ([`min_latency_overlay`]).
+    SmartRoute,
+    /// Spanning tree + latency-reducing shortcuts ([`add_shortcuts`]).
+    Shortcut,
+    /// A random allowed-link mesh — connectivity without latency-awareness.
+    RandomMesh,
+}
+
+impl RoutingApproach {
+    /// The canonical `CT_OVERLAY_ROUTING` token — stable across runs, so it can key a
+    /// results-CSV column (#76 OV1/OV6) without ambiguity.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RoutingApproach::Baseline => "baseline",
+            RoutingApproach::SmartRoute => "smart-route",
+            RoutingApproach::Shortcut => "shortcut",
+            RoutingApproach::RandomMesh => "random-mesh",
+        }
+    }
+
+    /// Parse the `CT_OVERLAY_ROUTING` factor token. Case-insensitive and accepts `_` as an
+    /// alias for `-` (so `SMART_ROUTE` == `smart-route`). An unknown token is an explicit
+    /// error — a DoE run must pin a **known** factor level, never silently fall back to the
+    /// baseline and thereby mislabel its results.
+    pub fn parse(token: &str) -> Result<Self, UnknownRoutingApproach> {
+        match token.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "baseline" => Ok(RoutingApproach::Baseline),
+            "smart-route" => Ok(RoutingApproach::SmartRoute),
+            "shortcut" => Ok(RoutingApproach::Shortcut),
+            "random-mesh" => Ok(RoutingApproach::RandomMesh),
+            _ => Err(UnknownRoutingApproach(token.to_string())),
+        }
+    }
+}
+
+impl std::str::FromStr for RoutingApproach {
+    type Err = UnknownRoutingApproach;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl std::fmt::Display for RoutingApproach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An unrecognized `CT_OVERLAY_ROUTING` token (echoes the offending value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownRoutingApproach(pub String);
+
+impl std::fmt::Display for UnknownRoutingApproach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown CT_OVERLAY_ROUTING factor {:?} (expected baseline|smart-route|shortcut|random-mesh)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownRoutingApproach {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +612,39 @@ mod tests {
         ]);
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(serde_json::from_str::<OverlayPlan>(&json).unwrap(), plan);
+    }
+
+    #[test]
+    fn routing_approach_parses_the_four_doe_factor_levels_and_rejects_unknown() {
+        // #76 OV3: the DoE factor selector. Every level parses, round-trips its canonical
+        // CT_OVERLAY_ROUTING token, and an unknown token is an explicit error (never a
+        // silent fallback to baseline — that would mislabel a run's results).
+        use RoutingApproach::*;
+        for (token, approach) in [
+            ("baseline", Baseline),
+            ("smart-route", SmartRoute),
+            ("shortcut", Shortcut),
+            ("random-mesh", RandomMesh),
+        ] {
+            assert_eq!(RoutingApproach::parse(token), Ok(approach), "{token} parses");
+            // Canonical token round-trips: as_str() is exactly the accepted token.
+            assert_eq!(approach.as_str(), token);
+            assert_eq!(RoutingApproach::parse(approach.as_str()), Ok(approach));
+            // Display == as_str, and FromStr agrees with parse.
+            assert_eq!(approach.to_string(), token);
+            assert_eq!(token.parse::<RoutingApproach>(), Ok(approach));
+        }
+
+        // Case-insensitive + `_` alias for `-` (env values are forgiving on separator/case).
+        assert_eq!(RoutingApproach::parse("SMART_ROUTE"), Ok(SmartRoute));
+        assert_eq!(RoutingApproach::parse("  Random_Mesh  "), Ok(RandomMesh));
+
+        // Default is the control (baseline).
+        assert_eq!(RoutingApproach::default(), Baseline);
+
+        // An unknown factor is rejected and the offending token is echoed.
+        let err = RoutingApproach::parse("mesh-routing").unwrap_err();
+        assert_eq!(err, UnknownRoutingApproach("mesh-routing".to_string()));
+        assert!(err.to_string().contains("mesh-routing"));
     }
 }
