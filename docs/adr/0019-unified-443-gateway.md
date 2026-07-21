@@ -99,7 +99,7 @@ party is acceptable.
   proxy HTTP to the control plane; stream both directions.
 - **GW3** Edge-side ACME (TLS-ALPN-01) for the portal hostname on :443, with
   on-disk cert cache + renewal; staging CA in CI, prod in a gated job.
-- **GW4** Wire DNS + deployment (`A`/`*.A` records, `CT_GATEWAY_PORTAL_HOST`,
+- **GW4** Wire DNS + deployment (`A`/`*.A` records, `CT_EDGE_PORTAL_HOST`,
   proxy target, ACME config) and document the everything-on-443 topology.
 - **(#23) BP4b/BP4c/BP5** cover the customer-subdomain half: hostname-ownership
   authorization, agent DNS-01, and the real-browser e2e. Not duplicated here.
