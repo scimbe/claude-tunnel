@@ -392,6 +392,11 @@ fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, 
     let swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
+        // #136: also carry the QUIC/UDP transport. TCP hole-punching through stateful NAT is
+        // unreliable/often infeasible; DCUtR's direct upgrade prefers QUIC (UDP), where the
+        // hole-punch actually works — the client must therefore have a QUIC transport + listen
+        // address to punch toward. The relay coordination leg can remain TCP.
+        .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|key, relay_client| DcutrRelayClientBehaviour {
             relay_client,

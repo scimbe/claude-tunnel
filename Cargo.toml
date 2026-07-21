@@ -25,7 +25,7 @@ license-file = "LICENSE"
 # `macros` for the `#[derive(NetworkBehaviour)]` that composes the relay-client + dcutr +
 # stream behaviours on a client swarm. MemoryTransport lives in libp2p-core (no feature
 # gate); no `dns` — we dial raw `/ip4/.../tcp/...` addresses.
-libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp", "relay", "dcutr", "kad", "macros"] }
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "noise", "yamux", "tcp", "quic", "relay", "dcutr", "kad", "macros"] }
 # Raw-substream protocol handler (the `stream::Behaviour`); a sibling crate, not an
 # umbrella feature. Gives us an `AsyncRead + AsyncWrite` stream out of the swarm.
 libp2p-stream = "0.4.0-alpha"
