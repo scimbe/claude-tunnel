@@ -54,13 +54,24 @@ pub enum ChannelJoinOutcome {
 /// challenge, answer with a 64-byte ed25519 signature over it; then read the
 /// `OK[ <endpoint>]` / `NO` ack. A refusal before the possession step finishes the
 /// stream with no challenge, which surfaces as [`ChannelJoinOutcome::Refused`].
+/// #140: how long the broker admission exchange (open the stream + send the join request + the
+/// possession challenge/response + read the ack) may take. It runs *after* `dial_peer_direct`
+/// connects but *before* #139 (post-admission stream setup) and #126 (Noise handshake) cover, so a
+/// transport-alive-but-stalled admission was previously unbounded — the same hang class as #139/#126,
+/// one layer earlier. Kept in the same 15s band.
+pub(crate) const ADMISSION_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub async fn present_channel_join(
     conn: &Connection,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
 ) -> Result<ChannelJoinOutcome, BoxError> {
-    let (send, recv) = conn.open_bi().await?;
-    present_channel_join_on_stream(send, recv, request, holder).await
+    // #140: bound `open_bi` too — it is the QUIC-path analog of the unbounded exchange below and
+    // was equally unbounded past dial_peer_direct's connect timeout.
+    let (send, recv) = tokio::time::timeout(ADMISSION_EXCHANGE_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| -> BoxError { "channel join open_bi stalled after connect (#140)".into() })??;
+    present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT).await
 }
 
 /// The transport-agnostic core of [`present_channel_join`]: run the channel-join wire
@@ -75,11 +86,17 @@ pub async fn present_channel_join_on_stream<W, R>(
     mut recv: R,
     request: &ChannelJoinRequest,
     holder: &SigningKey,
+    exchange_timeout: std::time::Duration,
 ) -> Result<ChannelJoinOutcome, BoxError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    // #140: bound the whole admission exchange so a transport-alive-but-stalled admission (broker not
+    // responding, half-open connection, early packet loss on this exchange) fails fast instead of
+    // hanging forever — the same bound-the-stall discipline as #139/#126. `exchange_timeout` is a
+    // parameter so tests drive it deterministically without waiting the production bound.
+    let exchange = async move {
     let bytes = request.encode();
     let len = u16::try_from(bytes.len()).map_err(|_| "channel join request too large")?;
     send.write_all(&len.to_be_bytes()).await?;
@@ -122,6 +139,11 @@ where
     let _ = recv.take(512).read_to_end(&mut ack).await;
     let ack = String::from_utf8_lossy(&ack);
     Ok(parse_channel_ack(&ack))
+    };
+    match tokio::time::timeout(exchange_timeout, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err("channel join admission exchange stalled (#140)".into()),
+    }
 }
 
 /// Parse a broker/relay admission ack into a [`ChannelJoinOutcome`]. `ack` is the whole ack
@@ -275,6 +297,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn present_channel_join_on_stream_bounds_a_stalled_admission_exchange() {
+        // #140 (frozen): the admission exchange runs after dial_peer_direct connects but BEFORE
+        // #139/#126 cover — an edge that accepts the stream but never sends the possession challenge
+        // hung the client forever with no fallback. The bound turns that into a fast error. Here the
+        // "edge" end stays open + silent (never writes the challenge), so the client's read blocks;
+        // the exchange must time out (~200ms), not hang.
+        use tokio::io::split;
+        let channel = [0x3Cu8; 32];
+        let holder = SigningKey::from_bytes(&[0x21u8; 32]);
+        let grant = signed_grant(channel, &holder, Direction::Initiate);
+        let request = ChannelJoinRequest { grant, endpoint: "203.0.113.7:7007".to_string() };
+
+        let (client_end, _silent_edge) = tokio::io::duplex(4096); // held open, never responds
+        let (cli_r, cli_w) = split(client_end);
+        let start = std::time::Instant::now();
+        let r = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, std::time::Duration::from_millis(200)).await;
+        assert!(r.is_err(), "a stalled admission exchange errors, it does not hang (#140)");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "the #140 bound fires fast (~200ms), not after a long hang"
+        );
+    }
+
+    #[tokio::test]
     async fn present_channel_join_on_stream_speaks_the_protocol_over_a_plain_duplex() {
         // #106 client-dial (frozen): the channel-join wire protocol is transport-agnostic
         // — it runs over a plain in-memory duplex (the stand-in for a TLS-over-TCP :443
@@ -295,7 +341,7 @@ mod tests {
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
             // send = write half, recv = read half — no quinn anywhere.
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
         });
 
         // Minimal "edge": read the framed request, challenge, verify possession, ack OK.
@@ -341,7 +387,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
         });
         // "edge": read the framed request, then send a malformed partial (neither 32 bytes
         // nor "NO") and close — a broken stream.
@@ -379,7 +425,7 @@ mod tests {
         let (client_end, edge_end) = tokio::io::duplex(4096);
         let (cli_r, cli_w) = split(client_end);
         let client = tokio::spawn(async move {
-            present_channel_join_on_stream(cli_w, cli_r, &request, &holder).await
+            present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT).await
         });
         let (mut er, mut ew) = split(edge_end);
         let mut len_buf = [0u8; 2];
@@ -734,7 +780,7 @@ mod tests {
 
         let client_tls = tcp_tls_connect(listen_addr, cert).await.expect("tls-tcp connect");
         let (cli_r, cli_w) = split(client_tls);
-        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder)
+        let outcome = present_channel_join_on_stream(cli_w, cli_r, &request, &holder, ADMISSION_EXCHANGE_TIMEOUT)
             .await
             .expect("join drives over the :443 duplex");
         let observed = srv.await.expect("edge task");

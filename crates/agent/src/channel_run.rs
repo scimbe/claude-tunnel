@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::channel::{
     present_channel_join, present_channel_join_on_stream, present_channel_relay_join_on_stream,
-    ChannelJoinOutcome,
+    ChannelJoinOutcome, ADMISSION_EXCHANGE_TIMEOUT,
 };
 use ct_common::a2a::{a2a_initiate, a2a_respond};
 use ct_common::noise::noise_pump;
@@ -1366,7 +1366,7 @@ pub async fn present_channel_join_via_ladder(
                     .await
                     .map_err(ChannelDialError::Failed)?;
                 let (recv, send) = tokio::io::split(stream);
-                present_channel_join_on_stream(send, recv, request, holder)
+                present_channel_join_on_stream(send, recv, request, holder, ADMISSION_EXCHANGE_TIMEOUT)
                     .await
                     .map_err(ChannelDialError::Failed)
             } else {
