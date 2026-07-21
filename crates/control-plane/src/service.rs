@@ -768,6 +768,7 @@ pub fn authed_topology_router(
         .route("/me/topologies", post(topology_create).get(topology_list))
         .route("/me/topologies/:id", get(topology_view))
         .route("/me/topologies/:id/mode", axum::routing::put(topology_set_mode))
+        .route("/me/topologies/:id/suggest", post(topology_suggest))
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
         .route("/me/topologies/:id/edges", post(topology_add_edge))
@@ -927,6 +928,99 @@ async fn topology_editor(
         .edges(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges)))
+}
+
+/// A caller-supplied candidate link + its measured latency cost, the input to the overlay
+/// suggestion (#107-ui-suggest). Costs will later come from live probes via
+/// `ct_common::overlay::link_cost_from_probes`; the endpoint stays transport-agnostic.
+#[derive(Deserialize)]
+struct SuggestLink {
+    a: String,
+    b: String,
+    cost: u64,
+}
+
+#[derive(Deserialize)]
+struct SuggestReq {
+    #[serde(default)]
+    links: Vec<SuggestLink>,
+    #[serde(default)]
+    shortcut_budget: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SuggestResp {
+    /// The topology's overlay mode the suggestion was computed under.
+    mode: String,
+    /// The suggested overlay links (canonical `(a, b)`).
+    links: Vec<(String, String)>,
+    total_cost: u64,
+    connected: bool,
+}
+
+/// The suggest endpoint's size caps (#113 — the optimizer must never wedge the control
+/// plane): `add_shortcuts` is O(budget·n³), so both the agent count and the shortcut budget
+/// are bounded before any optimization work.
+const MAX_SUGGEST_AGENTS: usize = 64;
+const MAX_SUGGEST_BUDGET: usize = 16;
+
+/// `POST /me/topologies/:id/suggest {links:[{a,b,cost}], shortcut_budget}` — surface the
+/// **adaptive overlay optimizer** (#107-ui-suggest): compute the best-physical-usage overlay
+/// over the topology's agents from the caller-supplied candidate link costs, respecting the
+/// topology's [`overlay mode`](topology_set_mode). *Direct* (`Baseline`) has no overlay to
+/// suggest → `409`; a complex-adaptive mode returns the minimum-latency spanning tree
+/// (`SmartRoute`), plus capped shortcut edges when the mode is `Shortcut`. Owner-scoped
+/// (`404`); size-capped (`400`) so it can't wedge the control plane.
+async fn topology_suggest(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SuggestReq>,
+) -> Result<Json<SuggestResp>, (StatusCode, String)> {
+    use ct_common::overlay::RoutingApproach;
+    let owner = subject_of(&state.verifier, &headers)?;
+    let t = owned_topology(&state, &owner, &id)?;
+    let mode = state
+        .topologies
+        .overlay_mode(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or(RoutingApproach::Baseline);
+    // Direct mode: the overlay is relay/direct only — there is nothing to optimize.
+    if mode == RoutingApproach::Baseline {
+        return Err((
+            StatusCode::CONFLICT,
+            "topology is in direct mode; switch to a complex overlay mode to compute a suggestion".to_string(),
+        ));
+    }
+    // Size caps before any O(budget·n³) work (#113).
+    if req.shortcut_budget > MAX_SUGGEST_BUDGET {
+        return Err((StatusCode::BAD_REQUEST, format!("shortcut_budget exceeds the cap ({MAX_SUGGEST_BUDGET})")));
+    }
+    let agents = state
+        .topologies
+        .agents_in(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if agents.len() > MAX_SUGGEST_AGENTS {
+        return Err((StatusCode::BAD_REQUEST, format!("topology exceeds the suggest agent cap ({MAX_SUGGEST_AGENTS})")));
+    }
+    let links: Vec<ct_common::overlay::WeightedLink> = req
+        .links
+        .iter()
+        .map(|l| ct_common::overlay::WeightedLink::new(l.a.as_str(), l.b.as_str(), l.cost))
+        .collect();
+    // The minimum-latency spanning-tree backbone; add capped shortcuts only in Shortcut mode.
+    let base = ct_common::overlay::min_latency_overlay(&agents, &links);
+    let plan = if mode == RoutingApproach::Shortcut {
+        ct_common::overlay::add_shortcuts(&agents, &links, base, req.shortcut_budget)
+    } else {
+        base
+    };
+    Ok(Json(SuggestResp {
+        mode: mode.as_str().to_string(),
+        links: plan.links,
+        total_cost: plan.total_cost,
+        connected: plan.connected,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -3234,6 +3328,39 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "unknown overlay mode -> 400"
         );
+
+        // #107-ui-suggest: in a complex-adaptive mode (smart-route, set above), the optimizer
+        // returns the minimum-latency overlay over the topology's agents. With one candidate
+        // link between the two members, the MST is exactly that link.
+        let sug = send("POST", format!("/me/topologies/{tid}/suggest"), Some(&alice),
+            r#"{"links":[{"a":"agent-1","b":"agent-2","cost":7}]}"#.into()).await.unwrap();
+        assert_eq!(sug.status(), StatusCode::OK, "suggest in a complex mode");
+        let body = to_bytes(sug.into_body(), 1 << 16).await.unwrap();
+        let s: SuggestResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(s.mode, "smart-route");
+        assert_eq!(s.links, vec![("agent-1".to_string(), "agent-2".to_string())]);
+        assert_eq!((s.total_cost, s.connected), (7, true), "MST spans both members");
+        // Size cap (#113): an over-budget shortcut request is refused before any O(n^3) work.
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/suggest"), Some(&alice), r#"{"links":[],"shortcut_budget":999}"#.into())
+                .await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "over-cap shortcut_budget -> 400"
+        );
+        // Direct mode has no overlay to suggest -> 409.
+        assert_eq!(
+            send("PUT", format!("/me/topologies/{tid}/mode"), Some(&alice), r#"{"mode":"baseline"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/suggest"), Some(&alice), r#"{"links":[]}"#.into())
+                .await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "direct mode -> nothing to suggest (409)"
+        );
+        // Restore the complex mode so later assertions are unaffected.
+        let _ = send("PUT", format!("/me/topologies/{tid}/mode"), Some(&alice), r#"{"mode":"smart-route"}"#.into()).await;
 
         // Owner isolation: mallory can't see or edit alice's topology.
         assert_eq!(
