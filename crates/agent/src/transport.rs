@@ -113,9 +113,22 @@ pub fn build_channel_dialer() -> Result<Endpoint, BoxError> {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
                 .with_no_client_auth();
-            let cfg = quinn::ClientConfig::new(Arc::new(
+            let mut cfg = quinn::ClientConfig::new(Arc::new(
                 quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
             ));
+            // #139: bound a dead-but-connected direct link at the transport level. Without a
+            // max_idle_timeout a QUIC connection that handshakes then goes silent (asymmetric NAT, a
+            // middlebox dropping post-handshake packets) never dies, so an await on it — `open_bi`,
+            // the Noise_IK handshake, the pump — can hang forever with no relay fallback. A ~20s idle
+            // timeout kills such a connection so those awaits error and the direct path can fall
+            // back; a 5s keepalive (< the idle timeout) holds a *live* but idle data session open so
+            // the timeout only ever fires on a genuinely dead path.
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_idle_timeout(Some(
+                quinn::IdleTimeout::try_from(std::time::Duration::from_secs(20)).expect("20s < quinn max idle"),
+            ));
+            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+            cfg.transport_config(Arc::new(transport));
             // A concurrent racer may win the set(); either config is equivalent.
             let _ = CLIENT_CONFIG.set(cfg.clone());
             cfg

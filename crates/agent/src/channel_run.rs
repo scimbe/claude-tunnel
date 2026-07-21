@@ -75,6 +75,34 @@ impl<W: AsyncWrite + Unpin, R: AsyncRead + Unpin> AsyncWrite for BiStream<W, R> 
     }
 }
 
+/// #139: how long a channel's QUIC stream setup (`open_bi`/`accept_bi`) may take past a successful
+/// `dial_peer_direct` connect before the direct path is treated as dead. A healthy connection sets
+/// the stream up sub-second; a conn that handshaked then went silent would otherwise hang here
+/// forever (the Noise handshake beyond this is already bounded, #126). Sits below the dialer's 20s
+/// idle-timeout (#139) so this tight bound fires first on the direct path.
+const DIRECT_STREAM_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Open (Initiate) or accept (Accept) the channel bi-stream on `conn`, **bounded** by `setup_timeout`
+/// (#139) so a stalled direct link fails fast (`io::ErrorKind::TimedOut`) instead of hanging — the
+/// exact `open_bi`/`accept_bi` gap central traced. The timeout is a parameter so tests can drive it
+/// deterministically without waiting the production bound.
+async fn open_channel_streams(
+    conn: &Connection,
+    role: ChannelRole,
+    setup_timeout: std::time::Duration,
+) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let open = async {
+        match role {
+            ChannelRole::Initiate => conn.open_bi().await.map_err(|e| map_err(Box::new(e))),
+            ChannelRole::Accept => conn.accept_bi().await.map_err(|e| map_err(Box::new(e))),
+        }
+    };
+    tokio::time::timeout(setup_timeout, open)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct channel stream setup stalled after connect (#139)"))?
+}
+
 /// Run one side of an A2A channel session over the established `conn`, then pump
 /// `local` (the CLI's stdio, or any duplex) over the encrypted tunnel until either
 /// end closes (#72 AF4-session-wire). `role` selects initiator/responder;
@@ -90,11 +118,12 @@ pub async fn run_channel_session<P>(
 where
     P: AsyncRead + AsyncWrite + Unpin,
 {
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| io::Error::new(io::ErrorKind::Other, e.to_string());
-    let (mut send, mut recv) = match role {
-        ChannelRole::Initiate => conn.open_bi().await.map_err(|e| map_err(Box::new(e)))?,
-        ChannelRole::Accept => conn.accept_bi().await.map_err(|e| map_err(Box::new(e)))?,
-    };
+    // #139: bound the channel stream setup. `dial_peer_direct` bounds only the QUIC *connect*; once
+    // it returns Ok(conn), `open_bi`/`accept_bi` here were unbounded — a conn that handshaked at the
+    // transport level then went dead hangs forever (the Noise handshake past this is already bounded,
+    // #126; this was the remaining gap). The dialer's idle-timeout (#139) is the transport-level
+    // backstop; this is the direct, tight bound on the exact call central traced.
+    let (mut send, mut recv) = open_channel_streams(conn, role, DIRECT_STREAM_SETUP_TIMEOUT).await?;
     // Pass the streams by `&mut` so `send` survives the pump (it moves the halves into a
     // `BiStream`), letting us drain it afterwards. #134: the pump FINs on plaintext EOF via
     // `shutdown()` = quinn `SendStream::finish()`, which only QUEUES the FIN — it does NOT wait
@@ -3332,6 +3361,37 @@ mod tests {
             .expect("responder task");
         assert!(ok, "the full {len}-byte payload was delivered (no truncation) despite the abrupt sender teardown (#134)");
         assert_eq!(got, expected, "delivered bytes are byte-exact and complete");
+    }
+
+    #[tokio::test]
+    async fn open_channel_streams_bounds_a_stalled_setup_instead_of_hanging() {
+        // #139 (frozen): after dial_peer_direct connects, open_bi/accept_bi were unbounded — a QUIC
+        // conn that handshaked then went dead hung the direct-session setup forever with no relay
+        // fallback. `open_channel_streams` bounds it. Here the client connects but NEVER opens the
+        // channel bi-stream, so the server's accept_bi would hang; the bound turns that into a fast
+        // `TimedOut`, which lets the direct path fall back to the relay instead of wedging.
+        use crate::transport::{build_channel_dialer, build_direct_listener_at};
+        let (server, _cert) = build_direct_listener_at("127.0.0.1:0".parse().unwrap()).expect("listener");
+        let addr = server.local_addr().expect("addr");
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await.expect("conn");
+            let start = std::time::Instant::now();
+            let r = open_channel_streams(&conn, ChannelRole::Accept, std::time::Duration::from_millis(300)).await;
+            (r.as_ref().err().map(|e| e.kind()), r.is_ok(), start.elapsed())
+        });
+
+        // Connect and hold the connection open, but NEVER open a bi-stream.
+        let dialer = build_channel_dialer().expect("dialer");
+        let _conn = dialer.connect(addr, "localhost").expect("cfg").await.expect("conn");
+
+        let (kind, ok, elapsed) = tokio::time::timeout(std::time::Duration::from_secs(5), srv)
+            .await
+            .expect("the bounded setup returns within 5s (a hang here is the #139 regression)")
+            .expect("join");
+        assert!(!ok, "a stalled stream setup errors, it does not hang or succeed");
+        assert_eq!(kind, Some(std::io::ErrorKind::TimedOut), "the stall is reported as TimedOut (#139)");
+        assert!(elapsed < std::time::Duration::from_secs(2), "the bound fires fast (~300ms), not after a long wait");
     }
 
     #[tokio::test]
