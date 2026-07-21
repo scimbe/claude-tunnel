@@ -1039,6 +1039,131 @@ impl SettleReceipt {
     }
 }
 
+/// The domain separating an agent-card preimage from every other signed object.
+const AGENT_CARD_DOMAIN: &[u8] = b"ct-agent-card-v1";
+
+/// An **affinity-group (cell) identifier** (#135 L1): a self-organized, task-scoped group of agents
+/// (e.g. #133's source/sink/central triangle). Opaque 32 bytes, same shape as [`ChannelId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CellId(pub [u8; 32]);
+
+/// A capability an agent advertises it can be asked to perform (#135 L1, A2A `AgentCard`-shaped):
+/// a stable `id`, a human `description`, and `examples` of use. Self-asserted advertisement — a
+/// reader learns *what the holder claims to offer*, and negotiates/authorizes the actual invocation
+/// separately (an `AgentCard` signature proves the holder issued the claim, never that it works).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skill {
+    pub id: String,
+    pub description: String,
+    pub examples: Vec<String>,
+}
+
+/// A **holder-signed, discoverable agent identity document** (#135 Layer 1) — an A2A `AgentCard`
+/// built on the ed25519 **holder** key this codebase already uses for channel membership. It says
+/// *who an agent is and what it offers*: its `role_tags`, `skills`, the `cells` it claims to sit in,
+/// and the `channels` it is reachable via — so a new participant can be discovered from a shared
+/// registry/vault instead of central hand-crafting each channel (the friction #133 onboarding paid).
+///
+/// **Self-assertion boundary (converged on #135):** every advertised field — `role_tags`, `skills`,
+/// and especially **`cells`** — is *self-asserted and unverified*. The signature proves only that the
+/// holder **issued** these claims, never that anyone **ratified** them (no one "admits" the holder to
+/// a cell here; that check, when it exists, lives at use-time against whatever backs the cell — a
+/// future governance layer). `cells` is empty/forward-looking until that layer lands. A reader trusts
+/// the *holder-issued* fact, then authorizes any actual action separately — the same discipline as
+/// [`BillingCommitment`]/[`SettleReceipt`], never the DHT/`PeerId` (invariant #1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCard {
+    /// The agent's ed25519 holder public key — the signature is checked against this, and it is the
+    /// same key family that authorizes the agent's channel membership + attests its Noise key.
+    pub holder_pubkey: [u8; 32],
+    pub role_tags: Vec<String>,
+    pub skills: Vec<Skill>,
+    /// Cells the holder *claims* membership in — self-asserted/unverified (see the type doc).
+    pub cells: Vec<CellId>,
+    /// Channels the holder advertises it is reachable via.
+    pub channels: Vec<ChannelId>,
+    pub issued_at: UnixSeconds,
+    pub expires_at: UnixSeconds,
+    /// The holder's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    pub signature: [u8; 64],
+}
+
+impl AgentCard {
+    /// Domain-separated, **canonical** preimage: `domain ‖ holder ‖ ⟨role_tags⟩ ‖ ⟨skills⟩ ‖
+    /// ⟨cells⟩ ‖ ⟨channels⟩ ‖ issued_at(LE) ‖ expires_at(LE)`, where every variable-length field is
+    /// length-prefixed (`count`/byte-`len` as u32 LE) so the encoding is injective — no two distinct
+    /// card contents share a preimage, and no field can be re-partitioned to forge an equivalent
+    /// signature. Fixed-wire binary (the codebase precedent), not JSON canonicalization.
+    pub fn signing_bytes(
+        holder_pubkey: &[u8; 32],
+        role_tags: &[String],
+        skills: &[Skill],
+        cells: &[CellId],
+        channels: &[ChannelId],
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> Vec<u8> {
+        fn put_str(m: &mut Vec<u8>, s: &str) {
+            m.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            m.extend_from_slice(s.as_bytes());
+        }
+        let mut m = Vec::new();
+        m.extend_from_slice(AGENT_CARD_DOMAIN);
+        m.extend_from_slice(holder_pubkey);
+        m.extend_from_slice(&(role_tags.len() as u32).to_le_bytes());
+        for t in role_tags {
+            put_str(&mut m, t);
+        }
+        m.extend_from_slice(&(skills.len() as u32).to_le_bytes());
+        for s in skills {
+            put_str(&mut m, &s.id);
+            put_str(&mut m, &s.description);
+            m.extend_from_slice(&(s.examples.len() as u32).to_le_bytes());
+            for e in &s.examples {
+                put_str(&mut m, e);
+            }
+        }
+        m.extend_from_slice(&(cells.len() as u32).to_le_bytes());
+        for c in cells {
+            m.extend_from_slice(&c.0);
+        }
+        m.extend_from_slice(&(channels.len() as u32).to_le_bytes());
+        for ch in channels {
+            m.extend_from_slice(&ch.0);
+        }
+        m.extend_from_slice(&issued_at.to_le_bytes());
+        m.extend_from_slice(&expires_at.to_le_bytes());
+        m
+    }
+
+    /// Whether this card is authentic AND still current at `now`: the holder signature verifies for
+    /// its exact contents and `now < expires_at`. A forged/tampered/expired card returns `false`.
+    /// This authenticates the *holder-issued claims* only — never that a self-asserted `cell`
+    /// membership or `skill` is ratified/working (see the struct doc).
+    pub fn is_valid(&self, now: UnixSeconds) -> bool {
+        if now >= self.expires_at {
+            return false;
+        }
+        match VerifyingKey::from_bytes(&self.holder_pubkey) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.holder_pubkey,
+                        &self.role_tags,
+                        &self.skills,
+                        &self.cells,
+                        &self.channels,
+                        self.issued_at,
+                        self.expires_at,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -2224,5 +2349,76 @@ mod tests {
             !self_attested.confirms_delivery(&ch, &receiver_id, &terms, &nonce, payload.len() as u64, &sender.digest()),
             "a send-side self-attested receipt is REFUSED — it is not signed by the expected receiver (#138)"
         );
+    }
+
+    #[test]
+    fn agent_card_verifies_authentic_claims_and_rejects_tampering_expiry_and_repartition() {
+        // #135 L1 (frozen): a holder-signed AgentCard authenticates the holder's SELF-ASSERTED claims
+        // (role_tags/skills/cells/channels) — verifies for its exact contents, dies at expiry, and
+        // any tamper breaks the holder signature. The signature proves the holder ISSUED the claims,
+        // never that a cell membership is ratified. Same discipline as BillingCommitment/SettleReceipt.
+        let sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let holder = sk.verifying_key().to_bytes();
+        let role_tags = vec!["source".to_string(), "reviewer".to_string()];
+        let skills = vec![Skill {
+            id: "fire_transfer_test".to_string(),
+            description: "trigger a live A2A transfer of N bytes".to_string(),
+            examples: vec!["fire_transfer_test(size_bytes=588895)".to_string()],
+        }];
+        let cells = vec![CellId([0x33u8; 32])];
+        let channels = vec![ChannelId([0x9bu8; 32])];
+        let (issued, expires) = (1_000u64, 5_000u64);
+        let sign = |holder: &[u8; 32],
+                    role_tags: &[String],
+                    skills: &[Skill],
+                    cells: &[CellId],
+                    channels: &[ChannelId],
+                    sk: &SigningKey|
+         -> AgentCard {
+            AgentCard {
+                holder_pubkey: *holder,
+                role_tags: role_tags.to_vec(),
+                skills: skills.to_vec(),
+                cells: cells.to_vec(),
+                channels: channels.to_vec(),
+                issued_at: issued,
+                expires_at: expires,
+                signature: sk
+                    .sign(&AgentCard::signing_bytes(holder, role_tags, skills, cells, channels, issued, expires))
+                    .to_bytes(),
+            }
+        };
+        let card = sign(&holder, &role_tags, &skills, &cells, &channels, &sk);
+
+        // (1) Authentic + unexpired → valid; (2) expiry.
+        assert!(card.is_valid(1_000), "an authentic, unexpired card verifies");
+        assert!(!card.is_valid(5_000), "at expires_at the card is dead");
+
+        // (3) Tamper each collection → the holder signature no longer verifies.
+        let mut t = card.clone();
+        t.role_tags.push("central".to_string());
+        assert!(!t.is_valid(1_000), "an added role_tag breaks the signature");
+        let mut t = card.clone();
+        t.skills[0].description = "do something else".to_string();
+        assert!(!t.is_valid(1_000), "a changed skill breaks the signature");
+        let mut t = card.clone();
+        t.cells.push(CellId([0x44u8; 32]));
+        assert!(!t.is_valid(1_000), "an added cell breaks the signature (self-asserted, but still signed)");
+        let mut t = card.clone();
+        t.channels[0] = ChannelId([0u8; 32]);
+        assert!(!t.is_valid(1_000), "a swapped channel breaks the signature");
+
+        // (4) Length-prefix injectivity: ["ab","c"] and ["a","bc"] share concatenated bytes but must
+        // NOT share a preimage — re-partitioning role_tags under the same signature is rejected.
+        let a = sign(&holder, &["ab".to_string(), "c".to_string()], &[], &[], &[], &sk);
+        let repartitioned = AgentCard { role_tags: vec!["a".to_string(), "bc".to_string()], ..a.clone() };
+        assert!(a.is_valid(1_000), "the first card is authentic");
+        assert!(!repartitioned.is_valid(1_000), "re-partitioning under the same signature is rejected (length-prefixed preimage)");
+
+        // (5) Forged holder: an attacker signs with its own key but stamps the victim's holder pubkey.
+        let victim = SigningKey::from_bytes(&[0x52u8; 32]).verifying_key().to_bytes();
+        let attacker = SigningKey::from_bytes(&[0x53u8; 32]);
+        let impersonated = sign(&victim, &role_tags, &skills, &cells, &channels, &attacker);
+        assert!(!impersonated.is_valid(1_000), "a card not signed by its holder is rejected");
     }
 }
