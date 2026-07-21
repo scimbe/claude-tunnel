@@ -17,9 +17,9 @@
 set -euo pipefail
 
 # --- deps (iproute2 + iptables + ping); installed on demand in the slim image ----------
-if ! command -v ip >/dev/null || ! command -v iptables >/dev/null || ! command -v ping >/dev/null; then
+if ! command -v ip >/dev/null || ! command -v iptables >/dev/null || ! command -v ping >/dev/null || ! command -v socat >/dev/null; then
   DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 iptables iputils-ping >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 iptables iputils-ping socat >/dev/null
 fi
 
 RELAY_PUB=203.0.113.1
@@ -87,6 +87,28 @@ expect_ok      "nsA reaches the public relay"      ip netns exec nsA ping -c1 -W
 expect_ok      "nsB reaches the public relay"      ip netns exec nsB ping -c1 -W1 "$RELAY_PUB"
 expect_blocked "nsA cannot reach nsB directly"     ip netns exec nsA ping -c1 -W1 10.0.2.2
 expect_blocked "nsB cannot reach nsA directly"     ip netns exec nsB ping -c1 -W1 10.0.1.2
+
+# --- relay data-path proof (the base leg the DCUtR session rides on) --------------------
+# A minimal public-segment relay bridges two TCP listeners; a payload sent by nsA (behind
+# NAT-A) must arrive at nsB (behind NAT-B) THROUGH it — proving the edge-relay base leg
+# traverses both NATs, which is exactly where the upgradable channel session starts before
+# it opportunistically punches to direct (N-rig-2). socat listens on 9001 first (the
+# receiver nsB), then 9000 (the sender nsA); it accepts one connection each and bridges them.
+relay_splice() {
+  local got; got=$(mktemp)
+  socat "TCP-LISTEN:9001,reuseaddr" "TCP-LISTEN:9000,reuseaddr" & local relay=$!
+  sleep 0.3
+  ip netns exec nsB timeout 4 socat -u "TCP:${RELAY_PUB}:9001" - >"$got" & local rcv=$!
+  sleep 0.6 # let nsB connect so socat advances to listening on 9000
+  printf 'A2B-VIA-RELAY-OK' | ip netns exec nsA timeout 4 socat -u - "TCP:${RELAY_PUB}:9000" || true
+  wait "$rcv" 2>/dev/null || true
+  kill "$relay" 2>/dev/null || true
+  grep -q 'A2B-VIA-RELAY-OK' "$got"
+  local r=$?
+  rm -f "$got"
+  return $r
+}
+expect_ok "payload from nsA reaches nsB THROUGH the public relay (base leg)" relay_splice
 
 echo "== nat-lab: ${pass} passed, ${fail} failed =="
 [ "$fail" -eq 0 ]
