@@ -767,6 +767,7 @@ pub fn authed_topology_router(
     Router::new()
         .route("/me/topologies", post(topology_create).get(topology_list))
         .route("/me/topologies/:id", get(topology_view))
+        .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
         .route("/me/topologies/:id/edges", post(topology_add_edge))
         .with_state(AuthedTopologyState { topologies, verifier })
@@ -866,6 +867,28 @@ async fn topology_view(
         .edges(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(TopologyView { id: t.id, net_uuid: t.net_uuid, agents, edges }))
+}
+
+/// `GET /me/topologies/:id/editor` — the owner-scoped, self-contained **Topology
+/// Editor** page (#107-ui): a modern draggable SVG node-graph of the topology's agents
+/// and links. Owner-isolated exactly like [`topology_view`] (a topology the subject does
+/// not own is a `404`, never a `403`). Returns HTML, not JSON.
+async fn topology_editor(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let t = owned_topology(&state, &owner, &id)?;
+    let agents = state
+        .topologies
+        .agents_in(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let edges = state
+        .topologies
+        .edges(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges)))
 }
 
 #[derive(Deserialize)]
@@ -1011,6 +1034,155 @@ fn render_topology_status(
         uuid = esc(&t.net_uuid),
         na = agents.len(),
         ne = edges.len(),
+    )
+}
+
+/// The Topology-Editor stylesheet (#107-ui) — self-contained, CSP-safe (no external
+/// assets), theme-aware (light/dark via `prefers-color-scheme`, GitHub-family palette).
+/// CSS custom properties are only ever read from CSS rules (never SVG presentation
+/// attributes, where `var()` is unsupported), so every node/edge colour flows through a
+/// class.
+const EDITOR_CSS: &str = r#"
+:root{--bg:#f6f8fa;--panel:#fff;--ink:#1f2328;--muted:#59636e;--line:#d1d9e0;--accent:#2da44e;--accent2:#0969da;--edge:#8c959f;--node:#fff;--nodeln:#d1d9e0}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--panel:#161b22;--ink:#e6edf3;--muted:#8b949e;--line:#30363d;--accent:#3fb950;--accent2:#58a6ff;--edge:#484f58;--node:#1c2128;--nodeln:#30363d}}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);display:flex;flex-direction:column}
+header.bar{display:flex;align-items:center;gap:.9rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
+.title{font-size:1rem;font-weight:650;letter-spacing:-.01em}
+.chip{font:500 .78rem/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:.32rem .62rem}
+.hint{margin-left:auto;color:var(--muted);font-size:.82rem}
+.stage{flex:1;min-height:0}
+svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var(--bg)}
+.dot{fill:var(--line);opacity:.55}
+.edge{fill:none;stroke:var(--edge);stroke-width:2;stroke-linecap:round;opacity:.9}
+.node{cursor:grab}.node:active{cursor:grabbing}
+.node .card{fill:var(--node);stroke:var(--nodeln);stroke-width:1}
+.node:hover .card,.node:focus .card{stroke:var(--accent2)}
+.node:focus{outline:none}
+.node .accent{fill:var(--accent)}
+.node .handle{fill:var(--accent2);opacity:.85}
+.node .label{fill:var(--ink);font:600 12px system-ui,sans-serif;pointer-events:none}
+.empty{fill:var(--muted);font:500 15px system-ui,sans-serif}
+"#;
+
+/// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
+/// Pointer-drag any node; connected edges re-route live. Progressive enhancement: the
+/// server already emits correct node/edge geometry, so the graph renders identically with
+/// JS disabled — this only adds interactivity.
+const EDITOR_JS: &str = r#"
+(function(){
+ var svg=document.getElementById('cv');if(!svg)return;
+ var sel=null,dx=0,dy=0;
+ function pt(e){var m=svg.getScreenCTM().inverse(),p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;return p.matrixTransform(m);}
+ function centers(){var m={};svg.querySelectorAll('.node').forEach(function(n){m[n.getAttribute('data-node')]=[+n.getAttribute('data-cx'),+n.getAttribute('data-cy')];});return m;}
+ function redraw(){var c=centers();svg.querySelectorAll('.edge').forEach(function(ed){var a=c[ed.getAttribute('data-a')],b=c[ed.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2;ed.setAttribute('d','M '+a[0]+' '+a[1]+' C '+mx+' '+a[1]+', '+mx+' '+b[1]+', '+b[0]+' '+b[1]);});}
+ svg.addEventListener('pointerdown',function(e){var g=e.target.closest('.node');if(!g)return;sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
+ svg.addEventListener('pointermove',function(e){if(!sel)return;var p=pt(e),x=p.x-dx,y=p.y-dy;sel.setAttribute('data-cx',x);sel.setAttribute('data-cy',y);sel.setAttribute('transform','translate('+x+','+y+')');redraw();});
+ svg.addEventListener('pointerup',function(){sel=null;});
+ redraw();
+})();
+"#;
+
+/// Render the owner-facing **Topology Editor** page (#107-ui): a self-contained
+/// (CSP-safe, no external assets), theme-aware, **draggable** SVG node-graph of the
+/// topology — agents as rounded node-cards on a dotted canvas, links as smooth bezier
+/// edges. Server-emitted geometry means it renders correctly without JS (progressive
+/// enhancement); the inline JS only adds drag interactivity. Agent ids are HTML-escaped
+/// (XSS-safe). An empty topology yields a valid page with an empty-state hint.
+fn render_topology_editor(
+    t: &crate::topology::Topology,
+    agents: &[String],
+    edges: &[(String, String)],
+) -> String {
+    use std::f64::consts::PI;
+    let esc = crate::portal::escape;
+    // Fixed design canvas (the SVG scales to the viewport via width/height:100%).
+    const VW: f64 = 900.0;
+    const VH: f64 = 560.0;
+    const CX: f64 = VW / 2.0;
+    const CY: f64 = VH / 2.0;
+    const R: f64 = 200.0;
+
+    // Circular initial layout — one node sits at the centre.
+    let n = agents.len();
+    let pos: std::collections::HashMap<&str, (f64, f64)> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if n == 1 {
+                (a.as_str(), (CX, CY))
+            } else {
+                let theta = 2.0 * PI * (i as f64) / (n as f64) - PI / 2.0;
+                (a.as_str(), (CX + R * theta.cos(), CY + R * theta.sin()))
+            }
+        })
+        .collect();
+
+    let defs = "<defs>\
+        <pattern id=\"grid\" width=\"26\" height=\"26\" patternUnits=\"userSpaceOnUse\">\
+        <circle class=\"dot\" cx=\"1\" cy=\"1\" r=\"1\"/></pattern>\
+        <filter id=\"nsh\" x=\"-30%\" y=\"-40%\" width=\"160%\" height=\"200%\">\
+        <feDropShadow dx=\"0\" dy=\"2\" stdDeviation=\"3\" flood-color=\"#1f232833\"/></filter>\
+        </defs><rect width=\"100%\" height=\"100%\" fill=\"url(#grid)\"/>";
+
+    let content = if agents.is_empty() {
+        format!(
+            "{defs}<text class=\"empty\" x=\"{CX}\" y=\"{CY}\" text-anchor=\"middle\">\
+             no agents yet — assign one to start composing</text>"
+        )
+    } else {
+        // Edges first (drawn under the nodes), each a bezier between node centres.
+        let edge_svg: String = edges
+            .iter()
+            .filter_map(|(a, b)| {
+                let (&(x1, y1), &(x2, y2)) = (pos.get(a.as_str())?, pos.get(b.as_str())?);
+                let mx = (x1 + x2) / 2.0;
+                Some(format!(
+                    "<path class=\"edge\" data-a=\"{a}\" data-b=\"{b}\" \
+                     d=\"M {x1:.1} {y1:.1} C {mx:.1} {y1:.1}, {mx:.1} {y2:.1}, {x2:.1} {y2:.1}\"/>",
+                    a = esc(a),
+                    b = esc(b),
+                ))
+            })
+            .collect();
+        let node_svg: String = agents
+            .iter()
+            .map(|a| {
+                let (x, y) = pos[a.as_str()];
+                // Truncate long ids for the card face (raw, then escape).
+                let raw: String = a.chars().take(16).collect();
+                let label = if a.chars().count() > 16 { format!("{raw}…") } else { raw };
+                format!(
+                    "<g class=\"node\" data-node=\"{id}\" data-cx=\"{x:.1}\" data-cy=\"{y:.1}\" \
+                     transform=\"translate({x:.1},{y:.1})\" tabindex=\"0\" role=\"listitem\" aria-label=\"agent {id}\">\
+                     <rect class=\"card\" x=\"-60\" y=\"-22\" width=\"120\" height=\"44\" rx=\"12\" ry=\"12\" filter=\"url(#nsh)\"/>\
+                     <rect class=\"accent\" x=\"-60\" y=\"-22\" width=\"120\" height=\"4\" rx=\"2\"/>\
+                     <circle class=\"handle\" cx=\"60\" cy=\"0\" r=\"4\"/>\
+                     <text class=\"label\" x=\"0\" y=\"5\" text-anchor=\"middle\">{label}</text></g>",
+                    id = esc(a),
+                    label = esc(&label),
+                )
+            })
+            .collect();
+        format!("{defs}{edge_svg}{node_svg}")
+    };
+
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Topology Editor — {uuid}</title><style>{css}</style></head><body>\
+         <header class=\"bar\"><span class=\"title\">Topology Editor</span>\
+         <span class=\"chip\">net:{uuid}</span>\
+         <span class=\"chip\">{na} agents</span><span class=\"chip\">{ne} links</span>\
+         <span class=\"hint\">drag nodes to arrange</span></header>\
+         <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
+         preserveAspectRatio=\"xMidYMid meet\" role=\"application\" aria-label=\"topology node graph\">\
+         {content}</svg></div><script>{js}</script></body></html>",
+        uuid = esc(&t.net_uuid),
+        na = agents.len(),
+        ne = edges.len(),
+        css = EDITOR_CSS,
+        js = EDITOR_JS,
     )
 }
 
@@ -3045,6 +3217,49 @@ mod tests {
         assert_eq!(dangling.matches("<line").count(), 0, "an edge to a non-member is dropped");
         // Empty topology -> a valid empty canvas, no panic.
         assert!(render_topology_svg(&[], &[]).contains("no agents yet"));
+    }
+
+    #[test]
+    fn topology_editor_page_is_a_self_contained_draggable_node_graph() {
+        // #107-ui: the editor renders a full, self-contained (CSP-safe) HTML page — a
+        // draggable SVG node-graph of an ARBITRARY (complex) topology, one node per agent
+        // and one bezier edge per link, with agent ids escaped and no external assets.
+        let t = crate::topology::Topology {
+            id: "t1".into(),
+            owner: "alice".into(),
+            net_uuid: "uuid-xyz".into(),
+        };
+        let agents = vec!["agent-1".to_string(), "agent-2".to_string(), "agent-3".to_string()];
+        // A complex (non-direct) wiring: a triangle among three agents.
+        let edges = vec![
+            ("agent-1".to_string(), "agent-2".to_string()),
+            ("agent-2".to_string(), "agent-3".to_string()),
+            ("agent-1".to_string(), "agent-3".to_string()),
+        ];
+        let html = render_topology_editor(&t, &agents, &edges);
+
+        // A complete, self-contained HTML document.
+        assert!(html.starts_with("<!doctype html>") && html.contains("</html>"), "full HTML doc");
+        assert!(html.contains("<style>") && html.contains("<script>"), "inline CSS + JS");
+        // Self-contained / CSP-safe: NO external assets of any kind.
+        for external in ["http://", "https://", "<link", "src=\"", "@import"] {
+            assert!(!html.contains(external), "no external asset: {external:?}");
+        }
+        // The full (complex) graph is preserved: one draggable node per agent, one edge per link.
+        assert_eq!(html.matches("class=\"node\"").count(), 3, "one node per agent");
+        assert_eq!(html.matches("class=\"edge\"").count(), 3, "one bezier edge per link");
+        assert!(html.contains("data-node=\"agent-2\"") && html.contains("data-cx="), "draggable node geometry");
+        assert!(html.contains("net:uuid-xyz"), "shows the net-uuid");
+
+        // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
+        let evil = vec!["<script>alert(1)</script>".to_string()];
+        let evil_html = render_topology_editor(&t, &evil, &[]);
+        assert!(!evil_html.contains("<script>alert(1)"), "hostile agent id is escaped");
+        assert!(evil_html.contains("&lt;script&gt;alert(1)"), "escaped form is present");
+
+        // An empty topology still yields a valid page with an empty-state hint (no panic).
+        let empty = render_topology_editor(&t, &[], &[]);
+        assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
     }
 
     #[tokio::test]
