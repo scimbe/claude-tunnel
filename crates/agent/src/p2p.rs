@@ -66,6 +66,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{dcutr, noise, relay, yamux, Multiaddr, StreamProtocol, Swarm, SwarmBuilder, Transport};
 use libp2p_stream as stream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -691,6 +692,101 @@ pub(crate) fn dcutr_upgrade_target(offered: &str, trusted_circuit: &Multiaddr) -
     };
     let prefix: Multiaddr = protos.into_iter().collect();
     (&prefix == trusted_circuit).then_some(target)
+}
+
+/// **#136 N136.3 — the NAT-to-NAT upgradable session.** Run one side of an A2A channel over the base
+/// relay stream (`relay_send`/`relay_recv`, the edge Noise pump halves) as an UPGRADABLE session that
+/// opportunistically hole-punches to a **direct** link via DCUtR and cuts the byte stream over — for
+/// two peers that are *both* NAT'd (neither has a dialable `SocketAddr`, so the #104 plain-QUIC path
+/// can't help them). Composes [`ct_common::upgrade::run_upgradable_session_initiator`]/`_responder`
+/// (transport-agnostic orchestration) with the DCUtR primitives: the **initiator** reserves a slot on
+/// `circuit_relay` (its configured edge Circuit-Relay v2 leg) via [`dcutr_reserve_and_accept`],
+/// advertises its `<relay>/p2p-circuit/p2p/<self>` address in-band (the Offer), and on `Ready` accepts
+/// the incoming DCUtR stream + [`ct_common::a2a::establish_direct_over_duplex`] as the direct-Noise
+/// RESPONDER; the **responder** validates the offered address against its own `circuit_relay`
+/// ([`dcutr_upgrade_target`], the #137-analog relay pin), dials it via [`dcutr_dial_via_relay`], and
+/// establishes as the direct-Noise INITIATOR. Hole-punch failure stays on the relay; the relay leg is
+/// end-to-end throughout. The live cross-NAT punch is proven on the deploy (#136 N136.4); this over an
+/// in-process relay on loopback.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // consumed by the join-path wire-in (relay-only members); landed with N136.3
+pub(crate) async fn run_channel_session_upgradable_dcutr<RW, RR, P>(
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    role: crate::channel_run::ChannelRole,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    circuit_relay: Multiaddr,
+) -> Result<(), BoxError>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    use ct_common::upgrade::{
+        run_upgradable_session_initiator, run_upgradable_session_responder, Role, UpgradeCoordinator,
+    };
+    // The relay handshake borrows these; the direct-establishment closures need owned copies.
+    let (relay_priv, relay_peer) = (*own_noise_private, *peer_noise_public);
+    let (direct_priv, direct_peer) = (*own_noise_private, *peer_noise_public);
+
+    match role {
+        crate::channel_run::ChannelRole::Initiate => {
+            // Reserve on the relay up front → we know our advertised circuit address, and the inbound
+            // DCUtR stream (from the responder's dial) arrives on `inbound_rx` later.
+            let client = build_dcutr_relay_client_swarm()?;
+            let own_peer = *client.local_peer_id();
+            let advertise = circuit_relay.clone().with(Protocol::P2p(own_peer)).to_string();
+            let inbound_rx = dcutr_reserve_and_accept(client, circuit_relay).await?;
+            let coord = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+            run_upgradable_session_initiator(
+                relay_send,
+                relay_recv,
+                local,
+                &relay_priv,
+                &relay_peer,
+                coord,
+                1,
+                || async move { Some(advertise) },
+                move || async move {
+                    let stream = inbound_rx.await.ok()?;
+                    ct_common::a2a::establish_direct_over_duplex(stream, false, &direct_priv, &direct_peer)
+                        .await
+                        .ok()
+                },
+            )
+            .await
+            .map_err(Into::into)
+        }
+        crate::channel_run::ChannelRole::Accept => {
+            let client = build_dcutr_relay_client_swarm()?;
+            let coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+            run_upgradable_session_responder(
+                relay_send,
+                relay_recv,
+                local,
+                &relay_priv,
+                coord,
+                1,
+                {
+                    let trusted = circuit_relay.clone();
+                    move |ep: String| async move { dcutr_upgrade_target(&ep, &trusted).is_some() }
+                },
+                move |ep: String| async move {
+                    // Relay-pin the peer-conveyed circuit address, then dial the target through it.
+                    let target = dcutr_upgrade_target(&ep, &circuit_relay)?;
+                    let addr: Multiaddr = ep.parse().ok()?;
+                    let stream = dcutr_dial_via_relay(client, addr, target).await.ok()?;
+                    ct_common::a2a::establish_direct_over_duplex(stream, true, &direct_priv, &direct_peer)
+                        .await
+                        .ok()
+                },
+            )
+            .await
+            .map_err(Into::into)
+        }
+    }
 }
 
 /// The domain-separation tag for a DHT coordinate record's signing preimage. A distinct,
@@ -1555,5 +1651,75 @@ mod tests {
 
         // Malformed → refused.
         assert_eq!(dcutr_upgrade_target("not-a-multiaddr", &trusted), None, "an unparseable address is refused");
+    }
+
+    #[tokio::test]
+    async fn upgradable_dcutr_session_delivers_byte_exact_across_the_nat_to_nat_composition() {
+        // #136 N136.3 (frozen, loopback analog of N136.4): two relay-only agents run the NAT-to-NAT
+        // upgradable session over an in-memory base relay leg, hole-punching to a direct link THROUGH
+        // an in-process Circuit-Relay v2 relay (DCUtR) — exercising the whole composition (initiator
+        // reserve/accept + advertise, responder relay-pinned dial, establish over the DCUtR stream,
+        // cutover) — and a payload arrives byte-exact. Loopback punch is trivial; the live cross-NAT
+        // punch is N136.4. Bounded so a stall fails fast instead of wedging the gate.
+        use crate::channel_run::ChannelRole;
+        use ct_common::noise::generate_static_keypair;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        tokio::time::timeout(Duration::from_secs(20), async move {
+            // In-process Circuit-Relay v2 relay — the DCUtR coordination leg both agents use.
+            let mut relay = build_relay_swarm().unwrap();
+            let relay_peer = *relay.local_peer_id();
+            relay.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+            let relay_addr: Multiaddr = loop {
+                match relay.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => break address,
+                    Some(_) => {}
+                    None => panic!("relay swarm closed before a listen address"),
+                }
+            };
+            relay.add_external_address(relay_addr.clone());
+            tokio::spawn(async move {
+                loop {
+                    relay.next().await;
+                }
+            });
+            let circuit: Multiaddr = relay_addr.with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit);
+
+            let a = generate_static_keypair(); // channel initiator
+            let b = generate_static_keypair(); // channel responder
+            let (a_priv, a_pub, b_priv, b_pub) = (a.private, a.public, b.private, b.public);
+
+            // Base relay leg (in-memory): a→b and b→a.
+            let (a2b_w, a2b_r) = tokio::io::duplex(1 << 16);
+            let (b2a_w, b2a_r) = tokio::io::duplex(1 << 16);
+
+            // App endpoints: test → initiator source; responder sink → test.
+            let (ini_app, ini_test) = tokio::io::duplex(1 << 16);
+            let (_ini_r, mut ini_feed) = tokio::io::split(ini_test);
+            let (resp_app, resp_test) = tokio::io::duplex(1 << 16);
+            let (mut resp_out, _resp_w) = tokio::io::split(resp_test);
+
+            let circ_i = circuit.clone();
+            let init = tokio::spawn(async move {
+                run_channel_session_upgradable_dcutr(a2b_w, b2a_r, ini_app, ChannelRole::Initiate, &a_priv, &b_pub, circ_i).await
+            });
+            let resp = tokio::spawn(async move {
+                run_channel_session_upgradable_dcutr(b2a_w, a2b_r, resp_app, ChannelRole::Accept, &b_priv, &a_pub, circuit).await
+            });
+
+            let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+            ini_feed.write_all(&payload).await.unwrap();
+            ini_feed.flush().await.unwrap();
+            ini_feed.shutdown().await.unwrap();
+
+            let mut got = vec![0u8; payload.len()];
+            resp_out.read_exact(&mut got).await.expect("responder receives the full payload");
+            assert_eq!(got, payload, "NAT-to-NAT relay→direct(DCUtR) upgradable session delivered byte-exact (#136)");
+
+            init.abort();
+            resp.abort();
+        })
+        .await
+        .expect("the DCUtR upgradable session delivers within 20s (a hang here is a deadlock)");
     }
 }
