@@ -22,6 +22,18 @@ libp2p = { workspace = true }
 libp2p-stream = { workspace = true }
 tokio-util = { workspace = true }
 
+[features]
+# #136 N-rig-2b: build the TEST-ONLY natlab harness binary (the Docker 2-NAT DCUtR punch
+# lab). Off by default — the harness runs an UNGUARDED relay (invariant #3's membership gate
+# is not wired), so it must never be part of a production build. Enable only in the lab:
+# `cargo build -p ct-agent --features nat-lab`.
+nat-lab = []
+
+[[bin]]
+name = "natlab"
+path = "src/bin/natlab.rs"
+required-features = ["nat-lab"]
+
 [dev-dependencies]
 # test-util enables `#[tokio::test(start_paused = true)]` for deterministic timeout tests (#126).
 tokio = { version = "1", features = ["test-util"] }

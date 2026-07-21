@@ -326,6 +326,28 @@ fn build_relay_swarm() -> Result<Swarm<relay::Behaviour>, BoxError> {
     Ok(swarm)
 }
 
+/// #136 N-rig-2b (**test-only**, `nat-lab` cargo feature): run the Circuit-Relay v2 relay node
+/// as a standalone process for the Docker 2-NAT hole-punch lab. It listens on `listen`, prints
+/// each bound multiaddr as `<addr>/p2p/<peerid>` on its own stdout line (so the lab's punch
+/// clients can reserve on / dial through it), then drives the swarm forever.
+///
+/// **NEVER a production capability.** This relay is unguarded ([`build_relay_swarm`] uses
+/// `relay::Config::default()`; invariant #3's `C-membership-gate` is not wired here), so it is
+/// compiled ONLY under `--features nat-lab` (the `natlab` bin), never exposed as a `ct-agent`
+/// subcommand — shipping an open relay would be a footgun.
+#[cfg(any(test, feature = "nat-lab"))]
+pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
+    let mut swarm = build_relay_swarm()?;
+    let peer = *swarm.local_peer_id();
+    swarm.listen_on(listen.parse::<Multiaddr>()?)?;
+    eprintln!("nat-lab relay: peer {peer}, requested listen {listen}");
+    loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            println!("{address}/p2p/{peer}");
+        }
+    }
+}
+
 /// Build a **relay client**'s swarm: TCP + noise + yamux, plus the Circuit-Relay v2 client
 /// transport (`with_relay_client`) so this peer can make a reservation on / dial through a
 /// relay, driving the composite [`RelayClientBehaviour`]. As on every transport, the fresh
