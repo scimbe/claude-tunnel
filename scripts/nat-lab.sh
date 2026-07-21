@@ -165,7 +165,7 @@ expect_ok "nsA=${NAT_A_PUB} and nsB=${NAT_B_PUB}: distinct public reflexive IPs 
 NATLAB="${NATLAB:-target/debug/natlab}"
 punch_smoke() {
   local rout aout dout; rout=$(mktemp); aout=$(mktemp); dout=$(mktemp)
-  ip netns exec nsR "$NATLAB" relay "/ip4/${RELAY_PUB}/tcp/4001" >"$rout" 2>/dev/null & local rp=$!
+  ip netns exec nsR "$NATLAB" relay "/ip4/${RELAY_PUB}/udp/4001/quic-v1" >"$rout" 2>/dev/null & local rp=$!
   local relay_addr; relay_addr=$(timeout 12 bash -c "until grep -m1 '/p2p/' '$rout' 2>/dev/null; do sleep 0.2; done" | head -1)
   [ -n "$relay_addr" ] || { kill "$rp" 2>/dev/null; rm -f "$rout" "$aout" "$dout"; return 1; }
   ip netns exec nsA "$NATLAB" listen "$relay_addr" >"$aout" 2>/dev/null & local ap=$!

@@ -318,6 +318,11 @@ fn build_relay_swarm() -> Result<Swarm<relay::Behaviour>, BoxError> {
     let swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
+        // #136: also relay over QUIC. If clients reach the relay over QUIC, `identify` observes
+        // (and shares) their QUIC reflexive address — the candidate DCUtR punches toward. Over a
+        // TCP-only relay leg, identify only surfaces TCP addresses and the QUIC punch has none
+        // (`dcutr NoAddresses`).
+        .with_quic()
         .with_behaviour(|key| relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()))?
         // Keep an otherwise-idle connection (a held reservation carries no app substream)
         // alive long enough for the relayed dial + substream to complete.
