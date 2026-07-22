@@ -2246,11 +2246,15 @@ mod tests {
         assert!(ack_y_acc.starts_with("OK "), "Y acceptor was admitted+paired, got {ack_y_acc:?}");
         assert!(ack_y_init.contains("203.0.113.4:7004"), "Y initiator learns Y acceptor's endpoint, got {ack_y_init:?}");
         assert!(ack_y_acc.contains("203.0.113.3:7003"), "Y acceptor learns Y initiator's endpoint, got {ack_y_acc:?}");
-        assert!(
-            !ack_y_init.contains("7001") && !ack_y_init.contains("7002")
-                && !ack_y_acc.contains("7001") && !ack_y_acc.contains("7002"),
-            "channel-keyed: no X<->Y cross-pair (Y never learns an X endpoint)",
-        );
+        // No X<->Y cross-pair: match X's FULL advertised host:port strings, not bare ":7001"/
+        // ":7002" ports. Each ack also carries the member's own `r=<reflexive>` token (an ephemeral
+        // `127.0.0.1:<port>` source the edge observed); that ephemeral port can substring-match a
+        // bare "7001"/"7002" and spuriously trip this check even with zero cross-pairing. An X
+        // endpoint can only appear in a Y ack via an actual cross-pair.
+        for x_ep in ["203.0.113.1:7001", "203.0.113.2:7002"] {
+            assert!(!ack_y_init.contains(x_ep), "channel-keyed: Y initiator never learns X endpoint {x_ep}, got {ack_y_init:?}");
+            assert!(!ack_y_acc.contains(x_ep), "channel-keyed: Y acceptor never learns X endpoint {x_ep}, got {ack_y_acc:?}");
+        }
 
         // Release X and verify its own acks swapped the X endpoints (X paired with X, not Y).
         let _ = x1_tx.send(());
