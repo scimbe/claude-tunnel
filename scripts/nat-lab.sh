@@ -179,11 +179,14 @@ punch_smoke() {
   rm -f "$rout" "$aout" "$dout"
   return $rc
 }
-# The punch smoke is reported but NOT yet fatal: the topology + harness are proven, but the
-# DCUtR direct upgrade currently fails with `NoAddresses` (the QUIC punch-candidate addresses
-# aren't propagated over the TCP coordination leg) — an open libp2p-transport issue under
-# diagnosis. Flip this to `expect_ok` once the upgrade fires. The 6 topology assertions above
-# are the gating checks.
+# The punch smoke is reported but NOT yet fatal. Address DISCOVERY now works: the relay runs an
+# identify server, so each client learns its PUBLIC reflexive QUIC address (e.g. listener
+# 203.0.113.10:<port>, dialer 203.0.113.20:<port>) and advertises it as an external candidate.
+# The remaining blocker is DEEPER: DCUtR's Connect still reports `NoAddresses` / `UnexpectedEof`
+# despite the reflexive addresses being known to the swarm — a libp2p-dcutr address-confirmation
+# /timing layer (the upgrade fires before the confirmed external addr reaches the Connect), under
+# diagnosis. Flip this to `expect_ok` once the upgrade fires. The 6 topology assertions above are
+# the gating checks.
 if [ -x "$NATLAB" ]; then
   if punch_smoke; then
     echo "PASS: cross-NAT DCUtR hole-punch — BOTH peers reported a DIRECT upgrade (PUNCH-OK)"

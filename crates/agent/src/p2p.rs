@@ -306,6 +306,17 @@ struct RelayClientBehaviour {
     stream: stream::Behaviour,
 }
 
+/// The **relay node**'s behaviour: the Circuit-Relay v2 *server* plus an `identify` server. The
+/// identify server is essential for the cross-NAT punch (#136) — when a client connects to the
+/// relay over QUIC, identify reports back the client's **observed reflexive** (public NAT-mapped)
+/// address, which the client then advertises as its DCUtR punch candidate. Without it a client
+/// knows only its private listen addr and the direct upgrade fails `NoAddresses`.
+#[derive(NetworkBehaviour)]
+struct RelayServerBehaviour {
+    relay: relay::Behaviour,
+    identify: identify::Behaviour,
+}
+
 /// Build the **relay node**'s swarm: a Tokio TCP transport upgraded with libp2p-noise +
 /// yamux, driving the Circuit-Relay v2 **server** [`relay::Behaviour`]. This node forwards
 /// circuits between clients; it terminates none of our channel traffic and never sees
@@ -314,7 +325,7 @@ struct RelayClientBehaviour {
 /// ⚠️ This relay is **unguarded** — `relay::Config::default()` accepts a reservation/circuit
 /// from any peer. That is safe **only** because this helper is test-only and in-process; a
 /// live/public relay MUST first gain the invariant-#3 membership gate (`C-membership-gate`).
-fn build_relay_swarm() -> Result<Swarm<relay::Behaviour>, BoxError> {
+fn build_relay_swarm() -> Result<Swarm<RelayServerBehaviour>, BoxError> {
     let swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)?
@@ -323,7 +334,18 @@ fn build_relay_swarm() -> Result<Swarm<relay::Behaviour>, BoxError> {
         // TCP-only relay leg, identify only surfaces TCP addresses and the QUIC punch has none
         // (`dcutr NoAddresses`).
         .with_quic()
-        .with_behaviour(|key| relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()))?
+        // #136: the relay MUST run an identify SERVER. That is what tells a connecting client its
+        // own **observed reflexive** (public NAT-mapped) QUIC address — the only address DCUtR can
+        // punch toward. Without identify on the relay the client learns only its private listen
+        // addr and the upgrade dies `NoAddresses` (confirmed in the netns lab). Same protocol
+        // string as the client so the exchange is symmetric.
+        .with_behaviour(|key| RelayServerBehaviour {
+            relay: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ct-dcutr-id/1.0.0".to_string(),
+                key.public(),
+            )),
+        })?
         // Keep an otherwise-idle connection (a held reservation carries no app substream)
         // alive long enough for the relayed dial + substream to complete.
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
@@ -349,9 +371,10 @@ pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
             // The Circuit-Relay v2 server MUST advertise its own external address or a client's
-            // reservation is refused (`NoAddressesInReservation`) — there is no identify/AutoNAT
-            // in the lab to discover it, so confirm the bound address explicitly (as the
-            // in-process harness does). Without this the punch clients never reserve.
+            // reservation is refused (`NoAddressesInReservation`) — confirm the bound address
+            // explicitly (as the in-process harness does). Without this the punch clients never
+            // reserve. (The relay now ALSO runs an identify server — see `RelayServerBehaviour` —
+            // so a connecting client learns its own reflexive address for the DCUtR punch.)
             swarm.add_external_address(address.clone());
             println!("{address}/p2p/{peer}");
         }
@@ -385,14 +408,26 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
                 {
                     swarm.add_external_address(address);
                 }
+                // The relay observed our PUBLIC reflexive QUIC endpoint over the port-reused QUIC
+                // socket (libp2p's quinn Endpoint listens + dials on the same UDP port, so the
+                // observed source == our listener's NAT mapping). Feeding it as an external
+                // candidate gives DCUtR a *punchable* address to offer — without it the swarm only
+                // knows its private `10.0.x.2` listen addr and the upgrade dies with `NoAddresses`.
+                SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Identify(
+                    identify::Event::Received { info, .. },
+                )) if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) => {
+                    eprintln!("listen: relay-observed reflexive {}", info.observed_addr);
+                    swarm.add_external_address(info.observed_addr);
+                }
                 SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { .. },
                 )) => println!("LISTEN-ADDR {}/p2p/{}", relay_circuit, me),
-                SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(
-                    dcutr::Event { result: Ok(_), .. },
-                )) => {
-                    println!("PUNCH-OK");
-                    return Ok(());
+                SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(e)) => {
+                    eprintln!("listen: dcutr event: {e:?}");
+                    if matches!(e, dcutr::Event { result: Ok(_), .. }) {
+                        println!("PUNCH-OK");
+                        return Ok(());
+                    }
                 }
                 _ => {}
             }
@@ -421,6 +456,17 @@ pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
                 if let SwarmEvent::NewListenAddr { address, .. } = &ev {
                     if !address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
                         swarm.add_external_address(address.clone());
+                    }
+                }
+                // Feed the relay-observed PUBLIC reflexive QUIC endpoint as an external candidate
+                // (see the listener) so DCUtR punches toward our NAT mapping, not our private addr.
+                if let SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Identify(
+                    identify::Event::Received { info, .. },
+                )) = &ev
+                {
+                    if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        eprintln!("dial: relay-observed reflexive {}", info.observed_addr);
+                        swarm.add_external_address(info.observed_addr.clone());
                     }
                 }
                 if let SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Dcutr(e)) = &ev {
