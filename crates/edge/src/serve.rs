@@ -283,25 +283,56 @@ fn resolve_proxy_addr(raw: Option<String>) -> Option<SocketAddr> {
 /// Build a front-door terminate-cert acceptor from an env cert/key PEM pair
 /// (#31 FD4-a, #48) — used per proxy host (Portal, Auth IdP). `None` when the pair
 /// is unset (the host is then raw-proxied) or invalid (logged, raw-proxied).
+/// #142: why a configured front-door vhost has no usable TLS cert (pure, testable). This fn
+/// is only ever called for a vhost the operator DID configure for TLS termination, so any gap
+/// means the vhost would silently raw-proxy — a plaintext downgrade to a non-TLS upstream, i.e.
+/// a total outage (curl exit 35) surfaced nowhere but a startup log. `None` => both a cert and
+/// a key value are present (a build attempt follows). `Some(reason)` => the material is
+/// missing/empty and TLS can't be terminated; the caller MUST warn loudly.
+fn front_door_cert_gap(
+    cert: Option<&str>,
+    key: Option<&str>,
+    cert_env: &str,
+    key_env: &str,
+) -> Option<String> {
+    let present = |v: Option<&str>| v.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    match (present(cert), present(key)) {
+        (true, true) => None,
+        (false, false) => Some(format!("{cert_env} and {key_env} unset/empty")),
+        (false, true) => Some(format!("{cert_env} unset/empty")),
+        (true, false) => Some(format!("{key_env} unset/empty")),
+    }
+}
+
 fn build_front_door_cert(
     label: &str,
     cert_env: &str,
     key_env: &str,
 ) -> Option<tokio_rustls::TlsAcceptor> {
-    match (std::env::var(cert_env), std::env::var(key_env)) {
-        (Ok(c), Ok(k)) if !c.is_empty() && !k.is_empty() => {
-            match crate::transport::build_portal_acceptor(&c, &k) {
-                Ok(a) => {
-                    eprintln!("ct-edge: front door terminates {label} TLS ({cert_env})");
-                    Some(a)
-                }
-                Err(e) => {
-                    eprintln!("ct-edge: invalid {label} cert/key ({e}); {label} raw-proxied instead");
-                    None
-                }
-            }
+    let cert = std::env::var(cert_env).ok();
+    let key = std::env::var(key_env).ok();
+    // #142: a configured-but-unusable cert must NEVER silently degrade to a plaintext raw-proxy
+    // (the upstream doesn't speak TLS -> total outage). If the material is missing/empty, warn
+    // LOUD and distinctly here instead of the old silent `_ => None`.
+    if let Some(gap) = front_door_cert_gap(cert.as_deref(), key.as_deref(), cert_env, key_env) {
+        eprintln!(
+            "ct-edge: WARNING — {label} front door has no usable TLS cert ({gap}); NOT terminating \
+             TLS, {label} will be raw-proxied — likely a PLAINTEXT OUTAGE for this host [#142]"
+        );
+        return None;
+    }
+    match crate::transport::build_portal_acceptor(cert.as_deref().unwrap(), key.as_deref().unwrap()) {
+        Ok(a) => {
+            eprintln!("ct-edge: front door terminates {label} TLS ({cert_env})");
+            Some(a)
         }
-        _ => None,
+        Err(e) => {
+            eprintln!(
+                "ct-edge: WARNING — {label} TLS cert configured but UNUSABLE ({e}); NOT terminating \
+                 TLS, {label} will be raw-proxied — likely a PLAINTEXT OUTAGE (fix {cert_env}/{key_env}) [#142]"
+            );
+            None
+        }
     }
 }
 
@@ -1539,6 +1570,25 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    #[test]
+    fn front_door_cert_gap_flags_every_configured_but_unusable_tls_vhost() {
+        // #142 (frozen): a front-door vhost is only asked for a cert when it's configured for TLS
+        // termination, so any missing/empty material must be REPORTED (→ a loud warning), never a
+        // silent plaintext raw-proxy downgrade. Only a full cert+key pair returns None (build it).
+        let c = "CT_EDGE_PORTAL_CERT";
+        let k = "CT_EDGE_PORTAL_KEY";
+        // Both present -> no gap (a build attempt follows).
+        assert_eq!(front_door_cert_gap(Some("/certs/fullchain.pem"), Some("/certs/privkey.pem"), c, k), None);
+        // The #142 trap: cert/key unset or empty -> a reported gap naming the offending var(s).
+        assert!(front_door_cert_gap(None, None, c, k).unwrap().contains(c));
+        assert!(front_door_cert_gap(None, None, c, k).unwrap().contains(k));
+        assert!(front_door_cert_gap(Some(""), Some(""), c, k).is_some(), "empty strings are a gap");
+        assert!(front_door_cert_gap(Some("   "), Some("x"), c, k).unwrap().contains(c), "whitespace cert is a gap");
+        // Partial config (one half missing) is a gap naming the missing half.
+        assert_eq!(front_door_cert_gap(Some("/c"), None, c, k), Some(format!("{k} unset/empty")));
+        assert_eq!(front_door_cert_gap(None, Some("/k"), c, k), Some(format!("{c} unset/empty")));
+    }
 
     #[test]
     fn channel_relay_addr_refuses_to_collide_with_the_rendezvous_port() {
