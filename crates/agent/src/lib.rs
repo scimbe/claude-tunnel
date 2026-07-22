@@ -15,6 +15,7 @@ pub mod p2p;
 pub mod reconnect;
 pub mod serve;
 pub mod transport;
+pub mod well_known;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
 pub const CRATE_NAME: &str = "ct-agent";
