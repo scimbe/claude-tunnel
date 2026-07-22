@@ -771,7 +771,7 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/suggest", post(topology_suggest))
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
-        .route("/me/topologies/:id/edges", post(topology_add_edge))
+        .route("/me/topologies/:id/edges", post(topology_add_edge).delete(topology_remove_edge))
         .with_state(AuthedTopologyState { topologies, verifier })
 }
 
@@ -1080,6 +1080,28 @@ async fn topology_add_edge(
     }
 }
 
+/// Remove an undirected edge `a—b` from the caller's topology (#107-ui-compose) — the
+/// owner-scoped inverse of [`topology_add_edge`], backing the editor's "unlink" gesture.
+/// `404` when the edge isn't the owner's to remove (a non-owner topology OR no such edge —
+/// deliberately indistinguishable, so a non-owner learns nothing about the topology's shape).
+async fn topology_remove_edge(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<EdgeReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let removed = state
+        .topologies
+        .remove_edge(&owner, &id, &req.a, &req.b)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if removed {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "edge not removed (not owner or no such edge)".to_string()))
+    }
+}
+
 /// Render the overlay as a self-contained inline **SVG node-graph** (#107 "live
 /// diagram"): agents are laid out on a circle as labelled nodes, edges as lines between
 /// them. Pure, no external assets. A single node is centred; an empty topology yields an
@@ -1207,6 +1229,7 @@ svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var
 #msg{color:var(--muted);font-size:.8rem;min-width:6rem}
 .bar button.active{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 .node.linking .card{stroke:var(--accent);stroke-width:2px}
+svg[data-linkmode="1"] .edge{cursor:pointer;stroke-width:5px}
 "#;
 
 /// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
@@ -1220,7 +1243,7 @@ const EDITOR_JS: &str = r#"
  function pt(e){var m=svg.getScreenCTM().inverse(),p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;return p.matrixTransform(m);}
  function centers(){var m={};svg.querySelectorAll('.node').forEach(function(n){m[n.getAttribute('data-node')]=[+n.getAttribute('data-cx'),+n.getAttribute('data-cy')];});return m;}
  function redraw(){var c=centers();svg.querySelectorAll('.edge').forEach(function(ed){var a=c[ed.getAttribute('data-a')],b=c[ed.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2;ed.setAttribute('d','M '+a[0]+' '+a[1]+' C '+mx+' '+a[1]+', '+mx+' '+b[1]+', '+b[0]+' '+b[1]);});}
- svg.addEventListener('pointerdown',function(e){var g=e.target.closest('.node');if(!g)return;if(svg.getAttribute('data-linkmode')==='1'){linkPick(g);return;}sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
+ svg.addEventListener('pointerdown',function(e){if(svg.getAttribute('data-linkmode')==='1'){var ed=e.target.closest('.edge');if(ed){removeEdge(ed);return;}}var g=e.target.closest('.node');if(!g)return;if(svg.getAttribute('data-linkmode')==='1'){linkPick(g);return;}sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
  svg.addEventListener('pointermove',function(e){if(!sel)return;var p=pt(e),x=p.x-dx,y=p.y-dy;sel.setAttribute('data-cx',x);sel.setAttribute('data-cy',y);sel.setAttribute('transform','translate('+x+','+y+')');redraw();});
  svg.addEventListener('pointerup',function(){sel=null;});
  redraw();
@@ -1249,8 +1272,9 @@ const EDITOR_JS: &str = r#"
  function edgeExists(a,b){var f=false;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=true;});return f;}
  function addEdgeEl(a,b){var first=svg.querySelector('.node');if(!first)return;first.insertAdjacentHTML('beforebegin','<path data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"/>');var np=first.previousElementSibling;if(np)np.setAttribute('class','edge');redraw();}
  function linkPick(g){var id=g.getAttribute('data-node');if(!src){src=g;g.classList.add('linking');say('connect: pick the target agent');return;}var a=src.getAttribute('data-node');clearSrc();if(a===id){say('connect: pick two different agents');return;}if(edgeExists(a,id)){say('already linked');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:id})}).then(function(r){if(r.ok){addEdgeEl(a,id);say('linked '+a+' — '+id);}else{say('link failed ('+r.status+')');}}).catch(function(){say('link failed');});}
+ function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();say('unlinked '+a+' — '+b);}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
  var linkBtn=document.getElementById('link');
- if(linkBtn){linkBtn.addEventListener('click',function(){var on=svg.getAttribute('data-linkmode')!=='1';svg.setAttribute('data-linkmode',on?'1':'');linkBtn.setAttribute('aria-pressed',on?'true':'false');linkBtn.classList.toggle('active',on);if(!on)clearSrc();say(on?'connect: click two agents to link':'');});}
+ if(linkBtn){linkBtn.addEventListener('click',function(){var on=svg.getAttribute('data-linkmode')!=='1';svg.setAttribute('data-linkmode',on?'1':'');linkBtn.setAttribute('aria-pressed',on?'true':'false');linkBtn.classList.toggle('active',on);if(!on)clearSrc();say(on?'connect: click two agents to link, or a link to remove':'');});}
 })();
 "#;
 
@@ -1260,7 +1284,8 @@ const EDITOR_JS: &str = r#"
 /// edges. Server-emitted geometry means it renders correctly without JS (progressive
 /// enhancement); the inline JS only adds drag interactivity + the overlay-mode toggle,
 /// "Suggest overlay", and the "Connect" click-to-compose tool (#107-ui-compose — toggle it,
-/// click two agents to draw a link via the owner `POST …/edges` endpoint). Agent ids are HTML-escaped
+/// click two agents to draw a link, or click a link to remove it, via the owner
+/// `POST`/`DELETE …/edges` endpoints). Agent ids are HTML-escaped
 /// (XSS-safe). An empty topology yields a valid page with an empty-state hint. `mode` is the
 /// topology's current [`overlay mode`](topology_set_mode) token, pre-selected in the toggle.
 fn render_topology_editor(
@@ -3427,6 +3452,39 @@ mod tests {
         // Restore the complex mode so later assertions are unaffected.
         let _ = send("PUT", format!("/me/topologies/{tid}/mode"), Some(&alice), r#"{"mode":"smart-route"}"#.into()).await;
 
+        // #107-ui-compose (edge removal): the DELETE leg is owner-scoped and canonical. A
+        // non-owner can't remove alice's edge (404), the edge survives that rejected delete,
+        // the owner removes it (order-independent — deleting b,a clears a,b), and deleting an
+        // already-absent edge is a 404 (not a silent success).
+        assert_eq!(
+            send("DELETE", format!("/me/topologies/{tid}/edges"), Some(&mallory), r#"{"a":"agent-1","b":"agent-2"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "non-owner can't remove alice's edge"
+        );
+        let view = send("GET", format!("/me/topologies/{tid}"), Some(&alice), String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TopologyView>(&body).unwrap().edges,
+            vec![("agent-1".to_string(), "agent-2".to_string())],
+            "the edge survives a non-owner delete"
+        );
+        assert_eq!(
+            send("DELETE", format!("/me/topologies/{tid}/edges"), Some(&alice), r#"{"a":"agent-2","b":"agent-1"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK,
+            "owner removes the edge (order-independent)"
+        );
+        let view = send("GET", format!("/me/topologies/{tid}"), Some(&alice), String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        assert!(serde_json::from_slice::<TopologyView>(&body).unwrap().edges.is_empty(), "the edge is gone");
+        assert_eq!(
+            send("DELETE", format!("/me/topologies/{tid}/edges"), Some(&alice), r#"{"a":"agent-1","b":"agent-2"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "removing an already-absent edge -> 404"
+        );
+
         // Owner isolation: mallory can't see or edit alice's topology.
         assert_eq!(
             send("GET", format!("/me/topologies/{tid}"), Some(&mallory), String::new()).await.unwrap().status(),
@@ -3546,6 +3604,9 @@ mod tests {
         assert!(html.contains("function linkPick"), "click-to-connect handler present");
         assert!(html.contains("/edges") && html.contains("method:'POST'"), "POSTs new links to the owner edges endpoint");
         assert!(html.contains("insertAdjacentHTML"), "live edge created without a namespace literal");
+        // ...and the inverse gesture: clicking an existing link (while armed) removes it via DELETE.
+        assert!(html.contains("function removeEdge"), "edge-remove handler present");
+        assert!(html.contains("method:'DELETE'"), "removal DELETEs the owner edges endpoint");
         // Still zero external assets — the compose JS must not smuggle any in (the SVG
         // namespace URL in particular must be absent).
         for external in ["http://", "https://", "<link", "src=\"", "@import"] {
