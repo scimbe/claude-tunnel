@@ -31,6 +31,22 @@ pub fn agent_card_response(card: &AgentCard) -> Response {
         .into_response()
 }
 
+/// An axum [`Router`](axum::Router) that serves the agent's holder-signed card at
+/// [`AGENT_CARD_WELL_KNOWN_PATH`] (and 404s any other path). Direction-agnostic: the origin
+/// helper — or `ct-agent onboard --mode browser` — mounts it and binds it to a TLS listener on
+/// the agent's subdomain. The card is served **at the origin** because browser mode is raw TLS
+/// passthrough (the agent forwards opaque bytes and never sees the request path); binding + the
+/// subdomain cert are the onboard integration follow.
+pub fn agent_card_router(card: AgentCard) -> axum::Router {
+    axum::Router::new().route(
+        AGENT_CARD_WELL_KNOWN_PATH,
+        axum::routing::get(move || {
+            let card = card.clone();
+            async move { agent_card_response(&card) }
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +108,32 @@ mod tests {
             resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
             "application/json",
         );
+    }
+
+    #[tokio::test]
+    async fn well_known_router_serves_the_card_and_404s_elsewhere() {
+        // #144 ①-wiring: the mountable router serves the signed card over HTTP at the well-known
+        // path (verifiable after the round-trip) and 404s everything else.
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let card = signed_card();
+        let resp = agent_card_router(card.clone())
+            .oneshot(Request::get(AGENT_CARD_WELL_KNOWN_PATH).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "application/json");
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let back: AgentCard = serde_json::from_slice(&body).expect("served body parses");
+        assert_eq!(back, card, "the router serves the exact signed card");
+        assert!(back.is_valid(1_000), "the card fetched over HTTP still verifies");
+
+        let miss = agent_card_router(signed_card())
+            .oneshot(Request::get("/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
     }
 }
