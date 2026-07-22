@@ -351,6 +351,129 @@ impl SqliteBootstrap {
     }
 }
 
+/// One entry in the **searchable agent directory** (#144 ②): an agent's holder key, the URL of
+/// its published [`AgentCard`](ct_common::channel::AgentCard) well-known document, and the
+/// self-asserted `role_tags` / `skill_ids` it wants to be discoverable by. The directory only
+/// *points* at the verifiable card — a searcher fetches `card_url`
+/// ([`/.well-known/agent-card.json`](ct_common::channel)) and re-checks the holder signature
+/// itself; the registry is discovery, never trust (same discipline as the card's self-assertion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDirectoryEntry {
+    /// Hex of the agent's 32-byte ed25519 holder public key (the identity).
+    pub holder_pubkey: String,
+    /// Where the holder-signed card is served.
+    pub card_url: String,
+    pub role_tags: Vec<String>,
+    pub skill_ids: Vec<String>,
+    pub registered_at: u64,
+}
+
+fn split_tokens(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split('\n').map(str::to_string).collect()
+    }
+}
+
+/// SQLite-backed **searchable agent directory** (#144 ②): agents self-register their published
+/// card URL + the roles/skills they advertise, and peers query `role`/`skill` to discover whom to
+/// fetch + verify. Distinct from [`SqliteRegistry`] (tunnels). Can share the same DB file as the
+/// other stores — it owns its `agent_cards` table + its own connection.
+pub struct SqliteAgentDirectory {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteAgentDirectory {
+    /// Open (creating if needed) a durable directory at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(open_tuned(path)?)
+    }
+
+    /// Open an ephemeral in-memory directory (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_cards (
+                 holder_pubkey TEXT PRIMARY KEY,
+                 card_url      TEXT NOT NULL,
+                 role_tags     TEXT NOT NULL,
+                 skill_ids     TEXT NOT NULL,
+                 registered_at INTEGER NOT NULL
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Self-register (or update) an agent's directory entry, keyed by its holder key — so an agent
+    /// re-registering (new card URL, changed roles/skills) **upserts** rather than duplicating.
+    /// `role_tags`/`skill_ids` are the self-asserted, searchable facets; `card_url` is where the
+    /// signed card is fetched + verified.
+    pub fn register(
+        &self,
+        holder_pubkey: &str,
+        card_url: &str,
+        role_tags: &[String],
+        skill_ids: &[String],
+        now: u64,
+    ) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "INSERT OR REPLACE INTO agent_cards
+                 (holder_pubkey, card_url, role_tags, skill_ids, registered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                holder_pubkey,
+                card_url,
+                role_tags.join("\n"),
+                skill_ids.join("\n"),
+                now as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Search the directory: entries whose `role_tags` contain `role` (when given) AND whose
+    /// `skill_ids` contain `skill` (when given), matched as **exact tokens** (not substrings, so
+    /// `"admin"` never matches `"administrator"`). Both `None` → the whole directory. Sorted by
+    /// holder key for a stable result.
+    pub fn search(
+        &self,
+        role: Option<&str>,
+        skill: Option<&str>,
+    ) -> rusqlite::Result<Vec<AgentDirectoryEntry>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT holder_pubkey, card_url, role_tags, skill_ids, registered_at
+             FROM agent_cards ORDER BY holder_pubkey",
+        )?;
+        let all = stmt
+            .query_map([], |r| {
+                let role_tags: String = r.get(2)?;
+                let skill_ids: String = r.get(3)?;
+                Ok(AgentDirectoryEntry {
+                    holder_pubkey: r.get(0)?,
+                    card_url: r.get(1)?,
+                    role_tags: split_tokens(&role_tags),
+                    skill_ids: split_tokens(&skill_ids),
+                    registered_at: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|e| {
+                role.map_or(true, |r| e.role_tags.iter().any(|t| t == r))
+                    && skill.map_or(true, |s| e.skill_ids.iter().any(|t| t == s))
+            })
+            .collect())
+    }
+}
+
 /// SQLite-backed tunnel registry (durable equivalent of
 /// [`crate::registry::TunnelRegistry`]). Can share the same database file as
 /// [`SqliteEnrollment`] — each store owns its tables and its own connection.
@@ -2667,5 +2790,39 @@ mod tests {
         assert_eq!(reopened.operator_pubkey(&ch).unwrap(), Some(op), "operator key persists");
         assert!(reopened.is_member(&ch, &member).unwrap(), "membership persists");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_directory_upserts_and_searches_by_exact_role_and_skill() {
+        // #144 ②: agents self-register their card URL + advertised roles/skills; peers search by
+        // role/skill to discover whom to fetch + verify. Re-registering upserts; matching is by
+        // EXACT token (not substring); role+skill compose (AND).
+        let dir = SqliteAgentDirectory::open_in_memory().unwrap();
+        dir.register("aa", "https://source-1.agents.z/.well-known/agent-card.json",
+            &["source".to_string()], &["transfer".to_string()], 100).unwrap();
+        dir.register("bb", "https://sink-1.agents.z/.well-known/agent-card.json",
+            &["sink".to_string(), "reviewer".to_string()], &["verify".to_string()], 100).unwrap();
+
+        assert_eq!(dir.search(None, None).unwrap().len(), 2, "no filter -> whole directory");
+
+        let sources = dir.search(Some("source"), None).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].holder_pubkey, "aa");
+        assert_eq!(sources[0].role_tags, vec!["source".to_string()]);
+        assert_eq!(sources[0].card_url, "https://source-1.agents.z/.well-known/agent-card.json");
+
+        assert_eq!(dir.search(None, Some("verify")).unwrap()[0].holder_pubkey, "bb", "by skill");
+        assert!(dir.search(Some("sourc"), None).unwrap().is_empty(), "exact token, not substring");
+        assert!(dir.search(Some("source"), Some("verify")).unwrap().is_empty(), "role AND skill");
+        assert_eq!(dir.search(Some("source"), Some("transfer")).unwrap().len(), 1, "role AND skill match");
+
+        // Re-register aa: new URL + an added role — upsert, not a duplicate.
+        dir.register("aa", "https://new.z/.well-known/agent-card.json",
+            &["source".to_string(), "coordinator".to_string()], &["transfer".to_string()], 200).unwrap();
+        assert_eq!(dir.search(None, None).unwrap().len(), 2, "re-register upserts (no dupe)");
+        let updated = dir.search(Some("coordinator"), None).unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].card_url, "https://new.z/.well-known/agent-card.json", "URL updated");
+        assert_eq!(updated[0].registered_at, 200, "timestamp updated");
     }
 }
