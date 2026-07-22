@@ -1224,6 +1224,7 @@ svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var
 .empty{fill:var(--muted);font:500 15px system-ui,sans-serif}
 .bar label{margin-left:auto;color:var(--muted);font-size:.82rem;display:flex;align-items:center;gap:.4rem}
 .bar select,.bar button{font:inherit;font-size:.82rem;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.35rem .6rem;cursor:pointer}
+.bar input{font:inherit;font-size:.82rem;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.35rem .6rem;width:8.5rem}
 .bar button.primary{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 .bar button.primary:hover{filter:brightness(1.06)}
 #msg{color:var(--muted);font-size:.8rem;min-width:6rem}
@@ -1275,6 +1276,10 @@ const EDITOR_JS: &str = r#"
  function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();say('unlinked '+a+' — '+b);}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
  var linkBtn=document.getElementById('link');
  if(linkBtn){linkBtn.addEventListener('click',function(){var on=svg.getAttribute('data-linkmode')!=='1';svg.setAttribute('data-linkmode',on?'1':'');linkBtn.setAttribute('aria-pressed',on?'true':'false');linkBtn.classList.toggle('active',on);if(!on)clearSrc();say(on?'connect: click two agents to link, or a link to remove':'');});}
+ // #107-ui-compose: add-agent — assign an existing agent into this topology, then re-render
+ // (the server lays out the new node with correct geometry). Exclusive-membership 409 is surfaced.
+ var addBtn=document.getElementById('addagent'),agIn=document.getElementById('agent');
+ if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a})}).then(function(r){if(r.ok){say('added '+a);location.reload();}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
 })();
 "#;
 
@@ -1283,9 +1288,10 @@ const EDITOR_JS: &str = r#"
 /// topology — agents as rounded node-cards on a dotted canvas, links as smooth bezier
 /// edges. Server-emitted geometry means it renders correctly without JS (progressive
 /// enhancement); the inline JS only adds drag interactivity + the overlay-mode toggle,
-/// "Suggest overlay", and the "Connect" click-to-compose tool (#107-ui-compose — toggle it,
+/// "Suggest overlay", the "Connect" click-to-compose tool (#107-ui-compose — toggle it,
 /// click two agents to draw a link, or click a link to remove it, via the owner
-/// `POST`/`DELETE …/edges` endpoints). Agent ids are HTML-escaped
+/// `POST`/`DELETE …/edges` endpoints), and an add-agent input (`POST …/agents`, re-rendering
+/// so the server lays out the new node). Agent ids are HTML-escaped
 /// (XSS-safe). An empty topology yields a valid page with an empty-state hint. `mode` is the
 /// topology's current [`overlay mode`](topology_set_mode) token, pre-selected in the toggle.
 fn render_topology_editor(
@@ -1394,6 +1400,8 @@ fn render_topology_editor(
          <span class=\"hint\">drag nodes to arrange</span>\
          <label>overlay <select id=\"mode\">{mode_options}</select></label>\
          <button id=\"link\" aria-pressed=\"false\">Connect</button>\
+         <input id=\"agent\" placeholder=\"agent id\" aria-label=\"agent id to add\"/>\
+         <button id=\"addagent\">Add</button>\
          <button id=\"suggest\" class=\"primary\">Suggest overlay</button>\
          <span id=\"msg\"></span></header>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
@@ -3607,6 +3615,9 @@ mod tests {
         // ...and the inverse gesture: clicking an existing link (while armed) removes it via DELETE.
         assert!(html.contains("function removeEdge"), "edge-remove handler present");
         assert!(html.contains("method:'DELETE'"), "removal DELETEs the owner edges endpoint");
+        // ...and add-agent: an input + button that assign an existing agent into the topology.
+        assert!(html.contains("id=\"agent\"") && html.contains("id=\"addagent\""), "add-agent control present");
+        assert!(html.contains("/agents"), "add-agent POSTs the owner agents endpoint");
         // Still zero external assets — the compose JS must not smuggle any in (the SVG
         // namespace URL in particular must be absent).
         for external in ["http://", "https://", "<link", "src=\"", "@import"] {
