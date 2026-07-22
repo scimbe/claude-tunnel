@@ -69,6 +69,10 @@ docker run --rm -v "$PWD":/work -w /work rust:1-slim \
   sh -c 'cargo build --workspace && cargo test --workspace'
 ```
 
+Building natively instead (no container) works too, but needs a **recent stable
+Rust — 1.85 or newer** (a transitive dependency requires the `edition2024` Cargo
+feature, stabilized in 1.85): `rustup update stable && cargo build --workspace`.
+
 ## Deploy
 
 ```bash

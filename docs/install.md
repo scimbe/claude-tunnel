@@ -20,6 +20,11 @@ docker run --rm -v "$PWD":/work -w /work rust:1-slim \
 That builds all six crates and runs the full test suite in a throwaway
 container.
 
+Prefer a native build (no container)? It works too, but needs a **recent stable
+Rust — 1.85 or newer**: a transitive dependency (`idna_adapter`) requires the
+`edition2024` Cargo feature, stabilized in Rust 1.85, so older toolchains fail to
+parse the manifest. Then `rustup update stable && cargo build --workspace`.
+
 ## 3. Run it
 
 ### Self-host (Docker Compose) — one file, durable state
