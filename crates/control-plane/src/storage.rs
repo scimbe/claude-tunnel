@@ -357,7 +357,7 @@ impl SqliteBootstrap {
 /// *points* at the verifiable card — a searcher fetches `card_url`
 /// ([`/.well-known/agent-card.json`](ct_common::channel)) and re-checks the holder signature
 /// itself; the registry is discovery, never trust (same discipline as the card's self-assertion).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentDirectoryEntry {
     /// Hex of the agent's 32-byte ed25519 holder public key (the identity).
     pub holder_pubkey: String,

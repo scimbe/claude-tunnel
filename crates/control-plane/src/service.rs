@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
@@ -24,8 +24,9 @@ use crate::payment::{PaymentError, PaymentId};
 use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
-    BootstrapError, LedgerOpError, PaymentOpError, RedeemError, SqliteBootstrap, SqliteChannelStore,
-    SqliteEnrollment, SqliteLedger, SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
+    AgentDirectoryEntry, BootstrapError, LedgerOpError, PaymentOpError, RedeemError,
+    SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore, SqliteEnrollment, SqliteLedger,
+    SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -773,6 +774,74 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/agents", post(topology_assign))
         .route("/me/topologies/:id/edges", post(topology_add_edge).delete(topology_remove_edge))
         .with_state(AuthedTopologyState { topologies, verifier })
+}
+
+/// State for the searchable agent directory (#144 ②): the store + OIDC verifier.
+#[derive(Clone)]
+struct AgentDirectoryState {
+    directory: Arc<SqliteAgentDirectory>,
+    verifier: Arc<OidcVerifier>,
+}
+
+/// #144 ②: the **searchable agent-directory** REST.
+///
+/// * `POST /registry/agents` `{holder_pubkey, card_url, role_tags?, skill_ids?}` — an agent
+///   self-registers (upsert) its published card URL + advertised facets. **OIDC-bearer-gated**
+///   (#87 — writes need an authenticated caller; anti-anonymous-spam). Trust is NOT the registry:
+///   a searcher fetches `card_url` (`/.well-known/agent-card.json`) and re-checks the holder
+///   signature, so binding the caller's subject to `holder_pubkey` is a hardening follow.
+/// * `GET /registry/agents?role=&skill=` — **public** search by exact role/skill token → the
+///   matching entries (each = holder key + card URL + facets to fetch & verify).
+pub fn agent_directory_router(
+    directory: Arc<SqliteAgentDirectory>,
+    verifier: Arc<OidcVerifier>,
+) -> Router {
+    Router::new()
+        .route("/registry/agents", post(agent_register).get(agent_search))
+        .with_state(AgentDirectoryState { directory, verifier })
+}
+
+#[derive(Deserialize)]
+struct RegisterAgentReq {
+    holder_pubkey: String,
+    card_url: String,
+    #[serde(default)]
+    role_tags: Vec<String>,
+    #[serde(default)]
+    skill_ids: Vec<String>,
+}
+
+async fn agent_register(
+    State(state): State<AgentDirectoryState>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterAgentReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // #87: writes require a valid bearer. The authenticated subject is the anti-spam gate; the
+    // card's holder signature (checked when a peer fetches `card_url`) is the actual trust anchor.
+    let _subject = subject_of(&state.verifier, &headers)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    state
+        .directory
+        .register(&req.holder_pubkey, &req.card_url, &req.role_tags, &req.skill_ids, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct AgentSearchQuery {
+    role: Option<String>,
+    skill: Option<String>,
+}
+
+async fn agent_search(
+    State(state): State<AgentDirectoryState>,
+    Query(q): Query<AgentSearchQuery>,
+) -> Result<Json<Vec<AgentDirectoryEntry>>, (StatusCode, String)> {
+    let entries = state
+        .directory
+        .search(q.role.as_deref(), q.skill.as_deref())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(entries))
 }
 
 /// A random opaque id (16 bytes, hex) for a topology id / net_uuid.
@@ -3661,6 +3730,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss.status(), StatusCode::NOT_FOUND, "unknown uuid -> 404");
+    }
+
+    #[tokio::test]
+    async fn agent_directory_rest_registers_with_bearer_and_searches_publicly() {
+        // #144 ②: POST self-register is OIDC-bearer-gated (#87), GET search is public. A registered
+        // agent is discoverable by its advertised role; the response carries the card URL a peer
+        // fetches + verifies.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let dir = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        let app = agent_directory_router(dir, verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        // POST without a bearer -> 401.
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::post("/registry/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"holder_pubkey":"aa","card_url":"https://x/.well-known/agent-card.json","role_tags":["source"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "self-register needs a bearer (#87)");
+
+        // POST with a bearer -> 200.
+        let reg = app
+            .clone()
+            .oneshot(
+                Request::post("/registry/agents")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"holder_pubkey":"aa","card_url":"https://source-1/.well-known/agent-card.json","role_tags":["source"],"skill_ids":["transfer"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reg.status(), StatusCode::OK, "authenticated self-register succeeds");
+
+        // GET is public: search by role returns the registered agent + its card URL.
+        let hit = app
+            .clone()
+            .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(hit.status(), StatusCode::OK, "search is public (no bearer)");
+        let body = to_bytes(hit.into_body(), 1 << 16).await.unwrap();
+        let hits: Vec<AgentDirectoryEntry> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].holder_pubkey, "aa");
+        assert_eq!(hits[0].card_url, "https://source-1/.well-known/agent-card.json");
+
+        // No match -> empty list.
+        let miss = app
+            .oneshot(Request::get("/registry/agents?role=nobody").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(miss.into_body(), 1 << 16).await.unwrap();
+        assert!(serde_json::from_slice::<Vec<AgentDirectoryEntry>>(&body).unwrap().is_empty());
     }
 
     #[tokio::test]
