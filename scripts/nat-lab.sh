@@ -179,14 +179,18 @@ punch_smoke() {
   rm -f "$rout" "$aout" "$dout"
   return $rc
 }
-# The punch smoke is reported but NOT yet fatal. Address DISCOVERY now works: the relay runs an
-# identify server, so each client learns its PUBLIC reflexive QUIC address (e.g. listener
-# 203.0.113.10:<port>, dialer 203.0.113.20:<port>) and advertises it as an external candidate.
-# The remaining blocker is DEEPER: DCUtR's Connect still reports `NoAddresses` / `UnexpectedEof`
-# despite the reflexive addresses being known to the swarm — a libp2p-dcutr address-confirmation
-# /timing layer (the upgrade fires before the confirmed external addr reaches the Connect), under
-# diagnosis. Flip this to `expect_ok` once the upgrade fires. The 6 topology assertions above are
-# the gating checks.
+# The punch smoke is reported but NOT yet fatal. The address plumbing is now fully correct and
+# verified (see the diag trace): the relay runs an identify server, so each client learns its
+# PUBLIC reflexive QUIC address (listener 203.0.113.10:<port>, dialer 203.0.113.20:<port>),
+# confirms it as an external address, and does so BEFORE it becomes dialable (the DCUtR sequencing
+# in `await_reflexive_via_relay`). Yet DCUtR's Connect STILL goes out address-less
+# (`NoAddresses`/`UnexpectedEof`). Ruled out, each with a lab run: (1) address discovery — fixed;
+# (2) timing/ordering — the reflexive is confirmed before the peer connection; (3) non-global
+# filtering — same failure with global-unicast IPs (11.0.0.x), not just RFC-5737 range. The
+# residual cause is INTERNAL to libp2p-0.56 `dcutr`: it does not source the swarm's confirmed
+# external addresses into its Connect message. This needs a libp2p-level fix/bump OR the real
+# AutoNAT/identify address-confirmation flow present on genuine NAT'd hosts (N-rig-3 live). Flip
+# to `expect_ok` once it upgrades. The 6 topology assertions above remain the gating checks.
 if [ -x "$NATLAB" ]; then
   if punch_smoke; then
     echo "PASS: cross-NAT DCUtR hole-punch — BOTH peers reported a DIRECT upgrade (PUNCH-OK)"

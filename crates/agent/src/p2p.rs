@@ -381,6 +381,40 @@ pub async fn nat_lab_relay(listen: &str) -> Result<(), BoxError> {
     }
 }
 
+/// #136 DCUtR **sequencing**: connect to the relay and pump events until identify reports our
+/// **reflexive** (public NAT-mapped) external address, confirming it as an external address
+/// BEFORE we become dialable / dial the peer. This is the standard libp2p DCUtR ordering: the
+/// hole-punch auto-fires the moment the relayed peer connection forms, and DCUtR's `Connect`
+/// carries only the external addresses confirmed *at that instant*. If identify hasn't yet run,
+/// the Connect goes out address-less and the upgrade dies `NoAddresses` — exactly what the lab
+/// showed. Waiting here guarantees the address is in hand first.
+#[cfg(any(test, feature = "nat-lab"))]
+async fn await_reflexive_via_relay(
+    swarm: &mut Swarm<DcutrRelayClientBehaviour>,
+    relay: Multiaddr,
+) -> Result<(), BoxError> {
+    swarm.dial(relay)?;
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err("nat-lab: no reflexive address from the relay within 20s".into()),
+            ev = swarm.select_next_some() => {
+                if let SwarmEvent::Behaviour(DcutrRelayClientBehaviourEvent::Identify(
+                    identify::Event::Received { info, .. },
+                )) = ev
+                {
+                    if !info.observed_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        eprintln!("reflexive confirmed via relay: {}", info.observed_addr);
+                        swarm.add_external_address(info.observed_addr);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// #136 N-rig-2b part 2 (**test-only**, `nat-lab` feature): the **listen** punch client — the
 /// relay-only peer that *accepts* a punch. Builds a DCUtR client, listens on QUIC (a punchable
 /// UDP reflexive address), reserves a slot on `relay` (`<relay>/p2p/<relay-id>`), prints its
@@ -392,6 +426,9 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
     let mut swarm = build_dcutr_relay_client_swarm()?;
     let me = *swarm.local_peer_id();
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive address
+    // #136 sequencing: learn+confirm our reflexive addr from the relay BEFORE reserving (becoming
+    // dialable), so the punch that follows has a confirmed external addr to advertise.
+    await_reflexive_via_relay(&mut swarm, relay.clone()).await?;
     let relay_circuit = relay.with(Protocol::P2pCircuit);
     swarm.listen_on(relay_circuit.clone())?; // reserve on the relay
     let deadline = tokio::time::sleep(Duration::from_secs(40));
@@ -444,6 +481,13 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
 pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
     let mut swarm = build_dcutr_relay_client_swarm()?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive address
+    // #136 sequencing: confirm our reflexive addr from the relay BEFORE dialing the peer. The
+    // relay addr is the prefix of `peer_via_relay` up to the `/p2p-circuit` hop.
+    let relay_addr: Multiaddr = peer_via_relay
+        .iter()
+        .take_while(|p| !matches!(p, Protocol::P2pCircuit))
+        .collect();
+    await_reflexive_via_relay(&mut swarm, relay_addr).await?;
     swarm.dial(peer_via_relay)?; // dial the listener through the relay
     let deadline = tokio::time::sleep(Duration::from_secs(40));
     tokio::pin!(deadline);
