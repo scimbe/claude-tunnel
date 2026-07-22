@@ -1205,6 +1205,8 @@ svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var
 .bar button.primary{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 .bar button.primary:hover{filter:brightness(1.06)}
 #msg{color:var(--muted);font-size:.8rem;min-width:6rem}
+.bar button.active{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
+.node.linking .card{stroke:var(--accent);stroke-width:2px}
 "#;
 
 /// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
@@ -1218,7 +1220,7 @@ const EDITOR_JS: &str = r#"
  function pt(e){var m=svg.getScreenCTM().inverse(),p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;return p.matrixTransform(m);}
  function centers(){var m={};svg.querySelectorAll('.node').forEach(function(n){m[n.getAttribute('data-node')]=[+n.getAttribute('data-cx'),+n.getAttribute('data-cy')];});return m;}
  function redraw(){var c=centers();svg.querySelectorAll('.edge').forEach(function(ed){var a=c[ed.getAttribute('data-a')],b=c[ed.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2;ed.setAttribute('d','M '+a[0]+' '+a[1]+' C '+mx+' '+a[1]+', '+mx+' '+b[1]+', '+b[0]+' '+b[1]);});}
- svg.addEventListener('pointerdown',function(e){var g=e.target.closest('.node');if(!g)return;sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
+ svg.addEventListener('pointerdown',function(e){var g=e.target.closest('.node');if(!g)return;if(svg.getAttribute('data-linkmode')==='1'){linkPick(g);return;}sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
  svg.addEventListener('pointermove',function(e){if(!sel)return;var p=pt(e),x=p.x-dx,y=p.y-dy;sel.setAttribute('data-cx',x);sel.setAttribute('data-cy',y);sel.setAttribute('transform','translate('+x+','+y+')');redraw();});
  svg.addEventListener('pointerup',function(){sel=null;});
  redraw();
@@ -1239,6 +1241,16 @@ const EDITOR_JS: &str = r#"
    .then(function(p){say('suggested '+p.links.length+' links, cost '+p.total_cost+(p.connected?' (connected)':' (partition)'));})
    .catch(function(s){say('suggest unavailable ('+s+')');});
  });}
+ // #107-ui-compose: click-to-connect — toggle Connect, then click two agents to draw a new
+ // overlay link; it POSTs the existing owner `…/edges` endpoint and the edge appears live.
+ var src=null;
+ function xesc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+ function clearSrc(){if(src){src.classList.remove('linking');src=null;}}
+ function edgeExists(a,b){var f=false;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=true;});return f;}
+ function addEdgeEl(a,b){var first=svg.querySelector('.node');if(!first)return;first.insertAdjacentHTML('beforebegin','<path data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"/>');var np=first.previousElementSibling;if(np)np.setAttribute('class','edge');redraw();}
+ function linkPick(g){var id=g.getAttribute('data-node');if(!src){src=g;g.classList.add('linking');say('connect: pick the target agent');return;}var a=src.getAttribute('data-node');clearSrc();if(a===id){say('connect: pick two different agents');return;}if(edgeExists(a,id)){say('already linked');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:id})}).then(function(r){if(r.ok){addEdgeEl(a,id);say('linked '+a+' — '+id);}else{say('link failed ('+r.status+')');}}).catch(function(){say('link failed');});}
+ var linkBtn=document.getElementById('link');
+ if(linkBtn){linkBtn.addEventListener('click',function(){var on=svg.getAttribute('data-linkmode')!=='1';svg.setAttribute('data-linkmode',on?'1':'');linkBtn.setAttribute('aria-pressed',on?'true':'false');linkBtn.classList.toggle('active',on);if(!on)clearSrc();say(on?'connect: click two agents to link':'');});}
 })();
 "#;
 
@@ -1246,8 +1258,9 @@ const EDITOR_JS: &str = r#"
 /// (CSP-safe, no external assets), theme-aware, **draggable** SVG node-graph of the
 /// topology — agents as rounded node-cards on a dotted canvas, links as smooth bezier
 /// edges. Server-emitted geometry means it renders correctly without JS (progressive
-/// enhancement); the inline JS only adds drag interactivity + the overlay-mode toggle and
-/// "Suggest overlay" action (wired to the owner REST endpoints). Agent ids are HTML-escaped
+/// enhancement); the inline JS only adds drag interactivity + the overlay-mode toggle,
+/// "Suggest overlay", and the "Connect" click-to-compose tool (#107-ui-compose — toggle it,
+/// click two agents to draw a link via the owner `POST …/edges` endpoint). Agent ids are HTML-escaped
 /// (XSS-safe). An empty topology yields a valid page with an empty-state hint. `mode` is the
 /// topology's current [`overlay mode`](topology_set_mode) token, pre-selected in the toggle.
 fn render_topology_editor(
@@ -1355,6 +1368,7 @@ fn render_topology_editor(
          <span class=\"chip\">{na} agents</span><span class=\"chip\">{ne} links</span>\
          <span class=\"hint\">drag nodes to arrange</span>\
          <label>overlay <select id=\"mode\">{mode_options}</select></label>\
+         <button id=\"link\" aria-pressed=\"false\">Connect</button>\
          <button id=\"suggest\" class=\"primary\">Suggest overlay</button>\
          <span id=\"msg\"></span></header>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
@@ -3507,6 +3521,36 @@ mod tests {
         // An empty topology still yields a valid page with an empty-state hint (no panic).
         let empty = render_topology_editor(&t, &[], &[], "baseline");
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
+    }
+
+    #[test]
+    fn topology_editor_supports_click_to_connect_compose() {
+        // #107-ui-compose: the editor lets the owner GRAPHICALLY compose the overlay — a
+        // "Connect" tool that, when armed, turns clicking two agents into a new link POSTed to
+        // the existing owner `…/edges` endpoint (the edge then appears live). Still fully
+        // self-contained / CSP-safe — the compose JS adds no external assets and (critically)
+        // creates the live edge via `insertAdjacentHTML` in SVG context, NOT `createElementNS`
+        // with an `http://…/svg` namespace literal that would break the CSP-safe invariant.
+        let t = crate::topology::Topology {
+            id: "t1".into(),
+            owner: "alice".into(),
+            net_uuid: "uuid-xyz".into(),
+        };
+        let agents = vec!["agent-1".to_string(), "agent-2".to_string()];
+        let html = render_topology_editor(&t, &agents, &[], "baseline");
+
+        // The Connect tool is present and starts un-armed (a11y state exposed).
+        assert!(html.contains("id=\"link\"") && html.contains("aria-pressed=\"false\""), "Connect tool present, un-armed");
+        // The compose behaviour: a link mode that turns clicks into an edge POST to `…/edges`.
+        assert!(html.contains("data-linkmode"), "link-mode gate wired");
+        assert!(html.contains("function linkPick"), "click-to-connect handler present");
+        assert!(html.contains("/edges") && html.contains("method:'POST'"), "POSTs new links to the owner edges endpoint");
+        assert!(html.contains("insertAdjacentHTML"), "live edge created without a namespace literal");
+        // Still zero external assets — the compose JS must not smuggle any in (the SVG
+        // namespace URL in particular must be absent).
+        for external in ["http://", "https://", "<link", "src=\"", "@import"] {
+            assert!(!html.contains(external), "compose editor stays CSP-safe: no {external:?}");
+        }
     }
 
     #[tokio::test]
