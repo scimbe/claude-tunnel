@@ -22,8 +22,8 @@ pub type UnixSeconds = u64;
 /// Opaque channel address in the Agent Fabric — like a `RoutingToken`, it reveals
 /// no hostname to the operator and decouples "who I want to reach" from any network
 /// address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChannelId(pub [u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ChannelId(#[serde(with = "card_hex::b32")] pub [u8; 32]);
 
 /// The domain separating a derived per-link channel id from every other hashed object.
 const LINK_CHANNEL_DOMAIN: &[u8] = b"ct-link-channel-v1";
@@ -1101,18 +1101,67 @@ const AGENT_CARD_DOMAIN: &[u8] = b"ct-agent-card-v1";
 
 /// An **affinity-group (cell) identifier** (#135 L1): a self-organized, task-scoped group of agents
 /// (e.g. #133's source/sink/central triangle). Opaque 32 bytes, same shape as [`ChannelId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CellId(pub [u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CellId(#[serde(with = "card_hex::b32")] pub [u8; 32]);
 
 /// A capability an agent advertises it can be asked to perform (#135 L1, A2A `AgentCard`-shaped):
 /// a stable `id`, a human `description`, and `examples` of use. Self-asserted advertisement — a
 /// reader learns *what the holder claims to offer*, and negotiates/authorizes the actual invocation
 /// separately (an `AgentCard` signature proves the holder issued the claim, never that it works).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Skill {
     pub id: String,
     pub description: String,
     pub examples: Vec<String>,
+}
+
+/// Hex (de)serialization for the fixed-size byte fields of an [`AgentCard`] and its
+/// [`ChannelId`]/[`CellId`] members, so the card's serde form is a human-readable JSON
+/// **profile** (`"7a3f…"` strings) rather than raw number arrays. The signed content is
+/// unchanged — [`AgentCard::signing_bytes`] remains the canonical binary preimage; JSON is
+/// only a transport/display encoding, and [`AgentCard::is_valid`] re-checks the signature
+/// after any round-trip (#135 L1 — the JSON profile agent onboarding / #133 dogfood reads).
+mod card_hex {
+    fn to_hex(b: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(b.len() * 2);
+        for byte in b {
+            let _ = write!(s, "{byte:02x}");
+        }
+        s
+    }
+    fn from_hex(s: &str) -> Option<Vec<u8>> {
+        if s.len() % 2 != 0 {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+    pub mod b32 {
+        use serde::{Deserialize, Deserializer, Serializer};
+        pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&super::to_hex(b))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+            let v = super::from_hex(&String::deserialize(d)?)
+                .ok_or_else(|| serde::de::Error::custom("invalid hex"))?;
+            v.try_into().map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+        }
+    }
+    pub mod b64 {
+        use serde::{Deserialize, Deserializer, Serializer};
+        pub fn serialize<S: Serializer>(b: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&super::to_hex(b))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+            let v = super::from_hex(&String::deserialize(d)?)
+                .ok_or_else(|| serde::de::Error::custom("invalid hex"))?;
+            let a: [u8; 64] = v.try_into().map_err(|_| serde::de::Error::custom("expected 64 bytes"))?;
+            Ok(a)
+        }
+    }
 }
 
 /// A **holder-signed, discoverable agent identity document** (#135 Layer 1) — an A2A `AgentCard`
@@ -1128,10 +1177,11 @@ pub struct Skill {
 /// future governance layer). `cells` is empty/forward-looking until that layer lands. A reader trusts
 /// the *holder-issued* fact, then authorizes any actual action separately — the same discipline as
 /// [`BillingCommitment`]/[`SettleReceipt`], never the DHT/`PeerId` (invariant #1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentCard {
     /// The agent's ed25519 holder public key — the signature is checked against this, and it is the
     /// same key family that authorizes the agent's channel membership + attests its Noise key.
+    #[serde(with = "card_hex::b32")]
     pub holder_pubkey: [u8; 32],
     pub role_tags: Vec<String>,
     pub skills: Vec<Skill>,
@@ -1142,6 +1192,7 @@ pub struct AgentCard {
     pub issued_at: UnixSeconds,
     pub expires_at: UnixSeconds,
     /// The holder's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    #[serde(with = "card_hex::b64")]
     pub signature: [u8; 64],
 }
 
@@ -2538,5 +2589,56 @@ mod tests {
         let attacker = SigningKey::from_bytes(&[0x53u8; 32]);
         let impersonated = sign(&victim, &role_tags, &skills, &cells, &channels, &attacker);
         assert!(!impersonated.is_valid(1_000), "a card not signed by its holder is rejected");
+    }
+
+    #[test]
+    fn agent_card_serdes_to_a_verifiable_json_profile() {
+        // #135 L1 (frozen): an AgentCard round-trips through JSON as a human-readable **profile**
+        // (byte fields are hex strings, not number arrays) and the holder signature STILL verifies
+        // after the round-trip — JSON is only a transport/display encoding of the canonical signed
+        // binary content, so a peer can read the profile from a registry/vault and re-check it.
+        let sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let holder = sk.verifying_key().to_bytes();
+        let role_tags = vec!["source".to_string()];
+        let skills = vec![Skill {
+            id: "fire_transfer_test".to_string(),
+            description: "trigger a live A2A transfer".to_string(),
+            examples: vec!["fire_transfer_test(size_bytes=588895)".to_string()],
+        }];
+        let cells = vec![CellId([0x33u8; 32])];
+        let channels = vec![ChannelId([0x9bu8; 32])];
+        let (issued, expires) = (1_000u64, 5_000u64);
+        let card = AgentCard {
+            holder_pubkey: holder,
+            role_tags: role_tags.clone(),
+            skills: skills.clone(),
+            cells: cells.clone(),
+            channels: channels.clone(),
+            issued_at: issued,
+            expires_at: expires,
+            signature: sk
+                .sign(&AgentCard::signing_bytes(&holder, &role_tags, &skills, &cells, &channels, issued, expires))
+                .to_bytes(),
+        };
+        assert!(card.is_valid(1_000), "precondition: an authentic card");
+
+        // Serializes to a human-readable JSON profile: hex STRING byte fields (not `[81,81,…]`
+        // arrays) + the self-asserted skills/role_tags carried verbatim.
+        let json = serde_json::to_string(&card).expect("card serializes to JSON");
+        assert!(json.contains("\"holder_pubkey\":\""), "holder pubkey is a hex string, not a byte array");
+        assert!(json.contains("\"signature\":\""), "signature is a hex string");
+        assert!(json.contains("\"fire_transfer_test\""), "skills are carried in the profile");
+        assert!(!json.contains("[81,81,"), "no raw number-array byte fields");
+
+        // Lossless round-trip AND the holder signature still verifies against the binary preimage.
+        let back: AgentCard = serde_json::from_str(&json).expect("card deserializes from JSON");
+        assert_eq!(back, card, "the JSON round-trip is lossless");
+        assert!(back.is_valid(1_000), "the holder signature still verifies after a JSON round-trip");
+        assert!(!back.is_valid(5_000), "expiry survives the round-trip");
+        // A tampered profile (edit the skill in the JSON) fails the signature — the profile is
+        // authenticated, not just transported.
+        let tampered = json.replace("trigger a live A2A transfer", "do something else entirely");
+        let bad: AgentCard = serde_json::from_str(&tampered).expect("still valid JSON");
+        assert!(!bad.is_valid(1_000), "editing the JSON profile breaks the holder signature");
     }
 }
