@@ -59,14 +59,30 @@ issues for the developer role.
 ## Prerequisites (from the central host)
 
 You need `CENTRAL=<host>` (control plane `:8090`, edge `:4433`) and the public
-`EDGE_CERT=<edge-cert.der>` (safe-to-distribute CA-root trust material). Build
-the binaries hermetically if `./target/debug` is empty:
+`EDGE_CERT=<edge-cert.der>` (safe-to-distribute CA-root trust material).
+
+**Build the binaries.** If `./target/debug` already has `ct-agent`, skip this. Otherwise
+a **native** build is the quickest path — but it needs a **recent stable Rust, 1.85 or
+newer**. The workspace pulls a dependency (`idna_adapter`) that requires the `edition2024`
+Cargo feature (stabilized in Rust 1.85), so older toolchains (e.g. 1.80 / 1.82) fail. With
+`rust-version = "1.85"` declared, `cargo` now reports this clearly as *"requires rustc 1.85
+or newer"* (rather than the older, cryptic *"feature `edition2024` is required"*):
+
+```bash
+rustup update stable          # or install any toolchain >= 1.85
+cargo build --workspace       # -> ./target/debug/ct-agent (run it natively)
+```
+
+**No modern toolchain handy?** Build hermetically in Docker — same output, zero local Rust
+(the pinned `rust:1-slim` is a recent stable, currently 1.97):
 
 ```bash
 docker run --rm -v "$PWD":/work -w /work -u $(id -u):$(id -g) \
   -v $HOME/.cache/ct-cargo:/tmp/cargo -e CARGO_HOME=/tmp/cargo -e HOME=/tmp \
   rust:1-slim cargo build --workspace
 ```
+
+Either path yields the same `./target/debug` binaries; run `ct-agent` natively from there.
 
 ## What you exercise
 

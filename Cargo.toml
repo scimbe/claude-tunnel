@@ -12,6 +12,12 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
+# A transitive dependency (idna_adapter) requires the `edition2024` Cargo feature,
+# stabilized in Rust 1.85; older toolchains (e.g. 1.80/1.82) fail to even parse the
+# manifest with a cryptic "feature `edition2024` is required". Declaring the floor here
+# (inherited by every crate) makes `cargo` emit a clear "requires rustc 1.85 or newer"
+# instead — see the agent skill's Prerequisites for the native no-Docker build path (#143).
+rust-version = "1.85"
 license-file = "LICENSE"
 
 [workspace.dependencies]
