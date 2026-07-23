@@ -1517,6 +1517,17 @@ pub struct UsageReceipt {
     #[serde(with = "card_hex::b32")]
     pub match_ref: [u8; 32],
     pub issued_at: UnixSeconds,
+    /// #149-A.4 forensic audit: SHA-256 of the served **request** content, or all-zeros for "not
+    /// recorded". The hash — never the content — rides the receipt, so a provider can later prove
+    /// exactly what was asked without the marketplace ever transmitting or retaining the plaintext.
+    /// Because it's in the co-signed preimage, neither party can alter the recorded request after the
+    /// fact without invalidating the other's signature.
+    #[serde(with = "card_hex::b32")]
+    pub request_hash: [u8; 32],
+    /// #149-A.4 forensic audit: SHA-256 of the returned **response** content (all-zeros = not
+    /// recorded), co-signed exactly like `request_hash`.
+    #[serde(with = "card_hex::b32")]
+    pub response_hash: [u8; 32],
     /// The provider's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
     #[serde(with = "card_hex::b64")]
     pub provider_sig: [u8; 64],
@@ -1527,8 +1538,11 @@ pub struct UsageReceipt {
 
 impl UsageReceipt {
     /// Domain-separated, **canonical injective** preimage both parties sign: `domain ‖ provider ‖
-    /// consumer ‖ kind(u8) ‖ ⟨model⟩ ‖ units_consumed(LE) ‖ match_ref ‖ issued_at(LE)`, the
-    /// variable-length `model` length-prefixed (u32 LE) so no two distinct receipts share a preimage.
+    /// consumer ‖ kind(u8) ‖ ⟨model⟩ ‖ units_consumed(LE) ‖ match_ref ‖ issued_at(LE) ‖ request_hash ‖
+    /// response_hash`, the variable-length `model` length-prefixed (u32 LE) so no two distinct
+    /// receipts share a preimage. The two fixed-size audit hashes are appended (#149-A.4) so both
+    /// parties co-sign the forensic record, not just the consumption terms.
+    #[allow(clippy::too_many_arguments)]
     pub fn signing_bytes(
         provider: &[u8; 32],
         consumer: &[u8; 32],
@@ -1537,6 +1551,8 @@ impl UsageReceipt {
         units_consumed: u64,
         match_ref: &[u8; 32],
         issued_at: UnixSeconds,
+        request_hash: &[u8; 32],
+        response_hash: &[u8; 32],
     ) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(USAGE_RECEIPT_DOMAIN);
@@ -1548,6 +1564,8 @@ impl UsageReceipt {
         m.extend_from_slice(&units_consumed.to_le_bytes());
         m.extend_from_slice(match_ref);
         m.extend_from_slice(&issued_at.to_le_bytes());
+        m.extend_from_slice(request_hash);
+        m.extend_from_slice(response_hash);
         m
     }
 
@@ -1564,6 +1582,8 @@ impl UsageReceipt {
             self.units_consumed,
             &self.match_ref,
             self.issued_at,
+            &self.request_hash,
+            &self.response_hash,
         );
         let ok = |pk: &[u8; 32], sig: &[u8; 64]| match VerifyingKey::from_bytes(pk) {
             Ok(vk) => vk.verify(&bytes, &Signature::from_bytes(sig)).is_ok(),
@@ -1572,10 +1592,9 @@ impl UsageReceipt {
         ok(&self.provider, &self.provider_sig) && ok(&self.consumer, &self.consumer_sig)
     }
 
-    /// Construct a fully co-signed receipt from both parties' `SigningKey`s (the production flow is
-    /// asymmetric — the provider pre-signs and the consumer counter-signs the identical bytes — but
-    /// the cryptographic object is the same, and deriving both pubkeys from the keys means neither
-    /// party can be attributed a signature it did not make).
+    /// Construct a fully co-signed receipt **without** forensic hashes (both audit fields all-zeros =
+    /// "not recorded") — the plain consumption proof. Equivalent to
+    /// [`co_sign_audited`](Self::co_sign_audited) with zero hashes.
     #[allow(clippy::too_many_arguments)]
     pub fn co_sign(
         provider_key: &ed25519_dalek::SigningKey,
@@ -1586,11 +1605,53 @@ impl UsageReceipt {
         match_ref: [u8; 32],
         issued_at: UnixSeconds,
     ) -> UsageReceipt {
+        Self::co_sign_audited(
+            provider_key,
+            consumer_key,
+            kind,
+            model,
+            units_consumed,
+            match_ref,
+            issued_at,
+            [0u8; 32],
+            [0u8; 32],
+        )
+    }
+
+    /// Construct a fully co-signed receipt that also binds a forensic **audit trail** (#149-A.4):
+    /// `request_hash`/`response_hash` are SHA-256 of the served request/response content (all-zeros for
+    /// "not recorded"). They ride the co-signed preimage, so both parties attest the exact hashes — a
+    /// provider can later prove *what* was requested/returned if abuse is reported, and neither side can
+    /// alter that record without invalidating the other's signature, all without the marketplace ever
+    /// transmitting or retaining the plaintext content. The production flow is asymmetric (provider
+    /// pre-signs, consumer counter-signs the identical bytes); deriving both pubkeys from the keys means
+    /// neither party can be attributed a signature it did not make.
+    #[allow(clippy::too_many_arguments)]
+    pub fn co_sign_audited(
+        provider_key: &ed25519_dalek::SigningKey,
+        consumer_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        model: String,
+        units_consumed: u64,
+        match_ref: [u8; 32],
+        issued_at: UnixSeconds,
+        request_hash: [u8; 32],
+        response_hash: [u8; 32],
+    ) -> UsageReceipt {
         use ed25519_dalek::Signer;
         let provider = provider_key.verifying_key().to_bytes();
         let consumer = consumer_key.verifying_key().to_bytes();
-        let bytes =
-            Self::signing_bytes(&provider, &consumer, kind, &model, units_consumed, &match_ref, issued_at);
+        let bytes = Self::signing_bytes(
+            &provider,
+            &consumer,
+            kind,
+            &model,
+            units_consumed,
+            &match_ref,
+            issued_at,
+            &request_hash,
+            &response_hash,
+        );
         UsageReceipt {
             provider,
             consumer,
@@ -1599,6 +1660,8 @@ impl UsageReceipt {
             units_consumed,
             match_ref,
             issued_at,
+            request_hash,
+            response_hash,
             provider_sig: provider_key.sign(&bytes).to_bytes(),
             consumer_sig: consumer_key.sign(&bytes).to_bytes(),
         }
@@ -3342,6 +3405,8 @@ mod tests {
             r.units_consumed,
             &r.match_ref,
             r.issued_at,
+            &r.request_hash,
+            &r.response_hash,
         );
         let mut provider_self_cosigns = r.clone();
         provider_self_cosigns.consumer_sig = provider_key.sign(&bytes).to_bytes();
@@ -3368,6 +3433,44 @@ mod tests {
         let back: UsageReceipt = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(back, r);
         assert!(back.is_valid(), "still verifies after a JSON round-trip");
+    }
+
+    #[test]
+    fn usage_receipt_audit_hashes_are_co_signed_and_tamper_evident() {
+        // #149-A.4 (frozen): the forensic request/response hashes ride the co-signed preimage, so both
+        // parties attest them and neither can rewrite the audit record after the fact. A plain co_sign
+        // records zero hashes ("not recorded") and still verifies (backward-compatible), and the hashes
+        // genuinely change the signature (they're covered, not ignored).
+        use ed25519_dalek::SigningKey;
+        let provider = SigningKey::from_bytes(&[0x11u8; 32]);
+        let consumer = SigningKey::from_bytes(&[0x22u8; 32]);
+        let (req_h, resp_h) = ([0xAAu8; 32], [0xBBu8; 32]);
+        let r = UsageReceipt::co_sign_audited(
+            &provider, &consumer, CapacityKind::CloudApiQuota, "m".into(), 10, [0x9u8; 32], 5_000, req_h, resp_h,
+        );
+        assert!(r.is_valid(), "an audited co-signed receipt verifies");
+        assert_eq!((r.request_hash, r.response_hash), (req_h, resp_h), "the hashes are recorded");
+
+        // Tampering either hash breaks BOTH signatures — a provider can't rewrite the audit trail.
+        let mut t = r.clone();
+        t.request_hash = [0u8; 32];
+        assert!(!t.is_valid(), "altering the recorded request hash invalidates the receipt");
+        let mut t2 = r.clone();
+        t2.response_hash[0] ^= 1;
+        assert!(!t2.is_valid(), "altering the recorded response hash invalidates the receipt");
+
+        // Backward-compatible: a plain co_sign records zero hashes and still verifies — and its
+        // signature differs from the audited one, proving the hashes are actually covered.
+        let plain =
+            UsageReceipt::co_sign(&provider, &consumer, CapacityKind::CloudApiQuota, "m".into(), 10, [0x9u8; 32], 5_000);
+        assert!(plain.is_valid(), "a plain (unrecorded) receipt still verifies");
+        assert_eq!((plain.request_hash, plain.response_hash), ([0u8; 32], [0u8; 32]), "not recorded = zero hashes");
+        assert_ne!(plain.provider_sig, r.provider_sig, "the audit hashes are covered by the signature");
+
+        // JSON round-trip preserves the hashes and still verifies.
+        let back: UsageReceipt = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        assert!(back.is_valid());
     }
 
     #[test]
