@@ -85,6 +85,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // <CT_AGENT_CARD_OUT>/.well-known/agent-card.json for the origin to serve — the runnable
         // path that closes the discovery chain (no hand-rolled ed25519). Prints the written path.
         if std::env::args().nth(2).as_deref() == Some("agent-card") {
+            // `agent-card --verify <file>`: the fetcher/operator self-check — parse the card and
+            // re-verify its holder signature + expiry, exiting non-zero on any failure so it
+            // scripts cleanly. No key needed; the trust anchor is the signature in the file.
+            if std::env::args().nth(3).as_deref() == Some("--verify") {
+                let file = std::env::args()
+                    .nth(4)
+                    .ok_or("usage: ct-agent channel agent-card --verify <file>")?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                    .as_secs();
+                let card = ct_agent::well_known::read_and_verify_agent_card(
+                    std::path::Path::new(&file),
+                    now,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let holder: String =
+                    card.holder_pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                println!(
+                    "valid  holder={holder}  role_tags={:?}  expires_at={}",
+                    card.role_tags, card.expires_at
+                );
+                return Ok(());
+            }
             let cfg = ct_agent::channel_run::AgentCardCliConfig::from_env()
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let now = std::time::SystemTime::now()

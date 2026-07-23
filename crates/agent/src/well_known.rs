@@ -64,6 +64,30 @@ pub fn write_agent_card_for_origin(
     Ok(path)
 }
 
+/// Read a JSON [`AgentCard`] profile from `path` and **verify** it at `now`: parse it, then
+/// re-check the holder signature and expiry via [`AgentCard::is_valid`]. Returns the card when
+/// it is authentic AND current, else an error naming why. This is the fetcher/operator
+/// self-check counterpart to [`write_agent_card_for_origin`] (#144 ①-wiring): a discovered card
+/// is trustworthy only after this check succeeds — never because a registry or origin served it.
+/// The trust anchor is the ed25519 holder signature carried in the file, not the transport.
+pub fn read_and_verify_agent_card(
+    path: &std::path::Path,
+    now: u64,
+) -> Result<AgentCard, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let card: AgentCard = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("not a valid AgentCard JSON profile: {e}"))?;
+    if !card.is_valid(now) {
+        return Err(format!(
+            "card failed verification at now={now}: bad holder signature or expired \
+             (expires_at={})",
+            card.expires_at
+        ));
+    }
+    Ok(card)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +193,41 @@ mod tests {
         let back: AgentCard = serde_json::from_slice(&bytes).expect("parses");
         assert_eq!(back, card, "the served file is the exact signed card");
         assert!(back.is_valid(1_000), "the written card still verifies");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_and_verify_accepts_authentic_and_rejects_tampered_expired_and_malformed() {
+        // #144 ①-wiring verify path (central's nice-to-have): the fetcher/operator self-check
+        // accepts an authentic, current card and rejects a tampered signature, an expired card,
+        // malformed JSON, and a missing file — so a discovered card is trusted only after this.
+        let card = signed_card(); // issued 1_000, expires 5_000
+        let dir = std::env::temp_dir().join(format!("ct-agent-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = write_agent_card_for_origin(&card, &dir).expect("card written");
+
+        // Authentic + current → returns the card, bound to the same holder key.
+        let ok = read_and_verify_agent_card(&path, 1_000).expect("authentic card verifies");
+        assert_eq!(ok.holder_pubkey, card.holder_pubkey);
+
+        // Expired (now >= expires_at) → rejected.
+        assert!(read_and_verify_agent_card(&path, 5_000).is_err(), "expired card rejected");
+
+        // Tampered but still-valid JSON (edit a signed field) → signature check fails.
+        let tampered = agent_card_well_known_body(&card)
+            .replace("trigger a live A2A transfer", "do something else entirely");
+        std::fs::write(&path, tampered).unwrap();
+        assert!(read_and_verify_agent_card(&path, 1_000).is_err(), "tampered card rejected");
+
+        // Malformed JSON → parse error (not a silent pass).
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(read_and_verify_agent_card(&path, 1_000).is_err(), "malformed profile rejected");
+
+        // Missing file → error.
+        assert!(
+            read_and_verify_agent_card(&dir.join("nope.json"), 1_000).is_err(),
+            "missing file is an error"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
