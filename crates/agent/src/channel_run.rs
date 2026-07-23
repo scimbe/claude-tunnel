@@ -1309,10 +1309,56 @@ where
     session_side
 }
 
-/// Build the channel session's local app duplex from the environment (#135 L2.1-cli): `CT_CHANNEL_SERVE=1`
-/// selects the persistent request/response **service** (echo handler for now — L2.3 swaps in MCP tool
-/// dispatch); unset keeps the historical stdin/stdout pipe.
+/// Call-mode local (#135 L2.3, client side): spawn a one-shot MCP client on one half of an in-process
+/// duplex — write ONE JSON-RPC request, print the peer's response body, then close — and return the
+/// session half for the pump. So `ct-agent channel --call <method>` = connect, invoke a peer's tool
+/// once, print the JSON-RPC reply, exit.
+/// One MCP request/response over a duplex's split halves (#135 L2.3 client core): frame + write the
+/// request, then read + return the peer's response body. Testable in isolation; `call_local` prints
+/// what it returns.
+async fn mcp_call_over<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    method: &str,
+    params: serde_json::Value,
+) -> io::Result<Vec<u8>>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let request = ct_common::mcp::encode_request(1, method, params);
+    ct_common::a2a::write_message(send, &request).await?;
+    ct_common::noise::read_frame(recv).await
+}
+
+fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStream {
+    let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let (mut recv, mut send) = tokio::io::split(serve_side);
+        match mcp_call_over(&mut send, &mut recv, &method, params).await {
+            Ok(response) => println!("{}", String::from_utf8_lossy(&response)),
+            Err(e) => eprintln!("ct-agent channel --call: no response ({e})"),
+        }
+        // Dropping serve_side EOFs the session side → the channel session ends → the process exits.
+    });
+    session_side
+}
+
+/// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
+/// → one-shot MCP **client** (invoke a peer's tool, print the reply, exit). `CT_CHANNEL_SERVE=1` → the
+/// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
+/// historical stdin/stdout pipe.
 fn channel_local() -> ChannelLocal {
+    // #135 L2.3 client: one MCP request/response over the channel, then exit.
+    if let Ok(method) = std::env::var("CT_CHANNEL_CALL") {
+        let method = method.trim().to_string();
+        let params = std::env::var("CT_CHANNEL_CALL_PARAMS")
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        eprintln!("ct-agent channel: --call {method} (one MCP request over the channel, then exit)");
+        return ChannelLocal::Serve(call_local(method, params));
+    }
     let serve = std::env::var("CT_CHANNEL_SERVE")
         .map(|v| {
             let v = v.trim();
@@ -1908,6 +1954,35 @@ mod tests {
                 "each framed request is answered over the one persistent session-side duplex"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_call_over_invokes_a_serve_local_peer_and_returns_its_response() {
+        // #135 L2.3 (frozen): the --call client (mcp_call_over) invokes a --serve peer's MCP endpoint
+        // and gets its answer back — the full call↔serve pair over one duplex (the pump would carry
+        // exactly these bytes encrypted). Client sends `tools/call ping`, the peer's registry → pong.
+        let registry = std::sync::Arc::new(ct_common::mcp::default_registry());
+        let server = serve_local(move |req: Vec<u8>| {
+            let registry = registry.clone();
+            async move { registry.dispatch(&req) }
+        });
+        // The server's session side IS a request→response endpoint (write a request, read its reply).
+        let (mut r, mut w) = tokio::io::split(server);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            mcp_call_over(&mut w, &mut r, "tools/call", serde_json::json!({ "name": "ping" })),
+        )
+        .await
+        .expect("a response within 2s")
+        .expect("got a response");
+
+        let decoded = ct_common::mcp::decode_response(&response).expect("valid JSON-RPC response");
+        assert_eq!(
+            decoded.result.unwrap(),
+            serde_json::json!({ "reply": "pong" }),
+            "the peer's ping tool answered the client's call over the pair"
+        );
+        assert!(decoded.error.is_none());
     }
 
     #[test]

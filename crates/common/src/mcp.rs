@@ -178,6 +178,24 @@ impl ToolRegistry {
     }
 }
 
+/// Encode a JSON-RPC 2.0 request **body** (#135 L2.3, client side) — the bytes a caller frames and
+/// sends to a peer's `--serve` MCP endpoint. `id` correlates the eventual response; `params` is
+/// method-specific (`Value::Null` when a method takes none).
+pub fn encode_request(id: impl Into<Value>, method: &str, params: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "jsonrpc": JSONRPC_VERSION,
+        "id": id.into(),
+        "method": method,
+        "params": params,
+    }))
+    .expect("a request we constructed always serializes")
+}
+
+/// Decode a JSON-RPC 2.0 response **body** a peer's MCP endpoint returned (#135 L2.3, client side).
+pub fn decode_response(bytes: &[u8]) -> Result<JsonRpcResponse, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON-RPC response: {e}"))
+}
+
 /// A minimal default tool registry for `ct-agent channel --serve` (#135 L2.3): a `ping` liveness tool,
 /// so the persistent service is callable out of the box (`tools/list` → `[ping]`, `tools/call ping` →
 /// `pong`). A real agent extends this with its own capability tools.
@@ -265,6 +283,26 @@ mod tests {
         let resp: JsonRpcResponse = serde_json::from_slice(&bytes).expect("parse-error response is valid JSON-RPC");
         assert_eq!(resp.id, Value::Null);
         assert_eq!(resp.error.unwrap().code, PARSE_ERROR);
+    }
+
+    #[test]
+    fn client_encode_and_server_dispatch_interoperate_round_trip() {
+        // #135 L2.3 (frozen): the client encodes a JSON-RPC request, the server's ToolRegistry
+        // dispatches it, and the client decodes the response — the full call/serve pair interoperates
+        // at exactly the message layer that rides one framed message over the channel.
+        let reg = registry();
+
+        let req = encode_request(42, "tools/call", json!({ "name": "ping" }));
+        let resp = decode_response(&reg.dispatch(&req)).expect("a valid JSON-RPC response");
+        assert_eq!(resp.id, json!(42), "the id correlates the response to the request");
+        assert_eq!(resp.result.unwrap(), json!({ "reply": "pong" }), "ping answered over the pair");
+        assert!(resp.error.is_none());
+
+        // A string id and a params-less method also round-trip.
+        let list = decode_response(&reg.dispatch(&encode_request("c1", "tools/list", Value::Null)))
+            .expect("valid response");
+        assert_eq!(list.id, json!("c1"));
+        assert!(list.result.unwrap()["tools"].as_array().unwrap().len() >= 2);
     }
 
     #[test]
