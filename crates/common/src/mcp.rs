@@ -265,6 +265,46 @@ pub fn register_settlement_tools(
     );
 }
 
+/// Register #147-L2 **auction** tools on a registry so a seller-agent runs the idle-capacity auction
+/// over the SAME authenticated #135 channel it's discovered + cooperated on:
+/// - `auction/offer` `{}` — return the agent's holder-signed [`CapacityOffer`](crate::channel::CapacityOffer)
+///   so a buyer discovers its advertised capacity + floor terms over the live session (like `agent/card`).
+/// - `auction/bid` `{bid: <CapacityOffer-style JSON>}` — decode a buyer's signed
+///   [`CapacityBid`](crate::channel::CapacityBid), clear it against *this agent's* offer with
+///   [`match_offer`](crate::channel::match_offer), and return the [`CapacityMatch`](crate::channel::CapacityMatch)
+///   (its deterministic `match_ref` keys the escrow `Hold` + L3 receipt), or a JSON-RPC tool error if it
+///   doesn't clear.
+///
+/// Time is stamped by **this serving agent** via `now_fn`, never taken from the caller's request — so a
+/// buyer can't pass a fake `now` to make an expired offer/bid clear.
+pub fn register_auction_tools(
+    reg: &mut ToolRegistry,
+    offer: crate::channel::CapacityOffer,
+    now_fn: impl Fn() -> crate::channel::UnixSeconds + Send + Sync + 'static,
+) {
+    let offer_for_get = offer.clone();
+    reg.register(
+        "auction/offer",
+        "the agent's holder-signed CapacityOffer — its advertised idle capacity + floor terms",
+        move |_| serde_json::to_value(&offer_for_get).map_err(|e| e.to_string()),
+    );
+    reg.register(
+        "auction/bid",
+        "submit a signed CapacityBid; returns the cleared CapacityMatch, or a no-match tool error",
+        move |args| {
+            let bid_val = args.get("bid").ok_or("missing `bid` object")?;
+            let bid: crate::channel::CapacityBid =
+                serde_json::from_value(bid_val.clone()).map_err(|e| format!("malformed bid: {e}"))?;
+            match crate::channel::match_offer(&offer, &bid, now_fn()) {
+                Some(m) => serde_json::to_value(m).map_err(|e| e.to_string()),
+                None => Err(
+                    "bid does not clear against this offer (kind/model/units/floor/expiry)".to_string(),
+                ),
+            }
+        },
+    );
+}
+
 /// The [`default_registry`] plus an **`agent/card`** tool returning `card_json` (#144 × #135): a peer
 /// that has connected over the authenticated channel can fetch the agent's holder-signed `AgentCard`
 /// directly, bound to the live session — the channel is authenticated by the same holder key, so the
@@ -422,6 +462,72 @@ mod tests {
             "params": { "name": "settlement/block", "arguments": { "block": "zz" } } }));
         assert!(bad.error.is_some(), "a malformed block is a tool error, not a panic");
         assert_eq!(replica.lock().unwrap().height(), 1, "no bad block was committed");
+    }
+
+    #[test]
+    fn auction_tools_serve_the_offer_and_clear_a_bid_over_mcp() {
+        // #147-L2 (frozen): a seller-agent runs the auction over the #135 channel — `auction/offer`
+        // returns its signed CapacityOffer; `auction/bid` clears a buyer's signed CapacityBid against
+        // it and returns the deterministic CapacityMatch (or a tool error). Time is the SELLER's (via
+        // now_fn), not the caller's — so a buyer can't pass a fake `now` to revive an expired offer.
+        use crate::channel::{match_offer, CapacityBid, CapacityKind, CapacityMatch, CapacityOffer};
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x51u8; 32]);
+        let buyer = SigningKey::from_bytes(&[0x52u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller,
+            CapacityKind::CloudApiQuota,
+            vec!["claude-opus-4-8".to_string()],
+            1_000,
+            100,
+            "ct-llm-token-chain".to_string(),
+            1_000,
+            9_000,
+        );
+        let bid = CapacityBid::sign_new(
+            &buyer,
+            CapacityKind::CloudApiQuota,
+            "claude-opus-4-8".to_string(),
+            200,
+            150,
+            1_000,
+            9_000,
+        );
+
+        let mut reg = default_registry();
+        register_auction_tools(&mut reg, offer.clone(), || 1_000);
+
+        // auction/offer → the seller's signed offer, round-tripping to the same CapacityOffer.
+        let got = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "auction/offer", "arguments": {} } }));
+        let back: CapacityOffer = serde_json::from_value(got.result.expect("auction/offer succeeds")).unwrap();
+        assert_eq!(back, offer, "auction/offer serves the agent's exact signed offer");
+
+        // auction/bid with a compatible bid → the deterministic match (same match_ref as computed locally).
+        let resp = call(&reg, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "auction/bid", "arguments": { "bid": serde_json::to_value(&bid).unwrap() } } }));
+        let m: CapacityMatch = serde_json::from_value(resp.result.expect("a compatible bid clears")).unwrap();
+        assert_eq!(m.match_ref, match_offer(&offer, &bid, 1_000).unwrap().match_ref, "same deterministic match_ref");
+        assert_eq!((m.units, m.total_price), (200, 150), "cleared at the bid's terms");
+
+        // A below-floor bid → tool error (no clear).
+        let low = CapacityBid::sign_new(&buyer, CapacityKind::CloudApiQuota, "claude-opus-4-8".into(), 10, 50, 1_000, 9_000);
+        let no = call(&reg, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "auction/bid", "arguments": { "bid": serde_json::to_value(&low).unwrap() } } }));
+        assert!(no.error.is_some(), "a bid below the seller's floor doesn't clear");
+
+        // A malformed bid payload → tool error, not a panic.
+        let bad = call(&reg, json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "auction/bid", "arguments": { "bid": { "not": "a bid" } } } }));
+        assert!(bad.error.is_some(), "a malformed bid is a tool error");
+
+        // Seller stamps time: a registry whose clock is past the offer's expiry won't clear the same
+        // good bid — the caller can't fake `now` to revive an expired offer.
+        let mut expired = default_registry();
+        register_auction_tools(&mut expired, offer.clone(), || 9_000);
+        let past = call(&expired, json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "auction/bid", "arguments": { "bid": serde_json::to_value(&bid).unwrap() } } }));
+        assert!(past.error.is_some(), "past the seller's clock the offer has expired and nothing clears");
     }
 
     #[test]

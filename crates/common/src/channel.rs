@@ -1708,11 +1708,13 @@ impl CapacityBid {
 /// it uniquely binds the downstream escrow [`crate::settlement::Hold`] and the [`UsageReceipt`] to
 /// *this* match (no cross-match replay). A `CapacityMatch` is a derived fact, not a signed object: its
 /// authority comes from the offer and bid it was computed from (both signed, both re-checkable).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapacityMatch {
     /// The provider (= the offer's `holder_pubkey`).
+    #[serde(with = "card_hex::b32")]
     pub provider: [u8; 32],
     /// The consumer (= the bid's `bidder`).
+    #[serde(with = "card_hex::b32")]
     pub consumer: [u8; 32],
     pub kind: CapacityKind,
     pub model: String,
@@ -1720,6 +1722,7 @@ pub struct CapacityMatch {
     /// The clearing amount the consumer escrows for the provider (= the bid's `total_price`).
     pub total_price: u64,
     /// Deterministic id binding the escrow hold + usage receipt to this match.
+    #[serde(with = "card_hex::b32")]
     pub match_ref: [u8; 32],
 }
 
