@@ -741,6 +741,80 @@ pub struct AdmittedStreamMember<S> {
     attest: Option<[u8; 64]>,
 }
 
+/// Which member of a relay pair a **mid-handoff** failure struck (#148). A completer ack-writes each
+/// side sequentially after authorization already succeeded; if one side's stream is dying (e.g. a
+/// long-running member caught mid-re-park), its write fails while the other side is perfectly healthy.
+/// Naming the side lets a log / caller tell the transient race apart from an actual admission refusal
+/// (and, by elimination, identify the healthy survivor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairSide {
+    A,
+    B,
+}
+
+impl std::fmt::Display for PairSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PairSide::A => "A",
+            PairSide::B => "B",
+        })
+    }
+}
+
+/// A relay pair that failed **after authorization succeeded** — while acking one side, NOT because a
+/// grant/membership was refused (#148). This distinction is the whole point: a mid-handoff write
+/// failure against one member (typically its stream torn down in a re-park race) is transient and says
+/// **nothing** about the other member, whose grant was already verified — so it must not surface as an
+/// ambiguous "connection lost" / "refused" that reads like an authorization problem. `failed_side`
+/// names the member whose I/O failed; the opposite side was healthy up to that point (a bare retry by
+/// the survivor should re-pair).
+#[derive(Debug)]
+pub struct RelayHandoffError {
+    /// The member whose ack write/flush failed. Its peer was healthy.
+    pub failed_side: PairSide,
+    source: BoxError,
+}
+
+impl std::fmt::Display for RelayHandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "relay handoff failed acking side {} (authorization already succeeded; the peer side was \
+             healthy — this is a transient handoff race, not an admission refusal): {}",
+            self.failed_side, self.source
+        )
+    }
+}
+
+impl std::error::Error for RelayHandoffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Write one member the rich `OK <peer…>\n` ack (+flush), tagging any I/O failure with `side` so the
+/// completer can report *which* member died mid-handoff (#148) rather than collapsing it into an
+/// indistinguishable error.
+async fn write_member_ack<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    peer_endpoint: &str,
+    peer_noise: Option<[u8; 32]>,
+    peer_holder: &[u8; 32],
+    peer_attest: Option<[u8; 64]>,
+    side: PairSide,
+) -> Result<(), RelayHandoffError> {
+    let line = format!("OK {}{}\n", peer_endpoint, member_ack_suffix(peer_noise, peer_holder, peer_attest));
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
+    Ok(())
+}
+
 /// Complete a **relay** pairing for two members admitted over generic byte streams
 /// (#106 relay-splice-generic) — the transport-agnostic sibling of [`finish_relay_pair`].
 /// Authorize the pair under member A's operator key, ack each side the RICH
@@ -777,29 +851,35 @@ where
             // `finish()`es the quinn stream instead, so it needs no delimiter). A relay-only
             // member's `endpoint` is the relay-only sentinel: the peer won't dial it (it's
             // relayed), it's just echoed through.
-            a.stream
-                .write_all(
-                    format!(
-                        "OK {}{}\n",
-                        b.req.endpoint,
-                        member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest)
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            a.stream.flush().await?;
-            b.stream
-                .write_all(
-                    format!(
-                        "OK {}{}\n",
-                        a.req.endpoint,
-                        member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest)
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            b.stream.flush().await?;
-            crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443").await?;
+            //
+            // #148: ack each side through `write_member_ack`, which tags an I/O failure with the
+            // side. If one member's stream is dying (a re-park race), this returns a
+            // `RelayHandoffError` naming the dead side — so the caller can log "handoff race, side X"
+            // instead of a bare "connection lost" that reads like the healthy peer was refused.
+            write_member_ack(
+                &mut a.stream,
+                &b.req.endpoint,
+                b.noise,
+                &b.req.grant.grant.holder,
+                b.attest,
+                PairSide::A,
+            )
+            .await?;
+            write_member_ack(
+                &mut b.stream,
+                &a.req.endpoint,
+                a.noise,
+                &a.req.grant.grant.holder,
+                a.attest,
+                PairSide::B,
+            )
+            .await?;
+            // Both sides acked cleanly; a failure now is the splice itself, not a one-sided ack race.
+            crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443")
+                .await
+                .map_err(|e| -> BoxError {
+                    format!("channel relay splice ended after both sides acked: {e}").into()
+                })?;
             Ok(pairing)
         }
         Err(e) => {
@@ -1297,6 +1377,65 @@ mod tests {
             grant: grant(channel, holder, Direction::Initiate, 1_000),
             endpoint: endpoint.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_handoff_ack_failure_names_the_dead_side_not_an_auth_refusal() {
+        // #148 (frozen): when one member's stream dies mid-handoff (a re-park race), the completer
+        // must report WHICH side failed — distinct from an authorization refusal — so the healthy
+        // survivor's drop doesn't read as "your grant was refused". Here authorization succeeds for
+        // both, A's ack lands, then B's already-dead stream fails: the error is a RelayHandoffError
+        // naming side B (not a "refused"), and A did receive its OK (proving it was healthy).
+        use tokio::io::{duplex, AsyncReadExt};
+
+        let ch = [7u8; 32];
+        let a_key = SigningKey::from_bytes(&[0x21u8; 32]);
+        let b_key = SigningKey::from_bytes(&[0x22u8; 32]);
+        let op = operator_pubkey();
+        let now = 100;
+
+        let (a_stream, mut a_peer) = duplex(1024);
+        let (b_stream, b_peer) = duplex(1024);
+        drop(b_peer); // B's stream is "dying" — writes to it now fail (BrokenPipe).
+
+        let a = AdmittedStreamMember {
+            stream: a_stream,
+            req: ChannelJoinRequest {
+                grant: grant_h(ch, &a_key, Direction::Both, 9_000),
+                endpoint: "relay-only".to_string(),
+            },
+            operator: op,
+            noise: None,
+            attest: None,
+        };
+        let b = AdmittedStreamMember {
+            stream: b_stream,
+            req: ChannelJoinRequest {
+                grant: grant_h(ch, &b_key, Direction::Both, 9_000),
+                endpoint: "relay-only".to_string(),
+            },
+            operator: op,
+            noise: None,
+            attest: None,
+        };
+
+        let err = finish_relay_pair_over_streams(a, b, now)
+            .await
+            .expect_err("B's dead stream must fail the handoff");
+
+        // The failure is typed and names side B — NOT an authorization refusal.
+        let handoff = err
+            .downcast_ref::<RelayHandoffError>()
+            .expect("a mid-handoff ack failure is a RelayHandoffError, not a generic drop");
+        assert_eq!(handoff.failed_side, PairSide::B, "the dead side (B) is identified");
+        let msg = format!("{err}");
+        assert!(!msg.contains("refused"), "must not read as an authorization refusal: {msg}");
+
+        // The survivor A DID receive its OK ack before B failed — proof it was healthy and this is a
+        // handoff race, not an admission problem on A.
+        let mut buf = [0u8; 3];
+        a_peer.read_exact(&mut buf).await.expect("A got its ack before B failed");
+        assert_eq!(&buf, b"OK ", "the surviving side A was acked OK (its grant was fine all along)");
     }
 
     /// Read the relay's `OK <..>\n` ack line off a spliced stream, stopping at the newline
