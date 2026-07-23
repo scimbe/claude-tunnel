@@ -15,6 +15,7 @@
 //! Accounts are ed25519 holder public keys — the same key family used everywhere else — so an agent's
 //! settlement account is its identity, and a transfer is authorized only by the holder's own signature.
 
+use crate::channel::UsageReceipt;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -377,6 +378,239 @@ impl Chain {
     }
 }
 
+/// Domain separating a [`Hold`] preimage from every other signed object in the codebase.
+const HOLD_DOMAIN: &[u8] = b"ct-settlement-hold-v1";
+
+/// A consumer's signed instruction to **lock** `amount` in escrow for one auction match (#147-L2 —
+/// *escrow-at-match*, maintainer decision 2026-07-23). Authorized ONLY by `from`'s (the consumer's)
+/// ed25519 signature, so no one can lock another account's funds. The locked amount is released to
+/// `to` (the provider) when a co-signed [`UsageReceipt`] for the **same** `match_ref` proves
+/// consumption (#147-L3), or refunded to `from` once `expires_at` passes with no proof — so a winning
+/// bid's guaranteed floor is a *held* amount (≈ a cap), never a unilateral loss on an unfulfilled win.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    /// The consumer locking the funds (and the signer).
+    pub from: Account,
+    /// The provider who receives the funds on release.
+    pub to: Account,
+    pub amount: Amount,
+    /// Binds the hold to a specific auction match — the same id the [`UsageReceipt`] carries.
+    pub match_ref: [u8; 32],
+    /// The consumer's monotonic hold counter (0-based) — makes a hold single-use, like a [`Transfer`].
+    pub nonce: u64,
+    /// Once `now >= expires_at`, an unreleased hold may be [`refund`](Escrow::refund)ed to `from`.
+    pub expires_at: u64,
+    pub signature: [u8; 64],
+}
+
+impl Hold {
+    /// Canonical fixed-wire preimage: `domain ‖ from ‖ to ‖ amount(LE) ‖ match_ref ‖ nonce(LE) ‖
+    /// expires_at(LE)`. All fields fixed-size, so the encoding is injective without length prefixes.
+    pub fn signing_bytes(
+        from: &Account,
+        to: &Account,
+        amount: Amount,
+        match_ref: &[u8; 32],
+        nonce: u64,
+        expires_at: u64,
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(HOLD_DOMAIN.len() + 32 + 32 + 8 + 32 + 8 + 8);
+        m.extend_from_slice(HOLD_DOMAIN);
+        m.extend_from_slice(from);
+        m.extend_from_slice(to);
+        m.extend_from_slice(&amount.to_le_bytes());
+        m.extend_from_slice(match_ref);
+        m.extend_from_slice(&nonce.to_le_bytes());
+        m.extend_from_slice(&expires_at.to_le_bytes());
+        m
+    }
+
+    /// Construct + sign a hold from the consumer's `SigningKey` (derives `from` from the key, so a
+    /// caller cannot lock funds from an account it does not hold).
+    pub fn sign_new(
+        from_key: &SigningKey,
+        to: Account,
+        amount: Amount,
+        match_ref: [u8; 32],
+        nonce: u64,
+        expires_at: u64,
+    ) -> Hold {
+        let from = from_key.verifying_key().to_bytes();
+        let signature = from_key
+            .sign(&Self::signing_bytes(&from, &to, amount, &match_ref, nonce, expires_at))
+            .to_bytes();
+        Hold { from, to, amount, match_ref, nonce, expires_at, signature }
+    }
+
+    /// Whether `from`'s signature authentically authorizes this hold.
+    pub fn verify(&self) -> bool {
+        match VerifyingKey::from_bytes(&self.from) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.from,
+                        &self.to,
+                        self.amount,
+                        &self.match_ref,
+                        self.nonce,
+                        self.expires_at,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Why an [`Escrow`] operation failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EscrowError {
+    /// The hold's signature does not verify against its `from` account.
+    BadSignature,
+    /// The consumer tried to lock more than its available balance.
+    Overdraft { from: Account, balance: Amount, amount: Amount },
+    /// The hold's nonce isn't the consumer's next expected nonce (replay / gap).
+    BadNonce { from: Account, expected: u64, got: u64 },
+    /// A hold already exists for this `match_ref` — a match escrows exactly once.
+    DuplicateHold { match_ref: [u8; 32] },
+    /// No held funds for this `match_ref` (never locked, or already released / refunded).
+    UnknownHold { match_ref: [u8; 32] },
+    /// The consumption proof isn't a valid co-signed receipt, or its `provider`/`consumer` don't
+    /// match the held record — so it can't authorize releasing these funds.
+    ReceiptMismatch,
+    /// A refund was attempted before the hold's `expires_at` — the provider still has time to prove.
+    NotYetExpired { expires_at: u64, now: u64 },
+}
+
+impl std::fmt::Display for EscrowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EscrowError::BadSignature => write!(f, "hold signature does not verify"),
+            EscrowError::Overdraft { balance, amount, .. } => {
+                write!(f, "overdraft: balance {balance} < amount {amount}")
+            }
+            EscrowError::BadNonce { expected, got, .. } => {
+                write!(f, "bad nonce: expected {expected}, got {got}")
+            }
+            EscrowError::DuplicateHold { .. } => write!(f, "a hold already exists for this match"),
+            EscrowError::UnknownHold { .. } => write!(f, "no held funds for this match"),
+            EscrowError::ReceiptMismatch => {
+                write!(f, "receipt is not a valid co-signed proof for the held record")
+            }
+            EscrowError::NotYetExpired { expires_at, now } => {
+                write!(f, "hold not yet refundable: now {now} < expires_at {expires_at}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EscrowError {}
+
+/// One escrowed record: the funds locked for a match, awaiting release-on-proof or refund-on-timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldRecord {
+    from: Account,
+    to: Account,
+    amount: Amount,
+    expires_at: u64,
+}
+
+/// An **in-memory escrow ledger** (#147-L2, escrow-at-match). Same single-writer, in-memory scope as
+/// the L4.1 [`Chain`] (folding holds into the hash-linked block is a follow slice). It tracks
+/// available `balances`, per-consumer hold `nonces`, and the currently-`held` records keyed by
+/// `match_ref`. The lifecycle: [`lock`](Self::lock) moves a consumer's funds out of available into
+/// escrow at match time; [`release`](Self::release) pays them to the provider on a co-signed
+/// [`UsageReceipt`]; [`refund`](Self::refund) returns them to the consumer after expiry if no proof
+/// arrived. Value is conserved throughout: `Σ balances + Σ held` never changes across operations.
+#[derive(Debug, Default)]
+pub struct Escrow {
+    balances: BTreeMap<Account, Amount>,
+    nonces: BTreeMap<Account, u64>,
+    held: BTreeMap<[u8; 32], HeldRecord>,
+}
+
+impl Escrow {
+    /// A fresh escrow with genesis account balances (the consumers' spendable funds).
+    pub fn new(genesis: BTreeMap<Account, Amount>) -> Self {
+        Escrow { balances: genesis, nonces: BTreeMap::new(), held: BTreeMap::new() }
+    }
+
+    /// The available (spendable, not-escrowed) balance of `account`.
+    pub fn balance(&self, account: &Account) -> Amount {
+        self.balances.get(account).copied().unwrap_or(0)
+    }
+
+    /// The amount currently held in escrow for `match_ref` (0 if none).
+    pub fn held_amount(&self, match_ref: &[u8; 32]) -> Amount {
+        self.held.get(match_ref).map(|r| r.amount).unwrap_or(0)
+    }
+
+    /// **Lock** consumer funds for a match. Verifies the consumer's signature, that `nonce` is its
+    /// next expected value, that no hold already exists for this `match_ref`, and that it has the
+    /// balance — then moves `amount` out of available into escrow. On any error nothing changes.
+    pub fn lock(&mut self, hold: &Hold) -> Result<(), EscrowError> {
+        if !hold.verify() {
+            return Err(EscrowError::BadSignature);
+        }
+        let expected = self.nonces.get(&hold.from).copied().unwrap_or(0);
+        if hold.nonce != expected {
+            return Err(EscrowError::BadNonce { from: hold.from, expected, got: hold.nonce });
+        }
+        if self.held.contains_key(&hold.match_ref) {
+            return Err(EscrowError::DuplicateHold { match_ref: hold.match_ref });
+        }
+        let balance = self.balance(&hold.from);
+        if balance < hold.amount {
+            return Err(EscrowError::Overdraft { from: hold.from, balance, amount: hold.amount });
+        }
+        self.balances.insert(hold.from, balance - hold.amount);
+        self.nonces.insert(hold.from, expected + 1);
+        self.held.insert(
+            hold.match_ref,
+            HeldRecord { from: hold.from, to: hold.to, amount: hold.amount, expires_at: hold.expires_at },
+        );
+        Ok(())
+    }
+
+    /// **Release** a match's held funds to the provider on a valid co-signed consumption proof
+    /// (#147-L3). The `receipt` must be a valid [`UsageReceipt`] whose `provider`/`consumer` match
+    /// the held record's `to`/`from` — the receipt is what authorizes moving the money, so a forged
+    /// or mismatched one can't drain the escrow. Idempotency: the hold is removed on release, so a
+    /// replayed receipt hits [`EscrowError::UnknownHold`] rather than paying twice.
+    pub fn release(&mut self, receipt: &UsageReceipt) -> Result<(), EscrowError> {
+        let rec = self
+            .held
+            .get(&receipt.match_ref)
+            .ok_or(EscrowError::UnknownHold { match_ref: receipt.match_ref })?;
+        if !receipt.is_valid() || receipt.provider != rec.to || receipt.consumer != rec.from {
+            return Err(EscrowError::ReceiptMismatch);
+        }
+        let (to, amount) = (rec.to, rec.amount);
+        self.held.remove(&receipt.match_ref);
+        *self.balances.entry(to).or_insert(0) += amount;
+        Ok(())
+    }
+
+    /// **Refund** a match's held funds to the consumer once `now >= expires_at` and no proof has
+    /// released them. Before expiry this is [`EscrowError::NotYetExpired`] (the provider still has
+    /// time to deliver + prove). The hold is removed on refund, so it can't be double-refunded or
+    /// released afterwards.
+    pub fn refund(&mut self, match_ref: &[u8; 32], now: u64) -> Result<(), EscrowError> {
+        let rec = self
+            .held
+            .get(match_ref)
+            .ok_or(EscrowError::UnknownHold { match_ref: *match_ref })?;
+        if now < rec.expires_at {
+            return Err(EscrowError::NotYetExpired { expires_at: rec.expires_at, now });
+        }
+        let (from, amount) = (rec.from, rec.amount);
+        self.held.remove(match_ref);
+        *self.balances.entry(from).or_insert(0) += amount;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +620,79 @@ mod tests {
     }
     fn acct(sk: &SigningKey) -> Account {
         sk.verifying_key().to_bytes()
+    }
+
+    #[test]
+    fn escrow_locks_at_match_releases_on_receipt_and_refunds_on_timeout() {
+        // #147-L2 (frozen): escrow-at-match. A consumer locks funds for a match; a co-signed L3
+        // UsageReceipt for that match releases them to the provider; if no proof arrives, the funds
+        // refund to the consumer after expiry — never a unilateral loss. Value is conserved
+        // throughout, forged/mismatched receipts can't drain escrow, and every op is single-shot.
+        use crate::channel::{CapacityKind, UsageReceipt};
+        let consumer = key(1);
+        let provider = key(2);
+        let (c, p) = (acct(&consumer), acct(&provider));
+        let m1 = [0x11u8; 32]; // match A
+        let m2 = [0x22u8; 32]; // match B
+        let total = |e: &Escrow| e.balance(&c) + e.balance(&p) + e.held_amount(&m1) + e.held_amount(&m2);
+
+        let mut esc = Escrow::new(BTreeMap::from([(c, 100)]));
+        assert_eq!(total(&esc), 100, "genesis value");
+
+        // LOCK match A: 40 of the consumer's funds move into escrow (out of available).
+        let hold_a = Hold::sign_new(&consumer, p, 40, m1, 0, 1_000);
+        esc.lock(&hold_a).expect("a well-signed, funded hold locks");
+        assert_eq!(esc.balance(&c), 60, "locked funds leave available balance");
+        assert_eq!(esc.held_amount(&m1), 40, "and sit in escrow for the match");
+        assert_eq!(total(&esc), 100, "value conserved on lock");
+
+        // RELEASE match A: a co-signed receipt for THIS match pays the provider.
+        let receipt = UsageReceipt::co_sign(&provider, &consumer, CapacityKind::CloudApiQuota, "m".into(), 40, m1, 500);
+        esc.release(&receipt).expect("a valid co-signed receipt releases to the provider");
+        assert_eq!(esc.balance(&p), 40, "provider paid the held amount");
+        assert_eq!(esc.held_amount(&m1), 0, "escrow for the match is cleared");
+        assert_eq!(total(&esc), 100, "value conserved on release");
+        // Replaying the same receipt can't pay twice — the hold is gone.
+        assert_eq!(esc.release(&receipt), Err(EscrowError::UnknownHold { match_ref: m1 }), "no double-release");
+
+        // LOCK match B, then let it time out and REFUND to the consumer.
+        let hold_b = Hold::sign_new(&consumer, p, 25, m2, 1, 2_000);
+        esc.lock(&hold_b).expect("second hold (next nonce) locks");
+        assert_eq!(esc.balance(&c), 35, "60 - 25 held for match B");
+        // Refund before expiry is refused — the provider still has time to prove.
+        assert_eq!(
+            esc.refund(&m2, 1_999),
+            Err(EscrowError::NotYetExpired { expires_at: 2_000, now: 1_999 }),
+            "can't refund before expiry"
+        );
+        esc.refund(&m2, 2_000).expect("at expiry, an unproven hold refunds to the consumer");
+        assert_eq!(esc.balance(&c), 60, "consumer got the 25 back");
+        assert_eq!(total(&esc), 100, "value conserved on refund");
+        assert_eq!(esc.refund(&m2, 3_000), Err(EscrowError::UnknownHold { match_ref: m2 }), "no double-refund");
+
+        // Guard rails on lock.
+        let mut esc2 = Escrow::new(BTreeMap::from([(c, 10)]));
+        let overdraft = Hold::sign_new(&consumer, p, 999, m1, 0, 1_000);
+        assert!(matches!(esc2.lock(&overdraft), Err(EscrowError::Overdraft { .. })), "can't lock more than balance");
+        let mut forged = Hold::sign_new(&consumer, p, 5, m1, 0, 1_000);
+        forged.amount = 6; // tamper after signing
+        assert_eq!(esc2.lock(&forged), Err(EscrowError::BadSignature), "a tampered hold is rejected");
+        // Good lock, then a duplicate match_ref and a stale nonce are both refused.
+        esc2.lock(&Hold::sign_new(&consumer, p, 5, m1, 0, 1_000)).expect("funded hold locks");
+        let dup = Hold::sign_new(&consumer, p, 1, m1, 1, 1_000);
+        assert_eq!(esc2.lock(&dup), Err(EscrowError::DuplicateHold { match_ref: m1 }), "one hold per match");
+        let stale = Hold::sign_new(&consumer, p, 1, m2, 0, 1_000);
+        assert!(matches!(esc2.lock(&stale), Err(EscrowError::BadNonce { .. })), "a replayed hold nonce is rejected");
+
+        // A receipt for the WRONG match, or naming a different provider/consumer, can't release a hold.
+        let mut esc3 = Escrow::new(BTreeMap::from([(c, 100)]));
+        esc3.lock(&Hold::sign_new(&consumer, p, 30, m1, 0, 1_000)).unwrap();
+        let wrong_match = UsageReceipt::co_sign(&provider, &consumer, CapacityKind::CloudApiQuota, "m".into(), 30, m2, 1);
+        assert_eq!(esc3.release(&wrong_match), Err(EscrowError::UnknownHold { match_ref: m2 }), "receipt for another match doesn't release");
+        let stranger = key(9);
+        let wrong_provider = UsageReceipt::co_sign(&stranger, &consumer, CapacityKind::CloudApiQuota, "m".into(), 30, m1, 1);
+        assert_eq!(esc3.release(&wrong_provider), Err(EscrowError::ReceiptMismatch), "receipt naming a different provider can't drain the hold");
+        assert_eq!(esc3.held_amount(&m1), 30, "the mismatched attempts left the escrow untouched");
     }
 
     #[test]
