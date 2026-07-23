@@ -610,6 +610,19 @@ fn build_dcutr_relay_client_swarm() -> Result<Swarm<DcutrRelayClientBehaviour>, 
     Ok(swarm)
 }
 
+/// #136: give a DCUtR client swarm a DIRECT punch candidate on BOTH transports — a **TCP**
+/// listener (Fix B, the DPI-surviving leg: source-2 confirmed 0/4 UDP ports punchable externally on
+/// the live plane host, TCP the sole survivor) AND a **QUIC** listener (for UDP-friendly networks).
+/// libp2p DCUtR punches toward the swarm's *external* addresses; with no direct listener the only
+/// address `identify` observes is the relay leg's ephemeral outbound port (nothing to punch INTO),
+/// so a relay-only client would never upgrade. The live NAT-to-NAT join primitives call this so a
+/// real `ct-agent channel` — not just the natlab proof roles — actually has a candidate to punch.
+fn add_direct_punch_listeners(swarm: &mut Swarm<DcutrRelayClientBehaviour>) -> Result<(), BoxError> {
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // punchable TCP reflexive (Fix B, DPI-surviving)
+    Ok(())
+}
+
 /// Connect two libp2p peers **through a third Circuit-Relay v2 relay node** and open a
 /// single raw stream between them, returning each side as an `AsyncRead + AsyncWrite +
 /// Unpin` duplex (the `(dialer, listener)` pair). Three in-process nodes run over TCP
@@ -818,6 +831,8 @@ pub(crate) async fn dcutr_reserve_and_accept(
     relay_circuit: Multiaddr,
 ) -> Result<tokio::sync::oneshot::Receiver<P2pDuplex>, BoxError> {
     let mut incoming = client.behaviour().stream.new_control().accept(CT_CHANNEL_PROTOCOL)?;
+    // #136: offer direct TCP+QUIC candidates so DCUtR can punch (else only the relay leg exists).
+    add_direct_punch_listeners(&mut client)?;
     client.listen_on(relay_circuit)?;
     let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
     let (inbound_tx, inbound_rx) = tokio::sync::oneshot::channel();
@@ -869,6 +884,8 @@ pub(crate) async fn dcutr_dial_via_relay(
     target_peer: libp2p::PeerId,
 ) -> Result<P2pDuplex, BoxError> {
     let mut control = client.behaviour().stream.new_control();
+    // #136: offer direct TCP+QUIC candidates so DCUtR can punch (else only the relay leg exists).
+    add_direct_punch_listeners(&mut client)?;
     let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if client.dial(peer_via_relay).is_err() {
@@ -1367,6 +1384,35 @@ mod tests {
         assert!(both.is_ok(), "both direct listeners should bind within 5s");
         assert!(saw_tcp, "client offers a direct TCP punch candidate (TCP Simultaneous Connect)");
         assert!(saw_quic, "client still offers a QUIC punch candidate");
+    }
+
+    #[tokio::test]
+    async fn add_direct_punch_listeners_gives_the_live_join_a_tcp_and_quic_candidate() {
+        // #136 (frozen): the PRODUCTION NAT-to-NAT join primitives (dcutr_reserve_and_accept /
+        // dcutr_dial_via_relay, driven by run_channel_session_upgradable_dcutr) call
+        // add_direct_punch_listeners, so a real `ct-agent channel` — not just the natlab proof
+        // roles — brings up a direct TCP (DPI-surviving) + QUIC listener. Without a direct listener
+        // a relay-only agent has no punchable candidate and would relay forever.
+        let mut swarm = build_dcutr_relay_client_swarm().expect("dcutr client swarm builds");
+        add_direct_punch_listeners(&mut swarm).expect("direct punch listeners bind");
+        let mut saw_tcp = false;
+        let mut saw_quic = false;
+        let both = tokio::time::timeout(Duration::from_secs(5), async {
+            while !(saw_tcp && saw_quic) {
+                if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                    let s = address.to_string();
+                    if s.contains("quic-v1") {
+                        saw_quic = true;
+                    } else if s.contains("/tcp/") {
+                        saw_tcp = true;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(both.is_ok(), "both direct listeners should bind within 5s");
+        assert!(saw_tcp, "the live join offers a direct TCP punch candidate (DPI-surviving)");
+        assert!(saw_quic, "the live join offers a direct QUIC punch candidate");
     }
 
     #[tokio::test]
