@@ -723,6 +723,75 @@ pub fn elect_leader(votes: &[Vote], members: &[Account], term: u64) -> Option<Ac
     tally.into_iter().find(|&(_, count)| count >= needed).map(|(candidate, _)| candidate)
 }
 
+/// Domain separating a [`LeaderAttestation`] preimage from every other signed object.
+const LEADER_BLOCK_DOMAIN: &[u8] = b"ct-settlement-leader-block-v1";
+
+/// A **leader's signature over a block it produced in a term** (#147-L4.2 leader-append). Once a term
+/// elects a leader ([`elect_leader`]), only that leader may extend the chain; it attaches this
+/// attestation to each block so a follower can verify — before [`accept_block`](Chain::accept_block)ing
+/// — that the block came from the term's elected leader, not any writer. The leader signs
+/// `domain ‖ term ‖ leader ‖ block_hash`, binding the attestation to the exact block (its content hash)
+/// and term, so it can be neither forged nor replayed onto a different block or term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderAttestation {
+    pub term: u64,
+    /// The attesting leader (an [`Account`]) — the signature is checked against this.
+    pub leader: Account,
+    /// The content hash of the attested block (see [`Chain::tip_block`] / `Block::hash`).
+    pub block_hash: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl LeaderAttestation {
+    /// Canonical fixed-wire preimage: `domain ‖ term(LE) ‖ leader ‖ block_hash`. All fixed-size, so the
+    /// encoding is injective without length prefixes.
+    pub fn signing_bytes(term: u64, leader: &Account, block_hash: &[u8; 32]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(LEADER_BLOCK_DOMAIN.len() + 8 + 32 + 32);
+        m.extend_from_slice(LEADER_BLOCK_DOMAIN);
+        m.extend_from_slice(&term.to_le_bytes());
+        m.extend_from_slice(leader);
+        m.extend_from_slice(block_hash);
+        m
+    }
+
+    /// Construct + sign an attestation from the leader's `SigningKey` (derives `leader` from the key,
+    /// so an attestation can't be attributed to a writer that didn't produce the block).
+    pub fn sign_new(leader_key: &SigningKey, term: u64, block_hash: [u8; 32]) -> LeaderAttestation {
+        let leader = leader_key.verifying_key().to_bytes();
+        let signature = leader_key.sign(&Self::signing_bytes(term, &leader, &block_hash)).to_bytes();
+        LeaderAttestation { term, leader, block_hash, signature }
+    }
+
+    /// Whether the leader's signature authentically authorizes this attestation.
+    pub fn verify(&self) -> bool {
+        match VerifyingKey::from_bytes(&self.leader) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(self.term, &self.leader, &self.block_hash),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// **Authorize a block for leader-append** (#147-L4.2-iii): the follower-side check that composes the
+/// election with block acceptance. Returns `true` iff the attestation (1) is for `term`, (2) names the
+/// `elected_leader` for that term (from [`elect_leader`]), (3) is for **this** block (`block_hash`
+/// matches), and (4) verifies. This is the reusable authorization heart a follower runs *before*
+/// [`accept_block`](Chain::accept_block) so a non-leader — even a valid writer — cannot extend the
+/// chain, enforcing Raft's single-leader-per-term safety. (Embedding the attestation in the block wire
+/// form + calling this inside `accept_block` is the follow slice; this is the pure, tested predicate.)
+pub fn authorize_leader_block(
+    att: &LeaderAttestation,
+    elected_leader: &Account,
+    term: u64,
+    block_hash: &[u8; 32],
+) -> bool {
+    att.term == term && &att.leader == elected_leader && &att.block_hash == block_hash && att.verify()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +872,42 @@ mod tests {
             None,
             "one equivocating voter cannot elect anyone"
         );
+    }
+
+    #[test]
+    fn authorize_leader_block_admits_only_the_terms_elected_leader() {
+        // #147-L4.2-iii (frozen): a block is authorized for append iff a LeaderAttestation over its
+        // hash verifies AND names the term's elected leader — so only the elected leader extends the
+        // chain; a non-leader / stale-term / wrong-block / forged attestation is rejected.
+        let (w1, w2, w3) = (key(1), key(2), key(3));
+        let (a, b, c) = (acct(&w1), acct(&w2), acct(&w3));
+        let members = [a, b, c];
+        let term = 7;
+        let elected =
+            elect_leader(&[Vote::sign_new(&w1, term, a), Vote::sign_new(&w2, term, a)], &members, term)
+                .expect("a is elected");
+        assert_eq!(elected, a);
+        let bh = [0x5Au8; 32]; // stand-in for a real Block content hash
+
+        // The elected leader `a` attests the block → authorized.
+        let att = LeaderAttestation::sign_new(&w1, term, bh);
+        assert!(authorize_leader_block(&att, &elected, term, &bh), "the term's elected leader is authorized");
+
+        // A non-leader `b` attesting the same block → rejected (authentic, but not the leader).
+        let att_b = LeaderAttestation::sign_new(&w2, term, bh);
+        assert!(!authorize_leader_block(&att_b, &elected, term, &bh), "a non-leader can't authorize a block");
+
+        // Wrong term, wrong block, and a forged signature are all rejected.
+        assert!(!authorize_leader_block(&att, &elected, term + 1, &bh), "an attestation for another term is rejected");
+        assert!(!authorize_leader_block(&att, &elected, term, &[0u8; 32]), "an attestation for a different block is rejected");
+        let mut forged = att.clone();
+        forged.signature = [0u8; 64];
+        assert!(!authorize_leader_block(&forged, &elected, term, &bh), "a forged/invalid signature is rejected");
+
+        // Impersonation: claiming to be leader `a` while signing with a different key fails verify.
+        let mut impersonate = LeaderAttestation::sign_new(&w2, term, bh);
+        impersonate.leader = a;
+        assert!(!authorize_leader_block(&impersonate, &elected, term, &bh), "claiming the leader's identity without its key fails");
     }
 
     #[test]
