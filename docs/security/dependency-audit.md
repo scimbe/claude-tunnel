@@ -18,19 +18,27 @@ advisory matches, so it can gate CI.
 
 | Field | Value |
 |-------|-------|
-| Date | 2026-07-18 |
+| Date | 2026-07-23 |
 | Tool | cargo-audit 0.22.2 |
-| Dependencies scanned | ~219 |
-| **Vulnerabilities** | **0** (1 documented-accepted advisory ignored — see below) |
-| **Warnings** (unmaintained / yanked) | **0** |
-| Exit code | 0 (clean, with the `.cargo/audit.toml` ignore) |
+| Dependencies scanned | 378 |
+| **Vulnerabilities** | **0** (3 documented-accepted advisories ignored — see below) |
+| **Warnings** (unmaintained / yanked) | **1** (`paste` — unmaintained, `RUSTSEC-2024-0436`; allowed, non-fatal) |
+| Exit code | 0 (clean, with the `.cargo/audit.toml` ignores + the one allowed warning) |
 
-**Accepted advisory (#80):** `RUSTSEC-2023-0071` — `rsa` "Marvin Attack" timing
-side-channel (no fixed upgrade available) — is ignored in `.cargo/audit.toml` with a
-documented rationale: `rsa` is a **dev-dependency only** (runtime RSA key generation
-+ RS256 signing in the OIDC/portal JWKS tests), is not in any shipped service binary,
-and the timing side-channel is not reachable via test key generation. Revisit if a
-fix lands or if `rsa` ever enters a runtime path.
+**Accepted advisories (#78/#80), all in `.cargo/audit.toml`:**
+
+- `RUSTSEC-2023-0071` (#80) — `rsa` "Marvin Attack" timing side-channel (no fixed
+  upgrade available): pulled only by the **test-side** `jsonwebtoken::encode` that
+  mints test JWTs (control-plane tests), not in any release binary; production only
+  **verifies** RS256 JWTs via a public-key `DecodingKey` (`portal.rs`), and the
+  Marvin attack targets RSA private-key operations this service never performs in
+  production. Revisit if a fix lands or if `rsa` ever enters a runtime path.
+- `RUSTSEC-2026-0118` / `RUSTSEC-2026-0119` (#78) — `hickory-proto` (NSEC3
+  unbounded loop / O(n²) name compression): present only as resolved-but-inactive
+  optional deps of libp2p's `dns`/`mdns` features, which this workspace does not
+  enable (libp2p features are `tokio,noise,yamux,tcp,relay,dcutr,kad,macros` — raw
+  multiaddr dialing, no DNS/mDNS); `ct-dns` is a hand-rolled codec that does not use
+  `hickory`. Not in the compiled graph.
 
 **Resolved (#80 SEC80b):** `RUSTSEC-2025-0134` — the unmaintained `rustls-pemfile`
 was a **runtime** dependency of `ct-edge` (PEM cert parsing for the `:443` front
