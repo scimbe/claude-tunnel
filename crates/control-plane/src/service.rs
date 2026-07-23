@@ -24,9 +24,9 @@ use crate::payment::{PaymentError, PaymentId};
 use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
-    AgentDirectoryEntry, BootstrapError, LedgerOpError, PaymentOpError, RedeemError,
-    SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore, SqliteEnrollment, SqliteLedger,
-    SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
+    AgentDirectoryEntry, AgentDirectoryError, BootstrapError, LedgerOpError, PaymentOpError,
+    RedeemError, SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore, SqliteEnrollment,
+    SqliteLedger, SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -819,11 +819,21 @@ async fn agent_register(
     // #87: writes require a valid bearer. The authenticated subject is the anti-spam gate; the
     // card's holder signature (checked when a peer fetches `card_url`) is the actual trust anchor.
     let _subject = subject_of(&state.verifier, &headers)?;
+    // SSRF defence-in-depth (same class as #137): only accept https card URLs. The authoritative
+    // internal/link-local/metadata-range block belongs at the (not-yet-existent) fetcher; rejecting
+    // a non-https `card_url` at registration closes the door before any fetcher lands.
+    if !req.card_url.starts_with("https://") {
+        return Err((StatusCode::BAD_REQUEST, "card_url must be an https:// URL".to_string()));
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     state
         .directory
         .register(&req.holder_pubkey, &req.card_url, &req.role_tags, &req.skill_ids, now)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| match e {
+            // A newline-bearing facet token is a client error (token-injection), not a 500.
+            AgentDirectoryError::InvalidToken(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+            AgentDirectoryError::Db(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })?;
     Ok(StatusCode::OK)
 }
 
@@ -3795,11 +3805,39 @@ mod tests {
 
         // No match -> empty list.
         let miss = app
+            .clone()
             .oneshot(Request::get("/registry/agents?role=nobody").body(Body::empty()).unwrap())
             .await
             .unwrap();
         let body = to_bytes(miss.into_body(), 1 << 16).await.unwrap();
         assert!(serde_json::from_slice::<Vec<AgentDirectoryEntry>>(&body).unwrap().is_empty());
+
+        // SSRF defence-in-depth: a non-https card_url is rejected 400 (source's finding).
+        let non_https = app
+            .clone()
+            .oneshot(
+                Request::post("/registry/agents")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"holder_pubkey":"bb","card_url":"http://169.254.169.254/latest/meta-data","role_tags":["x"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_https.status(), StatusCode::BAD_REQUEST, "non-https card_url rejected");
+
+        // Token-injection: a newline in a facet is rejected 400, not silently smuggled in.
+        let injected = app
+            .oneshot(
+                Request::post("/registry/agents")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"holder_pubkey\":\"cc\",\"card_url\":\"https://x/.well-known/agent-card.json\",\"role_tags\":[\"source\\nadmin\"]}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(injected.status(), StatusCode::BAD_REQUEST, "newline-injected facet token rejected");
     }
 
     #[tokio::test]

@@ -376,6 +376,33 @@ fn split_tokens(s: &str) -> Vec<String> {
     }
 }
 
+/// Why an agent-directory [`register`](SqliteAgentDirectory::register) was rejected.
+#[derive(Debug)]
+pub enum AgentDirectoryError {
+    /// A `role_tag`/`skill_id` contained the record delimiter (a newline). The store joins tokens
+    /// with `\n` and search splits on `\n`, so a token like `"source\nadmin"` would smuggle an
+    /// extra searchable facet the agent never advertised — a token-injection. Reject at the door.
+    InvalidToken(String),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for AgentDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentDirectoryError::InvalidToken(t) => {
+                write!(f, "role/skill token must not contain a newline: {t:?}")
+            }
+            AgentDirectoryError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for AgentDirectoryError {}
+impl From<rusqlite::Error> for AgentDirectoryError {
+    fn from(e: rusqlite::Error) -> Self {
+        AgentDirectoryError::Db(e)
+    }
+}
+
 /// SQLite-backed **searchable agent directory** (#144 ②): agents self-register their published
 /// card URL + the roles/skills they advertise, and peers query `role`/`skill` to discover whom to
 /// fetch + verify. Distinct from [`SqliteRegistry`] (tunnels). Can share the same DB file as the
@@ -421,7 +448,15 @@ impl SqliteAgentDirectory {
         role_tags: &[String],
         skill_ids: &[String],
         now: u64,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), AgentDirectoryError> {
+        // Token-injection defence (source's review finding): the facets are stored `\n`-joined and
+        // searched by splitting on `\n`, so a token containing a newline (`"source\nadmin"`) would
+        // smuggle an extra advertised facet. Reject any delimiter-bearing token at the door.
+        for t in role_tags.iter().chain(skill_ids.iter()) {
+            if t.contains('\n') || t.contains('\r') {
+                return Err(AgentDirectoryError::InvalidToken(t.clone()));
+            }
+        }
         self.conn.lock_safe().execute(
             "INSERT OR REPLACE INTO agent_cards
                  (holder_pubkey, card_url, role_tags, skill_ids, registered_at)
@@ -2824,5 +2859,15 @@ mod tests {
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].card_url, "https://new.z/.well-known/agent-card.json", "URL updated");
         assert_eq!(updated[0].registered_at, 200, "timestamp updated");
+
+        // Token-injection is rejected at the door (source's review finding): a newline in a facet
+        // would smuggle an extra advertised role, and the row must NOT be written.
+        let injected = dir.register(
+            "cc", "https://x/.well-known/agent-card.json",
+            &["source\nadmin".to_string()], &[], 100,
+        );
+        assert!(matches!(injected, Err(AgentDirectoryError::InvalidToken(_))), "newline token rejected");
+        assert!(dir.search(Some("admin"), None).unwrap().is_empty(), "the injected facet never landed");
+        assert!(dir.search(None, None).unwrap().iter().all(|e| e.holder_pubkey != "cc"), "no partial row for the rejected register");
     }
 }
