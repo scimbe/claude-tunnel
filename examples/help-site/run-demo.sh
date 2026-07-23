@@ -52,10 +52,20 @@ else
 fi
 
 # --- Mint a single-use join token ----------------------------------------------
+# #87 (SEC87b-auth): the live CP gates POST /enroll/issue behind `x-ct-admin-token`,
+# sourced from CT_CP_EDGE_ADMIN_TOKEN — the SAME shared secret used for the edge
+# host-auth call below. Present it when set; an ungated dev CP ignores the header.
+# (This script predated the gate, so a gated CP returned 401 here — #141.)
 say "Minting a join token at $CP_URL/enroll/issue"
-TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-          -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')"
-[ -n "$TOKEN" ] || die "could not mint a join token at $CP_URL/enroll/issue"
+if [ -n "$EDGE_ADMIN_TOKEN" ]; then
+  TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+            -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" \
+            -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')"
+else
+  TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
+            -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')"
+fi
+[ -n "$TOKEN" ] || die "could not mint a join token at $CP_URL/enroll/issue (if the CP gates /enroll/issue per #87, set CT_CP_EDGE_ADMIN_TOKEN in $ENV_FILE)"
 echo "   token minted (single-use; not printed)"
 
 # --- Authorize the hostname at the edge (#23 BP4b), if configured ---------------
