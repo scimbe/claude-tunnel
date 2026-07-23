@@ -39,6 +39,10 @@ pub enum ChainError {
     Overdraft { from: Account, balance: Amount, amount: Amount },
     /// The transfer's nonce isn't the sender's next expected nonce (replay / gap).
     BadNonce { from: Account, expected: u64, got: u64 },
+    /// Crediting `to` would overflow `u64` — rejected rather than silently wrapping/saturating a
+    /// balance. Under the bounded-supply invariant this is unreachable; checking it keeps the value
+    /// path **fail-closed** (money never silently changes magnitude).
+    BalanceOverflow { to: Account, balance: Amount, amount: Amount },
     /// A stored block's hash or `prev_hash` linkage is wrong (tamper detected).
     BrokenChain { height: u64 },
 }
@@ -52,6 +56,9 @@ impl std::fmt::Display for ChainError {
             }
             ChainError::BadNonce { expected, got, .. } => {
                 write!(f, "bad nonce: expected {expected}, got {got}")
+            }
+            ChainError::BalanceOverflow { balance, amount, .. } => {
+                write!(f, "balance overflow: {balance} + {amount} exceeds u64")
             }
             ChainError::BrokenChain { height } => write!(f, "broken chain at block {height}"),
         }
@@ -289,6 +296,13 @@ impl Chain {
         if balance < t.amount {
             return Err(ChainError::Overdraft { from: t.from, balance, amount: t.amount });
         }
+        // Fail-closed on the credit side too: reject a transfer that would overflow the recipient's
+        // balance rather than let `apply`'s saturating_add silently cap it. Unreachable under bounded
+        // supply, but a validated block must never contain a credit that changes magnitude silently.
+        let to_balance = balances.get(&t.to).copied().unwrap_or(0);
+        if to_balance.checked_add(t.amount).is_none() {
+            return Err(ChainError::BalanceOverflow { to: t.to, balance: to_balance, amount: t.amount });
+        }
         Self::apply(balances, nonces, t);
         Ok(())
     }
@@ -481,6 +495,10 @@ pub enum EscrowError {
     ReceiptMismatch,
     /// A refund was attempted before the hold's `expires_at` — the provider still has time to prove.
     NotYetExpired { expires_at: u64, now: u64 },
+    /// Crediting the payee (provider on release, consumer on refund) would overflow `u64` — the op is
+    /// rejected with the hold left intact rather than silently wrapping a balance. Unreachable under
+    /// bounded supply; present so the value paths are fail-closed (money never silently wraps).
+    BalanceOverflow { account: Account, balance: Amount, amount: Amount },
 }
 
 impl std::fmt::Display for EscrowError {
@@ -500,6 +518,9 @@ impl std::fmt::Display for EscrowError {
             }
             EscrowError::NotYetExpired { expires_at, now } => {
                 write!(f, "hold not yet refundable: now {now} < expires_at {expires_at}")
+            }
+            EscrowError::BalanceOverflow { balance, amount, .. } => {
+                write!(f, "balance overflow: {balance} + {amount} exceeds u64")
             }
         }
     }
@@ -587,8 +608,13 @@ impl Escrow {
             return Err(EscrowError::ReceiptMismatch);
         }
         let (to, amount) = (rec.to, rec.amount);
+        // Compute the credit before mutating, so an overflow leaves the hold intact (fail-closed).
+        let credited = self
+            .balance(&to)
+            .checked_add(amount)
+            .ok_or(EscrowError::BalanceOverflow { account: to, balance: self.balance(&to), amount })?;
         self.held.remove(&receipt.match_ref);
-        *self.balances.entry(to).or_insert(0) += amount;
+        self.balances.insert(to, credited);
         Ok(())
     }
 
@@ -605,8 +631,13 @@ impl Escrow {
             return Err(EscrowError::NotYetExpired { expires_at: rec.expires_at, now });
         }
         let (from, amount) = (rec.from, rec.amount);
+        // Compute the credit before mutating, so an overflow leaves the hold intact (fail-closed).
+        let credited = self
+            .balance(&from)
+            .checked_add(amount)
+            .ok_or(EscrowError::BalanceOverflow { account: from, balance: self.balance(&from), amount })?;
         self.held.remove(match_ref);
-        *self.balances.entry(from).or_insert(0) += amount;
+        self.balances.insert(from, credited);
         Ok(())
     }
 }
@@ -693,6 +724,53 @@ mod tests {
         let wrong_provider = UsageReceipt::co_sign(&stranger, &consumer, CapacityKind::CloudApiQuota, "m".into(), 30, m1, 1);
         assert_eq!(esc3.release(&wrong_provider), Err(EscrowError::ReceiptMismatch), "receipt naming a different provider can't drain the hold");
         assert_eq!(esc3.held_amount(&m1), 30, "the mismatched attempts left the escrow untouched");
+    }
+
+    #[test]
+    fn credits_that_would_overflow_a_balance_are_rejected_fail_closed() {
+        // Central's money-path advisory (frozen): a credit that would overflow u64 is rejected with
+        // an explicit error rather than silently saturating/wrapping a balance — on BOTH the L4.1
+        // chain append path and the L2 escrow release/refund paths — and state is left unchanged.
+        use crate::channel::{CapacityKind, UsageReceipt};
+        let alice = key(1);
+        let bob = key(2);
+        let (a, b) = (acct(&alice), acct(&bob));
+
+        // Chain: bob is near u64::MAX; a transfer that would overflow him is rejected at append and
+        // the chain is left unchanged (no partial commit), while a fitting transfer still commits.
+        let mut chain = Chain::new(BTreeMap::from([(a, 100), (b, u64::MAX - 10)]));
+        assert!(
+            matches!(
+                chain.append(vec![Transfer::sign_new(&alice, b, 50, 0)]),
+                Err(ChainError::BalanceOverflow { .. })
+            ),
+            "a transfer that would overflow the recipient is rejected"
+        );
+        assert_eq!(chain.height(), 0, "the overflowing block was not committed");
+        assert_eq!(chain.balance(&b), u64::MAX - 10, "bob's balance is unchanged");
+        chain.append(vec![Transfer::sign_new(&alice, b, 5, 0)]).expect("a fitting transfer still commits");
+        assert_eq!(chain.balance(&b), u64::MAX - 5);
+
+        // Escrow release: crediting a maxed-out provider is rejected with the hold left intact.
+        // (The provider is pre-funded to u64::MAX in genesis — the receiving side of a real match.)
+        let m = [0x33u8; 32];
+        let mut esc = Escrow::new(BTreeMap::from([(a, 100), (b, u64::MAX)]));
+        esc.lock(&Hold::sign_new(&alice, b, 40, m, 0, 1_000)).unwrap();
+        let receipt = UsageReceipt::co_sign(&bob, &alice, CapacityKind::CloudApiQuota, "m".into(), 40, m, 1);
+        assert_eq!(
+            esc.release(&receipt),
+            Err(EscrowError::BalanceOverflow { account: b, balance: u64::MAX, amount: 40 }),
+            "releasing into a maxed provider is rejected, not silently wrapped"
+        );
+        assert_eq!(esc.held_amount(&m), 40, "the hold is left intact on overflow (fail-closed)");
+        assert_eq!(esc.balance(&b), u64::MAX, "provider balance unchanged");
+
+        // The refund credit path has the symmetric `checked_add` guard; an overflow there is
+        // unreachable under value conservation (a consumer only gets back what it locked), so we just
+        // confirm a normal refund still makes the consumer exactly whole.
+        esc.refund(&m, 2_000).expect("after expiry the unreleased hold refunds");
+        assert_eq!(esc.balance(&a), 100, "alice made whole (60 remaining + 40 refunded), no overflow");
+        assert_eq!(esc.held_amount(&m), 0, "hold cleared by the refund");
     }
 
     #[test]
