@@ -1692,13 +1692,24 @@ pub struct CapacityBid {
     pub total_price: u64,
     pub issued_at: UnixSeconds,
     pub expires_at: UnixSeconds,
+    /// #149-A.5 acceptable-use acknowledgment: SHA-256 of the provider's stated use-restriction terms
+    /// this consumer accepts, or all-zeros for "no acknowledgment". It rides the bidder-signed preimage,
+    /// so the bid **is** a signed record that this consumer accepted terms identified by exactly this
+    /// hash — a liability-allocation artifact (doesn't *prevent* misuse, but makes acceptance provable
+    /// and non-repudiable). A provider that requires acceptance checks `terms_ack` against its own
+    /// terms hash; whether it's mandatory is the proposal's open enforcement question, so this is the
+    /// opt-in capability, not an enforced gate.
+    #[serde(with = "card_hex::b32")]
+    pub terms_ack: [u8; 32],
     #[serde(with = "card_hex::b64")]
     pub signature: [u8; 64],
 }
 
 impl CapacityBid {
     /// Domain-separated, canonical injective preimage: `domain ‖ bidder ‖ kind(u8) ‖ ⟨model⟩ ‖
-    /// units(LE) ‖ total_price(LE) ‖ issued_at(LE) ‖ expires_at(LE)`, `model` length-prefixed.
+    /// units(LE) ‖ total_price(LE) ‖ issued_at(LE) ‖ expires_at(LE) ‖ terms_ack`, `model`
+    /// length-prefixed. `terms_ack` (#149-A.5) is appended so the acceptance is covered by the signature.
+    #[allow(clippy::too_many_arguments)]
     pub fn signing_bytes(
         bidder: &[u8; 32],
         kind: CapacityKind,
@@ -1707,6 +1718,7 @@ impl CapacityBid {
         total_price: u64,
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
+        terms_ack: &[u8; 32],
     ) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(CAPACITY_BID_DOMAIN);
@@ -1718,6 +1730,7 @@ impl CapacityBid {
         m.extend_from_slice(&total_price.to_le_bytes());
         m.extend_from_slice(&issued_at.to_le_bytes());
         m.extend_from_slice(&expires_at.to_le_bytes());
+        m.extend_from_slice(terms_ack);
         m
     }
 
@@ -1737,6 +1750,7 @@ impl CapacityBid {
                         self.total_price,
                         self.issued_at,
                         self.expires_at,
+                        &self.terms_ack,
                     ),
                     &Signature::from_bytes(&self.signature),
                 )
@@ -1745,7 +1759,8 @@ impl CapacityBid {
         }
     }
 
-    /// Construct + sign a bid from the consumer's `SigningKey` (derives `bidder` from the key).
+    /// Construct + sign a bid **without** an acceptable-use acknowledgment (`terms_ack` all-zeros).
+    /// Equivalent to [`sign_new_with_terms`](Self::sign_new_with_terms) with a zero hash.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_new(
         signing_key: &ed25519_dalek::SigningKey,
@@ -1756,12 +1771,42 @@ impl CapacityBid {
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
     ) -> CapacityBid {
+        Self::sign_new_with_terms(
+            signing_key,
+            kind,
+            model,
+            units,
+            total_price,
+            issued_at,
+            expires_at,
+            [0u8; 32],
+        )
+    }
+
+    /// Construct + sign a bid that also **acknowledges the provider's use-restriction terms** (#149-A.5):
+    /// `terms_ack` is the SHA-256 of the terms the consumer accepts (all-zeros = none). Because it's in
+    /// the bidder-signed preimage, the resulting bid is a non-repudiable signed record of that
+    /// acceptance. Derives `bidder` from the key so the acknowledgment can't be attributed to a key the
+    /// caller doesn't hold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_new_with_terms(
+        signing_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        model: String,
+        units: u64,
+        total_price: u64,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+        terms_ack: [u8; 32],
+    ) -> CapacityBid {
         use ed25519_dalek::Signer;
         let bidder = signing_key.verifying_key().to_bytes();
         let signature = signing_key
-            .sign(&Self::signing_bytes(&bidder, kind, &model, units, total_price, issued_at, expires_at))
+            .sign(&Self::signing_bytes(
+                &bidder, kind, &model, units, total_price, issued_at, expires_at, &terms_ack,
+            ))
             .to_bytes();
-        CapacityBid { bidder, kind, model, units, total_price, issued_at, expires_at, signature }
+        CapacityBid { bidder, kind, model, units, total_price, issued_at, expires_at, terms_ack, signature }
     }
 }
 
@@ -3534,5 +3579,38 @@ mod tests {
         let receipt = UsageReceipt::co_sign(&seller, &buyer, m.kind, m.model.clone(), m.units, m.match_ref, 5_000);
         esc.release(&receipt).expect("the co-signed receipt for this match releases the escrow");
         assert_eq!(esc.balance(&m.provider), 150, "provider paid the cleared amount for this match");
+    }
+
+    #[test]
+    fn capacity_bid_terms_ack_is_signed_and_binding() {
+        // #149-A.5 (frozen): the acceptable-use acknowledgment rides the bidder-signed preimage, so a
+        // bid is a non-repudiable record of accepting exactly those terms. A plain sign_new records a
+        // zero ack and still verifies (backward-compatible), and the ack genuinely changes the
+        // signature (it's covered, not decorative) — so a consumer can't later deny which terms it took.
+        use ed25519_dalek::SigningKey;
+        let buyer = SigningKey::from_bytes(&[0x52u8; 32]);
+        let terms = [0x7Eu8; 32]; // SHA-256 of the provider's stated use-restriction terms
+        let b = CapacityBid::sign_new_with_terms(
+            &buyer, CapacityKind::CloudApiQuota, "m".into(), 10, 150, 1_000, 9_000, terms,
+        );
+        assert!(b.is_valid(1_000), "an acknowledged bid verifies");
+        assert_eq!(b.terms_ack, terms, "the accepted-terms hash is recorded");
+
+        // Tampering the ack (claiming acceptance of different terms) breaks the signature.
+        let mut t = b.clone();
+        t.terms_ack = [0u8; 32];
+        assert!(!t.is_valid(1_000), "altering the acknowledged terms invalidates the bid");
+
+        // Backward-compatible: a plain bid records a zero ack, still verifies, and has a different
+        // signature than the acknowledged one (proving terms_ack is covered by the signature).
+        let plain = CapacityBid::sign_new(&buyer, CapacityKind::CloudApiQuota, "m".into(), 10, 150, 1_000, 9_000);
+        assert!(plain.is_valid(1_000), "a plain (no-ack) bid still verifies");
+        assert_eq!(plain.terms_ack, [0u8; 32], "no acknowledgment = zero hash");
+        assert_ne!(plain.signature, b.signature, "the acknowledgment is covered by the signature");
+
+        // JSON round-trip preserves the ack and still verifies.
+        let back: CapacityBid = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back, b);
+        assert!(back.is_valid(1_000));
     }
 }
