@@ -1390,6 +1390,56 @@ pub fn authorize_relay_circuit_with_possession(
     Ok(())
 }
 
+/// Mints and single-use-verifies the fresh challenges [`authorize_relay_circuit_with_possession`]
+/// is checked against — the **freshness half** of the relay possession gate.
+///
+/// The possession predicate only verifies a signature *over* a `challenge` it is handed; it cannot,
+/// by itself, guarantee that challenge was fresh, unpredictable, and used once. Without that, a
+/// captured `(challenge, signature)` pair replays against a later reservation and the possession
+/// proof is defeated. `RelayChallenger` closes it: the relay accept-loop [`issue`](Self::issue)s a
+/// **CSPRNG** challenge per reservation attempt (so an attacker cannot pick a challenge it already
+/// holds a signature for) and [`consume`](Self::consume)s it **exactly once** (so the same pair
+/// cannot be replayed). The intended call order in the live loop is: `let c = challenger.issue();`
+/// → send `c` → receive the requester's grant + signature → `if !challenger.consume(&c) { reject }`
+/// → [`authorize_relay_circuit_with_possession`]. Consuming enforces both "we issued it" and
+/// "only once"; the predicate enforces the cryptographic binding to the grant `holder`.
+#[derive(Debug, Default)]
+pub struct RelayChallenger {
+    /// Challenges we have issued and not yet consumed. A `consume` removes its entry, so a second
+    /// presentation of the same challenge finds nothing and is refused.
+    outstanding: std::collections::HashSet<[u8; 32]>,
+}
+
+impl RelayChallenger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a fresh, unpredictable 32-byte challenge and record it as outstanding. The relay sends
+    /// this to the requester, which must sign it with its grant's holder key (proof of possession).
+    pub fn issue(&mut self) -> [u8; 32] {
+        use rand::RngCore;
+        let mut challenge = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut challenge);
+        self.outstanding.insert(challenge);
+        challenge
+    }
+
+    /// Accept a challenge for a possession check **exactly once**: `true` iff it is one we
+    /// [`issue`](Self::issue)d and have not consumed yet — the entry is then removed, so replaying
+    /// the same `(challenge, signature)` fails on the next call. `false` for a challenge we never
+    /// issued (an attacker-chosen value) or one already consumed.
+    pub fn consume(&mut self, challenge: &[u8; 32]) -> bool {
+        self.outstanding.remove(challenge)
+    }
+
+    /// Count of outstanding (issued, not-yet-consumed) challenges — for tests/observability; not
+    /// part of any trust decision.
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2051,6 +2101,35 @@ mod tests {
             Err(RelayCircuitError::RequesterChannelMismatch),
             "grant/co-membership checks still gate first — possession is layered on, never a bypass"
         );
+    }
+
+    #[test]
+    fn relay_challenger_mints_unpredictable_single_use_challenges() {
+        // #146 freshness half (frozen, central's integration caveat): the possession predicate only
+        // verifies a signature over a challenge — RelayChallenger supplies the fresh, single-use
+        // challenge that makes it replay-resistant. Each issue() is a distinct CSPRNG value; a
+        // challenge is consumable exactly once (defeats a captured (challenge,sig) replay); and a
+        // challenge we never issued (attacker-chosen) is refused.
+        let mut ch = RelayChallenger::new();
+        let a = ch.issue();
+        let b = ch.issue();
+        assert_ne!(a, b, "each issued challenge is a distinct CSPRNG value");
+        assert_ne!(a, [0u8; 32], "not the trivial all-zero challenge");
+        assert_eq!(ch.outstanding(), 2, "two issued, none consumed");
+
+        // A challenge we issued is accepted exactly ONCE.
+        assert!(ch.consume(&a), "an issued challenge is accepted");
+        assert!(!ch.consume(&a), "the same challenge can't be consumed twice (single-use, anti-replay)");
+        assert_eq!(ch.outstanding(), 1, "consuming removed a; b remains outstanding");
+
+        // A challenge we NEVER issued (an attacker-chosen value) is refused — so the requester can't
+        // present a challenge it already holds a signature for.
+        assert!(!ch.consume(&[0x42u8; 32]), "a challenge we never minted is refused");
+
+        // b is still independently consumable exactly once.
+        assert!(ch.consume(&b), "the other issued challenge is still good once");
+        assert!(!ch.consume(&b), "and only once");
+        assert_eq!(ch.outstanding(), 0, "all issued challenges now consumed");
     }
 
     #[test]
