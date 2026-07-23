@@ -1605,6 +1605,196 @@ impl UsageReceipt {
     }
 }
 
+const CAPACITY_BID_DOMAIN: &[u8] = b"ct-capacity-bid-v1";
+const CAPACITY_MATCH_DOMAIN: &[u8] = b"ct-capacity-match-v1";
+
+/// A **buyer's signed bid for idle capacity** (#147-L2 — the demand side of the auction). Where a
+/// [`CapacityOffer`] is the seller's advertisement (the ask), a `CapacityBid` is a consumer's
+/// commitment to pay up to `total_price` for `units` of `model` capacity of `kind`, valid until
+/// `expires_at`. Same domain-separated injective (length-prefixed) preimage discipline as
+/// `CapacityOffer`, signed by the consumer's ed25519 key so a bid can't be forged under another's key.
+/// `total_price` is the whole-bid amount the buyer commits (and, on a match, escrows via a
+/// [`crate::settlement::Hold`]) — it must meet the seller's `min_price` floor for the bid to clear.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapacityBid {
+    /// The bidding consumer's ed25519 public key — the signature is checked against this.
+    #[serde(with = "card_hex::b32")]
+    pub bidder: [u8; 32],
+    pub kind: CapacityKind,
+    /// The single model id the buyer wants served (must be one the offer lists).
+    pub model: String,
+    /// Units wanted (semantics per `kind`, as in [`CapacityOffer`]).
+    pub units: u64,
+    /// The whole-bid amount the buyer commits to pay for `units` (must be >= the offer's `min_price`).
+    pub total_price: u64,
+    pub issued_at: UnixSeconds,
+    pub expires_at: UnixSeconds,
+    #[serde(with = "card_hex::b64")]
+    pub signature: [u8; 64],
+}
+
+impl CapacityBid {
+    /// Domain-separated, canonical injective preimage: `domain ‖ bidder ‖ kind(u8) ‖ ⟨model⟩ ‖
+    /// units(LE) ‖ total_price(LE) ‖ issued_at(LE) ‖ expires_at(LE)`, `model` length-prefixed.
+    pub fn signing_bytes(
+        bidder: &[u8; 32],
+        kind: CapacityKind,
+        model: &str,
+        units: u64,
+        total_price: u64,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(CAPACITY_BID_DOMAIN);
+        m.extend_from_slice(bidder);
+        m.push(kind.tag());
+        m.extend_from_slice(&(model.len() as u32).to_le_bytes());
+        m.extend_from_slice(model.as_bytes());
+        m.extend_from_slice(&units.to_le_bytes());
+        m.extend_from_slice(&total_price.to_le_bytes());
+        m.extend_from_slice(&issued_at.to_le_bytes());
+        m.extend_from_slice(&expires_at.to_le_bytes());
+        m
+    }
+
+    /// Whether the bid is authentic and still current at `now` (signature verifies, `now < expires_at`).
+    pub fn is_valid(&self, now: UnixSeconds) -> bool {
+        if now >= self.expires_at {
+            return false;
+        }
+        match VerifyingKey::from_bytes(&self.bidder) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.bidder,
+                        self.kind,
+                        &self.model,
+                        self.units,
+                        self.total_price,
+                        self.issued_at,
+                        self.expires_at,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Construct + sign a bid from the consumer's `SigningKey` (derives `bidder` from the key).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_new(
+        signing_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        model: String,
+        units: u64,
+        total_price: u64,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> CapacityBid {
+        use ed25519_dalek::Signer;
+        let bidder = signing_key.verifying_key().to_bytes();
+        let signature = signing_key
+            .sign(&Self::signing_bytes(&bidder, kind, &model, units, total_price, issued_at, expires_at))
+            .to_bytes();
+        CapacityBid { bidder, kind, model, units, total_price, issued_at, expires_at, signature }
+    }
+}
+
+/// A **cleared match** between a seller's [`CapacityOffer`] and a buyer's [`CapacityBid`] (#147-L2).
+/// Produced by [`match_offer`], it names both parties and the agreed terms, and carries a
+/// **deterministic** `match_ref` — both sides compute the identical value from the same offer+bid, so
+/// it uniquely binds the downstream escrow [`crate::settlement::Hold`] and the [`UsageReceipt`] to
+/// *this* match (no cross-match replay). A `CapacityMatch` is a derived fact, not a signed object: its
+/// authority comes from the offer and bid it was computed from (both signed, both re-checkable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityMatch {
+    /// The provider (= the offer's `holder_pubkey`).
+    pub provider: [u8; 32],
+    /// The consumer (= the bid's `bidder`).
+    pub consumer: [u8; 32],
+    pub kind: CapacityKind,
+    pub model: String,
+    pub units: u64,
+    /// The clearing amount the consumer escrows for the provider (= the bid's `total_price`).
+    pub total_price: u64,
+    /// Deterministic id binding the escrow hold + usage receipt to this match.
+    pub match_ref: [u8; 32],
+}
+
+/// The deterministic `match_ref` for a cleared match — `sha256(domain ‖ provider ‖ consumer ‖
+/// kind(u8) ‖ ⟨model⟩ ‖ units(LE) ‖ total_price(LE) ‖ bid_issued_at(LE) ‖ offer_issued_at(LE))`.
+/// Both parties compute the same value; including both timestamps makes distinct auctions for the
+/// same terms distinct matches.
+fn compute_match_ref(
+    provider: &[u8; 32],
+    consumer: &[u8; 32],
+    kind: CapacityKind,
+    model: &str,
+    units: u64,
+    total_price: u64,
+    bid_issued_at: UnixSeconds,
+    offer_issued_at: UnixSeconds,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(CAPACITY_MATCH_DOMAIN);
+    h.update(provider);
+    h.update(consumer);
+    h.update([kind.tag()]);
+    h.update((model.len() as u32).to_le_bytes());
+    h.update(model.as_bytes());
+    h.update(units.to_le_bytes());
+    h.update(total_price.to_le_bytes());
+    h.update(bid_issued_at.to_le_bytes());
+    h.update(offer_issued_at.to_le_bytes());
+    h.finalize().into()
+}
+
+/// **Clear a bid against an offer** (#147-L2 matching). Returns a [`CapacityMatch`] iff the two are
+/// compatible at `now`, else `None`. Both must be authentic and unexpired (`is_valid`); the `kind`s
+/// must agree; the offer must list the bid's `model`; the offer must have enough `units_available`;
+/// and the bid's `total_price` must meet the offer's `min_price` **floor** (the buyer clears at or
+/// above the seller's minimum). The clearing amount is the bid's `total_price` — what the consumer
+/// then escrows via a [`crate::settlement::Hold`] keyed by the match's `match_ref`.
+pub fn match_offer(offer: &CapacityOffer, bid: &CapacityBid, now: UnixSeconds) -> Option<CapacityMatch> {
+    if !offer.is_valid(now) || !bid.is_valid(now) {
+        return None;
+    }
+    if offer.kind != bid.kind {
+        return None;
+    }
+    if !offer.models.iter().any(|m| m == &bid.model) {
+        return None;
+    }
+    if offer.units_available < bid.units {
+        return None;
+    }
+    if bid.total_price < offer.min_price {
+        return None;
+    }
+    let match_ref = compute_match_ref(
+        &offer.holder_pubkey,
+        &bid.bidder,
+        bid.kind,
+        &bid.model,
+        bid.units,
+        bid.total_price,
+        bid.issued_at,
+        offer.issued_at,
+    );
+    Some(CapacityMatch {
+        provider: offer.holder_pubkey,
+        consumer: bid.bidder,
+        kind: bid.kind,
+        model: bid.model.clone(),
+        units: bid.units,
+        total_price: bid.total_price,
+        match_ref,
+    })
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -3175,5 +3365,68 @@ mod tests {
         let back: UsageReceipt = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(back, r);
         assert!(back.is_valid(), "still verifies after a JSON round-trip");
+    }
+
+    #[test]
+    fn capacity_bid_matches_a_compatible_offer_and_threads_into_escrow() {
+        // #147-L2 (frozen): a buyer's signed bid clears against a seller's offer iff kind + model +
+        // units fit and the bid meets the seller's floor; the match is deterministic (same match_ref
+        // both sides) and that ref threads through the escrow Hold + L3 receipt so settlement binds to
+        // THIS match — advertise (L1) -> bid/match (L2) -> escrow+prove+release (L2/L3) end to end.
+        use crate::settlement::{Escrow, Hold};
+        use std::collections::BTreeMap;
+        let seller = SigningKey::from_bytes(&[0x51u8; 32]);
+        let buyer = SigningKey::from_bytes(&[0x52u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller,
+            CapacityKind::CloudApiQuota,
+            vec!["claude-opus-4-8".to_string(), "local-llama".to_string()],
+            1_000, // units_available
+            100,   // min_price (seller floor)
+            "ct-llm-token-chain".to_string(),
+            1_000,
+            9_000,
+        );
+        let bid = CapacityBid::sign_new(
+            &buyer,
+            CapacityKind::CloudApiQuota,
+            "claude-opus-4-8".to_string(),
+            200, // units (<= 1000 available)
+            150, // total_price (>= 100 floor)
+            1_000,
+            9_000,
+        );
+
+        // Happy path: clears with the expected terms.
+        let m = match_offer(&offer, &bid, 1_000).expect("a compatible bid clears");
+        assert_eq!(m.provider, seller.verifying_key().to_bytes(), "provider is the offer holder");
+        assert_eq!(m.consumer, buyer.verifying_key().to_bytes(), "consumer is the bidder");
+        assert_eq!((m.units, m.total_price), (200, 150), "cleared at the bid's terms");
+        // Deterministic: recomputing (later, while both still valid) yields the identical match_ref.
+        let m2 = match_offer(&offer, &bid, 2_000).expect("still clears while both are valid");
+        assert_eq!(m2.match_ref, m.match_ref, "match_ref is a deterministic function of offer+bid");
+
+        // Reject paths -> None.
+        let wrong_kind = CapacityBid::sign_new(&buyer, CapacityKind::LocalHardware, "claude-opus-4-8".into(), 10, 150, 1_000, 9_000);
+        assert!(match_offer(&offer, &wrong_kind, 1_000).is_none(), "kind must match");
+        let unlisted = CapacityBid::sign_new(&buyer, CapacityKind::CloudApiQuota, "gpt-9".into(), 10, 150, 1_000, 9_000);
+        assert!(match_offer(&offer, &unlisted, 1_000).is_none(), "offer must serve the model");
+        let too_many = CapacityBid::sign_new(&buyer, CapacityKind::CloudApiQuota, "claude-opus-4-8".into(), 5_000, 9_000, 1_000, 9_000);
+        assert!(match_offer(&offer, &too_many, 1_000).is_none(), "bid can't exceed available units");
+        let below_floor = CapacityBid::sign_new(&buyer, CapacityKind::CloudApiQuota, "claude-opus-4-8".into(), 10, 50, 1_000, 9_000);
+        assert!(match_offer(&offer, &below_floor, 1_000).is_none(), "bid must meet the seller's floor");
+        assert!(match_offer(&offer, &bid, 9_000).is_none(), "an expired offer/bid doesn't clear");
+        let mut forged = bid.clone();
+        forged.bidder = SigningKey::from_bytes(&[0x99u8; 32]).verifying_key().to_bytes();
+        assert!(match_offer(&offer, &forged, 1_000).is_none(), "a forged bid (bidder didn't sign) is rejected");
+
+        // End-to-end: the match_ref threads into escrow. The buyer escrows the cleared amount for the
+        // provider under the match_ref; a co-signed receipt for the SAME match releases it.
+        let mut esc = Escrow::new(BTreeMap::from([(m.consumer, 1_000)]));
+        esc.lock(&Hold::sign_new(&buyer, m.provider, m.total_price, m.match_ref, 0, 9_000)).expect("buyer escrows the cleared amount");
+        assert_eq!(esc.held_amount(&m.match_ref), 150, "the cleared amount is held under the match_ref");
+        let receipt = UsageReceipt::co_sign(&seller, &buyer, m.kind, m.model.clone(), m.units, m.match_ref, 5_000);
+        esc.release(&receipt).expect("the co-signed receipt for this match releases the escrow");
+        assert_eq!(esc.balance(&m.provider), 150, "provider paid the cleared amount for this match");
     }
 }
