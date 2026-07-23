@@ -277,10 +277,19 @@ pub fn register_settlement_tools(
 ///
 /// Time is stamped by **this serving agent** via `now_fn`, never taken from the caller's request — so a
 /// buyer can't pass a fake `now` to make an expired offer/bid clear.
+///
+/// #149-A.3 abuse control: `auction/bid` is per-consumer rate-limited (at most `max_bids_per_window`
+/// bids per `window_secs`-second fixed window, reusing [`KeyedRateLimiter`](crate::ratelimit::KeyedRateLimiter)
+/// — no new mechanism), keyed by the **authenticated** bidder. The bid's signature is verified *before*
+/// the limiter is charged, so a forged bid carrying a victim's `bidder` can't exhaust that victim's
+/// budget. This bounds how fast a single malicious consumer can hammer a provider with abuse attempts.
+/// A `window_secs` of 0 disables windowing (a single all-time window).
 pub fn register_auction_tools(
     reg: &mut ToolRegistry,
     offer: crate::channel::CapacityOffer,
     now_fn: impl Fn() -> crate::channel::UnixSeconds + Send + Sync + 'static,
+    max_bids_per_window: u32,
+    window_secs: u64,
 ) {
     let offer_for_get = offer.clone();
     reg.register(
@@ -288,6 +297,9 @@ pub fn register_auction_tools(
         "the agent's holder-signed CapacityOffer — its advertised idle capacity + floor terms",
         move |_| serde_json::to_value(&offer_for_get).map_err(|e| e.to_string()),
     );
+    let limiter = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::new(max_bids_per_window),
+    ));
     reg.register(
         "auction/bid",
         "submit a signed CapacityBid; returns the cleared CapacityMatch, or a no-match tool error",
@@ -295,7 +307,21 @@ pub fn register_auction_tools(
             let bid_val = args.get("bid").ok_or("missing `bid` object")?;
             let bid: crate::channel::CapacityBid =
                 serde_json::from_value(bid_val.clone()).map_err(|e| format!("malformed bid: {e}"))?;
-            match crate::channel::match_offer(&offer, &bid, now_fn()) {
+            let now = now_fn();
+            // Authenticate the bid BEFORE charging the limiter, so a forged bid carrying someone
+            // else's `bidder` can't burn that consumer's rate budget (#149-A.3).
+            if !bid.is_valid(now) {
+                return Err("bid signature invalid or expired".to_string());
+            }
+            let window = if window_secs == 0 { 0 } else { now / window_secs };
+            if !limiter
+                .lock()
+                .map_err(|_| "auction rate limiter lock poisoned")?
+                .allow(&bid.bidder, window)
+            {
+                return Err("bid rate limit exceeded for this consumer — slow down".to_string());
+            }
+            match crate::channel::match_offer(&offer, &bid, now) {
                 Some(m) => serde_json::to_value(m).map_err(|e| e.to_string()),
                 None => Err(
                     "bid does not clear against this offer (kind/model/units/floor/expiry)".to_string(),
@@ -495,7 +521,7 @@ mod tests {
         );
 
         let mut reg = default_registry();
-        register_auction_tools(&mut reg, offer.clone(), || 1_000);
+        register_auction_tools(&mut reg, offer.clone(), || 1_000, 1_000, 1); // generous limit: not under test here
 
         // auction/offer → the seller's signed offer, round-tripping to the same CapacityOffer.
         let got = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -524,10 +550,56 @@ mod tests {
         // Seller stamps time: a registry whose clock is past the offer's expiry won't clear the same
         // good bid — the caller can't fake `now` to revive an expired offer.
         let mut expired = default_registry();
-        register_auction_tools(&mut expired, offer.clone(), || 9_000);
+        register_auction_tools(&mut expired, offer.clone(), || 9_000, 1_000, 1); // generous limit
         let past = call(&expired, json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "auction/bid", "arguments": { "bid": serde_json::to_value(&bid).unwrap() } } }));
         assert!(past.error.is_some(), "past the seller's clock the offer has expired and nothing clears");
+    }
+
+    #[test]
+    fn auction_bid_is_rate_limited_per_authenticated_consumer() {
+        // #149-A.3 (frozen): auction/bid caps how fast one consumer can hammer a provider — at most
+        // `max_bids_per_window` bids per window, keyed by the AUTHENTICATED bidder. A forged bid
+        // carrying a victim's `bidder` is rejected before the limiter, so it can't burn the victim's
+        // budget; a distinct honest bidder has its own independent budget.
+        use crate::channel::{CapacityBid, CapacityKind, CapacityOffer};
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x51u8; 32]);
+        let buyer = SigningKey::from_bytes(&[0x52u8; 32]);
+        let other = SigningKey::from_bytes(&[0x53u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 1_000, 100, "c".into(), 1_000, 9_000,
+        );
+        let mk_bid = |k: &SigningKey| {
+            CapacityBid::sign_new(k, CapacityKind::CloudApiQuota, "m".into(), 10, 150, 1_000, 9_000)
+        };
+
+        // Two bids per window; the seller's clock is fixed at 1_000 → all in one window.
+        let mut reg = default_registry();
+        register_auction_tools(&mut reg, offer.clone(), || 1_000, 2, 100);
+        let bid_call = |reg: &ToolRegistry, id: i64, b: &CapacityBid| {
+            call(reg, json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "auction/bid", "arguments": { "bid": serde_json::to_value(b).unwrap() } } }))
+        };
+
+        let buyer_bid = mk_bid(&buyer);
+        assert!(bid_call(&reg, 1, &buyer_bid).result.is_some(), "1st bid within the limit clears");
+        assert!(bid_call(&reg, 2, &buyer_bid).result.is_some(), "2nd bid within the limit clears");
+        let third = bid_call(&reg, 3, &buyer_bid);
+        assert!(third.error.is_some(), "3rd bid in the same window is rate-limited");
+        assert!(third.error.unwrap().message.contains("rate limit"), "the error names the rate limit");
+
+        // A different authenticated consumer has its own budget — not blocked by the buyer's.
+        assert!(bid_call(&reg, 4, &mk_bid(&other)).result.is_some(), "a distinct consumer isn't rate-limited");
+
+        // A FORGED bid (victim's `bidder`, someone else's signature) is rejected before the limiter,
+        // so it can't be used to exhaust the victim's budget.
+        let mut forged = mk_bid(&buyer);
+        forged.bidder = other.verifying_key().to_bytes(); // claim `other` but keep buyer's signature
+        let f = bid_call(&reg, 5, &forged);
+        assert!(f.error.unwrap().message.contains("invalid"), "a forged bid is rejected as invalid, not rate-limited");
+        // `other`'s real budget is untouched: it still has room after the forged attempt.
+        assert!(bid_call(&reg, 6, &mk_bid(&other)).result.is_some(), "the forged bid didn't burn the victim's budget");
     }
 
     #[test]
