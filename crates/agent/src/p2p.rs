@@ -426,6 +426,12 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
     let mut swarm = build_dcutr_relay_client_swarm()?;
     let me = *swarm.local_peer_id();
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive address
+    // #136 Fix B: also offer a direct TCP candidate so DCUtR can attempt "TCP Simultaneous
+    // Connect" — the only punch transport that survives the host's UDP/QUIC DPI block (source-2
+    // confirmed 0/4 UDP ports punchable externally on the live plane; TCP the sole survivor).
+    // The client already carries a TCP transport; this listen makes its reflexive TCP addr — the
+    // one identify observes over the (TCP) relay leg — a usable punch candidate, not QUIC-only.
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // punchable TCP reflexive address (Fix B)
     // #136 sequencing: learn+confirm our reflexive addr from the relay BEFORE reserving (becoming
     // dialable), so the punch that follows has a confirmed external addr to advertise.
     await_reflexive_via_relay(&mut swarm, relay.clone()).await?;
@@ -481,6 +487,12 @@ pub async fn nat_lab_listen(relay: Multiaddr) -> Result<(), BoxError> {
 pub async fn nat_lab_dial(peer_via_relay: Multiaddr) -> Result<(), BoxError> {
     let mut swarm = build_dcutr_relay_client_swarm()?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?; // punchable QUIC reflexive address
+    // #136 Fix B: also offer a direct TCP candidate so DCUtR can attempt "TCP Simultaneous
+    // Connect" — the only punch transport that survives the host's UDP/QUIC DPI block (source-2
+    // confirmed 0/4 UDP ports punchable externally on the live plane; TCP the sole survivor).
+    // The client already carries a TCP transport; this listen makes its reflexive TCP addr — the
+    // one identify observes over the (TCP) relay leg — a usable punch candidate, not QUIC-only.
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?; // punchable TCP reflexive address (Fix B)
     // #136 sequencing: confirm our reflexive addr from the relay BEFORE dialing the peer. The
     // relay addr is the prefix of `peer_via_relay` up to the `/p2p-circuit` hop.
     let relay_addr: Multiaddr = peer_via_relay
@@ -1320,6 +1332,42 @@ mod tests {
     use crate::channel_run::{run_channel_session_on_stream, ChannelRole};
     use ct_common::noise::generate_static_keypair;
     use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn dcutr_client_offers_both_a_tcp_and_a_quic_direct_punch_candidate() {
+        // #136 Fix B (frozen): the punch client must bring up a direct **TCP** listener in
+        // addition to QUIC, so DCUtR can attempt "TCP Simultaneous Connect" — the only punch
+        // transport that survives the real host's UDP/QUIC DPI block (source-2 confirmed 0/4 UDP
+        // ports punchable externally, TCP the sole survivor). A QUIC-only client can never punch
+        // there; this asserts both direct candidates come up so the TCP path exists.
+        let mut swarm = build_dcutr_relay_client_swarm().expect("dcutr client swarm builds");
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .expect("TCP listen accepted (the client carries a TCP transport)");
+        swarm
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .expect("QUIC listen accepted");
+
+        let mut saw_tcp = false;
+        let mut saw_quic = false;
+        let both = tokio::time::timeout(Duration::from_secs(5), async {
+            while !(saw_tcp && saw_quic) {
+                if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                    let s = address.to_string();
+                    if s.contains("quic-v1") {
+                        saw_quic = true;
+                    } else if s.contains("/tcp/") {
+                        saw_tcp = true;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(both.is_ok(), "both direct listeners should bind within 5s");
+        assert!(saw_tcp, "client offers a direct TCP punch candidate (TCP Simultaneous Connect)");
+        assert!(saw_quic, "client still offers a QUIC punch candidate");
+    }
 
     #[tokio::test]
     async fn channel_noise_session_runs_over_a_libp2p_memory_stream() {
