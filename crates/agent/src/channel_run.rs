@@ -1501,6 +1501,123 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(v.as_slice()).ok()
 }
 
+/// Split a comma-separated env value into trimmed, non-empty tokens (empty input → no tokens).
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Configuration for `ct-agent channel agent-card` (#144 ①-wiring): assemble + sign this
+/// agent's holder [`AgentCard`](ct_common::channel::AgentCard) from `CT_CHANNEL_HOLDER_KEY`
+/// plus the advertised claims, and write it to `<CT_AGENT_CARD_OUT>/.well-known/agent-card.json`
+/// for the operator's origin to serve — the runnable path that closes the emit chain without
+/// anyone hand-rolling ed25519. Env-parsed with the clock injected at [`write_card`], so the
+/// assembly is a pure, testable function.
+pub struct AgentCardCliConfig {
+    /// The holder ed25519 signing key the card is bound to (`CT_CHANNEL_HOLDER_KEY`, hex). SECRET.
+    pub holder: SigningKey,
+    /// Advertised role tags (`CT_AGENT_CARD_ROLES`, comma-separated) — at least one required.
+    pub role_tags: Vec<String>,
+    /// Advertised skills (`CT_AGENT_CARD_SKILLS`, `;`-separated `id|description` entries).
+    pub skills: Vec<ct_common::channel::Skill>,
+    /// Self-asserted cells (`CT_AGENT_CARD_CELLS`, comma-separated 64-hex) — usually empty.
+    pub cells: Vec<ct_common::channel::CellId>,
+    /// Channels the agent advertises reachability via (`CT_AGENT_CARD_CHANNELS`, comma-separated 64-hex).
+    pub channels: Vec<ct_common::channel::ChannelId>,
+    /// Validity window in seconds (`CT_AGENT_CARD_TTL_SECS`, default 86400).
+    pub ttl_secs: u64,
+    /// Directory the `.well-known/agent-card.json` is written under (`CT_AGENT_CARD_OUT`, default `.`).
+    pub out_dir: std::path::PathBuf,
+}
+
+impl AgentCardCliConfig {
+    /// Read the config from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (the `from_env` seam — testable without touching the real env).
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let holder = SigningKey::from_bytes(
+            &f("CT_CHANNEL_HOLDER_KEY")
+                .as_deref()
+                .and_then(hex32)
+                .ok_or("CT_CHANNEL_HOLDER_KEY required (64 hex)")?,
+        );
+        let role_tags = split_csv(f("CT_AGENT_CARD_ROLES").as_deref().unwrap_or_default());
+        if role_tags.is_empty() {
+            return Err("CT_AGENT_CARD_ROLES required (comma-separated role tags)".to_string());
+        }
+        let skills = parse_card_skills(f("CT_AGENT_CARD_SKILLS").as_deref().unwrap_or_default());
+        let channels = parse_hex32_ids(f("CT_AGENT_CARD_CHANNELS").as_deref().unwrap_or_default())
+            .map_err(|bad| format!("CT_AGENT_CARD_CHANNELS entry not 64 hex: {bad}"))?
+            .into_iter()
+            .map(ct_common::channel::ChannelId)
+            .collect();
+        let cells = parse_hex32_ids(f("CT_AGENT_CARD_CELLS").as_deref().unwrap_or_default())
+            .map_err(|bad| format!("CT_AGENT_CARD_CELLS entry not 64 hex: {bad}"))?
+            .into_iter()
+            .map(ct_common::channel::CellId)
+            .collect();
+        let ttl_secs = match f("CT_AGENT_CARD_TTL_SECS").as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s
+                .parse::<u64>()
+                .map_err(|e| format!("CT_AGENT_CARD_TTL_SECS invalid: {e}"))?,
+            _ => 86_400,
+        };
+        let out_dir = std::path::PathBuf::from(
+            f("CT_AGENT_CARD_OUT").unwrap_or_else(|| ".".to_string()),
+        );
+        Ok(Self { holder, role_tags, skills, cells, channels, ttl_secs, out_dir })
+    }
+
+    /// Sign the card (`issued_at = now`, `expires_at = now + ttl_secs`) and write it to
+    /// `<out_dir>/.well-known/agent-card.json`. Returns the written path. The clock is a
+    /// parameter so the whole assembly is deterministic + testable.
+    pub fn write_card(&self, now: u64) -> std::io::Result<std::path::PathBuf> {
+        let card = ct_common::channel::AgentCard::sign_new(
+            &self.holder,
+            self.role_tags.clone(),
+            self.skills.clone(),
+            self.cells.clone(),
+            self.channels.clone(),
+            now,
+            now.saturating_add(self.ttl_secs),
+        );
+        crate::well_known::write_agent_card_for_origin(&card, &self.out_dir)
+    }
+}
+
+/// Parse `CT_AGENT_CARD_SKILLS`: `;`-separated entries, each `id|description` (a bare `id`
+/// yields an empty description). Empty/blank entries are dropped. Examples are left empty —
+/// the card is a discovery advertisement, not an invocation contract.
+fn parse_card_skills(s: &str) -> Vec<ct_common::channel::Skill> {
+    s.split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|entry| {
+            let (id, description) = match entry.split_once('|') {
+                Some((i, d)) => (i.trim().to_string(), d.trim().to_string()),
+                None => (entry.to_string(), String::new()),
+            };
+            ct_common::channel::Skill { id, description, examples: Vec::new() }
+        })
+        .collect()
+}
+
+/// Parse a comma-separated list of 64-hex tokens into `[u8; 32]`s. Returns the first
+/// malformed token as `Err` so the caller can name the offending field.
+fn parse_hex32_ids(s: &str) -> Result<Vec<[u8; 32]>, String> {
+    let mut out = Vec::new();
+    for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        out.push(hex32(tok).ok_or_else(|| tok.to_string())?);
+    }
+    Ok(out)
+}
+
 /// Configuration for the `ct-agent channel` runner (#98/#100), read from the
 /// environment so the whole thing fits a copy-paste one-liner. The peer's transport
 /// cert and Noise key travel as hex (as the broker/CP will hand them over); Noise_IK
@@ -1627,6 +1744,59 @@ mod tests {
     }
 
     const K64: &str = "aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20aa20";
+
+    #[test]
+    fn agent_card_cli_config_parses_and_writes_a_verifiable_card() {
+        // #144 ①-wiring CLI (frozen): the runnable `channel agent-card` path parses
+        // CT_CHANNEL_HOLDER_KEY + CT_AGENT_CARD_* into a signed card and drops it at the RFC-8615
+        // well-known path — closing the emit chain with no hand-rolled ed25519. The written file
+        // round-trips to a card whose holder signature verifies, bound to the CLI-supplied key.
+        use ct_common::channel::AgentCard;
+
+        let dir = std::env::temp_dir().join(format!("ct-agent-card-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let chan = "9b".repeat(32);
+        let pairs = [
+            ("CT_CHANNEL_HOLDER_KEY", K64),
+            ("CT_AGENT_CARD_ROLES", "central, orchestrator"),
+            ("CT_AGENT_CARD_SKILLS", "orchestrate_task|coordinate an agent network; fire_transfer"),
+            ("CT_AGENT_CARD_CHANNELS", chan.as_str()),
+            ("CT_AGENT_CARD_TTL_SECS", "4000"),
+            ("CT_AGENT_CARD_OUT", dir.to_str().unwrap()),
+        ];
+        let map: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let cfg = AgentCardCliConfig::from_lookup(|k| map.get(k).cloned()).expect("parses");
+
+        // Claims parsed as expected (CSV roles; `id|desc` and bare-`id` skills; TTL).
+        assert_eq!(cfg.role_tags, vec!["central".to_string(), "orchestrator".to_string()]);
+        assert_eq!(cfg.skills.len(), 2);
+        assert_eq!(cfg.skills[0].id, "orchestrate_task");
+        assert_eq!(cfg.skills[0].description, "coordinate an agent network");
+        assert_eq!(cfg.skills[1].id, "fire_transfer", "a bare id (no |) is allowed");
+        assert_eq!(cfg.skills[1].description, "");
+        assert_eq!(cfg.channels.len(), 1);
+        assert_eq!(cfg.ttl_secs, 4000);
+
+        // Write + read back: a verifiable card bound to the CLI holder key, at the well-known path.
+        let path = cfg.write_card(1_000).expect("writes the card");
+        assert!(path.ends_with(".well-known/agent-card.json"), "RFC-8615 path, got {path:?}");
+        let back: AgentCard = serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("parses");
+        assert!(back.is_valid(1_000), "the written card verifies");
+        assert!(!back.is_valid(5_000), "expires at issued+ttl = 5000");
+        let holder_pub = SigningKey::from_bytes(&hex32(K64).unwrap()).verifying_key().to_bytes();
+        assert_eq!(back.holder_pubkey, holder_pub, "bound to the CLI-supplied holder key");
+        assert_eq!(back.role_tags, cfg.role_tags);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Missing roles → error; a bad holder key → error.
+        let no_roles: HashMap<String, String> = [("CT_CHANNEL_HOLDER_KEY", K64)]
+            .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert!(AgentCardCliConfig::from_lookup(|k| no_roles.get(k).cloned()).is_err(), "roles required");
+        let bad_key: HashMap<String, String> = [("CT_CHANNEL_HOLDER_KEY", "zz"), ("CT_AGENT_CARD_ROLES", "central")]
+            .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert!(AgentCardCliConfig::from_lookup(|k| bad_key.get(k).cloned()).is_err(), "bad holder key rejected");
+    }
 
     #[test]
     fn channel_identity_generates_self_service_keys_the_cli_accepts() {

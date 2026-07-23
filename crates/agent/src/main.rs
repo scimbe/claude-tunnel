@@ -80,6 +80,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             eprintln!("registered channel {} with the control plane", req.channel_hex);
             return Ok(());
         }
+        // #144 ①-wiring `ct-agent channel agent-card`: assemble + sign this agent's holder
+        // AgentCard from CT_CHANNEL_HOLDER_KEY + CT_AGENT_CARD_* claims and write it to
+        // <CT_AGENT_CARD_OUT>/.well-known/agent-card.json for the origin to serve — the runnable
+        // path that closes the discovery chain (no hand-rolled ed25519). Prints the written path.
+        if std::env::args().nth(2).as_deref() == Some("agent-card") {
+            let cfg = ct_agent::channel_run::AgentCardCliConfig::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .as_secs();
+            let path = cfg.write_card(now)?;
+            println!("{}", path.display());
+            return Ok(());
+        }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
         // the grant, learn the peer via the broker (keys relayed), connect
         // direct-then-relay. Otherwise the direct-address path (CT_CHANNEL_ADDR).
