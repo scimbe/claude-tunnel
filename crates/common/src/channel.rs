@@ -1270,6 +1270,50 @@ impl AgentCard {
             Err(_) => false,
         }
     }
+
+    /// Construct and **sign** a card from a holder `SigningKey` and the claims to advertise
+    /// (#144 ①-wiring construct-and-sign). This is the production analogue of what was, until
+    /// now, only a test helper: it derives `holder_pubkey` from the key, signs the canonical
+    /// [`signing_bytes`](Self::signing_bytes) preimage, and returns a card for which
+    /// [`is_valid`](Self::is_valid) holds at any `now < expires_at`. Callers (an
+    /// `onboard --mode browser` / `ct-agent channel agent-card` hook) load the holder key, pass
+    /// the role/skill/cell/channel claims, and hand the result to
+    /// `ct_agent::well_known::write_agent_card_for_origin` — closing the emit chain without
+    /// anyone hand-rolling ed25519. The `holder_pubkey` is always the signing key's own public
+    /// key, so a caller cannot mint a card claiming a key it does not hold.
+    pub fn sign_new(
+        signing_key: &ed25519_dalek::SigningKey,
+        role_tags: Vec<String>,
+        skills: Vec<Skill>,
+        cells: Vec<CellId>,
+        channels: Vec<ChannelId>,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> AgentCard {
+        use ed25519_dalek::Signer;
+        let holder_pubkey = signing_key.verifying_key().to_bytes();
+        let signature = signing_key
+            .sign(&Self::signing_bytes(
+                &holder_pubkey,
+                &role_tags,
+                &skills,
+                &cells,
+                &channels,
+                issued_at,
+                expires_at,
+            ))
+            .to_bytes();
+        AgentCard {
+            holder_pubkey,
+            role_tags,
+            skills,
+            cells,
+            channels,
+            issued_at,
+            expires_at,
+            signature,
+        }
+    }
 }
 
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
@@ -2640,5 +2684,59 @@ mod tests {
         let tampered = json.replace("trigger a live A2A transfer", "do something else entirely");
         let bad: AgentCard = serde_json::from_str(&tampered).expect("still valid JSON");
         assert!(!bad.is_valid(1_000), "editing the JSON profile breaks the holder signature");
+    }
+
+    #[test]
+    fn sign_new_builds_a_valid_card_bound_to_the_signing_key() {
+        // #144 ①-wiring construct-and-sign: the production path (no longer a test helper) assembles
+        // + signs a card that verifies, derives holder_pubkey from the key itself, and produces the
+        // SAME canonical signature the hand-built preimage would — so it drops straight into the
+        // emit chain (write_agent_card_for_origin) with no hand-rolled ed25519.
+        let sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let role_tags = vec!["central".to_string()];
+        let skills = vec![Skill {
+            id: "orchestrate_task".to_string(),
+            description: "coordinate an agent network".to_string(),
+            examples: vec![],
+        }];
+        let cells = vec![CellId([0x33u8; 32])];
+        let channels = vec![ChannelId([0x9bu8; 32])];
+        let (issued, expires) = (1_000u64, 5_000u64);
+
+        let card = AgentCard::sign_new(
+            &sk,
+            role_tags.clone(),
+            skills.clone(),
+            cells.clone(),
+            channels.clone(),
+            issued,
+            expires,
+        );
+
+        // Authentic + current, and the holder key is the signing key's own public key.
+        assert!(card.is_valid(1_000), "sign_new produces a card that verifies");
+        assert_eq!(card.holder_pubkey, sk.verifying_key().to_bytes(), "holder_pubkey is the signer's key");
+        assert!(!card.is_valid(5_000), "expiry is honoured");
+
+        // Byte-identical to the explicit hand-built card (same canonical preimage + deterministic
+        // ed25519) — sign_new is exactly the construct-and-sign the test helper used to inline.
+        let expected_sig = sk
+            .sign(&AgentCard::signing_bytes(
+                &sk.verifying_key().to_bytes(),
+                &role_tags,
+                &skills,
+                &cells,
+                &channels,
+                issued,
+                expires,
+            ))
+            .to_bytes();
+        assert_eq!(card.signature, expected_sig, "canonical signature matches the hand-built preimage");
+
+        // The claims are carried verbatim (no re-ordering / drop).
+        assert_eq!(card.role_tags, role_tags);
+        assert_eq!(card.skills, skills);
+        assert_eq!(card.cells, cells);
+        assert_eq!(card.channels, channels);
     }
 }
