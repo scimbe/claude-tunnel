@@ -315,6 +315,23 @@ impl Chain {
     /// and consensus (L4.2) build on to replicate the ledger across writers; fork-choice / voting is a
     /// later slice (this only accepts a block that cleanly extends the local tip).
     pub fn accept_block(&mut self, block: Block) -> Result<(), ChainError> {
+        // Gossip (L4.3) re-delivers blocks by design, so a peer will hand us blocks we already
+        // hold. A genuine re-delivery of a block already committed at its height is an idempotent
+        // no-op success — NOT an error — otherwise every redundant delivery looks like a fault and
+        // a gossip loop that penalizes accept_block errors would punish a well-behaved peer. We
+        // treat it as a duplicate only when it is content-consistent AND its hash matches the block
+        // we already hold at that height; a *conflicting* block at a known height (same height,
+        // different hash — a fork/equivocation) is still rejected, since accepting it would require
+        // fork-choice (a later slice).
+        if block.height <= self.height() {
+            let known_hash = self.blocks[block.height as usize].hash;
+            let content_ok =
+                block.hash == block_hash(block.height, &block.prev_hash, &block.transfers);
+            if content_ok && known_hash == block.hash {
+                return Ok(());
+            }
+            return Err(ChainError::BrokenChain { height: block.height });
+        }
         let expected_height = self.height() + 1;
         if block.height != expected_height
             || block.prev_hash != self.tip_hash()
@@ -525,11 +542,26 @@ mod tests {
         assert_eq!(replica.balance(&b), 40);
         assert!(replica.is_valid().is_ok(), "the replicated chain re-validates");
 
-        // Wrong height: re-accepting the same block (replica is already at height 1).
+        // Gossip re-delivers blocks: re-accepting the SAME block the replica already holds is an
+        // idempotent no-op (not a fault), so redundant delivery can't look like peer misbehavior.
+        replica
+            .accept_block(block.clone())
+            .expect("re-accepting an already-held block is an idempotent no-op");
+        assert_eq!(replica.height(), 1, "a duplicate delivery neither grows nor forks the chain");
+        assert_eq!(replica.tip_hash(), producer.tip_hash(), "still converged after the duplicate");
+        assert_eq!(replica.balance(&b), 40, "a duplicate delivery doesn't double-apply transfers");
+
+        // A CONFLICTING block at an already-known height (same height, different content) is a real
+        // fork and is still rejected — accepting it would require fork-choice (a later slice).
+        let mut producer2 = Chain::new(genesis.clone());
+        producer2.append(vec![Transfer::sign_new(&alice, b, 30, 0)]).unwrap();
+        let conflicting = producer2.blocks[1].clone();
+        assert_ne!(conflicting.hash, block.hash, "the fork block genuinely differs at height 1");
         assert!(
-            matches!(replica.accept_block(block.clone()), Err(ChainError::BrokenChain { .. })),
-            "a block that doesn't extend the tip (stale height) is rejected"
+            matches!(replica.accept_block(conflicting), Err(ChainError::BrokenChain { .. })),
+            "a conflicting block at an already-known height (a fork) is rejected, not silently taken"
         );
+        assert_eq!(replica.balance(&b), 40, "the rejected fork left committed state untouched");
 
         // Tampered hash: a block claiming a correct link but a wrong content hash.
         let mut fresh = Chain::new(genesis.clone());
