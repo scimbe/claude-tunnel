@@ -1316,6 +1316,170 @@ impl AgentCard {
     }
 }
 
+/// The domain separating a [`CapacityOffer`] preimage from every other signed object.
+const CAPACITY_OFFER_DOMAIN: &[u8] = b"ct-capacity-offer-v1";
+
+/// The kind of idle LLM capacity an agent offers (#147 requirement 1 — both must coexist): proxying
+/// calls through the agent's own remaining **cloud API quota**, or dispatching inference jobs onto its
+/// idle **local hardware**. They have genuinely different mechanisms + consumption-proof needs
+/// (a provider response signature vs. attesting a local model actually ran), so a marketplace primitive
+/// must distinguish them from the start; that proof scheme is a later phase, not decided here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CapacityKind {
+    CloudApiQuota,
+    LocalHardware,
+}
+
+impl CapacityKind {
+    /// The one byte that represents this kind in the signing preimage (stable across serde renames).
+    fn tag(self) -> u8 {
+        match self {
+            CapacityKind::CloudApiQuota => 0,
+            CapacityKind::LocalHardware => 1,
+        }
+    }
+}
+
+/// A **holder-signed advertisement of idle LLM capacity** (#147 L1 — the discovery/advertisement layer
+/// of the idle-capacity marketplace). The design-neutral foundation: it says *what an agent offers and
+/// its floor terms* so a buyer can discover + bid, WITHOUT deciding the contentious later phases —
+/// the consumption-proof scheme (#147 req 2), the escrow/minimum-spend resolution (#147 req 4 tension),
+/// or the dedicated settlement chain (#147 req 3, referenced here only as an opaque `currency_id`).
+///
+/// Same cryptographic discipline as [`AgentCard`]/[`BillingCommitment`]: a domain-separated, injective
+/// (length-prefixed) preimage signed by the agent's ed25519 **holder** key. The signature proves the
+/// holder *issued* the offer — never that capacity was delivered or consumed (that is exactly what the
+/// later proof phase must establish). `min_price` is the **buyer's guaranteed-minimum floor** (#147 req
+/// 4), not a seller reserve; how it interacts with unproven consumption is the open tension, out of
+/// scope for this primitive.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapacityOffer {
+    /// The offering agent's ed25519 holder public key — the signature is checked against this.
+    #[serde(with = "card_hex::b32")]
+    pub holder_pubkey: [u8; 32],
+    /// Which kind of capacity (cloud API quota vs. local hardware).
+    pub kind: CapacityKind,
+    /// The model ids this capacity can serve (e.g. `claude-opus-4-8`, a local model tag).
+    pub models: Vec<String>,
+    /// Units offered (tokens for cloud quota, job-units for local hardware — unit semantics per `kind`).
+    pub units_available: u64,
+    /// The buyer's guaranteed-minimum spend floor for winning this capacity (#147 req 4), in
+    /// `currency_id`'s smallest unit. NOT a seller reserve.
+    pub min_price: u64,
+    /// Opaque id of the dedicated LLM-token settlement currency/chain (#147 req 3) — this primitive
+    /// does not implement or validate the chain, only names which one settles this offer.
+    pub currency_id: String,
+    pub issued_at: UnixSeconds,
+    pub expires_at: UnixSeconds,
+    /// The holder's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    #[serde(with = "card_hex::b64")]
+    pub signature: [u8; 64],
+}
+
+impl CapacityOffer {
+    /// Domain-separated, **canonical injective** preimage: `domain ‖ holder ‖ kind(u8) ‖ ⟨models⟩ ‖
+    /// units_available(LE) ‖ min_price(LE) ‖ ⟨currency_id⟩ ‖ issued_at(LE) ‖ expires_at(LE)`, every
+    /// variable-length field length-prefixed (u32 LE count/byte-len) so no two distinct offers share a
+    /// preimage and no field can be re-partitioned to forge an equivalent signature.
+    pub fn signing_bytes(
+        holder_pubkey: &[u8; 32],
+        kind: CapacityKind,
+        models: &[String],
+        units_available: u64,
+        min_price: u64,
+        currency_id: &str,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> Vec<u8> {
+        fn put_str(m: &mut Vec<u8>, s: &str) {
+            m.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            m.extend_from_slice(s.as_bytes());
+        }
+        let mut m = Vec::new();
+        m.extend_from_slice(CAPACITY_OFFER_DOMAIN);
+        m.extend_from_slice(holder_pubkey);
+        m.push(kind.tag());
+        m.extend_from_slice(&(models.len() as u32).to_le_bytes());
+        for model in models {
+            put_str(&mut m, model);
+        }
+        m.extend_from_slice(&units_available.to_le_bytes());
+        m.extend_from_slice(&min_price.to_le_bytes());
+        put_str(&mut m, currency_id);
+        m.extend_from_slice(&issued_at.to_le_bytes());
+        m.extend_from_slice(&expires_at.to_le_bytes());
+        m
+    }
+
+    /// Whether this offer is authentic AND still current at `now`: the holder signature verifies for its
+    /// exact contents and `now < expires_at`. A forged/tampered/expired offer returns `false`. Proves
+    /// only that the holder *issued* the offer — never that the capacity exists or was delivered.
+    pub fn is_valid(&self, now: UnixSeconds) -> bool {
+        if now >= self.expires_at {
+            return false;
+        }
+        match VerifyingKey::from_bytes(&self.holder_pubkey) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(
+                        &self.holder_pubkey,
+                        self.kind,
+                        &self.models,
+                        self.units_available,
+                        self.min_price,
+                        &self.currency_id,
+                        self.issued_at,
+                        self.expires_at,
+                    ),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Construct + sign an offer from a holder `SigningKey` (the production analogue of a hand-built
+    /// offer). Derives `holder_pubkey` from the key, so a caller cannot advertise capacity under a key
+    /// it does not hold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_new(
+        signing_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        models: Vec<String>,
+        units_available: u64,
+        min_price: u64,
+        currency_id: String,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+    ) -> CapacityOffer {
+        use ed25519_dalek::Signer;
+        let holder_pubkey = signing_key.verifying_key().to_bytes();
+        let signature = signing_key
+            .sign(&Self::signing_bytes(
+                &holder_pubkey,
+                kind,
+                &models,
+                units_available,
+                min_price,
+                &currency_id,
+                issued_at,
+                expires_at,
+            ))
+            .to_bytes();
+        CapacityOffer {
+            holder_pubkey,
+            kind,
+            models,
+            units_available,
+            min_price,
+            currency_id,
+            issued_at,
+            expires_at,
+            signature,
+        }
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -2738,5 +2902,67 @@ mod tests {
         assert_eq!(card.skills, skills);
         assert_eq!(card.cells, cells);
         assert_eq!(card.channels, channels);
+    }
+
+    #[test]
+    fn capacity_offer_verifies_authentic_claims_and_rejects_tampering_expiry_and_forgery() {
+        // #147 L1 (frozen): a holder-signed idle-capacity offer verifies for its exact contents,
+        // covers both capacity kinds, honours expiry, and rejects any tampered field / forged holder —
+        // the same signed-claim discipline as AgentCard, and the design-neutral marketplace foundation
+        // (no settlement/proof/chain here).
+        let sk = SigningKey::from_bytes(&[0x77u8; 32]);
+        let make = |kind| {
+            CapacityOffer::sign_new(
+                &sk,
+                kind,
+                vec!["claude-opus-4-8".to_string(), "local-llama".to_string()],
+                1_000_000,
+                50,
+                "ct-llm-token-chain".to_string(),
+                1_000,
+                5_000,
+            )
+        };
+
+        for kind in [CapacityKind::CloudApiQuota, CapacityKind::LocalHardware] {
+            let offer = make(kind);
+            assert!(offer.is_valid(1_000), "authentic offer verifies ({kind:?})");
+            assert_eq!(offer.holder_pubkey, sk.verifying_key().to_bytes(), "bound to the signer");
+            assert!(!offer.is_valid(5_000), "expiry honoured (now == expires_at)");
+            assert!(!offer.is_valid(9_999), "expired offer rejected");
+
+            let mut t = offer.clone();
+            t.units_available += 1;
+            assert!(!t.is_valid(1_000), "raising the units breaks the signature");
+            let mut t2 = offer.clone();
+            t2.min_price = 0;
+            assert!(!t2.is_valid(1_000), "lowering the price floor breaks the signature");
+            let mut t3 = offer.clone();
+            t3.currency_id = "other-chain".to_string();
+            assert!(!t3.is_valid(1_000), "swapping the settlement currency breaks the signature");
+            let mut t4 = offer.clone();
+            t4.models.push("smuggled-model".to_string());
+            assert!(!t4.is_valid(1_000), "adding an advertised model breaks the signature");
+            let mut t5 = offer.clone();
+            t5.kind = if kind == CapacityKind::CloudApiQuota {
+                CapacityKind::LocalHardware
+            } else {
+                CapacityKind::CloudApiQuota
+            };
+            assert!(!t5.is_valid(1_000), "flipping the capacity kind breaks the signature");
+        }
+
+        // A forged holder (someone else's key claiming this offer's pubkey) fails.
+        let mut forged = make(CapacityKind::CloudApiQuota);
+        forged.holder_pubkey = SigningKey::from_bytes(&[0x88u8; 32]).verifying_key().to_bytes();
+        assert!(!forged.is_valid(1_000), "a holder key that didn't sign is rejected");
+
+        // Lossless, still-verifiable JSON profile round-trip (hex byte fields), like AgentCard.
+        let offer = make(CapacityKind::LocalHardware);
+        let json = serde_json::to_string(&offer).expect("serializes");
+        assert!(json.contains("\"holder_pubkey\":\""), "hex-string byte fields");
+        let back: CapacityOffer = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, offer);
+        assert!(back.is_valid(1_000), "signature still verifies after a JSON round-trip");
     }
 }
