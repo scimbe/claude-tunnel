@@ -1244,6 +1244,91 @@ impl ChannelRegisterRequest {
     }
 }
 
+/// The channel session's local application duplex (#135 L2.1-cli). **Pipe** mode (default) is the
+/// CLI's stdin/stdout — the historical one-shot behaviour (stdin-EOF tears the session down).
+/// **Serve** mode (`CT_CHANNEL_SERVE=1`) makes the channel a persistent request/response *service*:
+/// the session side of an in-process duplex whose other half runs
+/// [`serve_request_loop`](ct_common::a2a::serve_request_loop), so the peer can call it many times
+/// over one Noise tunnel. A single enum keeps the two shapes one concrete type for the generic pump.
+enum ChannelLocal {
+    Pipe(tokio::io::Join<tokio::io::Stdin, tokio::io::Stdout>),
+    Serve(tokio::io::DuplexStream),
+}
+
+impl AsyncRead for ChannelLocal {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ChannelLocal::Pipe(p) => Pin::new(p).poll_read(cx, buf),
+            ChannelLocal::Serve(d) => Pin::new(d).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ChannelLocal {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            ChannelLocal::Pipe(p) => Pin::new(p).poll_write(cx, buf),
+            ChannelLocal::Serve(d) => Pin::new(d).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ChannelLocal::Pipe(p) => Pin::new(p).poll_flush(cx),
+            ChannelLocal::Serve(d) => Pin::new(d).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ChannelLocal::Pipe(p) => Pin::new(p).poll_shutdown(cx),
+            ChannelLocal::Serve(d) => Pin::new(d).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Serve-mode local (#135 L2.1-cli): spawn [`serve_request_loop`](ct_common::a2a::serve_request_loop)
+/// with `handle` on one half of an in-process duplex and return the *session* half — the pump drives
+/// it, so the peer's framed requests are answered by `handle` over the one persistent Noise tunnel.
+fn serve_local<H, F>(handle: H) -> tokio::io::DuplexStream
+where
+    H: FnMut(Vec<u8>) -> F + Send + 'static,
+    F: std::future::Future<Output = Vec<u8>> + Send,
+{
+    let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let (mut recv, mut send) = tokio::io::split(serve_side);
+        let _ = ct_common::a2a::serve_request_loop(&mut send, &mut recv, handle).await;
+    });
+    session_side
+}
+
+/// Build the channel session's local app duplex from the environment (#135 L2.1-cli): `CT_CHANNEL_SERVE=1`
+/// selects the persistent request/response **service** (echo handler for now — L2.3 swaps in MCP tool
+/// dispatch); unset keeps the historical stdin/stdout pipe.
+fn channel_local() -> ChannelLocal {
+    let serve = std::env::var("CT_CHANNEL_SERVE")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    if serve {
+        eprintln!(
+            "ct-agent channel: --serve mode (L2.1 persistent request/response; echo handler until L2.3 MCP dispatch)"
+        );
+        ChannelLocal::Serve(serve_local(|req: Vec<u8>| async move { req }))
+    } else {
+        ChannelLocal::Pipe(tokio::io::join(tokio::io::stdin(), tokio::io::stdout()))
+    }
+}
+
 /// Run the plane-brokered `ct-agent channel` flow (#98 / #103): connect to the edge
 /// rendezvous + relay, present the grant, and pipe **stdin/stdout** over the A2A tunnel
 /// with automatic direct-then-relay recovery via [`run_channel_join`]. The broker
@@ -1273,7 +1358,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
             let relay_conn = crate::transport::build_channel_dialer()?
                 .connect(cfg.relay_addr, "localhost")?
                 .await?;
-            let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+            let local = channel_local();
             eprintln!(
                 "ct-agent channel: relay-only DCUtR-upgradable {:?} (relay {}, circuit {})",
                 cfg.role, cfg.relay_addr, circuit
@@ -1345,7 +1430,7 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         "ct-agent channel: plane-brokered {:?} (relay {})",
         cfg.role, cfg.relay_addr
     );
-    let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    let local = channel_local();
     run_channel_join_with_admission(
         admission,
         relay,
@@ -1680,7 +1765,7 @@ impl ChannelRunConfig {
 /// direct path; the initiator dials `addr` trusting the configured peer cert. The
 /// real mutual auth is the Noise_IK session keyed on the member Noise keys.
 pub async fn run_channel_command(cfg: ChannelRunConfig) -> Result<(), BoxError> {
-    let local = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    let local = channel_local();
     match cfg.role {
         ChannelRole::Accept => {
             let (endpoint, cert) = crate::transport::build_direct_listener_at(cfg.addr)?;
@@ -1796,6 +1881,26 @@ mod tests {
         let bad_key: HashMap<String, String> = [("CT_CHANNEL_HOLDER_KEY", "zz"), ("CT_AGENT_CARD_ROLES", "central")]
             .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         assert!(AgentCardCliConfig::from_lookup(|k| bad_key.get(k).cloned()).is_err(), "bad holder key rejected");
+    }
+
+    #[tokio::test]
+    async fn serve_local_answers_framed_requests_as_a_persistent_service() {
+        // #135 L2.1-cli (frozen): serve-mode local turns the channel's app duplex into a persistent
+        // request/response SERVICE — the pump-driven session side accepts framed requests and gets
+        // the handler's framed responses back, MANY times over ONE duplex (not one-shot pipe). The
+        // handler here upper-cases (a stand-in for the L2.3 MCP dispatch that replaces the echo).
+        use ct_common::noise::{frame, read_frame};
+
+        let mut local = serve_local(|req: Vec<u8>| async move { req.to_ascii_uppercase() });
+        for msg in [&b"one"[..], b"two", b"three"] {
+            local.write_all(&frame(msg)).await.expect("write request frame");
+            let resp = read_frame(&mut local).await.expect("read response frame");
+            assert_eq!(
+                resp,
+                msg.to_ascii_uppercase(),
+                "each framed request is answered over the one persistent session-side duplex"
+            );
+        }
     }
 
     #[test]
