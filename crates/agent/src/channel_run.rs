@@ -1321,9 +1321,16 @@ fn channel_local() -> ChannelLocal {
         .unwrap_or(false);
     if serve {
         eprintln!(
-            "ct-agent channel: --serve mode (L2.1 persistent request/response; echo handler until L2.3 MCP dispatch)"
+            "ct-agent channel: --serve mode (L2.3 MCP-over-channel; JSON-RPC tools/list + tools/call, default tool: ping)"
         );
-        ChannelLocal::Serve(serve_local(|req: Vec<u8>| async move { req }))
+        // #135 L2.3: each framed request body is a JSON-RPC 2.0 message dispatched against the agent's
+        // MCP tool registry; the response body is the JSON-RPC reply. Arc so the registry is shared
+        // across the persistent session's calls.
+        let registry = std::sync::Arc::new(ct_common::mcp::default_registry());
+        ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
+            let registry = registry.clone();
+            async move { registry.dispatch(&req) }
+        }))
     } else {
         ChannelLocal::Pipe(tokio::io::join(tokio::io::stdin(), tokio::io::stdout()))
     }
