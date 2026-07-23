@@ -1480,6 +1480,131 @@ impl CapacityOffer {
     }
 }
 
+const USAGE_RECEIPT_DOMAIN: &[u8] = b"ct-usage-receipt-v1";
+
+/// A **co-signed attestation that a specific amount of capacity was consumed** (#147 L3 — the
+/// consumption-proof layer). Maintainer decision 2026-07-23: the scheme is *co-signed usage
+/// receipts*, chosen as the **highest-correctness-enforcement** option — BOTH parties sign the
+/// **same** token count over the **same** preimage, so neither can unilaterally claim consumption:
+/// a provider cannot over-bill (the consumer never signed that number) and a consumer cannot
+/// under-report (the provider never signed the smaller one). A one-sided receipt is simply not a
+/// proof. This is the settlement trigger the auction escrow (#147 L2) releases on and the
+/// settlement chain (#147 L4) turns into a finalized transfer.
+///
+/// Same domain-separated, injective (length-prefixed) preimage discipline as [`CapacityOffer`],
+/// but with **two** signatures over the identical bytes: `provider_sig` (the capacity holder) and
+/// `consumer_sig` (the buyer). [`is_valid`](Self::is_valid) requires BOTH to verify. It is per
+/// [`CapacityKind`] — a cloud-API response vs a local-inference result are different mechanisms, so
+/// `units_consumed`'s semantics follow `kind` exactly as in `CapacityOffer`. `match_ref` binds the
+/// receipt to the auction match/offer it settles, so a receipt can't be replayed against a different
+/// match. A receipt attests a *past* event, so it has no expiry (a proof of consumption doesn't lapse).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageReceipt {
+    /// The capacity holder (provider)'s ed25519 public key — `provider_sig` is checked against this.
+    #[serde(with = "card_hex::b32")]
+    pub provider: [u8; 32],
+    /// The buyer (consumer)'s ed25519 public key — `consumer_sig` is checked against this.
+    #[serde(with = "card_hex::b32")]
+    pub consumer: [u8; 32],
+    /// Which capacity kind was consumed (cloud API quota vs local hardware).
+    pub kind: CapacityKind,
+    /// The model id served (e.g. `claude-opus-4-8`, a local model tag).
+    pub model: String,
+    /// Units both parties attest were consumed (semantics per `kind`, as in [`CapacityOffer`]).
+    pub units_consumed: u64,
+    /// Opaque 32-byte id binding the receipt to the auction match/offer it settles (e.g. a hash of
+    /// the winning bid) — prevents replaying one consumption proof against a different match.
+    #[serde(with = "card_hex::b32")]
+    pub match_ref: [u8; 32],
+    pub issued_at: UnixSeconds,
+    /// The provider's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    #[serde(with = "card_hex::b64")]
+    pub provider_sig: [u8; 64],
+    /// The consumer's ed25519 signature over the **same** [`signing_bytes`](Self::signing_bytes).
+    #[serde(with = "card_hex::b64")]
+    pub consumer_sig: [u8; 64],
+}
+
+impl UsageReceipt {
+    /// Domain-separated, **canonical injective** preimage both parties sign: `domain ‖ provider ‖
+    /// consumer ‖ kind(u8) ‖ ⟨model⟩ ‖ units_consumed(LE) ‖ match_ref ‖ issued_at(LE)`, the
+    /// variable-length `model` length-prefixed (u32 LE) so no two distinct receipts share a preimage.
+    pub fn signing_bytes(
+        provider: &[u8; 32],
+        consumer: &[u8; 32],
+        kind: CapacityKind,
+        model: &str,
+        units_consumed: u64,
+        match_ref: &[u8; 32],
+        issued_at: UnixSeconds,
+    ) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(USAGE_RECEIPT_DOMAIN);
+        m.extend_from_slice(provider);
+        m.extend_from_slice(consumer);
+        m.push(kind.tag());
+        m.extend_from_slice(&(model.len() as u32).to_le_bytes());
+        m.extend_from_slice(model.as_bytes());
+        m.extend_from_slice(&units_consumed.to_le_bytes());
+        m.extend_from_slice(match_ref);
+        m.extend_from_slice(&issued_at.to_le_bytes());
+        m
+    }
+
+    /// Whether this is an authentic co-signed proof: **both** the provider signature (against
+    /// `provider`) and the consumer signature (against `consumer`) verify for the receipt's exact
+    /// contents. A receipt with either signature forged, or that one party never signed, returns
+    /// `false` — that is the whole point: consumption is proven only by mutual agreement.
+    pub fn is_valid(&self) -> bool {
+        let bytes = Self::signing_bytes(
+            &self.provider,
+            &self.consumer,
+            self.kind,
+            &self.model,
+            self.units_consumed,
+            &self.match_ref,
+            self.issued_at,
+        );
+        let ok = |pk: &[u8; 32], sig: &[u8; 64]| match VerifyingKey::from_bytes(pk) {
+            Ok(vk) => vk.verify(&bytes, &Signature::from_bytes(sig)).is_ok(),
+            Err(_) => false,
+        };
+        ok(&self.provider, &self.provider_sig) && ok(&self.consumer, &self.consumer_sig)
+    }
+
+    /// Construct a fully co-signed receipt from both parties' `SigningKey`s (the production flow is
+    /// asymmetric — the provider pre-signs and the consumer counter-signs the identical bytes — but
+    /// the cryptographic object is the same, and deriving both pubkeys from the keys means neither
+    /// party can be attributed a signature it did not make).
+    #[allow(clippy::too_many_arguments)]
+    pub fn co_sign(
+        provider_key: &ed25519_dalek::SigningKey,
+        consumer_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        model: String,
+        units_consumed: u64,
+        match_ref: [u8; 32],
+        issued_at: UnixSeconds,
+    ) -> UsageReceipt {
+        use ed25519_dalek::Signer;
+        let provider = provider_key.verifying_key().to_bytes();
+        let consumer = consumer_key.verifying_key().to_bytes();
+        let bytes =
+            Self::signing_bytes(&provider, &consumer, kind, &model, units_consumed, &match_ref, issued_at);
+        UsageReceipt {
+            provider,
+            consumer,
+            kind,
+            model,
+            units_consumed,
+            match_ref,
+            issued_at,
+            provider_sig: provider_key.sign(&bytes).to_bytes(),
+            consumer_sig: consumer_key.sign(&bytes).to_bytes(),
+        }
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -2964,5 +3089,91 @@ mod tests {
         let back: CapacityOffer = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(back, offer);
         assert!(back.is_valid(1_000), "signature still verifies after a JSON round-trip");
+    }
+
+    #[test]
+    fn usage_receipt_needs_both_parties_and_rejects_unilateral_or_tampered_claims() {
+        // #147 L3 (frozen): a consumption proof is a receipt co-signed by BOTH the provider and the
+        // consumer over the same units/kind/match — the highest-correctness scheme (maintainer decision
+        // 2026-07-23). Neither party can forge the other's side (no unilateral over-bill/under-report),
+        // every field is bound by both signatures, both capacity kinds share one shape, and it JSON
+        // round-trips. This is the settlement trigger #147-L2 escrow releases on and #147-L4 finalizes.
+        use ed25519_dalek::{Signer, SigningKey};
+        let provider_key = SigningKey::from_bytes(&[0x11u8; 32]);
+        let consumer_key = SigningKey::from_bytes(&[0x22u8; 32]);
+        let make = |kind| {
+            UsageReceipt::co_sign(
+                &provider_key,
+                &consumer_key,
+                kind,
+                "claude-opus-4-8".to_string(),
+                4242,
+                [0x9au8; 32],
+                7_000,
+            )
+        };
+
+        for kind in [CapacityKind::CloudApiQuota, CapacityKind::LocalHardware] {
+            let r = make(kind);
+            assert!(r.is_valid(), "an authentic co-signed receipt verifies ({kind:?})");
+            assert_eq!(r.provider, provider_key.verifying_key().to_bytes(), "bound to the provider");
+            assert_eq!(r.consumer, consumer_key.verifying_key().to_bytes(), "bound to the consumer");
+
+            // Every field is bound by BOTH signatures — tampering any invalidates the receipt.
+            let mut t = r.clone();
+            t.units_consumed += 1;
+            assert!(!t.is_valid(), "inflating consumed units breaks both signatures");
+            let mut t2 = r.clone();
+            t2.match_ref = [0x00u8; 32];
+            assert!(!t2.is_valid(), "re-pointing the receipt at another match breaks it (anti-replay)");
+            let mut t3 = r.clone();
+            t3.model = "cheaper-model".to_string();
+            assert!(!t3.is_valid(), "swapping the served model breaks it");
+            let mut t4 = r.clone();
+            t4.kind = if kind == CapacityKind::CloudApiQuota {
+                CapacityKind::LocalHardware
+            } else {
+                CapacityKind::CloudApiQuota
+            };
+            assert!(!t4.is_valid(), "flipping the capacity kind breaks it");
+        }
+
+        // The core property: NO unilateral claim. Neither party can produce a valid receipt the
+        // other never co-signed — even though each holds its own key and knows both pubkeys.
+        let r = make(CapacityKind::CloudApiQuota);
+        let bytes = UsageReceipt::signing_bytes(
+            &r.provider,
+            &r.consumer,
+            r.kind,
+            &r.model,
+            r.units_consumed,
+            &r.match_ref,
+            r.issued_at,
+        );
+        let mut provider_self_cosigns = r.clone();
+        provider_self_cosigns.consumer_sig = provider_key.sign(&bytes).to_bytes();
+        assert!(
+            !provider_self_cosigns.is_valid(),
+            "a provider can't stand in for the consumer's signature — no unilateral over-bill"
+        );
+        let mut consumer_self_cosigns = r.clone();
+        consumer_self_cosigns.provider_sig = consumer_key.sign(&bytes).to_bytes();
+        assert!(
+            !consumer_self_cosigns.is_valid(),
+            "a consumer can't stand in for the provider's signature either"
+        );
+
+        // An unrelated third party's signature in either slot is rejected.
+        let outsider = SigningKey::from_bytes(&[0x33u8; 32]);
+        let mut forged = r.clone();
+        forged.provider_sig = outsider.sign(&bytes).to_bytes();
+        assert!(!forged.is_valid(), "an outsider's signature is not the provider's");
+
+        // Lossless, still-verifiable JSON round-trip (hex byte fields), like CapacityOffer.
+        let json = serde_json::to_string(&r).expect("serializes");
+        assert!(json.contains("\"provider\":\"") && json.contains("\"consumer_sig\":\""), "hex byte fields");
+        let back: UsageReceipt = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, r);
+        assert!(back.is_valid(), "still verifies after a JSON round-trip");
     }
 }
