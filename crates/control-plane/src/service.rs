@@ -123,6 +123,10 @@ const MAX_BATCH_TOKENS: usize = 100;
 struct IssueBatchReq {
     tenant: String,
     count: usize,
+    /// Optional idempotency key (#145, Marq): when present, a retried request with the same key
+    /// returns the same token set instead of minting duplicates.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct IssueBatchResp {
@@ -145,10 +149,13 @@ async fn issue_batch(
             format!("count must be 1..={MAX_BATCH_TOKENS}"),
         ));
     }
-    let tokens = st
-        .store
-        .issue_join_tokens(&TenantId(req.tenant), req.count)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let tenant = TenantId(req.tenant);
+    // #145 (Marq): an idempotency key makes a retried mint return the same tokens instead of duplicating.
+    let tokens = match req.idempotency_key.as_deref() {
+        Some(key) => st.store.issue_join_tokens_idempotent(&tenant, req.count, key),
+        None => st.store.issue_join_tokens(&tenant, req.count),
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(IssueBatchResp {
         tokens: tokens.iter().map(|t| hex_encode(&t.0)).collect(),
     }))
@@ -2618,6 +2625,19 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "count over MAX_BATCH_TOKENS -> 400"
         );
+
+        // #145 (Marq): with an idempotency_key, a retried request returns the SAME tokens (no dup mint).
+        let tokens_of = |body: &'static str| async move {
+            let r = batch(Some(hex_encode(&admin)), body).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let b = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+            serde_json::from_slice::<IssueBatchResp>(&b).unwrap().tokens
+        };
+        let first = tokens_of(r#"{"tenant":"t1","count":2,"idempotency_key":"k1"}"#).await;
+        let replay = tokens_of(r#"{"tenant":"t1","count":2,"idempotency_key":"k1"}"#).await;
+        assert_eq!(replay, first, "same idempotency_key -> identical token set on replay");
+        let other = tokens_of(r#"{"tenant":"t1","count":2,"idempotency_key":"k2"}"#).await;
+        assert_ne!(other, first, "a different idempotency_key mints a fresh set");
     }
 
     #[tokio::test]

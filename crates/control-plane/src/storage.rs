@@ -120,6 +120,11 @@ impl SqliteEnrollment {
                  agent  TEXT PRIMARY KEY,
                  tenant TEXT NOT NULL,
                  pubkey BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS batch_issuance (
+                 idem_key TEXT PRIMARY KEY,
+                 tenant   TEXT NOT NULL,
+                 tokens   BLOB NOT NULL
              );",
         )?;
         Ok(Self {
@@ -148,6 +153,52 @@ impl SqliteEnrollment {
         count: usize,
     ) -> rusqlite::Result<Vec<JoinToken>> {
         (0..count).map(|_| self.issue_join_token(tenant)).collect()
+    }
+
+    /// Issue `count` join tokens **idempotently** keyed by `idempotency_key` (#145, Marq's provisioning
+    /// contract): the FIRST request with a given key mints + records its token set; any retry with the
+    /// SAME key returns that exact set without minting again — so a network-retried batch provision
+    /// can't create duplicate identities. The whole check-then-mint runs under one connection lock, so
+    /// two concurrent requests with the same key can't both mint (the second sees the record).
+    pub fn issue_join_tokens_idempotent(
+        &self,
+        tenant: &TenantId,
+        count: usize,
+        idempotency_key: &str,
+    ) -> rusqlite::Result<Vec<JoinToken>> {
+        let conn = self.conn.lock_safe();
+        // Replay: return the previously-minted set for this key, unchanged.
+        let existing: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT tokens FROM batch_issuance WHERE idem_key = ?1",
+                params![idempotency_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(blob) = existing {
+            return Ok(blob
+                .chunks_exact(32)
+                .filter_map(|c| <[u8; 32]>::try_from(c).ok().map(JoinToken))
+                .collect());
+        }
+        // First time: mint `count` tokens, persisting each join token + the idempotency record.
+        let mut tokens = Vec::with_capacity(count);
+        let mut blob = Vec::with_capacity(count * 32);
+        for _ in 0..count {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            conn.execute(
+                "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
+                params![&bytes[..], tenant.0],
+            )?;
+            blob.extend_from_slice(&bytes);
+            tokens.push(JoinToken(bytes));
+        }
+        conn.execute(
+            "INSERT INTO batch_issuance (idem_key, tenant, tokens) VALUES (?1, ?2, ?3)",
+            params![idempotency_key, tenant.0, blob],
+        )?;
+        Ok(tokens)
     }
 
     /// Redeem a join token, binding `agent`'s public key to the token's tenant.
@@ -2486,6 +2537,31 @@ mod tests {
 
         // count = 0 yields no tokens (caller/REST layer decides whether that's an error).
         assert!(store.issue_join_tokens(&tenant(), 0).unwrap().is_empty(), "zero count mints nothing");
+    }
+
+    #[test]
+    fn issue_join_tokens_idempotent_replays_the_same_set_without_reminting() {
+        // #145 (Marq): a retried batch mint with the same idempotency key returns the SAME tokens and
+        // does NOT mint new ones — so a network blip can't create duplicate identities.
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+
+        let first = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
+        assert_eq!(first.len(), 3);
+
+        // Replay with the same key → the exact same tokens, no new mint.
+        let replay = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
+        assert_eq!(replay, first, "same idempotency key returns the same token set");
+
+        // A DIFFERENT key mints a fresh, distinct set.
+        let other = store.issue_join_tokens_idempotent(&tenant(), 3, "req-xyz").unwrap();
+        assert!(other.iter().all(|t| !first.contains(t)), "a different key mints distinct tokens");
+
+        // The idempotently-minted tokens are real, single-use join tokens.
+        assert!(store.redeem(&first[0], &AgentId("a".into()), [1u8; 32]).is_ok(), "an idempotent token redeems");
+        // Replaying the key again AFTER one was redeemed still returns the same set (idempotency is
+        // about issuance, not redemption state).
+        let replay2 = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
+        assert_eq!(replay2, first, "replay is stable regardless of downstream redemption");
     }
 
     #[test]
