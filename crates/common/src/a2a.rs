@@ -220,6 +220,36 @@ where
     establish_direct_session(send, recv, initiator, own_noise_private, peer_noise_public).await
 }
 
+/// The maximum body size of one framed message (#135 L2.2). The `noise::frame` envelope carries a
+/// **`u16`** length prefix, so a body over `u16::MAX` bytes makes `frame()`'s `msg.len() as u16`
+/// silently TRUNCATE the length and corrupt the stream. This is the ceiling [`write_message`]
+/// enforces. (Large/streaming results are out of scope — per sink's reality-check L2.4 returns
+/// references/handles, not multi-frame blobs.)
+pub const MAX_MESSAGE_BYTES: usize = u16::MAX as usize;
+
+/// Write one length-prefixed message (#135 L2.2 — message-framing formalization). Same wire envelope
+/// as [`noise::frame`](crate::noise::frame) (2-byte big-endian length + body), but **guarded**: a body
+/// larger than [`MAX_MESSAGE_BYTES`] is rejected with `InvalidInput` **before anything is written**,
+/// instead of the bare `frame()` silently truncating the `u16` length into stream corruption. The read
+/// side stays [`read_frame`](crate::noise::read_frame), so this does NOT change the envelope shape — it
+/// only hardens the size policy; any richer envelope (version / type / request-id) remains an additive
+/// follow. `serve_request_loop` writes its responses through this, so a handler can't corrupt the
+/// session with an oversize reply.
+pub async fn write_message<W: AsyncWrite + Unpin>(send: &mut W, msg: &[u8]) -> io::Result<()> {
+    if msg.len() > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "message body {} exceeds MAX_MESSAGE_BYTES ({MAX_MESSAGE_BYTES})",
+                msg.len()
+            ),
+        ));
+    }
+    send.write_all(&frame(msg)).await?;
+    send.flush().await?;
+    Ok(())
+}
+
 /// **L2.1 — persistent request/response runner (#135 MCP-over-channel).** The primitive that turns
 /// `ct-agent channel` from one-shot **pipe-and-exit** (stdin-EOF → teardown) into a long-lived
 /// **callable service**: read one length-prefixed request frame, hand its bytes to `handle`, write
@@ -251,8 +281,9 @@ where
             Err(e) => return Err(e),
         };
         let response = handle(request).await;
-        send.write_all(&frame(&response)).await?;
-        send.flush().await?;
+        // #135 L2.2: guarded write — an oversize response errors the loop rather than truncating the
+        // u16 length and corrupting the session.
+        write_message(send, &response).await?;
         served += 1;
     }
 }
@@ -444,5 +475,30 @@ mod tests {
         drop(c2s_w);
         let served = server.await.expect("join").expect("loop ends cleanly on peer close");
         assert_eq!(served, 3, "the runner served all three requests before the peer closed");
+    }
+
+    #[tokio::test]
+    async fn write_message_frames_within_the_limit_and_rejects_oversize_before_writing() {
+        // #135 L2.2 (frozen): write_message shares noise::frame's wire envelope (read back with
+        // read_frame) but guards the u16 size ceiling — a body AT the max frames fine, one byte OVER
+        // is rejected as InvalidInput BEFORE any bytes hit the stream, so it can never truncate the
+        // length prefix into stream corruption.
+        let (mut w, mut r) = tokio::io::duplex(1 << 17);
+
+        write_message(&mut w, b"hello").await.expect("small body writes");
+        assert_eq!(read_frame(&mut r).await.expect("read back"), b"hello");
+
+        let at_max = vec![0xABu8; MAX_MESSAGE_BYTES];
+        write_message(&mut w, &at_max).await.expect("a body exactly at the ceiling is allowed");
+        assert_eq!(read_frame(&mut r).await.expect("read back max"), at_max);
+
+        let over = vec![0u8; MAX_MESSAGE_BYTES + 1];
+        let err = write_message(&mut w, &over).await.expect_err("one byte over is rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // The oversize call emitted NO bytes — the reader sees no further frame (no partial/corrupt one).
+        let nothing =
+            tokio::time::timeout(std::time::Duration::from_millis(50), read_frame(&mut r)).await;
+        assert!(nothing.is_err(), "oversize write emitted no bytes — nothing to read");
     }
 }
