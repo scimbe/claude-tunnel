@@ -24,8 +24,9 @@ use crate::payment::{PaymentError, PaymentId};
 use crate::payment_provider::WebhookVerifier;
 use crate::registry::TunnelInfo;
 use crate::storage::{
-    AgentDirectoryEntry, AgentDirectoryError, BootstrapError, LedgerOpError, PaymentOpError,
-    RedeemError, SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore, SqliteEnrollment,
+    AgentDirectoryEntry, AgentDirectoryError, BootstrapError, IssueBatchError, LedgerOpError,
+    PaymentOpError, RedeemError, SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore,
+    SqliteEnrollment,
     SqliteLedger, SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
 };
 use ct_common::channel::ChannelId;
@@ -150,12 +151,25 @@ async fn issue_batch(
         ));
     }
     let tenant = TenantId(req.tenant);
-    // #145 (Marq): an idempotency key makes a retried mint return the same tokens instead of duplicating.
+    // #145: an idempotency key makes a retried mint return the same tokens instead of duplicating.
+    // A key reused with a *different* tenant/count is a 409 Conflict (idem-conflict), not a silent
+    // replay of the original set — so a client key-reuse bug surfaces loudly instead of mis-provisioning.
     let tokens = match req.idempotency_key.as_deref() {
-        Some(key) => st.store.issue_join_tokens_idempotent(&tenant, req.count, key),
-        None => st.store.issue_join_tokens(&tenant, req.count),
-    }
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Some(key) => st
+            .store
+            .issue_join_tokens_idempotent(&tenant, req.count, key)
+            .map_err(|e| {
+                let code = match e {
+                    IssueBatchError::Conflict => StatusCode::CONFLICT,
+                    IssueBatchError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (code, e.to_string())
+            })?,
+        None => st
+            .store
+            .issue_join_tokens(&tenant, req.count)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    };
     Ok(Json(IssueBatchResp {
         tokens: tokens.iter().map(|t| hex_encode(&t.0)).collect(),
     }))
@@ -2638,6 +2652,27 @@ mod tests {
         assert_eq!(replay, first, "same idempotency_key -> identical token set on replay");
         let other = tokens_of(r#"{"tenant":"t1","count":2,"idempotency_key":"k2"}"#).await;
         assert_ne!(other, first, "a different idempotency_key mints a fresh set");
+
+        // #145 idem-conflict: reusing key "k1" with a mismatched count or tenant is a loud 409,
+        // not a silent replay of the original set (a client key-reuse bug can't mis-provision).
+        assert_eq!(
+            batch(Some(hex_encode(&admin)), r#"{"tenant":"t1","count":3,"idempotency_key":"k1"}"#)
+                .await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "same key + different count -> 409"
+        );
+        assert_eq!(
+            batch(Some(hex_encode(&admin)), r#"{"tenant":"t2","count":2,"idempotency_key":"k1"}"#)
+                .await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "same key + different tenant -> 409"
+        );
+        // The original operation still replays cleanly after the rejected conflicts.
+        assert_eq!(
+            tokens_of(r#"{"tenant":"t1","count":2,"idempotency_key":"k1"}"#).await,
+            first,
+            "matching retry still returns the original set after conflicts"
+        );
     }
 
     #[tokio::test]

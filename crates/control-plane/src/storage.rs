@@ -93,6 +93,39 @@ impl From<rusqlite::Error> for RedeemError {
     }
 }
 
+/// Why an idempotent batch issuance could not be served (#145 idem-conflict).
+#[derive(Debug)]
+pub enum IssueBatchError {
+    /// A retry reused an `idempotency_key` that already names an operation with a
+    /// **different** `tenant` or `count`. Rather than silently return the original
+    /// (wrong) token set — which, since issuance is one global admin across tenants,
+    /// could hand tenant-A's tokens back to a "tenant-B, same key" retry — we refuse.
+    /// The caller surfaces this as `409 Conflict`, turning a client key-reuse bug
+    /// into a loud error instead of a mis-provisioning footgun.
+    Conflict,
+    /// The underlying database operation failed.
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for IssueBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssueBatchError::Conflict => {
+                write!(f, "idempotency_key reused with a different tenant or count")
+            }
+            IssueBatchError::Db(e) => write!(f, "storage error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for IssueBatchError {}
+
+impl From<rusqlite::Error> for IssueBatchError {
+    fn from(e: rusqlite::Error) -> Self {
+        IssueBatchError::Db(e)
+    }
+}
+
 /// SQLite-backed enrollment store (durable equivalent of [`crate::enrollment::Enrollment`]).
 pub struct SqliteEnrollment {
     conn: Mutex<Connection>,
@@ -160,22 +193,33 @@ impl SqliteEnrollment {
     /// SAME key returns that exact set without minting again — so a network-retried batch provision
     /// can't create duplicate identities. The whole check-then-mint runs under one connection lock, so
     /// two concurrent requests with the same key can't both mint (the second sees the record).
+    ///
+    /// A retry must name the **same operation**: if the key already exists but was
+    /// recorded for a different `tenant` or `count`, this returns
+    /// [`IssueBatchError::Conflict`] instead of silently replaying the original set
+    /// (the stored `tenant` and the recorded token count — `blob.len() / 32` — are the
+    /// authoritative operation identity, so no extra column is needed).
     pub fn issue_join_tokens_idempotent(
         &self,
         tenant: &TenantId,
         count: usize,
         idempotency_key: &str,
-    ) -> rusqlite::Result<Vec<JoinToken>> {
+    ) -> Result<Vec<JoinToken>, IssueBatchError> {
         let conn = self.conn.lock_safe();
-        // Replay: return the previously-minted set for this key, unchanged.
-        let existing: Option<Vec<u8>> = conn
+        // Replay: return the previously-minted set for this key — but only if the retry
+        // names the same operation. We fetch the stored `tenant` alongside the tokens so
+        // a key reused with mismatched params fails loudly rather than mis-provisioning.
+        let existing: Option<(String, Vec<u8>)> = conn
             .query_row(
-                "SELECT tokens FROM batch_issuance WHERE idem_key = ?1",
+                "SELECT tenant, tokens FROM batch_issuance WHERE idem_key = ?1",
                 params![idempotency_key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some(blob) = existing {
+        if let Some((stored_tenant, blob)) = existing {
+            if stored_tenant != tenant.0 || blob.len() != count * 32 {
+                return Err(IssueBatchError::Conflict);
+            }
             return Ok(blob
                 .chunks_exact(32)
                 .filter_map(|c| <[u8; 32]>::try_from(c).ok().map(JoinToken))
@@ -2562,6 +2606,35 @@ mod tests {
         // about issuance, not redemption state).
         let replay2 = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
         assert_eq!(replay2, first, "replay is stable regardless of downstream redemption");
+    }
+
+    #[test]
+    fn issue_join_tokens_idempotent_rejects_key_reuse_with_mismatched_params() {
+        // #145 idem-conflict: an idempotency key names ONE operation. Reusing it with a different
+        // `count` or `tenant` must fail loudly (Conflict) instead of silently returning the original
+        // set — otherwise a client key-reuse bug could hand tenant-A's tokens to a tenant-B retry.
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let first = store.issue_join_tokens_idempotent(&tenant(), 3, "req-1").unwrap();
+        assert_eq!(first.len(), 3);
+
+        // Same key, DIFFERENT count → Conflict, and nothing is re-minted.
+        let mismatch_count = store.issue_join_tokens_idempotent(&tenant(), 5, "req-1");
+        assert!(
+            matches!(mismatch_count, Err(IssueBatchError::Conflict)),
+            "reusing a key with a different count is a Conflict"
+        );
+
+        // Same key, DIFFERENT tenant → Conflict (won't leak tenant()'s tokens to another tenant).
+        let mismatch_tenant =
+            store.issue_join_tokens_idempotent(&TenantId("other-tenant".into()), 3, "req-1");
+        assert!(
+            matches!(mismatch_tenant, Err(IssueBatchError::Conflict)),
+            "reusing a key with a different tenant is a Conflict"
+        );
+
+        // The original operation still replays cleanly — a rejected mismatch changed nothing.
+        let replay = store.issue_join_tokens_idempotent(&tenant(), 3, "req-1").unwrap();
+        assert_eq!(replay, first, "the matching retry still returns the original set after conflicts");
     }
 
     #[test]
