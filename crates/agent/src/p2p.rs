@@ -56,7 +56,9 @@
 
 use std::time::Duration;
 
-use ct_common::channel::{verify, ChannelId, GrantError, SignedChannelGrant, UnixSeconds};
+use ct_common::channel::{
+    verify, verify_holder_possession, ChannelId, GrantError, SignedChannelGrant, UnixSeconds,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use libp2p::core::transport::MemoryTransport;
 use libp2p::core::upgrade::Version;
@@ -1274,6 +1276,11 @@ pub enum RelayCircuitError {
     /// The requester's grant is authentic but for a **different channel** than the circuit
     /// it is asking to open — it has not proven co-membership on this channel.
     RequesterChannelMismatch,
+    /// The requester's grant is authentic and co-member, but it failed to prove **possession**
+    /// of the grant's `holder` key over the relay's fresh challenge: a valid grant presented by
+    /// someone who does not hold its private key (a copied / stolen grant). Closes
+    /// "grant = bearer token" for relay *use* (the #81-gap-1 possession check, relay path).
+    RequesterPossessionFailed,
 }
 
 impl std::fmt::Display for RelayCircuitError {
@@ -1288,6 +1295,9 @@ impl std::fmt::Display for RelayCircuitError {
             }
             RelayCircuitError::RequesterChannelMismatch => {
                 write!(f, "requester grant is for a different channel than the circuit")
+            }
+            RelayCircuitError::RequesterPossessionFailed => {
+                write!(f, "requester did not prove possession of its grant's holder key")
             }
         }
     }
@@ -1339,6 +1349,43 @@ pub fn authorize_relay_circuit(
         .map_err(RelayCircuitError::RequesterGrantInvalid)?;
     if requester_grant.grant.channel != *circuit_channel {
         return Err(RelayCircuitError::RequesterChannelMismatch);
+    }
+    Ok(())
+}
+
+/// [`authorize_relay_circuit`] **plus a connect-time proof of possession** — the full
+/// admission a *live* superpeer relay applies, and the last unit-gatable layer before the
+/// `C-circuit-relay-transport` relay is safe to run publicly. On top of the two grant +
+/// co-membership checks, the requester must prove it holds the private key for its grant's
+/// `holder` by signing the relay's fresh, single-use `challenge` (`requester_possession`).
+///
+/// This closes "a valid grant is a bearer token" for relay *use*: a peer that merely
+/// **copied** an authentic `SignedChannelGrant` (without the holder key) can reproduce the
+/// grant bytes but cannot sign the challenge, so [`authorize_relay_circuit`] alone would let
+/// it reserve/relay — this layer refuses it with [`RelayCircuitError::RequesterPossessionFailed`].
+/// It is the relay-path analog of the broker's connect-time possession check (#81 gap 1); the
+/// caller issues one fresh challenge per reservation/circuit attempt and feeds the requester's
+/// signature here. The relay's own key possession is implicit (it runs this gate locally); the
+/// trust boundary is the remote requester. The libp2p `PeerId` is still never an authorization
+/// input (invariant #1) — possession is proven against the grant's `holder`, not the PeerId.
+///
+/// Ordering is additive: the grant/co-membership checks run **first** (an unauthorized or
+/// wrong-channel grant is refused before possession is even considered), so enabling this
+/// stricter gate can never *weaken* [`authorize_relay_circuit`] — it can only add the
+/// possession requirement.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_relay_circuit_with_possession(
+    operator_pubkey: &[u8; 32],
+    relay_grant: &SignedChannelGrant,
+    requester_grant: &SignedChannelGrant,
+    circuit_channel: &ChannelId,
+    challenge: &[u8],
+    requester_possession: &[u8; 64],
+    now: UnixSeconds,
+) -> Result<(), RelayCircuitError> {
+    authorize_relay_circuit(operator_pubkey, relay_grant, requester_grant, circuit_channel, now)?;
+    if !verify_holder_possession(&requester_grant.grant.holder, challenge, requester_possession) {
+        return Err(RelayCircuitError::RequesterPossessionFailed);
     }
     Ok(())
 }
@@ -1924,6 +1971,85 @@ mod tests {
             authorize_relay_circuit(&operator, &relay_grant, &requester_grant, &ChannelId(ch_a), 10_000),
             Err(RelayCircuitError::RelayGrantInvalid(GrantError::Expired)),
             "an expired relay grant may not relay (TTL-bounded, invariant #7)"
+        );
+    }
+
+    #[test]
+    fn relay_circuit_authz_with_possession_requires_the_requester_to_hold_its_grant_key() {
+        // #146 C-membership-gate possession layer (frozen): beyond authentic grants + co-membership,
+        // a LIVE relay requires the requester to PROVE possession of its grant's holder key over the
+        // relay's fresh challenge — so a copied/stolen grant (valid bytes, no private key) can't be
+        // replayed to abuse the relay. Closes "grant = bearer token" for relay use (#81 gap 1, relay
+        // path). Possession is proven against the grant's holder, never the libp2p PeerId (invariant #1).
+        use ct_common::channel::{ChannelGrant, Direction, Rights};
+        let now = 1_000;
+        let ch_a = [0x11u8; 32];
+        let op_sk = SigningKey::from_bytes(&[7u8; 32]);
+        let operator = op_sk.verifying_key().to_bytes();
+
+        // The requester holds a REAL keypair; its grant's holder is that public key.
+        let requester_sk = SigningKey::from_bytes(&[0xb2u8; 32]);
+        let requester_holder = requester_sk.verifying_key().to_bytes();
+
+        let mk_grant = |channel: [u8; 32], holder: [u8; 32]| {
+            let grant = ChannelGrant {
+                channel: ChannelId(channel),
+                holder,
+                direction: Direction::Both,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 10_000,
+            };
+            let signature = op_sk.sign(&grant.signing_bytes()).to_bytes();
+            SignedChannelGrant { grant, signature }
+        };
+        let relay_grant = mk_grant(ch_a, [0xa1u8; 32]);
+        let requester_grant = mk_grant(ch_a, requester_holder);
+        let challenge = b"relay-fresh-single-use-challenge";
+
+        // (1) HAPPY PATH: the requester signs the relay's challenge with its holder key → admitted.
+        let good_sig = requester_sk.sign(challenge).to_bytes();
+        assert_eq!(
+            authorize_relay_circuit_with_possession(
+                &operator, &relay_grant, &requester_grant, &ChannelId(ch_a), challenge, &good_sig, now
+            ),
+            Ok(()),
+            "a requester that proves possession over the fresh challenge is admitted"
+        );
+
+        // (2) STOLEN GRANT: an attacker presents the authentic requester_grant but signs the
+        // challenge with a DIFFERENT key (it never held requester_holder's private key) → refused.
+        let thief_sk = SigningKey::from_bytes(&[0xccu8; 32]);
+        let thief_sig = thief_sk.sign(challenge).to_bytes();
+        assert_eq!(
+            authorize_relay_circuit_with_possession(
+                &operator, &relay_grant, &requester_grant, &ChannelId(ch_a), challenge, &thief_sig, now
+            ),
+            Err(RelayCircuitError::RequesterPossessionFailed),
+            "a copied grant without the holder key can't prove possession — no relay for a stolen grant"
+        );
+
+        // (3) REPLAYED PROOF: a valid possession signature but over a DIFFERENT (old) challenge does
+        // not satisfy the relay's fresh challenge → refused (single-use freshness, anti-replay).
+        let stale_sig = requester_sk.sign(b"a-different-earlier-challenge").to_bytes();
+        assert_eq!(
+            authorize_relay_circuit_with_possession(
+                &operator, &relay_grant, &requester_grant, &ChannelId(ch_a), challenge, &stale_sig, now
+            ),
+            Err(RelayCircuitError::RequesterPossessionFailed),
+            "a possession proof over a different challenge is rejected (anti-replay)"
+        );
+
+        // (4) ADDITIVE, NEVER A BYPASS: grant/co-membership checks still gate FIRST. A requester grant
+        // for another channel is refused with the same error as before, even with a valid possession
+        // signature — the possession layer is stacked on top, it can't weaken authorize_relay_circuit.
+        let wrong_channel_grant = mk_grant([0x22u8; 32], requester_holder);
+        assert_eq!(
+            authorize_relay_circuit_with_possession(
+                &operator, &relay_grant, &wrong_channel_grant, &ChannelId(ch_a), challenge, &good_sig, now
+            ),
+            Err(RelayCircuitError::RequesterChannelMismatch),
+            "grant/co-membership checks still gate first — possession is layered on, never a bypass"
         );
     }
 
