@@ -1399,15 +1399,24 @@ pub fn authorize_relay_circuit_with_possession(
 /// proof is defeated. `RelayChallenger` closes it: the relay accept-loop [`issue`](Self::issue)s a
 /// **CSPRNG** challenge per reservation attempt (so an attacker cannot pick a challenge it already
 /// holds a signature for) and [`consume`](Self::consume)s it **exactly once** (so the same pair
-/// cannot be replayed). The intended call order in the live loop is: `let c = challenger.issue();`
-/// → send `c` → receive the requester's grant + signature → `if !challenger.consume(&c) { reject }`
-/// → [`authorize_relay_circuit_with_possession`]. Consuming enforces both "we issued it" and
-/// "only once"; the predicate enforces the cryptographic binding to the grant `holder`.
+/// cannot be replayed). The intended call order in the live loop is:
+/// `let c = challenger.issue(now, ttl);` → send `c` → receive the requester's grant + signature →
+/// `if !challenger.consume(&c, now) { reject }` → [`authorize_relay_circuit_with_possession`].
+/// Consuming enforces both "we issued it" and "only once"; the predicate enforces the cryptographic
+/// binding to the grant `holder`.
+///
+/// Each issued challenge carries a TTL: a reservation that is abandoned (challenge never consumed)
+/// would otherwise leak its entry forever, so under sustained load the outstanding set could grow
+/// unboundedly. Every [`issue`](Self::issue)/[`consume`](Self::consume) first **evicts expired
+/// challenges** (caller-supplied `now`, exactly as [`crate`]'s `ReplayCache` does), bounding the set
+/// to only currently-valid challenges — and an expired challenge is refused even before eviction, so
+/// a slow-replayed `(challenge, signature)` past its TTL can't be used. A challenge is dead once
+/// `now >= expires_at`.
 #[derive(Debug, Default)]
 pub struct RelayChallenger {
-    /// Challenges we have issued and not yet consumed. A `consume` removes its entry, so a second
-    /// presentation of the same challenge finds nothing and is refused.
-    outstanding: std::collections::HashSet<[u8; 32]>,
+    /// Challenges we have issued and not yet consumed, each mapped to its `expires_at`. A `consume`
+    /// removes its entry (so a replay finds nothing) and expiry evicts abandoned ones.
+    outstanding: std::collections::HashMap<[u8; 32], u64>,
 }
 
 impl RelayChallenger {
@@ -1415,26 +1424,35 @@ impl RelayChallenger {
         Self::default()
     }
 
-    /// Mint a fresh, unpredictable 32-byte challenge and record it as outstanding. The relay sends
-    /// this to the requester, which must sign it with its grant's holder key (proof of possession).
-    pub fn issue(&mut self) -> [u8; 32] {
+    /// Mint a fresh, unpredictable 32-byte challenge valid until `now + ttl` and record it. The relay
+    /// sends this to the requester, which must sign it with its grant's holder key (proof of
+    /// possession). Evicts already-expired challenges first, so abandoned attempts don't accumulate.
+    pub fn issue(&mut self, now: u64, ttl: u64) -> [u8; 32] {
         use rand::RngCore;
+        self.evict_expired(now);
         let mut challenge = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
-        self.outstanding.insert(challenge);
+        self.outstanding.insert(challenge, now.saturating_add(ttl));
         challenge
     }
 
-    /// Accept a challenge for a possession check **exactly once**: `true` iff it is one we
-    /// [`issue`](Self::issue)d and have not consumed yet — the entry is then removed, so replaying
-    /// the same `(challenge, signature)` fails on the next call. `false` for a challenge we never
-    /// issued (an attacker-chosen value) or one already consumed.
-    pub fn consume(&mut self, challenge: &[u8; 32]) -> bool {
-        self.outstanding.remove(challenge)
+    /// Accept a challenge for a possession check **exactly once**, at time `now`: `true` iff it is one
+    /// we [`issue`](Self::issue)d, have not consumed, and that has not expired — the entry is then
+    /// removed, so replaying the same `(challenge, signature)` fails on the next call. `false` for a
+    /// challenge we never issued (an attacker-chosen value), one already consumed, or one past its TTL.
+    pub fn consume(&mut self, challenge: &[u8; 32], now: u64) -> bool {
+        self.evict_expired(now);
+        self.outstanding.remove(challenge).is_some()
     }
 
-    /// Count of outstanding (issued, not-yet-consumed) challenges — for tests/observability; not
-    /// part of any trust decision.
+    /// Drop every outstanding challenge whose TTL has elapsed by `now` (`expires_at <= now`), so the
+    /// set only ever retains currently-valid challenges.
+    fn evict_expired(&mut self, now: u64) {
+        self.outstanding.retain(|_, &mut expires_at| expires_at > now);
+    }
+
+    /// Count of outstanding (issued, unexpired-as-of-last-access, not-yet-consumed) challenges — for
+    /// tests/observability; not part of any trust decision.
     pub fn outstanding(&self) -> usize {
         self.outstanding.len()
     }
@@ -2108,28 +2126,40 @@ mod tests {
         // #146 freshness half (frozen, central's integration caveat): the possession predicate only
         // verifies a signature over a challenge — RelayChallenger supplies the fresh, single-use
         // challenge that makes it replay-resistant. Each issue() is a distinct CSPRNG value; a
-        // challenge is consumable exactly once (defeats a captured (challenge,sig) replay); and a
-        // challenge we never issued (attacker-chosen) is refused.
+        // challenge is consumable exactly once (defeats a captured (challenge,sig) replay); a
+        // challenge we never issued (attacker-chosen) is refused; and abandoned challenges expire.
+        let ttl = 30;
         let mut ch = RelayChallenger::new();
-        let a = ch.issue();
-        let b = ch.issue();
+        let a = ch.issue(1_000, ttl);
+        let b = ch.issue(1_000, ttl);
         assert_ne!(a, b, "each issued challenge is a distinct CSPRNG value");
         assert_ne!(a, [0u8; 32], "not the trivial all-zero challenge");
         assert_eq!(ch.outstanding(), 2, "two issued, none consumed");
 
-        // A challenge we issued is accepted exactly ONCE.
-        assert!(ch.consume(&a), "an issued challenge is accepted");
-        assert!(!ch.consume(&a), "the same challenge can't be consumed twice (single-use, anti-replay)");
+        // A challenge we issued is accepted exactly ONCE (within its TTL).
+        assert!(ch.consume(&a, 1_010), "an issued challenge is accepted while fresh");
+        assert!(!ch.consume(&a, 1_010), "the same challenge can't be consumed twice (single-use, anti-replay)");
         assert_eq!(ch.outstanding(), 1, "consuming removed a; b remains outstanding");
 
         // A challenge we NEVER issued (an attacker-chosen value) is refused — so the requester can't
         // present a challenge it already holds a signature for.
-        assert!(!ch.consume(&[0x42u8; 32]), "a challenge we never minted is refused");
+        assert!(!ch.consume(&[0x42u8; 32], 1_010), "a challenge we never minted is refused");
 
         // b is still independently consumable exactly once.
-        assert!(ch.consume(&b), "the other issued challenge is still good once");
-        assert!(!ch.consume(&b), "and only once");
+        assert!(ch.consume(&b, 1_010), "the other issued challenge is still good once");
+        assert!(!ch.consume(&b, 1_010), "and only once");
         assert_eq!(ch.outstanding(), 0, "all issued challenges now consumed");
+
+        // Expiry / GC (central's flagged nit): an abandoned challenge (never consumed) is refused once
+        // past its TTL and doesn't accumulate — a later issue() evicts it, bounding the set.
+        let stale = ch.issue(1_000, ttl); // expires at 1_030
+        assert_eq!(ch.outstanding(), 1, "one abandoned challenge outstanding");
+        assert!(!ch.consume(&stale, 1_030), "a challenge at/after its expiry is refused (slow-replay defeated)");
+        assert_eq!(ch.outstanding(), 0, "the expired challenge was evicted on access, not retained");
+        // A fresh issue after time has moved on evicts any leftover abandoned entries too.
+        let _ = ch.issue(2_000, ttl);
+        ch.issue(5_000, ttl); // now=5_000 evicts the 2_000-issued one (expired at 2_030)
+        assert_eq!(ch.outstanding(), 1, "issue() GCs abandoned challenges so the set stays bounded");
     }
 
     #[test]
