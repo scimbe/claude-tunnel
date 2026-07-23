@@ -220,6 +220,43 @@ where
     establish_direct_session(send, recv, initiator, own_noise_private, peer_noise_public).await
 }
 
+/// **L2.1 — persistent request/response runner (#135 MCP-over-channel).** The primitive that turns
+/// `ct-agent channel` from one-shot **pipe-and-exit** (stdin-EOF → teardown) into a long-lived
+/// **callable service**: read one length-prefixed request frame, hand its bytes to `handle`, write
+/// that handler's length-prefixed response frame, and **loop** until the peer closes the stream —
+/// a clean `UnexpectedEof` *between* frames ends the loop with `Ok(count)` (the number of requests
+/// served), any mid-frame error propagates. This is a pure **runner** change over the app-side
+/// duplex; the caller runs it in place of the stdin/stdout pipe and the existing byte-exact
+/// bidirectional `noise_pump` carries the frames encrypted over the one Noise tunnel (no crypto
+/// here, no new dependency). Framing reuses the codebase's `noise::{frame, read_frame}` 2-byte
+/// length envelope; L2.2 formalizes message framing and L2.3 makes `handle` an MCP tool dispatch —
+/// here `handle` is any request→response function so the loop is testable in isolation.
+pub async fn serve_request_loop<W, R, H, Fut>(
+    send: &mut W,
+    recv: &mut R,
+    mut handle: H,
+) -> io::Result<u64>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    H: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Vec<u8>>,
+{
+    let mut served = 0u64;
+    loop {
+        let request = match read_frame(recv).await {
+            Ok(msg) => msg,
+            // The peer closed the stream between requests — a clean, expected end of the session.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(served),
+            Err(e) => return Err(e),
+        };
+        let response = handle(request).await;
+        send.write_all(&frame(&response)).await?;
+        send.flush().await?;
+        served += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +414,35 @@ mod tests {
         a2a_send(&mut b_send, &mut b_ts, b"pong-direct").await.expect("b sends");
         let got2 = a2a_recv(&mut a_recv, &mut a_ts).await.expect("a receives");
         assert_eq!(got2, b"pong-direct", "responder→initiator over the established direct session");
+    }
+
+    #[tokio::test]
+    async fn serve_request_loop_serves_many_requests_over_one_session_then_ends_on_peer_close() {
+        // L2.1 (#135, frozen): the persistent runner reads a framed request, calls the handler,
+        // writes a framed response, and LOOPS over ONE session (not pipe-and-exit) — several
+        // request→response round-trips on the same stream — then returns Ok(count) when the peer
+        // closes cleanly between requests. Handler here is an upper-casing echo (a stand-in for
+        // L2.3's MCP dispatch) so the loop is exercised in isolation.
+        let (mut c2s_w, mut c2s_r) = tokio::io::duplex(1 << 16); // client → server (requests)
+        let (mut s2c_w, mut s2c_r) = tokio::io::duplex(1 << 16); // server → client (responses)
+
+        let server = tokio::spawn(async move {
+            serve_request_loop(&mut s2c_w, &mut c2s_r, |req: Vec<u8>| async move {
+                req.to_ascii_uppercase()
+            })
+            .await
+        });
+
+        // THREE requests over the SAME session — proving it is persistent, not one-shot.
+        for msg in [&b"first"[..], b"second", b"third"] {
+            c2s_w.write_all(&frame(msg)).await.expect("send request frame");
+            let resp = read_frame(&mut s2c_r).await.expect("read response frame");
+            assert_eq!(resp, msg.to_ascii_uppercase(), "each request gets its response on the one session");
+        }
+
+        // Peer closes its send side → the runner's next read hits a clean EOF between frames.
+        drop(c2s_w);
+        let served = server.await.expect("join").expect("loop ends cleanly on peer close");
+        assert_eq!(served, 3, "the runner served all three requests before the peer closed");
     }
 }
