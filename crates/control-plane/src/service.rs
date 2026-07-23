@@ -2288,6 +2288,10 @@ pub fn persistent_control_plane_router(
     if let Some(oidc) = oidc {
         // #102-rest: the declarative-network REST surface (owner = verified subject).
         let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
+        // #144 ②: the searchable agent directory — public `GET /registry/agents` search +
+        // bearer-gated `POST` self-register. Mounted here (needs the OIDC verifier for the POST),
+        // so without an OIDC config it's simply absent, like the other authed surfaces.
+        let agent_directory = Arc::new(SqliteAgentDirectory::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -2296,6 +2300,7 @@ pub fn persistent_control_plane_router(
             ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone()))
+            .merge(agent_directory_router(agent_directory, oidc.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc));
@@ -3196,6 +3201,37 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[tokio::test]
+    async fn persistent_control_plane_mounts_the_agent_registry() {
+        // #144 ②: the searchable agent directory is actually MOUNTED into the composed app when an
+        // OIDC verifier is configured — `GET /registry/agents` is reachable (200, not 404) — and
+        // is absent (404) without one, like the other authed surfaces.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let db = temp_db_path();
+        let oidc = Some(Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct")));
+        let app = persistent_control_plane_router(&db, b"webhook-secret", oidc).unwrap();
+        let resp = app
+            .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /registry/agents is mounted (not 404)");
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        assert!(serde_json::from_slice::<Vec<AgentDirectoryEntry>>(&body).unwrap().is_empty(), "empty directory");
+
+        // Without an OIDC verifier the whole authed surface (incl. the registry) is absent.
+        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", None).unwrap();
+        let miss = no_oidc
+            .oneshot(Request::get("/registry/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND, "registry absent without OIDC");
+
+        let _ = std::fs::remove_file(&db);
     }
 
     /// The milestone E2E: the whole control plane (enrollment + registry +
