@@ -244,6 +244,12 @@ impl Chain {
         self.blocks.last().expect("genesis").height
     }
 
+    /// The tip block — the one a node gossips to peers (#147-L4.3 send side). `encode` it and a peer
+    /// feeds the bytes to [`accept_block`](Self::accept_block).
+    pub fn tip_block(&self) -> &Block {
+        self.blocks.last().expect("chain always has the genesis block")
+    }
+
     /// Fold genesis + all committed transfers into `(balances, next_nonce per sender)`.
     fn state(&self) -> (BTreeMap<Account, Amount>, BTreeMap<Account, u64>) {
         let balances = self.genesis.clone();

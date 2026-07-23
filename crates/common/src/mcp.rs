@@ -205,6 +205,66 @@ pub fn default_registry() -> ToolRegistry {
     r
 }
 
+fn to_hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        let _ = write!(s, "{x:02x}");
+    }
+    s
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Register #147-L4.3 settlement-chain **gossip** tools on a registry, over a shared `chain`, so the
+/// ledger propagates over the SAME authenticated #135 Agent-Fabric channel agents discover + cooperate
+/// on (no separate P2P layer):
+/// - `settlement/block` `{block: <hex>}` — decode + [`accept_block`](crate::settlement::Chain::accept_block)
+///   a peer's block; returns the new `height` + `tip` (or a JSON-RPC tool error if it doesn't extend
+///   the tip / is invalid — the ledger stays unchanged).
+/// - `settlement/balance` `{account: <hex 32-byte>}` — query an account balance.
+///
+/// The send side is an agent calling `settlement/block` on its peers with `chain.tip_block().encode()`.
+pub fn register_settlement_tools(
+    reg: &mut ToolRegistry,
+    chain: std::sync::Arc<std::sync::Mutex<crate::settlement::Chain>>,
+) {
+    let accept = std::sync::Arc::clone(&chain);
+    reg.register(
+        "settlement/block",
+        "accept a gossiped settlement block (hex-encoded) into the ledger",
+        move |args| {
+            let hex = args.get("block").and_then(Value::as_str).ok_or("missing hex `block`")?;
+            let bytes = from_hex(hex).ok_or("`block` is not valid hex")?;
+            let block = crate::settlement::Block::decode(&bytes).ok_or("malformed block encoding")?;
+            let mut chain = accept.lock().map_err(|_| "settlement chain lock poisoned")?;
+            chain.accept_block(block).map_err(|e| e.to_string())?;
+            Ok(json!({ "accepted": true, "height": chain.height(), "tip": to_hex(&chain.tip_hash()) }))
+        },
+    );
+    let query = std::sync::Arc::clone(&chain);
+    reg.register(
+        "settlement/balance",
+        "query a settlement account balance (32-byte hex account)",
+        move |args| {
+            let hex = args.get("account").and_then(Value::as_str).ok_or("missing hex `account`")?;
+            let account: [u8; 32] = from_hex(hex)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or("`account` must be 32-byte hex")?;
+            let chain = query.lock().map_err(|_| "settlement chain lock poisoned")?;
+            Ok(json!({ "balance": chain.balance(&account) }))
+        },
+    );
+}
+
 /// The [`default_registry`] plus an **`agent/card`** tool returning `card_json` (#144 × #135): a peer
 /// that has connected over the authenticated channel can fetch the agent's holder-signed `AgentCard`
 /// directly, bound to the live session — the channel is authenticated by the same holder key, so the
@@ -318,6 +378,50 @@ mod tests {
             .expect("valid response");
         assert_eq!(list.id, json!("c1"));
         assert!(list.result.unwrap()["tools"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn settlement_tools_gossip_a_block_over_mcp_and_report_balances() {
+        // #147-L4.3 (frozen): a producer mines a block, encodes it, and gossips it via the
+        // `settlement/block` MCP tool to a replica — which accepts it and converges; `settlement/balance`
+        // reads the result. So the settlement ledger rides the #135 authenticated channel. A malformed
+        // block returns a JSON-RPC tool error and leaves the ledger unchanged.
+        use crate::settlement::{Chain, Transfer};
+        use ed25519_dalek::SigningKey;
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let bob = SigningKey::from_bytes(&[2u8; 32]);
+        let (a, b) = (alice.verifying_key().to_bytes(), bob.verifying_key().to_bytes());
+        let genesis = BTreeMap::from([(a, 100u64)]);
+
+        let mut producer = Chain::new(genesis.clone());
+        producer.append(vec![Transfer::sign_new(&alice, b, 40, 0)]).unwrap();
+        let block_hex = to_hex(&producer.tip_block().encode());
+
+        // The replica exposes the gossip tools over its own (same-genesis) chain.
+        let replica = Arc::new(Mutex::new(Chain::new(genesis)));
+        let mut reg = default_registry();
+        register_settlement_tools(&mut reg, Arc::clone(&replica));
+
+        // Gossip the block over MCP → accepted, height 1.
+        let resp = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "settlement/block", "arguments": { "block": block_hex } } }));
+        let r = resp.result.expect("settlement/block succeeds");
+        assert_eq!(r["accepted"], json!(true));
+        assert_eq!(r["height"], json!(1), "the replica advanced to height 1");
+
+        // Query bob's balance over MCP → 40.
+        let bal = call(&reg, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "settlement/balance", "arguments": { "account": to_hex(&b) } } }));
+        assert_eq!(bal.result.unwrap()["balance"], json!(40), "settlement/balance reads the replicated ledger");
+
+        // A malformed block → JSON-RPC tool error, ledger unchanged.
+        let bad = call(&reg, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "settlement/block", "arguments": { "block": "zz" } } }));
+        assert!(bad.error.is_some(), "a malformed block is a tool error, not a panic");
+        assert_eq!(replica.lock().unwrap().height(), 1, "no bad block was committed");
     }
 
     #[test]
