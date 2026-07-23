@@ -50,6 +50,12 @@ services:
       - CT_AGENT_JOIN_TOKEN=${HELP_JOIN_TOKEN:?single-use join token}
       - CT_AGENT_ID=help-demo
       - CT_AGENT_EDGE_CERT_URL=${HELP_AGENT_EDGE_CERT_URL:-}
+      # #141: persist the onboarding outcome (bound identity + tenant) on the durable
+      # help_agent_state volume so a container restart RESTORES it instead of
+      # re-redeeming the single-use join token — the crash-loop that took the demo
+      # down. First boot redeems + persists here; every later boot restores and never
+      # touches the control plane. Live-restart-verified (RestartCount stays 0).
+      - CT_AGENT_STATE_DIR=/var/lib/ct-agent
       # #36: retry forever so a redeployed/bounced edge (the #15 stack churn) is
       # rejoined automatically instead of the agent giving up after 10 tries and
       # exiting — which, holding a single-use join token, can't cleanly re-onboard.
@@ -64,9 +70,13 @@ services:
     # edge forever (it won't exit on edge downtime), so this won't crash-loop
     # redeeming an already-spent join token.
     restart: unless-stopped
+    # #141: durable state for restart-safe onboarding (see CT_AGENT_STATE_DIR above).
+    volumes:
+      - help_agent_state:/var/lib/ct-agent
 
 volumes:
   help_caddy_data:
+  help_agent_state:
 
 # #45: join the running self-host plane's network so help-agent/help-origin can
 # reach `edge` and `control-plane` (and the HELP_AGENT_EDGE/HELP_AGENT_CP_URL
