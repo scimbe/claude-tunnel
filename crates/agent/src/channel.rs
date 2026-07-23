@@ -237,9 +237,23 @@ where
                 }
             }
             // EOF before a newline — a bare `NO` refusal, or a dropped relay leg. Classify
-            // from whatever arrived (a bare `NO` becomes `Refused`).
+            // from whatever arrived below (a bare `NO` becomes `Refused`; nothing at all is a race).
             Err(_) => break,
         }
+    }
+    // #148 client-facing: on the relay path a genuine refusal is ALWAYS an explicit `NO`
+    // (`finish_relay_pair_over_streams` writes `b"NO"` before closing). We only reach here after the
+    // edge's possession challenge was received and answered — i.e. admission already succeeded — so an
+    // **empty** ack (the leg closed without any `OK`/`NO`) is a dropped relay leg / handoff race (the
+    // peer's stream dying mid-pairing, #148), NOT an authorization refusal. Surface it as a DISTINCT,
+    // retryable error instead of the generic `Refused` that reads like the join was denied — closing
+    // the client-facing half of #148 (the edge already logs the race server-side). An explicit `NO`
+    // (non-empty) still parses to `Refused` exactly as before.
+    if line.is_empty() {
+        return Err("relay pairing dropped after admission before the edge ack — a transport/handoff \
+                    race (the peer connection likely died mid-pairing, #148), not an authorization \
+                    refusal; retry"
+            .into());
     }
     let ack = String::from_utf8_lossy(&line);
     Ok(parse_channel_ack(&ack))
@@ -808,5 +822,72 @@ mod tests {
             }
             ChannelJoinOutcome::Refused => panic!("a valid :443 join must be Admitted, not Refused"),
         }
+    }
+
+    #[tokio::test]
+    async fn present_relay_join_reports_a_dropped_leg_distinctly_from_a_refusal() {
+        // #148 client-facing (frozen): on the relay path a refusal is an explicit `NO`, so an EMPTY
+        // ack after the challenge was accepted is a dropped leg / handoff race — a DISTINCT retryable
+        // error, not the generic `Refused` that reads like an authorization denial. An explicit `NO`
+        // still parses to `Refused`.
+        use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
+        let channel = [0xC1u8; 32];
+        let holder = SigningKey::from_bytes(&[0x0bu8; 32]);
+        let request = ChannelJoinRequest {
+            grant: signed_grant(channel, &holder, Direction::Initiate),
+            endpoint: "203.0.113.9:6051".to_string(),
+        };
+
+        // Play the edge side up to the ack: read the framed request, send a 32-byte challenge, read
+        // the 64-byte possession sig — then run `finish` (drop = empty ack, or write an explicit NO).
+        async fn edge_until_ack(
+            server: tokio::io::DuplexStream,
+        ) -> (
+            tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        ) {
+            let (mut sr, mut sw) = split(server);
+            let mut len = [0u8; 2];
+            sr.read_exact(&mut len).await.unwrap();
+            let mut req = vec![0u8; u16::from_be_bytes(len) as usize];
+            sr.read_exact(&mut req).await.unwrap();
+            sw.write_all(&[0u8; 32]).await.unwrap(); // possession challenge
+            sw.flush().await.unwrap();
+            let mut sig = [0u8; 64];
+            sr.read_exact(&mut sig).await.unwrap();
+            (sr, sw)
+        }
+
+        // (1) Dropped leg: the edge closes without any OK/NO after admission → a distinct retryable Err.
+        let (client, server) = duplex(4096);
+        let (mut cr, mut cw) = split(client);
+        let srv = tokio::spawn(async move {
+            let (_sr, sw) = edge_until_ack(server).await;
+            drop(sw); // no OK/NO — the #148 dropped leg
+        });
+        let err = present_channel_relay_join_on_stream(&mut cw, &mut cr, &request, &holder)
+            .await
+            .expect_err("a dropped relay leg after admission must be a distinct error, not Ok(Refused)");
+        srv.await.unwrap();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("race") && msg.contains("retry"), "distinct retryable message: {msg}");
+        assert!(
+            msg.contains("not an authorization refusal"),
+            "must explicitly disclaim being a refusal, not read like one: {msg}"
+        );
+
+        // (2) Explicit NO: a genuine post-pairing refusal still parses to Refused.
+        let (client2, server2) = duplex(4096);
+        let (mut cr2, mut cw2) = split(client2);
+        let srv2 = tokio::spawn(async move {
+            let (_sr, mut sw) = edge_until_ack(server2).await;
+            sw.write_all(b"NO").await.unwrap();
+            sw.flush().await.unwrap();
+        });
+        let outcome = present_channel_relay_join_on_stream(&mut cw2, &mut cr2, &request, &holder)
+            .await
+            .expect("an explicit NO is a clean outcome, not an error");
+        srv2.await.unwrap();
+        assert!(matches!(outcome, ChannelJoinOutcome::Refused), "an explicit post-pairing NO stays Refused");
     }
 }
