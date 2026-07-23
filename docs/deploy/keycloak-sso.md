@@ -126,7 +126,7 @@ https://<AUTH_PUBLIC_HOST>/realms/ct-demo/broker/<alias>/endpoint
 | GitLab | `gitlab` | GitLab → Preferences → Applications (scopes: `openid`, `email`, `profile`) | `KC_GITLAB_CLIENT_ID`, `KC_GITLAB_CLIENT_SECRET` |
 
 Put the credentials in `docker/deploy/.env`, then redeploy (or restart Keycloak) —
-the realm import substitutes them via `${env.KC_*}`. A provider left with **empty**
+the realm import substitutes them via `${KC_*}`. A provider left with **empty**
 credentials still shows a button that errors on click; disable or delete the ones
 you don't use in the Keycloak admin console (Identity Providers → the provider →
 toggle *Enabled* off), or remove them from the realm JSON.

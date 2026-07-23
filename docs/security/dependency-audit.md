@@ -36,8 +36,9 @@ advisory matches, so it can gate CI.
 - `RUSTSEC-2026-0118` / `RUSTSEC-2026-0119` (#78) — `hickory-proto` (NSEC3
   unbounded loop / O(n²) name compression): present only as resolved-but-inactive
   optional deps of libp2p's `dns`/`mdns` features, which this workspace does not
-  enable (libp2p features are `tokio,noise,yamux,tcp,relay,dcutr,kad,macros` — raw
-  multiaddr dialing, no DNS/mDNS); `ct-dns` is a hand-rolled codec that does not use
+  enable (libp2p features are
+  `tokio,noise,yamux,tcp,quic,relay,dcutr,identify,kad,macros` — raw multiaddr
+  dialing, no DNS/mDNS); `ct-dns` is a hand-rolled codec that does not use
   `hickory`. Not in the compiled graph.
 
 **Resolved (#80 SEC80b):** `RUSTSEC-2025-0134` — the unmaintained `rustls-pemfile`
