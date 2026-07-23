@@ -5,6 +5,8 @@
 //! plane); the signing key is held privately and exposed by no accessor.
 
 use ed25519_dalek::{Signature, Signer, SigningKey};
+use std::io;
+use std::path::Path;
 
 /// An Agent's identity keypair. The signing (private) key never leaves the Agent.
 pub struct AgentIdentity {
@@ -17,6 +19,34 @@ impl AgentIdentity {
         Self {
             signing: SigningKey::generate(&mut rand::rngs::OsRng),
         }
+    }
+
+    /// Persist the signing key to `path` as its raw 32 secret bytes, owner-only
+    /// (`0600`) on Unix. This is the one seam that touches the secret — it is
+    /// written to disk but never RETURNED, so the "exposed by no accessor"
+    /// invariant holds. Enables restart-safe onboarding (#141): the identity that
+    /// redeemed the single-use join token is reloaded on restart instead of
+    /// re-redeeming a spent token.
+    pub fn save_secret_to(&self, path: &Path) -> io::Result<()> {
+        std::fs::write(path, self.signing.to_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Reload an identity previously written by [`save_secret_to`]. Rejects any
+    /// file that is not exactly 32 bytes.
+    pub fn load_secret_from(path: &Path) -> io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "identity key must be exactly 32 bytes")
+        })?;
+        Ok(Self {
+            signing: SigningKey::from_bytes(&arr),
+        })
     }
 
     /// The public identity key (ed25519 verifying-key bytes) to present at
@@ -56,6 +86,33 @@ mod tests {
         let sig = id.sign(msg);
         let vk = VerifyingKey::from_bytes(&id.public_key_bytes()).expect("valid key");
         assert!(vk.verify(msg, &sig).is_ok(), "signature must verify");
+    }
+
+    #[test]
+    fn save_and_reload_round_trips_the_same_signing_key() {
+        // #141 restart-safety: the persisted identity reloads to the SAME keypair,
+        // so a restart presents the key the control plane already bound — no
+        // re-redeem of the spent single-use join token.
+        let id = AgentIdentity::generate();
+        let dir = std::env::temp_dir().join(format!("ct-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.key");
+        id.save_secret_to(&path).expect("save");
+        let reloaded = AgentIdentity::load_secret_from(&path).expect("reload");
+        assert_eq!(
+            reloaded.public_key_bytes(),
+            id.public_key_bytes(),
+            "reloaded identity is the same keypair"
+        );
+        // And it still signs as the same key (the private half survived, not just the public).
+        let msg = b"post-restart proof-of-possession";
+        let vk = VerifyingKey::from_bytes(&id.public_key_bytes()).unwrap();
+        assert!(vk.verify(msg, &reloaded.sign(msg)).is_ok(), "reloaded key signs verifiably");
+        assert!(
+            AgentIdentity::load_secret_from(&dir.join("nope.key")).is_err(),
+            "a missing key file is an error, not a silent fresh identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::config::AgentConfig;
 use crate::identity::AgentIdentity;
 use ct_common::{AgentId, TenantId};
 use ct_control_plane::client::{ControlPlaneClient, CpError};
+use std::path::Path;
 
 /// Decode exactly 64 lowercase/uppercase hex chars into 32 bytes.
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
@@ -146,6 +147,108 @@ pub async fn onboard(
     })
 }
 
+/// Failure onboarding-or-restoring: either the control-plane redeem failed
+/// ([`CpError`]) or persisting/restoring the local onboarding state failed
+/// (I/O). Kept distinct so the caller can tell "the CP rejected us" from "the
+/// state directory is unwritable".
+#[derive(Debug)]
+pub enum OnboardError {
+    /// The control-plane enrollment call failed (e.g. a spent join token).
+    Cp(CpError),
+    /// Reading/writing the persisted onboarding state failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for OnboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnboardError::Cp(e) => write!(f, "control-plane onboarding failed: {e}"),
+            OnboardError::Io(e) => write!(f, "onboarding-state I/O failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OnboardError {}
+
+impl From<CpError> for OnboardError {
+    fn from(e: CpError) -> Self {
+        OnboardError::Cp(e)
+    }
+}
+
+impl From<std::io::Error> for OnboardError {
+    fn from(e: std::io::Error) -> Self {
+        OnboardError::Io(e)
+    }
+}
+
+impl OnboardedAgent {
+    /// File names under the state directory. Kept separate (not one delimited
+    /// record) so operator-supplied `agent_id`/`tenant` strings need no escaping.
+    const IDENTITY_FILE: &'static str = "identity.key";
+    const AGENT_FILE: &'static str = "agent";
+    const TENANT_FILE: &'static str = "tenant";
+
+    /// Persist just enough to resume WITHOUT re-enrolling: the identity keypair
+    /// the control plane bound, the agent id it was bound under, and the tenant it
+    /// was bound to. Writes into `state_dir` (created if absent). The single-use
+    /// join token is deliberately NOT stored — it is spent and must never be
+    /// replayed (#141).
+    pub fn persist(&self, state_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(state_dir)?;
+        self.identity.save_secret_to(&state_dir.join(Self::IDENTITY_FILE))?;
+        std::fs::write(state_dir.join(Self::AGENT_FILE), &self.agent_id.0)?;
+        std::fs::write(state_dir.join(Self::TENANT_FILE), &self.tenant.0)?;
+        Ok(())
+    }
+
+    /// Restore the bound identity + tenant from `state_dir`, if a prior onboarding
+    /// for THIS `agent_id` is persisted there. Returns `Ok(None)` when there is no
+    /// persisted identity yet (first boot) or it was written for a different agent
+    /// id (stale/foreign state — fall back to a fresh enrollment). Only the
+    /// identity + tenant are returned; the caller pairs them with its live config.
+    fn restore(state_dir: &Path, agent_id: &AgentId) -> std::io::Result<Option<(AgentIdentity, TenantId)>> {
+        let key_path = state_dir.join(Self::IDENTITY_FILE);
+        if !key_path.exists() {
+            return Ok(None);
+        }
+        let persisted_agent = std::fs::read_to_string(state_dir.join(Self::AGENT_FILE))?;
+        if persisted_agent != agent_id.0 {
+            return Ok(None);
+        }
+        let identity = AgentIdentity::load_secret_from(&key_path)?;
+        let tenant = TenantId(std::fs::read_to_string(state_dir.join(Self::TENANT_FILE))?);
+        Ok(Some((identity, tenant)))
+    }
+}
+
+/// Restart-safe onboarding (#141). On first boot this redeems the single-use
+/// join token like [`onboard`] and persists the bound identity/tenant under
+/// `state_dir`; on every subsequent boot it RESTORES that persisted state and
+/// serves without touching the control plane — so a container restart never
+/// replays the spent token into a crash-loop. A `state_dir` with no persisted
+/// identity (or one written for a different agent id) falls back to a fresh
+/// enrollment.
+pub async fn onboard_or_restore(
+    cp_url: &str,
+    join_token: &[u8; 32],
+    agent_id: AgentId,
+    config: AgentConfig,
+    state_dir: &Path,
+) -> Result<OnboardedAgent, OnboardError> {
+    if let Some((identity, tenant)) = OnboardedAgent::restore(state_dir, &agent_id)? {
+        return Ok(OnboardedAgent {
+            identity,
+            agent_id,
+            tenant,
+            config,
+        });
+    }
+    let onboarded = onboard(cp_url, join_token, agent_id, config).await?;
+    onboarded.persist(state_dir)?;
+    Ok(onboarded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +291,49 @@ mod tests {
             Some((tenant, onboarded.identity.public_key_bytes())),
             "the generated identity is bound to the agent id"
         );
+    }
+
+    #[tokio::test]
+    async fn onboard_or_restore_is_restart_safe_and_never_replays_the_spent_token() {
+        // #141: the help-agent crash-looped because every container restart re-redeemed
+        // a single-use join token. onboard_or_restore fixes it: first boot redeems +
+        // persists; a restart RESTORES the bound identity/tenant and never touches the CP.
+        let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let tenant = TenantId("tenant-help".into());
+        let token = store.issue_join_token(&tenant).unwrap();
+        let url = serve(store.clone()).await;
+        let cfg = AgentConfig::parse("127.0.0.1:4433", "127.0.0.1:8080").unwrap();
+        let agent_id = AgentId("help-agent".into());
+        let dir = std::env::temp_dir().join(format!("ct-onboard-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First boot: redeems the single-use token and persists the binding.
+        let first = onboard_or_restore(&url, &token.0, agent_id.clone(), cfg.clone(), &dir)
+            .await
+            .expect("first boot onboards");
+        let bound_pk = first.identity.public_key_bytes();
+        assert_eq!(first.tenant, tenant);
+
+        // Restart with the SAME (now-spent) token: must RESTORE from disk, not re-redeem.
+        let restart = onboard_or_restore(&url, &token.0, agent_id.clone(), cfg.clone(), &dir)
+            .await
+            .expect("restart restores without re-redeeming the spent token");
+        assert_eq!(restart.identity.public_key_bytes(), bound_pk, "same bound identity after restart");
+        assert_eq!(restart.tenant, tenant, "same tenant binding after restart");
+        assert_eq!(restart.config, cfg, "the live config is paired back in on restore");
+
+        // Proof this is what saved us: a plain re-onboard with the spent token DOES fail —
+        // exactly the crash the persistence sidesteps.
+        let replay = onboard(&url, &token.0, agent_id.clone(), cfg.clone()).await;
+        assert!(replay.is_err(), "re-redeeming a spent single-use token fails (#141 crash-loop)");
+
+        // Foreign/stale state (different agent id) falls back to a fresh enrollment, not a restore.
+        assert!(
+            OnboardedAgent::restore(&dir, &AgentId("other-agent".into())).unwrap().is_none(),
+            "persisted state for one agent id is not restored for another"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use tokio::time::Instant;
 
 use ct_agent::capability::{parse_routing_token_hex, resolve_serving_identity_with_token};
 use ct_agent::config::AgentConfig;
-use ct_agent::onboard::OnboardEnv;
+use ct_agent::onboard::{onboard_or_restore, OnboardEnv};
 use ct_agent::serve::run_agent;
 use ct_agent::transport::load_cert;
 
@@ -108,14 +108,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // with a dead token and never recover (#36). So the timeout is OPT-IN: unset
         // ⇒ wait indefinitely (prior behaviour, resilient); set only where a bounded
         // fail-fast is wanted (CI / the e2e smoke script).
+        //
+        // #141 restart-safety: with CT_AGENT_STATE_DIR set (a persistent volume), the
+        // FIRST boot redeems + persists the bound identity/tenant there and every
+        // later boot RESTORES it — so a container restart never replays the spent
+        // token into a crash-loop (the help-agent outage). Unset ⇒ prior always-redeem.
+        let state_dir = std::env::var("CT_AGENT_STATE_DIR").ok();
+        let run = async move {
+            match state_dir.as_deref() {
+                Some(dir) => onboard_or_restore(
+                    &env.cp_url,
+                    &env.join_token,
+                    env.agent_id,
+                    env.config,
+                    std::path::Path::new(dir),
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                None => env.onboard().await.map_err(|e| e.to_string()),
+            }
+        };
         let onboarded = match std::env::var("CT_AGENT_ONBOARD_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
         {
-            Some(secs) => tokio::time::timeout(Duration::from_secs(secs), env.onboard())
+            Some(secs) => tokio::time::timeout(Duration::from_secs(secs), run)
                 .await
                 .map_err(|_| format!("ct-agent: onboarding timed out after {secs}s"))??,
-            None => env.onboard().await?,
+            None => run.await?,
         };
         eprintln!(
             "ct-agent: onboarded agent={} tenant={} via {} (edge={})",
