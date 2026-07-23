@@ -47,6 +47,23 @@ pub fn agent_card_router(card: AgentCard) -> axum::Router {
     )
 }
 
+/// #144 ①-wiring (central's option **(ii)** — *emit a runnable helper, don't bake an HTTP server
+/// into ct-agent*): write the agent's holder-signed card to `<out_dir>/.well-known/agent-card.json`
+/// so the operator drops it under their **existing** origin (the subdomain that already terminates
+/// TLS), serving it at the well-known path with zero HTTP surface added to `ct-agent`. The card is
+/// self-authenticating (holder signature), so the file needs no further protection. Returns the
+/// written path. `ct-agent onboard --mode browser` calls this + prints where it landed.
+pub fn write_agent_card_for_origin(
+    card: &AgentCard,
+    out_dir: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let wk_dir = out_dir.join(".well-known");
+    std::fs::create_dir_all(&wk_dir)?;
+    let path = wk_dir.join("agent-card.json");
+    std::fs::write(&path, agent_card_well_known_body(card))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +152,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn write_agent_card_for_origin_drops_a_verifiable_well_known_file() {
+        // #144 ①-wiring (option ii): the card is written at `<dir>/.well-known/agent-card.json`
+        // for the operator's origin to serve — and the file round-trips into a card whose holder
+        // signature still verifies (self-authenticating; the file needs no further protection).
+        let card = signed_card();
+        let dir = std::env::temp_dir().join(format!("ct-agent-card-{}-{}", std::process::id(), "wk"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = write_agent_card_for_origin(&card, &dir).expect("card written");
+        assert!(path.ends_with(".well-known/agent-card.json"), "RFC-8615 path, got {path:?}");
+        assert!(path.exists(), "the file exists");
+        let bytes = std::fs::read(&path).expect("read back");
+        let back: AgentCard = serde_json::from_slice(&bytes).expect("parses");
+        assert_eq!(back, card, "the served file is the exact signed card");
+        assert!(back.is_valid(1_000), "the written card still verifies");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
