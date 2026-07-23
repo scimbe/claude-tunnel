@@ -301,6 +301,29 @@ impl Chain {
         Ok(())
     }
 
+    /// Accept a **complete block a peer produced** (#147-L4.2 receive side — the counterpart to
+    /// [`append`](Self::append), which produces locally). Validates that it extends the current tip
+    /// (right `height` + `prev_hash`), that its stored content `hash` is correct, and that every
+    /// transfer is valid against *this node's* current state (signature, nonce, no overdraft) — then
+    /// commits it, or rejects it leaving the chain unchanged. This is the primitive block gossip (L4.3)
+    /// and consensus (L4.2) build on to replicate the ledger across writers; fork-choice / voting is a
+    /// later slice (this only accepts a block that cleanly extends the local tip).
+    pub fn accept_block(&mut self, block: Block) -> Result<(), ChainError> {
+        let expected_height = self.height() + 1;
+        if block.height != expected_height
+            || block.prev_hash != self.tip_hash()
+            || block.hash != block_hash(block.height, &block.prev_hash, &block.transfers)
+        {
+            return Err(ChainError::BrokenChain { height: expected_height });
+        }
+        let (mut balances, mut nonces) = self.state();
+        for t in &block.transfers {
+            Self::validate_and_apply(&mut balances, &mut nonces, t)?;
+        }
+        self.blocks.push(block);
+        Ok(())
+    }
+
     /// The balance of `account` = its genesis allocation plus/minus every committed transfer.
     pub fn balance(&self, account: &Account) -> Amount {
         self.state().0.get(account).copied().unwrap_or(0)
@@ -472,5 +495,55 @@ mod tests {
         // A decoded block still content-hashes correctly (bytes are the same), so it will re-validate.
         let decoded = Block::decode(&bytes).unwrap();
         assert_eq!(decoded.hash, block_hash(decoded.height, &decoded.prev_hash, &decoded.transfers));
+    }
+
+    #[test]
+    fn accept_block_replicates_a_valid_peer_block_and_rejects_bad_ones() {
+        // #147-L4.2 (frozen): a node accepts a valid block a peer produced (extends tip, hash correct,
+        // transfers valid) → the two chains converge; and it rejects wrong-height, tampered-hash, and
+        // forged-transfer blocks. This is the ledger-sync primitive gossip + consensus build on.
+        let alice = key(1);
+        let bob = key(2);
+        let mallory = key(9);
+        let (a, b) = (acct(&alice), acct(&bob));
+        let genesis = BTreeMap::from([(a, 100)]);
+
+        // Producer mines a block; a fresh replica (same genesis) accepts it and converges.
+        let mut producer = Chain::new(genesis.clone());
+        let mut replica = Chain::new(genesis.clone());
+        producer.append(vec![Transfer::sign_new(&alice, b, 40, 0)]).unwrap();
+        let block = producer.blocks[1].clone();
+
+        replica.accept_block(block.clone()).expect("a valid peer block is accepted");
+        assert_eq!(replica.tip_hash(), producer.tip_hash(), "replica converged to the producer's tip");
+        assert_eq!(replica.balance(&b), 40);
+        assert!(replica.is_valid().is_ok(), "the replicated chain re-validates");
+
+        // Wrong height: re-accepting the same block (replica is already at height 1).
+        assert!(
+            matches!(replica.accept_block(block.clone()), Err(ChainError::BrokenChain { .. })),
+            "a block that doesn't extend the tip (stale height) is rejected"
+        );
+
+        // Tampered hash: a block claiming a correct link but a wrong content hash.
+        let mut fresh = Chain::new(genesis.clone());
+        let mut bad_hash = block.clone();
+        bad_hash.hash = [0x11u8; 32];
+        assert!(
+            matches!(fresh.accept_block(bad_hash), Err(ChainError::BrokenChain { .. })),
+            "a block with an incorrect content hash is rejected"
+        );
+
+        // Forged transfer: a well-linked, correctly-hashed block whose transfer isn't signed by `from`.
+        let mut forged = Transfer::sign_new(&mallory, b, 5, 0);
+        forged.from = a;
+        let ph = fresh.tip_hash();
+        let h = block_hash(1, &ph, std::slice::from_ref(&forged));
+        let forged_block = Block { height: 1, prev_hash: ph, transfers: vec![forged], hash: h };
+        assert!(
+            matches!(fresh.accept_block(forged_block), Err(ChainError::BadSignature)),
+            "a block carrying a forged transfer is rejected"
+        );
+        assert_eq!(fresh.height(), 0, "no bad block was ever committed to the replica");
     }
 }
