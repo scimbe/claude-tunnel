@@ -17,6 +17,7 @@ pub mod policy;
 pub mod pow;
 pub mod ratelimit;
 pub mod replay;
+pub mod settlement;
 pub mod sync;
 pub mod upgrade;
 
