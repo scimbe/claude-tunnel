@@ -18,7 +18,7 @@
 use crate::channel::UsageReceipt;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A settlement account — an ed25519 holder public key.
 pub type Account = [u8; 32];
@@ -642,6 +642,87 @@ impl Escrow {
     }
 }
 
+/// Domain separating a [`Vote`] preimage from every other signed object in the codebase.
+const VOTE_DOMAIN: &[u8] = b"ct-settlement-vote-v1";
+
+/// A writer's **signed vote for a leader candidate in a term** (#147-L4.2, Raft-style election — the
+/// maintainer-chosen "fast + fault-tolerant" flavor). The single-writer chain (L4.1) becomes
+/// multi-writer by electing one leader per term who alone [`append`](Chain::append)s; this is the vote
+/// the election tallies. Authorized ONLY by the voter's own ed25519 signature, so votes can't be
+/// forged; an honest voter casts one vote per term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vote {
+    pub term: u64,
+    /// The writer proposed as leader (an [`Account`]).
+    pub candidate: Account,
+    /// The writer casting the vote (the signer).
+    pub voter: Account,
+    pub signature: [u8; 64],
+}
+
+impl Vote {
+    /// Canonical fixed-wire preimage: `domain ‖ term(LE) ‖ candidate ‖ voter`. All fixed-size, so the
+    /// encoding is injective without length prefixes.
+    pub fn signing_bytes(term: u64, candidate: &Account, voter: &Account) -> Vec<u8> {
+        let mut m = Vec::with_capacity(VOTE_DOMAIN.len() + 8 + 32 + 32);
+        m.extend_from_slice(VOTE_DOMAIN);
+        m.extend_from_slice(&term.to_le_bytes());
+        m.extend_from_slice(candidate);
+        m.extend_from_slice(voter);
+        m
+    }
+
+    /// Construct + sign a vote from the voter's `SigningKey` (derives `voter` from the key, so a vote
+    /// can't be attributed to a writer that didn't cast it).
+    pub fn sign_new(voter_key: &SigningKey, term: u64, candidate: Account) -> Vote {
+        let voter = voter_key.verifying_key().to_bytes();
+        let signature = voter_key.sign(&Self::signing_bytes(term, &candidate, &voter)).to_bytes();
+        Vote { term, candidate, voter, signature }
+    }
+
+    /// Whether the voter's signature authentically authorizes this vote.
+    pub fn verify(&self) -> bool {
+        match VerifyingKey::from_bytes(&self.voter) {
+            Ok(vk) => vk
+                .verify(
+                    &Self::signing_bytes(self.term, &self.candidate, &self.voter),
+                    &Signature::from_bytes(&self.signature),
+                )
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// **Tally votes for `term` and return the elected leader**, if a candidate has a strict majority of
+/// `members` (#147-L4.2). A vote counts only when it (1) `verify`s, (2) is for `term`, (3) is cast by a
+/// `members` writer, and (4) names a `members` writer as candidate. A voter that appears more than once
+/// in the term is counted **once** — its first accepted vote in `votes` order — so an equivocating
+/// writer can't inflate a candidate's tally beyond one. Returns the unique candidate with `> members/2`
+/// votes, or `None` if none reaches a majority (a hung election — the caller keeps the prior leader /
+/// retries a higher term, never a split-brain commit).
+pub fn elect_leader(votes: &[Vote], members: &[Account], term: u64) -> Option<Account> {
+    let member_set: BTreeSet<&Account> = members.iter().collect();
+    let mut counted_voters: BTreeSet<Account> = BTreeSet::new();
+    let mut tally: BTreeMap<Account, usize> = BTreeMap::new();
+    for v in votes {
+        if v.term != term
+            || !member_set.contains(&v.voter)
+            || !member_set.contains(&v.candidate)
+            || !v.verify()
+        {
+            continue;
+        }
+        // One vote per voter (first accepted wins) — equivocation can't inflate a tally.
+        if !counted_voters.insert(v.voter) {
+            continue;
+        }
+        *tally.entry(v.candidate).or_insert(0) += 1;
+    }
+    let needed = members.len() / 2 + 1; // strict majority: > members/2
+    tally.into_iter().find(|&(_, count)| count >= needed).map(|(candidate, _)| candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +732,77 @@ mod tests {
     }
     fn acct(sk: &SigningKey) -> Account {
         sk.verifying_key().to_bytes()
+    }
+
+    #[test]
+    fn elect_leader_needs_a_verified_majority_and_resists_forgery_and_equivocation() {
+        // #147-L4.2 (frozen): a Raft-style leader election elects the candidate with a STRICT majority
+        // of members, counting only authentic votes for the term from members; forged/foreign votes are
+        // ignored, an equivocating voter is counted once, and no majority → None (hung, never
+        // split-brain). 3 members → 2 votes elect; 1 vote does not.
+        let (w1, w2, w3) = (key(1), key(2), key(3));
+        let (a, b, c) = (acct(&w1), acct(&w2), acct(&w3));
+        let members = [a, b, c];
+        let term = 7;
+
+        // Majority: w1 and w2 both vote for candidate `a` in term 7 → a is elected.
+        let elected = elect_leader(
+            &[Vote::sign_new(&w1, term, a), Vote::sign_new(&w2, term, a)],
+            &members,
+            term,
+        );
+        assert_eq!(elected, Some(a), "two of three votes for `a` elect it");
+
+        // No majority: one vote each for a and b → hung, None.
+        assert_eq!(
+            elect_leader(&[Vote::sign_new(&w1, term, a), Vote::sign_new(&w2, term, b)], &members, term),
+            None,
+            "a split vote elects no one (never split-brain)"
+        );
+
+        // Wrong term ignored: two votes but for term 6, asked for 7 → None.
+        assert_eq!(
+            elect_leader(&[Vote::sign_new(&w1, 6, a), Vote::sign_new(&w2, 6, a)], &members, 7),
+            None,
+            "votes for another term don't count"
+        );
+
+        // Forgery: a vote whose signature doesn't match its voter is ignored, so a forged second vote
+        // can't manufacture a majority.
+        let mut forged = Vote::sign_new(&w2, term, a);
+        forged.voter = c; // claim w3 cast it, but it's w2's signature
+        assert_eq!(
+            elect_leader(&[Vote::sign_new(&w1, term, a), forged], &members, term),
+            None,
+            "a forged vote is ignored — one real vote is not a majority"
+        );
+
+        // Non-member voter ignored: an outsider's authentic vote doesn't count toward the majority.
+        let outsider = key(9);
+        assert_eq!(
+            elect_leader(&[Vote::sign_new(&w1, term, a), Vote::sign_new(&outsider, term, a)], &members, term),
+            None,
+            "a non-member's vote doesn't count"
+        );
+
+        // Equivocation: w2 votes for BOTH a and b in the term — counted once (first), so it can't push
+        // `a` to a spurious majority on its own; with w1 also for `a`, `a` still wins by two real voters.
+        let elected = elect_leader(
+            &[
+                Vote::sign_new(&w1, term, a),
+                Vote::sign_new(&w2, term, a),
+                Vote::sign_new(&w2, term, b), // w2's second (equivocating) vote — ignored
+            ],
+            &members,
+            term,
+        );
+        assert_eq!(elected, Some(a), "an equivocating voter counts once; a still has a real majority");
+        // And equivocation alone can't elect: w2 voting a then b, with no other votes → no majority.
+        assert_eq!(
+            elect_leader(&[Vote::sign_new(&w2, term, a), Vote::sign_new(&w2, term, b)], &members, term),
+            None,
+            "one equivocating voter cannot elect anyone"
+        );
     }
 
     #[test]
