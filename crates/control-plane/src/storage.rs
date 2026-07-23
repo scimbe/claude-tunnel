@@ -138,6 +138,18 @@ impl SqliteEnrollment {
         Ok(JoinToken(bytes))
     }
 
+    /// Issue `count` fresh single-use join tokens for `tenant` in one call (#145 bulk provisioning):
+    /// each is independently random + persisted + redeemable **exactly once**, so "provision N agents"
+    /// becomes one mint instead of N. On any failure the partial tokens already persisted stay valid
+    /// (each is standalone); the caller sees the error and can retry for the remainder.
+    pub fn issue_join_tokens(
+        &self,
+        tenant: &TenantId,
+        count: usize,
+    ) -> rusqlite::Result<Vec<JoinToken>> {
+        (0..count).map(|_| self.issue_join_token(tenant)).collect()
+    }
+
     /// Redeem a join token, binding `agent`'s public key to the token's tenant.
     /// Single-use: a second redemption of the same token is rejected, and the
     /// consumption is persisted so it survives a restart.
@@ -2442,6 +2454,38 @@ mod tests {
             matches!(second, Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))),
             "second redemption rejected"
         );
+    }
+
+    #[test]
+    fn issue_join_tokens_mints_distinct_independently_redeemable_tokens() {
+        // #145 bulk provisioning (frozen): a batch mint yields N DISTINCT tokens, each redeemable
+        // exactly once and independent of the others — "provision N agents" in one call.
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let tokens = store.issue_join_tokens(&tenant(), 5).unwrap();
+        assert_eq!(tokens.len(), 5, "five tokens minted");
+
+        // All distinct.
+        let mut seen = std::collections::HashSet::new();
+        for t in &tokens {
+            assert!(seen.insert(t.0), "each batch token is distinct");
+        }
+
+        // Each is a real, independently single-use token: redeem #0, its replay fails, #1 still works.
+        assert!(store.redeem(&tokens[0], &AgentId("a0".into()), [10u8; 32]).is_ok(), "first token redeems");
+        assert!(
+            matches!(
+                store.redeem(&tokens[0], &AgentId("a0b".into()), [11u8; 32]),
+                Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))
+            ),
+            "a batch token is single-use like any other"
+        );
+        assert!(
+            store.redeem(&tokens[1], &AgentId("a1".into()), [12u8; 32]).is_ok(),
+            "a different batch token is unaffected — independent tokens"
+        );
+
+        // count = 0 yields no tokens (caller/REST layer decides whether that's an error).
+        assert!(store.issue_join_tokens(&tenant(), 0).unwrap().is_empty(), "zero count mints nothing");
     }
 
     #[test]

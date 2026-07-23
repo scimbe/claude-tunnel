@@ -62,6 +62,7 @@ pub fn enrollment_router_sqlite_with_admin(
 ) -> Router {
     Router::new()
         .route("/enroll/issue", post(issue))
+        .route("/enroll/issue-batch", post(issue_batch))
         .route("/enroll/redeem", post(redeem))
         .with_state(EnrollState { store, issue_admin_token })
 }
@@ -75,30 +76,81 @@ struct IssueResp {
     token: String,
 }
 
+/// #87 SEC87b-auth / #145: gate join-token issuance behind the configured admin token (constant-time
+/// compare). `Ok(())` when no token is configured (dev/back-compat) OR the correct `x-ct-admin-token`
+/// header is presented; `401` otherwise. Shared by single (`/enroll/issue`) and batch
+/// (`/enroll/issue-batch`) issuance so both enforce the exact same gate.
+fn require_issue_admin(
+    headers: &HeaderMap,
+    expected: &Option<[u8; 32]>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(exp) = expected {
+        let ok = headers
+            .get("x-ct-admin-token")
+            .and_then(|v| v.to_str().ok())
+            .and_then(hex_decode_32)
+            .map(|t| ct_token_eq(&t, exp))
+            .unwrap_or(false);
+        if !ok {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "join-token issuance requires the admin token".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn issue(
     State(st): State<EnrollState>,
     headers: HeaderMap,
     Json(req): Json<IssueReq>,
 ) -> Result<Json<IssueResp>, (StatusCode, String)> {
-    // #87 SEC87b-auth: when configured, minting a join token requires the admin token
-    // (constant-time compare) — closing "anyone mints a join token for any tenant".
-    if let Some(expected) = st.issue_admin_token {
-        let ok = headers
-            .get("x-ct-admin-token")
-            .and_then(|v| v.to_str().ok())
-            .and_then(hex_decode_32)
-            .map(|t| ct_token_eq(&t, &expected))
-            .unwrap_or(false);
-        if !ok {
-            return Err((StatusCode::UNAUTHORIZED, "join-token issuance requires the admin token".to_string()));
-        }
-    }
+    require_issue_admin(&headers, &st.issue_admin_token)?;
     let token = st
         .store
         .issue_join_token(&TenantId(req.tenant))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(IssueResp {
         token: hex_encode(&token.0),
+    }))
+}
+
+/// Cap on one batch issuance so a single call can't exhaust the store (#145 bulk provisioning).
+const MAX_BATCH_TOKENS: usize = 100;
+
+#[derive(Deserialize)]
+struct IssueBatchReq {
+    tenant: String,
+    count: usize,
+}
+#[derive(Serialize, Deserialize)]
+struct IssueBatchResp {
+    tokens: Vec<String>,
+}
+
+/// `POST /enroll/issue-batch` (#145 bulk provisioning): mint `count` single-use join tokens for a
+/// tenant in ONE admin call — turning "provision N agents" from N manual mints into one. Same
+/// admin gate as `/enroll/issue`; `count` must be `1..=MAX_BATCH_TOKENS` (a `400` otherwise so one
+/// call can't exhaust the store). Each token is independently redeemable exactly once.
+async fn issue_batch(
+    State(st): State<EnrollState>,
+    headers: HeaderMap,
+    Json(req): Json<IssueBatchReq>,
+) -> Result<Json<IssueBatchResp>, (StatusCode, String)> {
+    require_issue_admin(&headers, &st.issue_admin_token)?;
+    if req.count == 0 || req.count > MAX_BATCH_TOKENS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("count must be 1..={MAX_BATCH_TOKENS}"),
+        ));
+    }
+    let tokens = st
+        .store
+        .issue_join_tokens(&TenantId(req.tenant), req.count)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(IssueBatchResp {
+        tokens: tokens.iter().map(|t| hex_encode(&t.0)).collect(),
     }))
 }
 
@@ -2513,6 +2565,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "issuance open when no admin token is configured");
+    }
+
+    #[tokio::test]
+    async fn enroll_issue_batch_is_admin_gated_caps_count_and_mints_n_tokens() {
+        // #145 bulk provisioning (frozen): POST /enroll/issue-batch mints N tokens in one admin call,
+        // enforces the SAME admin gate as /enroll/issue, and caps count to 1..=MAX_BATCH_TOKENS.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x5eu8; 32];
+        let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = enrollment_router_sqlite_with_admin(store, Some(admin));
+        let batch = |tok: Option<String>, body: &'static str| {
+            let mut req =
+                Request::post("/enroll/issue-batch").header("content-type", "application/json");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        // Same admin gate as /enroll/issue.
+        assert_eq!(
+            batch(None, r#"{"tenant":"t1","count":3}"#).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "no admin token -> 401"
+        );
+
+        // Correct admin token → 200 with exactly `count` distinct hex tokens.
+        let ok = batch(Some(hex_encode(&admin)), r#"{"tenant":"t1","count":3}"#).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = to_bytes(ok.into_body(), 1 << 16).await.unwrap();
+        let resp: IssueBatchResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.tokens.len(), 3, "three tokens minted in one call");
+        assert_eq!(
+            resp.tokens.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "the batch tokens are distinct"
+        );
+        assert!(resp.tokens.iter().all(|t| t.len() == 64), "each is 64 hex chars");
+
+        // count out of range → 400 (can't exhaust the store, can't ask for zero).
+        assert_eq!(
+            batch(Some(hex_encode(&admin)), r#"{"tenant":"t1","count":0}"#).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "count 0 -> 400"
+        );
+        assert_eq!(
+            batch(Some(hex_encode(&admin)), r#"{"tenant":"t1","count":101}"#).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "count over MAX_BATCH_TOKENS -> 400"
+        );
     }
 
     #[tokio::test]
