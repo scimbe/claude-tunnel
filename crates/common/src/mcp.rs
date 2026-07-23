@@ -205,6 +205,21 @@ pub fn default_registry() -> ToolRegistry {
     r
 }
 
+/// The [`default_registry`] plus an **`agent/card`** tool returning `card_json` (#144 × #135): a peer
+/// that has connected over the authenticated channel can fetch the agent's holder-signed `AgentCard`
+/// directly, bound to the live session — the channel is authenticated by the same holder key, so the
+/// card the peer gets here is provably the one the connected agent holds (not merely one served at a
+/// URL). `card_json` is the card's JSON profile (`serde_json::to_value(&card)`).
+pub fn registry_with_card(card_json: Value) -> ToolRegistry {
+    let mut r = default_registry();
+    r.register(
+        "agent/card",
+        "the agent's holder-signed AgentCard — identity over the authenticated channel",
+        move |_| Ok(card_json.clone()),
+    );
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +318,25 @@ mod tests {
             .expect("valid response");
         assert_eq!(list.id, json!("c1"));
         assert!(list.result.unwrap()["tools"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn registry_with_card_serves_the_agent_card_over_the_tool() {
+        // #144 × #135 (frozen): a card-aware registry exposes `agent/card`; tools/list advertises it
+        // and tools/call returns exactly the supplied card JSON (the identity a peer fetches over the
+        // authenticated channel). ping still works alongside it.
+        let card = json!({ "holder_pubkey": "af1491a7", "role_tags": ["sink"], "expires_at": 5000 });
+        let reg = registry_with_card(card.clone());
+
+        let listed: Vec<String> = reg
+            .list()["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert!(listed.contains(&"agent/card".to_string()), "agent/card advertised, got {listed:?}");
+        assert!(listed.contains(&"ping".to_string()), "ping still present");
+
+        let resp = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": { "name": "agent/card" } }));
+        assert_eq!(resp.result.unwrap(), card, "agent/card returns the exact card JSON");
     }
 
     #[test]

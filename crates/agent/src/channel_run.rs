@@ -1366,13 +1366,31 @@ fn channel_local() -> ChannelLocal {
         })
         .unwrap_or(false);
     if serve {
-        eprintln!(
-            "ct-agent channel: --serve mode (L2.3 MCP-over-channel; JSON-RPC tools/list + tools/call, default tool: ping)"
-        );
         // #135 L2.3: each framed request body is a JSON-RPC 2.0 message dispatched against the agent's
         // MCP tool registry; the response body is the JSON-RPC reply. Arc so the registry is shared
-        // across the persistent session's calls.
-        let registry = std::sync::Arc::new(ct_common::mcp::default_registry());
+        // across the persistent session's calls. #144×#135: if the agent has AgentCard config
+        // (CT_CHANNEL_HOLDER_KEY + CT_AGENT_CARD_*), also expose `agent/card` — its signed identity
+        // over the authenticated channel; otherwise just the default `ping` tool.
+        let registry = std::sync::Arc::new(match AgentCardCliConfig::from_env() {
+            Ok(cfg) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let card_json =
+                    serde_json::to_value(cfg.build_card(now)).unwrap_or(serde_json::Value::Null);
+                eprintln!(
+                    "ct-agent channel: --serve mode (MCP-over-channel; tools: ping, agent/card)"
+                );
+                ct_common::mcp::registry_with_card(card_json)
+            }
+            Err(_) => {
+                eprintln!(
+                    "ct-agent channel: --serve mode (MCP-over-channel; tool: ping — set CT_AGENT_CARD_* to also expose agent/card)"
+                );
+                ct_common::mcp::default_registry()
+            }
+        });
         ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
             let registry = registry.clone();
             async move { registry.dispatch(&req) }
@@ -1712,11 +1730,11 @@ impl AgentCardCliConfig {
         Ok(Self { holder, role_tags, skills, cells, channels, ttl_secs, out_dir })
     }
 
-    /// Sign the card (`issued_at = now`, `expires_at = now + ttl_secs`) and write it to
-    /// `<out_dir>/.well-known/agent-card.json`. Returns the written path. The clock is a
-    /// parameter so the whole assembly is deterministic + testable.
-    pub fn write_card(&self, now: u64) -> std::io::Result<std::path::PathBuf> {
-        let card = ct_common::channel::AgentCard::sign_new(
+    /// Assemble + sign the agent's card (`issued_at = now`, `expires_at = now + ttl_secs`). The clock
+    /// is a parameter so the assembly is deterministic + testable. Shared by [`write_card`] (emit to
+    /// the origin) and the `agent/card` MCP tool (serve the identity over the authenticated channel).
+    pub fn build_card(&self, now: u64) -> ct_common::channel::AgentCard {
+        ct_common::channel::AgentCard::sign_new(
             &self.holder,
             self.role_tags.clone(),
             self.skills.clone(),
@@ -1724,8 +1742,12 @@ impl AgentCardCliConfig {
             self.channels.clone(),
             now,
             now.saturating_add(self.ttl_secs),
-        );
-        crate::well_known::write_agent_card_for_origin(&card, &self.out_dir)
+        )
+    }
+
+    /// Sign the card and write it to `<out_dir>/.well-known/agent-card.json`. Returns the written path.
+    pub fn write_card(&self, now: u64) -> std::io::Result<std::path::PathBuf> {
+        crate::well_known::write_agent_card_for_origin(&self.build_card(now), &self.out_dir)
     }
 }
 
