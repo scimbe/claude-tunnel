@@ -130,8 +130,10 @@ where
     // for the peer to acknowledge the buffered data. QUIC is userspace, so if the connection is
     // then dropped (the agent process exits right after the session returns) quinn discards the
     // unacknowledged tail and the peer receives a silently-truncated prefix of a large transfer.
-    // (The `:443`/TLS-TCP relay path — `run_channel_session_on_stream` called directly — is
-    // unaffected: the OS TCP stack keeps draining a FIN'd socket after close.)
+    // (The `:443`/TLS-TCP relay path — `run_channel_session_on_stream` called directly — has its own
+    // bounded `graceful_stream_drain` at the end of that fn: #150 found the "OS keeps draining a FIN'd
+    // socket after close" assumption FALSE when `ct-agent` is a container's PID 1, since the netns is
+    // torn down on exit with no stack left to flush the tail.)
     run_channel_session_on_stream(&mut send, &mut recv, role, own_noise_private, peer_noise_public, local).await?;
     // Graceful send-drain: wait until the peer has acknowledged receipt of all our stream data
     // (`stopped()` resolves after our `finish()` once the peer acks) BEFORE returning — so the
@@ -141,6 +143,28 @@ where
     let _ = send.finish(); // idempotent — the pump already FIN'd on EOF; ignore "already closed"
     let _ = tokio::time::timeout(SEND_DRAIN_TIMEOUT, send.stopped()).await;
     Ok(())
+}
+
+/// #150: how long [`graceful_stream_drain`] waits for the peer to close before giving up — matches
+/// the QUIC send-drain bound (#134) so a vanished peer can never hang teardown.
+const RELAY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #150: graceful teardown of a stream session before the process may exit. FIN our write half, then
+/// read the peer to EOF (bounded by `timeout`) — keeping the process, and in a container its network
+/// namespace, alive until the peer has closed, by which point the OS has transmitted + had acknowledged
+/// our send buffer. The `:443`/TLS-TCP relay path needs this: unlike a bare host (whose OS TCP stack
+/// keeps draining a FIN'd socket after the process closes it), a container tied to `ct-agent`'s PID 1
+/// tears down the network namespace on exit, so there's no persisting stack left to flush an unsent
+/// tail — the last bytes of a large single-shot transfer would be truncated. Best-effort + bounded: a
+/// vanished peer can't hang teardown, and I/O errors are ignored (we've done our best to drain).
+async fn graceful_stream_drain<W, R>(send: &mut W, recv: &mut R, timeout: std::time::Duration)
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let _ = send.shutdown().await;
+    let _ = tokio::time::timeout(timeout, tokio::io::copy(recv, &mut tokio::io::sink())).await;
 }
 
 /// The transport-agnostic core of [`run_channel_session`] (#106 relay-leg-443): run one
@@ -182,7 +206,15 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "a2a Noise_IK handshake timed out (#126)"))?
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    noise_pump(session, BiStream { send, recv }, local).await
+    // Reborrow the halves so they survive the pump: after the session ends we must drain before
+    // returning (#150), because a caller may exit immediately (a single-shot `ct-agent channel` as a
+    // container's PID 1) and a container tears down its netns on exit — so the OS won't flush a FIN'd
+    // `:443`/TLS-TCP relay socket's tail the way a bare host would. `graceful_stream_drain` FINs and
+    // waits (bounded) for the peer to close, keeping the process + netns alive until our tail is
+    // delivered. (The QUIC path keeps its stronger `stopped()` ack-wait in `run_channel_session`.)
+    let pumped = noise_pump(session, BiStream { send: &mut send, recv: &mut recv }, local).await;
+    graceful_stream_drain(&mut send, &mut recv, RELAY_DRAIN_TIMEOUT).await;
+    pumped
 }
 
 /// Hands-off A2A join with automatic **direct-then-relay** recovery (#72 AF4 /
@@ -2560,6 +2592,41 @@ mod tests {
         drop(b_app);
         let _ = a_task.await;
         let _ = b_task.await;
+    }
+
+    #[tokio::test]
+    async fn graceful_stream_drain_returns_when_the_peer_closes() {
+        // #150 (frozen): the drain FINs our write half and reads the peer to EOF — so once the peer
+        // closes it returns promptly, having kept us alive just long enough to flush our tail (the
+        // fix for `:443`/TLS-TCP truncation when `ct-agent` exits as a container's PID 1).
+        use std::time::Duration;
+        use tokio::io::{duplex, split};
+        let (ours, peer) = duplex(64);
+        let (mut our_r, mut our_w) = split(ours);
+        drop(peer); // the peer closes → our read half EOFs
+        let done = tokio::time::timeout(
+            Duration::from_secs(2),
+            graceful_stream_drain(&mut our_w, &mut our_r, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(done.is_ok(), "drain returns promptly once the peer has closed (well within its bound)");
+    }
+
+    #[tokio::test]
+    async fn graceful_stream_drain_is_bounded_on_a_silent_peer() {
+        // #150 (frozen): a peer that FINs nothing (vanished mid-transfer) must NOT hang teardown —
+        // the drain is bounded by its own timeout and returns best-effort, never blocking forever.
+        use std::time::Duration;
+        use tokio::io::{duplex, split};
+        let (ours, peer_kept) = duplex(64);
+        let (mut our_r, mut our_w) = split(ours);
+        let _peer_kept = peer_kept; // keep the peer open + silent so our read half never EOFs
+        let done = tokio::time::timeout(
+            Duration::from_secs(3),
+            graceful_stream_drain(&mut our_w, &mut our_r, Duration::from_millis(150)),
+        )
+        .await;
+        assert!(done.is_ok(), "a silent peer times out the bounded drain instead of hanging teardown");
     }
 
     #[test]
