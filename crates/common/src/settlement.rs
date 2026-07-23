@@ -106,6 +106,35 @@ impl Transfer {
             Err(_) => false,
         }
     }
+
+    /// Fixed wire length: `from(32) ‖ to(32) ‖ amount(8) ‖ nonce(8) ‖ signature(64)`.
+    pub const WIRE_LEN: usize = 32 + 32 + 8 + 8 + 64;
+
+    /// Canonical fixed-layout binary encoding (the persist / gossip wire form the L4.2/L4.3 slices
+    /// consume — a chain that can't be serialized can't be replicated or agreed on).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&self.from);
+        out.extend_from_slice(&self.to);
+        out.extend_from_slice(&self.amount.to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// Decode from [`encode`](Self::encode). `None` on a wrong-length input.
+    pub fn decode(b: &[u8]) -> Option<Transfer> {
+        if b.len() != Self::WIRE_LEN {
+            return None;
+        }
+        Some(Transfer {
+            from: b[0..32].try_into().ok()?,
+            to: b[32..64].try_into().ok()?,
+            amount: u64::from_le_bytes(b[64..72].try_into().ok()?),
+            nonce: u64::from_le_bytes(b[72..80].try_into().ok()?),
+            signature: b[80..144].try_into().ok()?,
+        })
+    }
 }
 
 /// One block: its height, the hash of the previous block (linkage), the transfers it commits, and its
@@ -117,6 +146,48 @@ pub struct Block {
     pub prev_hash: [u8; 32],
     pub transfers: Vec<Transfer>,
     pub hash: [u8; 32],
+}
+
+impl Block {
+    /// Canonical binary encoding: `height(8) ‖ prev_hash(32) ‖ count(u32 LE) ‖ ⟨transfers⟩ ‖ hash(32)`
+    /// — the wire form for persistence + L4.3 gossip.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(8 + 32 + 4 + self.transfers.len() * Transfer::WIRE_LEN + 32);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.prev_hash);
+        out.extend_from_slice(&(self.transfers.len() as u32).to_le_bytes());
+        for t in &self.transfers {
+            out.extend_from_slice(&t.encode());
+        }
+        out.extend_from_slice(&self.hash);
+        out
+    }
+
+    /// Decode from [`encode`](Self::encode). `None` on truncated / mis-sized input. **Structural only**
+    /// — the content-hash correctness + `prev_hash` linkage are (re-)checked by [`Chain::is_valid`]
+    /// once the block joins a chain, so a decoded block is never trusted on its own.
+    pub fn decode(b: &[u8]) -> Option<Block> {
+        const HEAD: usize = 8 + 32 + 4; // height + prev_hash + count
+        if b.len() < HEAD + 32 {
+            return None;
+        }
+        let height = u64::from_le_bytes(b[0..8].try_into().ok()?);
+        let prev_hash: [u8; 32] = b[8..40].try_into().ok()?;
+        let count = u32::from_le_bytes(b[40..44].try_into().ok()?) as usize;
+        let body = count.checked_mul(Transfer::WIRE_LEN)?;
+        let expected = HEAD.checked_add(body)?.checked_add(32)?;
+        if b.len() != expected {
+            return None;
+        }
+        let mut transfers = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = HEAD + i * Transfer::WIRE_LEN;
+            transfers.push(Transfer::decode(&b[off..off + Transfer::WIRE_LEN])?);
+        }
+        let hash: [u8; 32] = b[expected - 32..expected].try_into().ok()?;
+        Some(Block { height, prev_hash, transfers, hash })
+    }
 }
 
 /// The domain-separated content hash of a block: `sha256(domain ‖ height ‖ prev_hash ‖ count ‖
@@ -370,5 +441,36 @@ mod tests {
             matches!(relinked.is_valid(), Err(ChainError::BrokenChain { height: 1 })),
             "a broken prev_hash link is caught"
         );
+    }
+
+    #[test]
+    fn transfer_and_block_encode_round_trip_and_reject_malformed() {
+        // #147-L4.2-a (frozen): the persist/gossip wire form round-trips losslessly and rejects
+        // truncated input — the prerequisite for replicating/agreeing on the chain (L4.2/L4.3).
+        let alice = key(1);
+        let bob = key(2);
+        let b = acct(&bob);
+
+        let t = Transfer::sign_new(&alice, b, 7, 3);
+        assert_eq!(t.encode().len(), Transfer::WIRE_LEN);
+        assert_eq!(Transfer::decode(&t.encode()).unwrap(), t, "transfer round-trips");
+        assert!(Transfer::decode(&t.encode()[..Transfer::WIRE_LEN - 1]).is_none(), "truncated transfer → None");
+
+        let mut chain = Chain::new(BTreeMap::from([(acct(&alice), 100)]));
+        chain
+            .append(vec![Transfer::sign_new(&alice, b, 10, 0), Transfer::sign_new(&alice, b, 5, 1)])
+            .unwrap();
+        let block = chain.blocks[1].clone();
+        let bytes = block.encode();
+        assert_eq!(Block::decode(&bytes).unwrap(), block, "a two-transfer block round-trips");
+        assert!(Block::decode(&bytes[..bytes.len() - 1]).is_none(), "truncated block → None");
+
+        // The genesis (empty) block also round-trips.
+        let g = chain.blocks[0].clone();
+        assert_eq!(Block::decode(&g.encode()).unwrap(), g, "genesis block round-trips");
+
+        // A decoded block still content-hashes correctly (bytes are the same), so it will re-validate.
+        let decoded = Block::decode(&bytes).unwrap();
+        assert_eq!(decoded.hash, block_hash(decoded.height, &decoded.prev_hash, &decoded.transfers));
     }
 }
