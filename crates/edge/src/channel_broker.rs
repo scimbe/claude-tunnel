@@ -695,16 +695,24 @@ pub(crate) async fn finish_relay_pair(
 ) -> Result<ChannelPairing, BoxError> {
     match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
         Ok(pairing) => {
-            a.send.write_all(b"OK").await?;
-            b.send.write_all(b"OK").await?;
-            a.send.finish()?;
-            b.send.finish()?;
+            // #154: ack each side through `quic_ack_member`, which tags an I/O failure with its
+            // `PairSide` — so a mid-handoff drop on this QUIC-native completer surfaces as a
+            // `RelayHandoffError` naming the dead side (a transient race, not an admission refusal),
+            // exactly as `finish_relay_pair_over_streams` already does for the stream path (#148). This
+            // is the completer the NAT-to-NAT relay path uses, so the distinction matters most here.
+            quic_ack_member(&mut a.send, PairSide::A).await?;
+            quic_ack_member(&mut b.send, PairSide::B).await?;
             let (init_conn, acc_conn) = if pairing.initiator_holder == a.req.grant.grant.holder {
                 (&a.conn, &b.conn)
             } else {
                 (&b.conn, &a.conn)
             };
-            crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay").await?;
+            // Both sides acked cleanly; a failure now is the splice itself, not a one-sided ack race.
+            crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay")
+                .await
+                .map_err(|e| -> BoxError {
+                    format!("channel relay splice ended after both sides acked: {e}").into()
+                })?;
             Ok(pairing)
         }
         Err(e) => {
@@ -715,6 +723,20 @@ pub(crate) async fn finish_relay_pair(
             Err(format!("channel relay pair refused: {e}").into())
         }
     }
+}
+
+/// Write the bare `OK` ack + FIN one **QUIC-native** member ([`finish_relay_pair`]), tagging any I/O
+/// failure with `side` so a mid-handoff drop is a [`RelayHandoffError`] naming the dead side — not a
+/// bare error indistinguishable from an admission refusal (#148/#154). The QUIC-native analog of
+/// [`write_member_ack`]; the ack here is a plain `OK` on the admission bi-stream (the rich peer line
+/// isn't needed — this path's members reach each other by re-dialed bi-streams, not a spliced stream).
+async fn quic_ack_member(send: &mut quinn::SendStream, side: PairSide) -> Result<(), RelayHandoffError> {
+    send.write_all(b"OK")
+        .await
+        .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
+    send.finish()
+        .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
+    Ok(())
 }
 
 /// A channel member admitted over a **generic byte stream** (not a `quinn::Connection`)
@@ -1436,6 +1458,41 @@ mod tests {
         let mut buf = [0u8; 3];
         a_peer.read_exact(&mut buf).await.expect("A got its ack before B failed");
         assert_eq!(&buf, b"OK ", "the surviving side A was acked OK (its grant was fine all along)");
+    }
+
+    #[tokio::test]
+    async fn quic_ack_member_tags_the_side_on_a_mid_handoff_write_failure() {
+        // #154 (frozen): the QUIC-native completer's per-side ack (finish_relay_pair) tags an I/O
+        // failure with its PairSide, so a mid-handoff drop on the NAT-to-NAT relay path is a typed
+        // RelayHandoffError (naming the dead side, explicitly "not an admission refusal") — not the bare
+        // "connection lost" that #148 eliminated on the stream sibling but missed here.
+        use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                let conn = incoming.await.expect("server accepts the connection");
+                // Keep the connection alive briefly so the client handshake + open_bi complete.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(conn);
+            }
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("client connects");
+        let (mut send, _recv) = conn.open_bi().await.expect("open the admission bi-stream");
+        // Close the connection locally → any ack write on its stream now fails (a dying member's
+        // mid-handoff drop, deterministically reproduced).
+        conn.close(0u32.into(), b"member gone mid-handoff");
+
+        let err = quic_ack_member(&mut send, PairSide::B)
+            .await
+            .expect_err("acking over a closed connection must fail");
+        assert_eq!(err.failed_side, PairSide::B, "the dead side (B) is identified, not a bare error");
+        assert!(
+            format!("{err}").contains("not an admission refusal"),
+            "the QUIC-native completer now disambiguates a handoff race from a refusal too"
+        );
+        srv.abort();
     }
 
     /// Read the relay's `OK <..>\n` ack line off a spliced stream, stopping at the newline
