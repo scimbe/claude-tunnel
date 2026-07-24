@@ -595,33 +595,39 @@ function guardPrompt(p) {
 }
 
 // Map a natural-language prompt onto the form controls (the local crew stand-in).
+// Returns the list of changes it actually recognized — EMPTY means the prompt used
+// no words this fixed-vocabulary stand-in understands (#170: never claim "built"
+// for a no-op; that's what the live LLM crew, #171, is for).
 function interpretPrompt(p) {
   const s = p.toLowerCase();
+  const changes = [];
   const set = (id, v) => { $(id).value = v; };
-  if (/\b(insane|brutal|very hard|really hard)\b/.test(s)) { $("preset").value = "hard"; applyPreset(); set("speed", 230); set("gap", 100); }
-  else if (/\b(hard|harder|difficult|tough)\b/.test(s)) { $("preset").value = "hard"; applyPreset(); }
-  else if (/\b(easy|easier|chill|gentle|relax)\b/.test(s)) { $("preset").value = "easy"; applyPreset(); }
-  if (/\b(fast|faster|speedy|quick)\b/.test(s)) { $("preset").value = "custom"; set("speed", Math.min(260, +$("speed").value + 50)); }
-  if (/\b(slow|slower)\b/.test(s)) { $("preset").value = "custom"; set("speed", Math.max(90, +$("speed").value - 40)); }
-  if (/\b(float|low gravity|moon|floaty)\b/.test(s)) { $("preset").value = "custom"; set("gravity", 1100); }
-  if (/\bnight|dark|midnight\b/.test(s)) set("theme", "night");
-  else if (/\bsunset|evening|dusk\b/.test(s)) set("theme", "sunset");
-  else if (/\bretro|gameboy|game boy|8-?bit\b/.test(s)) set("theme", "retro");
-  else if (/\bcandy|pink|sweet\b/.test(s)) set("theme", "candy");
-  else if (/\bday|classic sky|blue sky\b/.test(s)) set("theme", "day");
+  if (/\b(insane|brutal|very hard|really hard)\b/.test(s)) { $("preset").value = "hard"; applyPreset(); set("speed", 230); set("gap", 100); changes.push("difficulty→insane"); }
+  else if (/\b(hard|harder|difficult|tough)\b/.test(s)) { $("preset").value = "hard"; applyPreset(); changes.push("difficulty→hard"); }
+  else if (/\b(easy|easier|chill|gentle|relax)\b/.test(s)) { $("preset").value = "easy"; applyPreset(); changes.push("difficulty→easy"); }
+  if (/\b(fast|faster|speedy|quick)\b/.test(s)) { $("preset").value = "custom"; set("speed", Math.min(260, +$("speed").value + 50)); changes.push("faster"); }
+  if (/\b(slow|slower)\b/.test(s)) { $("preset").value = "custom"; set("speed", Math.max(90, +$("speed").value - 40)); changes.push("slower"); }
+  if (/\b(float|low gravity|moon|floaty)\b/.test(s)) { $("preset").value = "custom"; set("gravity", 1100); changes.push("low-gravity"); }
+  let theme = null;
+  if (/\bnight|dark|midnight\b/.test(s)) theme = "night";
+  else if (/\bsunset|evening|dusk\b/.test(s)) theme = "sunset";
+  else if (/\bretro|gameboy|game boy|8-?bit\b/.test(s)) theme = "retro";
+  else if (/\bcandy|pink|sweet\b/.test(s)) theme = "candy";
+  else if (/\bday|classic sky|blue sky\b/.test(s)) theme = "day";
+  if (theme) { set("theme", theme); changes.push("theme→" + theme); }
   const emojiMap = [[/rocket|space/, "🚀"], [/duck/, "🦆"], [/parrot/, "🦜"], [/fish/, "🐟"], [/bee/, "🐝"], [/alien|invader/, "👾"], [/classic|circle|dot/, ""]];
   for (const [re, em] of emojiMap) {
-    if (re.test(s)) { selEmoji = em; [...erow.children].forEach(c => c.classList.toggle("sel", c.textContent === (em || "●"))); break; }
+    if (re.test(s)) { selEmoji = em; [...erow.children].forEach(c => c.classList.toggle("sel", c.textContent === (em || "●"))); changes.push("bird→" + (em || "classic")); break; }
   }
   const colourMap = { red: "#e23b3b", blue: "#3b7de2", green: "#3bcf5c", yellow: "#f7d51d", purple: "#8a3bff", orange: "#ff8a3b", pink: "#ff6fd0", white: "#eeeeee", black: "#222222" };
-  for (const [name, hex] of Object.entries(colourMap)) { if (new RegExp("\\b" + name + "\\b").test(s)) { set("birdColor", hex); break; } }
+  for (const [name, hex] of Object.entries(colourMap)) { if (new RegExp("\\b" + name + "\\b").test(s)) { set("birdColor", hex); changes.push("colour→" + name); break; } }
   const m = s.match(/\b(?:called|named|titled)\s+"?([a-z0-9 ]{2,24})"?/);
-  if (m) set("title", m[1].trim().replace(/\b\w/g, (c) => c.toUpperCase()));
-  else if (p.trim().length <= 28) set("title", p.trim());
+  if (m) { set("title", m[1].trim().replace(/\b\w/g, (c) => c.toUpperCase())); changes.push("title"); }
+  else if (p.trim().length <= 28) { set("title", p.trim()); changes.push("title"); }
   syncLabels();
+  return changes;
 }
 
-let lastGoodConfig = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The marketplace: per role, candidate provider agents bid their idle LLM capacity
@@ -659,7 +665,7 @@ async function renderAuction(role, icon) {
   return w;
 }
 
-async function runBuild(prompt) {
+async function runBuild() {
   const members = [...document.querySelectorAll(".crew .member")];
   const steps = [
     ["physics", 34, "🕹️"],
@@ -679,7 +685,6 @@ async function runBuild(prompt) {
     $("buildBar").style.width = pct + "%";
     el.classList.remove("active"); el.classList.add("done");
   }
-  interpretPrompt(prompt);
   startPreview();
   await sleep(320);
   $("build").style.display = "none";
@@ -694,13 +699,22 @@ $("buildBtn").addEventListener("click", async () => {
     msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept.";
     return;
   }
-  lastGoodConfig = readConfig();  // fallback anchor (rejected prompts already change nothing)
+  // #170: interpret FIRST — if the fixed-vocabulary stand-in recognized nothing, say so
+  // honestly and change nothing (the previous game stays), rather than faking a build.
+  const changes = interpretPrompt(p);
+  if (changes.length === 0) {
+    msg.className = "pmsg reject";
+    msg.textContent = "⚠ The local crew stand-in couldn't place that — it only maps common game words " +
+      "(bird, theme, colour, difficulty, speed). Free-text prompts like that are what the live LLM crew " +
+      "(#171) is for. Nothing changed — try e.g. \"night theme, rocket bird, harder\".";
+    return;
+  }
   $("buildBtn").disabled = true;
   msg.className = "pmsg"; msg.textContent = "";
   try {
-    await runBuild(p);
+    await runBuild();
     msg.className = "pmsg ok";
-    msg.textContent = "✓ Built by the crew. Keep prompting to refine, or download your game below.";
+    msg.textContent = "✓ Built by the crew — applied: " + changes.join(", ") + ". Keep prompting to refine, or download below.";
   } finally {
     $("buildBtn").disabled = false;
   }
