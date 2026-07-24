@@ -641,30 +641,26 @@ pub(crate) async fn finish_rendezvous_pair(
             // reflexive as the trailing `r=<addr>` token (#121 B1-follow) — so a member learns
             // its punch address during live rendezvous pairing. The client parses `r=` as a
             // self-addressed, order-independent token (absent on legacy acks → `None`).
-            a.send
-                .write_all(
-                    format!(
-                        "OK {}{} r={}",
-                        b.req.endpoint,
-                        member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
-                        a.observed
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            b.send
-                .write_all(
-                    format!(
-                        "OK {}{} r={}",
-                        a.req.endpoint,
-                        member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
-                        b.observed
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            a.send.finish()?;
-            b.send.finish()?;
+            //
+            // #155: ack each side through `quic_ack_member` so a mid-handoff drop on THIS completer
+            // — the QUIC rendezvous broker, which every member (including relay-only NAT'd ones)
+            // admits through before any relay fallback — surfaces as a `RelayHandoffError` naming the
+            // dead side, not a bare error that reads like a refusal (the fix #148/#154 gave the other
+            // two completers; this is the one actually in source-2/sink's admission path).
+            let a_ack = format!(
+                "OK {}{} r={}",
+                b.req.endpoint,
+                member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
+                a.observed
+            );
+            let b_ack = format!(
+                "OK {}{} r={}",
+                a.req.endpoint,
+                member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
+                b.observed
+            );
+            quic_ack_member(&mut a.send, a_ack.as_bytes(), PairSide::A).await?;
+            quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
             a.conn.closed().await;
             b.conn.closed().await;
             Ok(pairing)
@@ -700,8 +696,8 @@ pub(crate) async fn finish_relay_pair(
             // `RelayHandoffError` naming the dead side (a transient race, not an admission refusal),
             // exactly as `finish_relay_pair_over_streams` already does for the stream path (#148). This
             // is the completer the NAT-to-NAT relay path uses, so the distinction matters most here.
-            quic_ack_member(&mut a.send, PairSide::A).await?;
-            quic_ack_member(&mut b.send, PairSide::B).await?;
+            quic_ack_member(&mut a.send, b"OK", PairSide::A).await?;
+            quic_ack_member(&mut b.send, b"OK", PairSide::B).await?;
             let (init_conn, acc_conn) = if pairing.initiator_holder == a.req.grant.grant.holder {
                 (&a.conn, &b.conn)
             } else {
@@ -725,13 +721,18 @@ pub(crate) async fn finish_relay_pair(
     }
 }
 
-/// Write the bare `OK` ack + FIN one **QUIC-native** member ([`finish_relay_pair`]), tagging any I/O
-/// failure with `side` so a mid-handoff drop is a [`RelayHandoffError`] naming the dead side — not a
-/// bare error indistinguishable from an admission refusal (#148/#154). The QUIC-native analog of
-/// [`write_member_ack`]; the ack here is a plain `OK` on the admission bi-stream (the rich peer line
-/// isn't needed — this path's members reach each other by re-dialed bi-streams, not a spliced stream).
-async fn quic_ack_member(send: &mut quinn::SendStream, side: PairSide) -> Result<(), RelayHandoffError> {
-    send.write_all(b"OK")
+/// Write one **QUIC-native** member's `ack` bytes + FIN, tagging any I/O failure with `side` so a
+/// mid-handoff drop is a [`RelayHandoffError`] naming the dead side — not a bare error indistinguishable
+/// from an admission refusal (#148/#154/#155). The QUIC-native analog of [`write_member_ack`], shared
+/// by all three QUIC completers: [`finish_relay_pair`] passes a plain `OK`, while
+/// [`finish_rendezvous_pair`] passes its rich `OK <peer…> r=<observed>` line — the helper is content-
+/// agnostic, so every completer distinguishes a handoff race from a refusal consistently.
+async fn quic_ack_member(
+    send: &mut quinn::SendStream,
+    ack: &[u8],
+    side: PairSide,
+) -> Result<(), RelayHandoffError> {
+    send.write_all(ack)
         .await
         .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
     send.finish()
@@ -1484,7 +1485,9 @@ mod tests {
         // mid-handoff drop, deterministically reproduced).
         conn.close(0u32.into(), b"member gone mid-handoff");
 
-        let err = quic_ack_member(&mut send, PairSide::B)
+        // Pass a rich `OK ...` ack line (the shape finish_rendezvous_pair uses) to confirm the shared
+        // helper is content-agnostic across all three completers.
+        let err = quic_ack_member(&mut send, b"OK 203.0.113.9:1 r=203.0.113.9:2", PairSide::B)
             .await
             .expect_err("acking over a closed connection must fail");
         assert_eq!(err.failed_side, PairSide::B, "the dead side (B) is identified, not a bare error");
@@ -2645,6 +2648,67 @@ mod tests {
         assert!(ack_a.contains("203.0.113.2:7052"), "A learns B's endpoint via the finisher, got {ack_a:?}");
         assert!(ack_b.contains("203.0.113.1:7051"), "B learns A's endpoint via the finisher, got {ack_b:?}");
         assert_eq!(paired, (ia, ib), "the finisher decides roles from the grants, same as the monolithic broker");
+    }
+
+    #[tokio::test]
+    async fn finish_rendezvous_pair_tags_the_side_on_a_mid_handoff_write_failure() {
+        // #155 (frozen): the QUIC rendezvous completer — the one EVERY member (incl. relay-only NAT'd
+        // ones) admits through before any relay fallback, i.e. source-2/sink's actual critical path —
+        // now tags an ack I/O failure with its PairSide (RelayHandoffError) instead of the bare
+        // "connection lost" that #148/#154 eliminated on the other two completers. Authorization
+        // succeeds for both; B's connection is dropped before its ack, so the ack fails mid-handoff.
+        let pk = operator_pubkey();
+        let channel = [0xD6u8; 32];
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let cert_b = cert.clone();
+        let holder_a = holder_sk(0xa3);
+        let holder_b = holder_sk(0xb4);
+        let req_a = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.1:7061".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
+            endpoint: "203.0.113.2:7062".to_string(),
+        };
+        // Both clients connect + present their joins so admission succeeds; keep them alive so the
+        // failure is purely the server-side connection drop below, not a client race.
+        let a_cli = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let _ = present_join(&conn, &req_a.encode(), &holder_a).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            conn.close(0u32.into(), b"done");
+        });
+        let b_cli = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let _ = present_join(&conn, &req_b.encode(), &holder_b).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            conn.close(0u32.into(), b"done");
+        });
+
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let a = accept_member(&server, 500, &authorize).await.expect("admit a");
+        let b = accept_member(&server, 500, &authorize).await.expect("admit b");
+        // Deterministically break B's ack: close B's connection server-side before the finisher acks.
+        b.conn.close(0u32.into(), b"member gone before ack");
+
+        let err = finish_rendezvous_pair(a, b, 500)
+            .await
+            .expect_err("B's closed connection must fail its ack mid-handoff");
+        let handoff = err
+            .downcast_ref::<RelayHandoffError>()
+            .expect("a typed RelayHandoffError, not a bare I/O error");
+        assert_eq!(handoff.failed_side, PairSide::B, "the dead side (B) is identified");
+        assert!(
+            format!("{err}").contains("not an admission refusal"),
+            "the rendezvous completer now disambiguates a handoff race from a refusal too"
+        );
+        let _ = a_cli.await;
+        let _ = b_cli.await;
     }
 
     #[tokio::test]
