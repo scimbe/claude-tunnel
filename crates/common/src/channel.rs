@@ -1852,14 +1852,20 @@ pub struct CapacityBid {
     /// opt-in capability, not an enforced gate.
     #[serde(with = "card_hex::b32")]
     pub terms_ack: [u8; 32],
+    /// #149-A.1 requested service: the closed task-type this bid is for, or `None` for an unspecified
+    /// (generic) request. In the bidder-signed preimage, so the requested service is attested. When
+    /// `Some`, [`match_offer`] only clears the bid against an offer whose catalog declares that service.
+    #[serde(default)]
+    pub service: Option<ServiceType>,
     #[serde(with = "card_hex::b64")]
     pub signature: [u8; 64],
 }
 
 impl CapacityBid {
     /// Domain-separated, canonical injective preimage: `domain ‖ bidder ‖ kind(u8) ‖ ⟨model⟩ ‖
-    /// units(LE) ‖ total_price(LE) ‖ issued_at(LE) ‖ expires_at(LE) ‖ terms_ack`, `model`
-    /// length-prefixed. `terms_ack` (#149-A.5) is appended so the acceptance is covered by the signature.
+    /// units(LE) ‖ total_price(LE) ‖ issued_at(LE) ‖ expires_at(LE) ‖ terms_ack ‖ service`, `model`
+    /// length-prefixed. `terms_ack` (#149-A.5) and `service` (#149-A.1, `0` = none, else `1 ‖ tag`) are
+    /// appended so both are covered by the signature.
     #[allow(clippy::too_many_arguments)]
     pub fn signing_bytes(
         bidder: &[u8; 32],
@@ -1870,6 +1876,7 @@ impl CapacityBid {
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
         terms_ack: &[u8; 32],
+        service: Option<ServiceType>,
     ) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(CAPACITY_BID_DOMAIN);
@@ -1882,6 +1889,13 @@ impl CapacityBid {
         m.extend_from_slice(&issued_at.to_le_bytes());
         m.extend_from_slice(&expires_at.to_le_bytes());
         m.extend_from_slice(terms_ack);
+        match service {
+            Some(s) => {
+                m.push(1);
+                m.push(s.tag());
+            }
+            None => m.push(0),
+        }
         m
     }
 
@@ -1902,6 +1916,7 @@ impl CapacityBid {
                         self.issued_at,
                         self.expires_at,
                         &self.terms_ack,
+                        self.service,
                     ),
                     &Signature::from_bytes(&self.signature),
                 )
@@ -1910,8 +1925,8 @@ impl CapacityBid {
         }
     }
 
-    /// Construct + sign a bid **without** an acceptable-use acknowledgment (`terms_ack` all-zeros).
-    /// Equivalent to [`sign_new_with_terms`](Self::sign_new_with_terms) with a zero hash.
+    /// Construct + sign a bid with no acknowledgment and no specified service (`terms_ack` all-zeros,
+    /// `service` `None`). Equivalent to [`sign_new_full`](Self::sign_new_full) with those defaults.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_new(
         signing_key: &ed25519_dalek::SigningKey,
@@ -1922,23 +1937,11 @@ impl CapacityBid {
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
     ) -> CapacityBid {
-        Self::sign_new_with_terms(
-            signing_key,
-            kind,
-            model,
-            units,
-            total_price,
-            issued_at,
-            expires_at,
-            [0u8; 32],
-        )
+        Self::sign_new_full(signing_key, kind, model, units, total_price, issued_at, expires_at, [0u8; 32], None)
     }
 
-    /// Construct + sign a bid that also **acknowledges the provider's use-restriction terms** (#149-A.5):
-    /// `terms_ack` is the SHA-256 of the terms the consumer accepts (all-zeros = none). Because it's in
-    /// the bidder-signed preimage, the resulting bid is a non-repudiable signed record of that
-    /// acceptance. Derives `bidder` from the key so the acknowledgment can't be attributed to a key the
-    /// caller doesn't hold.
+    /// Construct + sign a bid that **acknowledges the provider's use-restriction terms** (#149-A.5) with
+    /// no specified service. Equivalent to [`sign_new_full`](Self::sign_new_full) with `service = None`.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_new_with_terms(
         signing_key: &ed25519_dalek::SigningKey,
@@ -1950,14 +1953,32 @@ impl CapacityBid {
         expires_at: UnixSeconds,
         terms_ack: [u8; 32],
     ) -> CapacityBid {
+        Self::sign_new_full(signing_key, kind, model, units, total_price, issued_at, expires_at, terms_ack, None)
+    }
+
+    /// Construct + sign a bid with a `terms_ack` **and** a requested `service` (#149-A.1/A.5). Both ride
+    /// the bidder-signed preimage. Derives `bidder` from the key so neither the acknowledgment nor the
+    /// requested service can be attributed to a key the caller doesn't hold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_new_full(
+        signing_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        model: String,
+        units: u64,
+        total_price: u64,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+        terms_ack: [u8; 32],
+        service: Option<ServiceType>,
+    ) -> CapacityBid {
         use ed25519_dalek::Signer;
         let bidder = signing_key.verifying_key().to_bytes();
         let signature = signing_key
             .sign(&Self::signing_bytes(
-                &bidder, kind, &model, units, total_price, issued_at, expires_at, &terms_ack,
+                &bidder, kind, &model, units, total_price, issued_at, expires_at, &terms_ack, service,
             ))
             .to_bytes();
-        CapacityBid { bidder, kind, model, units, total_price, issued_at, expires_at, terms_ack, signature }
+        CapacityBid { bidder, kind, model, units, total_price, issued_at, expires_at, terms_ack, service, signature }
     }
 }
 
@@ -2029,6 +2050,15 @@ pub fn match_offer(offer: &CapacityOffer, bid: &CapacityBid, now: UnixSeconds) -
     }
     if !offer.models.iter().any(|m| m == &bid.model) {
         return None;
+    }
+    // #149-A.1: a service-specific bid only clears against an offer whose declared catalog serves that
+    // service. A bid with no service (`None`) is unconstrained (matches as before); a service-specific
+    // bid against a generic (undeclared) or non-matching offer does NOT clear — the schema-typed
+    // catalog is enforced at match time, not merely advertised.
+    if let Some(service) = bid.service {
+        if !offer.services.contains(&service) {
+            return None;
+        }
     }
     if offer.units_available < bid.units {
         return None;
@@ -3839,5 +3869,43 @@ mod tests {
         let back: CapacityBid = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
         assert_eq!(back, b);
         assert!(back.is_valid(1_000));
+    }
+
+    #[test]
+    fn service_specific_bid_only_clears_against_an_offer_declaring_that_service() {
+        // #149-A.1 enforcement (frozen): a bid requesting a specific ServiceType clears only against an
+        // offer whose declared catalog serves it; a service-less bid is unconstrained (matches as
+        // before); the requested service is signed (tamper-evident); a service-specific bid against a
+        // generic (undeclared) or non-matching offer does NOT clear — the catalog is enforced at match.
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x51u8; 32]);
+        let buyer = SigningKey::from_bytes(&[0x52u8; 32]);
+        let mk_offer = |services: Vec<ServiceType>| {
+            CapacityOffer::sign_new_with_services(
+                &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 1_000, 100, "c".into(), 1_000, 9_000, services,
+            )
+        };
+        let mk_bid = |service: Option<ServiceType>| {
+            CapacityBid::sign_new_full(&buyer, CapacityKind::CloudApiQuota, "m".into(), 10, 150, 1_000, 9_000, [0u8; 32], service)
+        };
+
+        let code_offer = mk_offer(vec![ServiceType::CodeGeneration]);
+        let generic_offer = mk_offer(vec![]);
+
+        // A CodeGeneration bid clears against an offer declaring CodeGeneration...
+        assert!(match_offer(&code_offer, &mk_bid(Some(ServiceType::CodeGeneration)), 1_000).is_some(), "declared service clears");
+        // ...but not one that only declares SecurityReview, nor a generic (undeclared) offer.
+        assert!(match_offer(&mk_offer(vec![ServiceType::SecurityReview]), &mk_bid(Some(ServiceType::CodeGeneration)), 1_000).is_none(), "non-matching catalog doesn't clear");
+        assert!(match_offer(&generic_offer, &mk_bid(Some(ServiceType::CodeGeneration)), 1_000).is_none(), "a generic offer can't serve a service-specific bid");
+
+        // A service-less bid is unconstrained: it clears against both the declared and the generic offer.
+        assert!(match_offer(&code_offer, &mk_bid(None), 1_000).is_some(), "a service-less bid clears against a declared offer");
+        assert!(match_offer(&generic_offer, &mk_bid(None), 1_000).is_some(), "a service-less bid clears against a generic offer");
+
+        // The requested service is signed: tampering it invalidates the bid (so it can't clear at all).
+        let mut tampered = mk_bid(Some(ServiceType::CodeGeneration));
+        tampered.service = Some(ServiceType::TextGeneration);
+        assert!(!tampered.is_valid(1_000), "the requested service is covered by the signature");
+        assert!(match_offer(&mk_offer(vec![ServiceType::TextGeneration]), &tampered, 1_000).is_none(), "an invalid (tampered) bid never clears");
     }
 }
