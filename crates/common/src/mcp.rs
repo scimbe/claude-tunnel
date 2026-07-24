@@ -300,6 +300,10 @@ pub fn register_auction_tools(
     let limiter = std::sync::Arc::new(std::sync::Mutex::new(
         crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::new(max_bids_per_window),
     ));
+    // #158: authoritative per-offer capacity tally so cleared matches can't oversell this offer beyond
+    // its `units_available` (match_offer alone is a stateless preview and would double-book).
+    let commitments =
+        std::sync::Arc::new(std::sync::Mutex::new(crate::channel::OfferCommitments::new()));
     reg.register(
         "auction/bid",
         "submit a signed CapacityBid; returns the cleared CapacityMatch, or a no-match tool error",
@@ -322,7 +326,21 @@ pub fn register_auction_tools(
                 return Err("bid rate limit exceeded for this consumer — slow down".to_string());
             }
             match crate::channel::match_offer(&offer, &bid, now) {
-                Some(m) => serde_json::to_value(m).map_err(|e| e.to_string()),
+                Some(m) => {
+                    // #158: reserve the matched units against the offer's running capacity; refuse the
+                    // match if the offer is already fully booked, so it can't be oversold.
+                    if !commitments
+                        .lock()
+                        .map_err(|_| "auction commitments lock poisoned")?
+                        .commit(&offer, m.units)
+                    {
+                        return Err(
+                            "offer capacity already committed to prior matches — not enough units remain"
+                                .to_string(),
+                        );
+                    }
+                    serde_json::to_value(m).map_err(|e| e.to_string())
+                }
                 None => Err(
                     "bid does not clear against this offer (kind/model/units/floor/expiry)".to_string(),
                 ),
@@ -695,6 +713,36 @@ mod tests {
         let none = call(&reg, json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": { "name": "service/safety_check", "arguments": { "input": "x" } } }));
         assert!(none.error.is_some(), "an undeclared service is not exposed");
+    }
+
+    #[test]
+    fn auction_bid_refuses_to_oversell_the_offer_capacity() {
+        // #158 (frozen): the auction/bid tool tracks cumulative committed units, so an offer can't be
+        // matched beyond its units_available — a second full-capacity bid from a different buyer is
+        // refused once the first has booked the whole offer (no double-booking / overselling).
+        use crate::channel::{CapacityBid, CapacityKind, CapacityOffer};
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x51u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 100, 10, "c".into(), 1_000, 9_000,
+        );
+        let mut reg = default_registry();
+        register_auction_tools(&mut reg, offer, || 1_000, 1_000, 1); // generous rate limit (not under test)
+        let mk_bid = |seed: u8| {
+            CapacityBid::sign_new(
+                &SigningKey::from_bytes(&[seed; 32]), CapacityKind::CloudApiQuota, "m".into(), 100, 50, 1_000, 9_000,
+            )
+        };
+        let call_bid = |reg: &ToolRegistry, id: i64, b: &CapacityBid| {
+            call(reg, json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "auction/bid", "arguments": { "bid": serde_json::to_value(b).unwrap() } } }))
+        };
+        // The first full-capacity (100-unit) bid clears and books the whole offer.
+        assert!(call_bid(&reg, 1, &mk_bid(0x60)).result.is_some(), "the first full-capacity bid clears");
+        // A second full-capacity bid from a DIFFERENT buyer is refused — the offer is fully committed.
+        let second = call_bid(&reg, 2, &mk_bid(0x61));
+        let err = second.error.expect("the offer can't be double-booked");
+        assert!(err.message.contains("capacity"), "the error names the exhausted capacity: {}", err.message);
     }
 
     #[test]

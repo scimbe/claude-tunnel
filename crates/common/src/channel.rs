@@ -2087,6 +2087,49 @@ pub fn match_offer(offer: &CapacityOffer, bid: &CapacityBid, now: UnixSeconds) -
     })
 }
 
+/// **Cumulative per-offer capacity accounting** (#158): [`match_offer`] is a stateless *preview* — it
+/// checks `offer.units_available >= bid.units` but has no memory of units already committed to prior
+/// matches, so on its own the same 1000-unit offer could clear unlimited full-capacity bids
+/// (overselling). This is the authoritative running tally the *caller* keeps at commit time (where the
+/// escrow/match bookkeeping lives): after a preview clears, [`commit`](Self::commit) atomically checks
+/// remaining capacity and reserves the units, so an offer can never be booked beyond `units_available`.
+/// Keyed by the offer's signature, which uniquely identifies it.
+#[derive(Debug, Default)]
+pub struct OfferCommitments {
+    committed: std::collections::BTreeMap<[u8; 64], u64>,
+}
+
+impl OfferCommitments {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Units already committed against `offer`.
+    pub fn committed(&self, offer: &CapacityOffer) -> u64 {
+        self.committed.get(&offer.signature).copied().unwrap_or(0)
+    }
+
+    /// Units still available on `offer` (`units_available - committed`, saturating).
+    pub fn remaining(&self, offer: &CapacityOffer) -> u64 {
+        offer.units_available.saturating_sub(self.committed(offer))
+    }
+
+    /// **Reserve `units` against `offer`**, returning `true` (and recording them) iff the cumulative
+    /// total would not exceed `offer.units_available`, else `false` with no change. This is the check
+    /// that prevents double-booking: the Nth bid fails once prior matches have consumed the capacity.
+    /// `checked_add` so a huge `units` can't wrap the tally.
+    pub fn commit(&mut self, offer: &CapacityOffer, units: u64) -> bool {
+        let already = self.committed(offer);
+        match already.checked_add(units) {
+            Some(total) if total <= offer.units_available => {
+                self.committed.insert(offer.signature, total);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A **cross-user channel invitation** (#72 AF3): the operator invites a specific
 /// *invitee identity* (another user's agent) to join a channel, **without yet knowing**
 /// the member (holder) key that agent will use. The invitee's agent redeems it — proving
@@ -3907,5 +3950,43 @@ mod tests {
         tampered.service = Some(ServiceType::TextGeneration);
         assert!(!tampered.is_valid(1_000), "the requested service is covered by the signature");
         assert!(match_offer(&mk_offer(vec![ServiceType::TextGeneration]), &tampered, 1_000).is_none(), "an invalid (tampered) bid never clears");
+    }
+
+    #[test]
+    fn offer_commitments_prevent_double_booking_beyond_advertised_capacity() {
+        // #158 (frozen): match_offer is a stateless preview; OfferCommitments is the authoritative
+        // running tally that stops an offer being booked past its units_available. Two full-capacity
+        // bids against the same offer can't both commit; partials fill exactly to capacity; a different
+        // offer has its own independent budget.
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x51u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 1_000, 100, "c".into(), 1_000, 9_000,
+        );
+        let mut book = OfferCommitments::new();
+        assert_eq!(book.remaining(&offer), 1_000, "nothing committed yet");
+
+        // First full-capacity commit succeeds; a second one can't double-book.
+        assert!(book.commit(&offer, 1_000), "the first 1000-unit match commits");
+        assert_eq!(book.remaining(&offer), 0, "the offer is now fully committed");
+        assert!(!book.commit(&offer, 1), "a second bid can't exceed advertised capacity (#158 fixed)");
+
+        // Partials fill exactly to capacity, never past it.
+        let mut book2 = OfferCommitments::new();
+        assert!(book2.commit(&offer, 600), "600 of 1000 commits");
+        assert!(!book2.commit(&offer, 500), "500 more would oversell (only 400 left)");
+        assert_eq!(book2.remaining(&offer), 400);
+        assert!(book2.commit(&offer, 400), "400 fills it exactly");
+        assert!(!book2.commit(&offer, 1), "and not one unit more");
+
+        // A different offer (different signature) has its own budget.
+        let offer_b = CapacityOffer::sign_new(
+            &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 500, 100, "c".into(), 1_000, 9_000,
+        );
+        assert_eq!(book.remaining(&offer_b), 500, "a distinct offer is tracked separately");
+        assert!(book.commit(&offer_b, 500), "and has its own full capacity");
+
+        // A huge units value can't wrap the tally.
+        assert!(!OfferCommitments::new().commit(&offer, u64::MAX), "an overflowing commit is refused");
     }
 }
