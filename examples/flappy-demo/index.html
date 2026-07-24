@@ -673,8 +673,8 @@ function feedLine(cls, html) {
   d.className = cls; d.innerHTML = html;
   $("auctionFeed").appendChild(d); $("auctionFeed").scrollTop = 1e9;
 }
-async function renderAuction(role, icon) {
-  const bids = CREW_AUCTION[role];
+async function renderAuction(role, icon, bids) {
+  bids = bids || CREW_AUCTION[role];
   feedLine("abid", icon + " <b>" + role + "</b> — auction open (" + bids.length + " offer" + (bids.length > 1 ? "s" : "") + ")");
   for (const b of bids) {
     await sleep(150);
@@ -686,13 +686,12 @@ async function renderAuction(role, icon) {
   return w;
 }
 
-async function runBuild() {
+// runBuild animates the crew + auction. Pass a live {role: bids[]} map to show the REAL
+// marketplace (from the crew bridge); omit it to show the local stand-in. `applyThen` runs
+// AFTER the animation (the live path applies the crew's real config there).
+async function runBuild(bidsByRole, applyThen) {
   const members = [...document.querySelectorAll(".crew .member")];
-  const steps = [
-    ["physics", 34, "🕹️"],
-    ["art", 70, "🎨"],
-    ["integration", 100, "🧩"],
-  ];
+  const steps = [["physics", 34, "🕹️"], ["art", 70, "🎨"], ["integration", 100, "🧩"]];
   $("build").style.display = "flex";
   $("buildBar").style.width = "0%";
   $("auctionFeed").innerHTML = "";
@@ -700,42 +699,89 @@ async function runBuild() {
   for (const [role, pct, icon] of steps) {
     const el = members.find((m) => m.dataset.role === role);
     el.classList.add("active");
-    const w = await renderAuction(role, icon);
+    const w = await renderAuction(role, icon, bidsByRole && bidsByRole[role]);
     $("buildStep").textContent = icon + " " + w.who + " (" + w.model + ") is producing the " + role + " part…";
     await sleep(480);
     $("buildBar").style.width = pct + "%";
     el.classList.remove("active"); el.classList.add("done");
   }
+  if (applyThen) applyThen();
   startPreview();
   await sleep(320);
   $("build").style.display = "none";
 }
 
+// ---- live crew bridge (#171): the browser can't speak the QUIC/Noise channel, so it POSTs
+// the prompt to a small HTTP bridge on the plane that runs the real safety_check + per-role
+// matches + handlers and returns {safety, auction, config}. Configurable via an optional
+// untracked crew.json ({"url":"…"}); default is a same-origin /crew/build. UNREACHABLE or bad
+// response → the caller falls back to the local stand-in (which keeps its own regex guard).
+let CREW_URL = "crew/build";
+fetch("crew.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null))
+  .then((j) => { if (j && j.url) CREW_URL = j.url; }).catch(() => {});
+async function liveBuild(prompt) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const res = await fetch(CREW_URL, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt }), signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error("crew bridge " + res.status);
+    return await res.json();   // { safety:{ok,reason}, auction:[{role,bids}], config:{…} }
+  } finally { clearTimeout(to); }
+}
+// Apply the crew's real config to the form (arbitrary birdEmoji supported since #169).
+function applyLiveConfig(c) {
+  if (!c) return;
+  const num = (id, v) => { if (v != null && !Number.isNaN(+v)) $(id).value = v; };
+  if (c.title) $("title").value = String(c.title).slice(0, 28);
+  if (c.theme && THEMES[c.theme]) $("theme").value = c.theme;
+  if (c.birdColor) $("birdColor").value = c.birdColor;
+  if (typeof c.birdEmoji === "string") setBirdEmoji(c.birdEmoji);
+  num("gravity", c.gravity); num("jump", c.jump); num("gap", c.gap); num("speed", c.speed);
+  if (c.gravity != null || c.speed != null) $("preset").value = "custom";
+  syncLabels();
+}
+
 $("buildBtn").addEventListener("click", async () => {
-  const p = $("prompt").value;
-  const g = guardPrompt(p);
+  const p = $("prompt").value.trim();
   const msg = $("promptMsg");
-  if (!g.ok) {
-    msg.className = "pmsg reject";
-    msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept.";
-    return;
-  }
-  // #170: interpret FIRST — if the fixed-vocabulary stand-in recognized nothing, say so
-  // honestly and change nothing (the previous game stays), rather than faking a build.
-  const changes = interpretPrompt(p);
-  if (changes.length === 0) {
-    msg.className = "pmsg reject";
-    msg.textContent = "⚠ The local crew stand-in couldn't place that — it only maps common game words " +
-      "(bird, theme, colour, difficulty, speed). Free-text prompts like that are what the live LLM crew " +
-      "(#171) is for. Nothing changed — try e.g. \"night theme, rocket bird, harder\".";
-    return;
-  }
+  if (p.length < 3) { msg.className = "pmsg reject"; msg.textContent = "Say a bit more about the game you want."; return; }
   $("buildBtn").disabled = true;
   msg.className = "pmsg"; msg.textContent = "";
   try {
+    // 1) LIVE path — the real crew over the tunnel (#169/#171). The authoritative safety_check
+    //    runs server-side; a rejection here is the live LLM guard, not the regex.
+    let data = null;
+    try { data = await liveBuild(p); } catch (e) { data = null; }
+    if (data && (data.safety || data.config || data.auction)) {
+      if (data.safety && data.safety.ok === false) {
+        msg.className = "pmsg reject";
+        msg.textContent = "⛔ Rejected by the live safety agent — " + (data.safety.reason || "not a valid game request") + " Your current game is kept.";
+        return;
+      }
+      const bidsByRole = {};
+      (data.auction || []).forEach((a) => { if (a && a.role) bidsByRole[a.role] = a.bids; });
+      await runBuild(bidsByRole, () => applyLiveConfig(data.config));
+      msg.className = "pmsg ok";
+      msg.textContent = "✓ Built live by the crew over the tunnel. Keep prompting to refine, or download below.";
+      return;
+    }
+    // 2) FALLBACK — the crew bridge is unreachable; use the local stand-in (its own regex guard
+    //    still applies, and #170's honest no-op for out-of-vocabulary prompts).
+    const g = guardPrompt(p);
+    if (!g.ok) { msg.className = "pmsg reject"; msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept."; return; }
+    const changes = interpretPrompt(p);
+    if (changes.length === 0) {
+      msg.className = "pmsg reject";
+      msg.textContent = "⚠ The live crew is unreachable and the offline stand-in only maps common game words " +
+        "(bird, theme, colour, difficulty, speed) — it couldn't place that, so nothing changed. Try those, or retry when the crew is up.";
+      return;
+    }
     await runBuild();
     msg.className = "pmsg ok";
-    msg.textContent = "✓ Built by the crew — applied: " + changes.join(", ") + ". Keep prompting to refine, or download below.";
+    msg.textContent = "✓ Built (offline stand-in — live crew unreachable) — applied: " + changes.join(", ") + ".";
   } finally {
     $("buildBtn").disabled = false;
   }
