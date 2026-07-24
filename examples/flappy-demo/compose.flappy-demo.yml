@@ -1,0 +1,71 @@
+# Demo: serve https://flappy-demo.bunsenbrenner.org through the Browser Plane, with
+# a real Let's Encrypt certificate obtained at the origin via deSEC DNS-01 — the
+# SAME publishing shape as examples/help-site (help.bunsenbrenner.org).
+#
+# This is an OPTIONAL demo subsystem: bring it up to enable, `down` to take it
+# offline. It runs ALONGSIDE an already-running plane (ct-edge with
+# CT_EDGE_BROWSER_LISTEN=:443 + a ct-control-plane the agent onboards against).
+#
+#   enable:   examples/flappy-demo/run-demo.sh up      (or: docker compose -f … up -d)
+#   disable:  examples/flappy-demo/run-demo.sh down     (takes the demo offline)
+#
+# Env comes from docker/deploy/.env (see docs/dns01-desec.md).
+services:
+  flappy-origin:
+    # Caddy + deSEC plugin: terminates TLS with the LE cert for the hostname and
+    # serves the self-contained Flappy Pipeline Studio page (index.html).
+    build:
+      context: .
+      dockerfile: Caddy.Dockerfile
+    environment:
+      - DESEC_TOKEN=${DESEC_TOKEN:?set DESEC_TOKEN in docker/deploy/.env}
+    volumes:
+      - ./index.html:/srv/index.html:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - flappy_caddy_data:/data
+    expose:
+      - "443"   # reachable only via the tunnel/agent, not published to the host
+    restart: unless-stopped
+
+  flappy-agent:
+    # The workspace ct-agent image, in Browser-Plane mode (SNI passthrough).
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      args:
+        - CRATE=ct-agent
+    environment:
+      - CT_AGENT_MODE=browser
+      - CT_AGENT_HOSTNAME=flappy-demo.bunsenbrenner.org
+      - CT_AGENT_TOKEN=${FLAPPY_AGENT_TOKEN:-}
+      - CT_AGENT_ORIGIN=flappy-origin:443
+      - CT_AGENT_ORIGIN_PROTO=tcp
+      - CT_AGENT_CAPABILITY_OUT=/tmp/capability.bin
+      - CT_AGENT_EDGE=${FLAPPY_AGENT_EDGE:?edge host:port, e.g. edge:4433}
+      - CT_AGENT_CP_URL=${FLAPPY_AGENT_CP_URL:?control-plane URL for onboarding}
+      - CT_AGENT_JOIN_TOKEN=${FLAPPY_JOIN_TOKEN:?single-use join token}
+      - CT_AGENT_ID=flappy-demo
+      - CT_AGENT_EDGE_CERT_URL=${FLAPPY_AGENT_EDGE_CERT_URL:-}
+      # #141: persist onboarding so a restart RESTORES the bound identity instead of
+      # re-redeeming the single-use join token (the crash-loop that takes a demo down).
+      - CT_AGENT_STATE_DIR=/var/lib/ct-agent
+      # #36: retry the edge forever so a bounced edge is rejoined automatically.
+      - CT_AGENT_RECONNECT_MAX_ATTEMPTS=0
+    command: ["ct-agent", "onboard"]
+    depends_on:
+      - flappy-origin
+    restart: unless-stopped
+    volumes:
+      - flappy_agent_state:/var/lib/ct-agent
+
+volumes:
+  flappy_caddy_data:
+  flappy_agent_state:
+
+# Join the running self-host plane's network so flappy-agent/flappy-origin can reach
+# `edge` and `control-plane`. The base stack (compose.selfhost.yml, name: ct-selfhost)
+# creates the ct-selfhost_default network; bring it up first.
+networks:
+  default:
+    name: ct-selfhost_default
+    external: true
