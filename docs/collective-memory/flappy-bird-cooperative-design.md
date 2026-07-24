@@ -34,4 +34,10 @@ read whichever lands — a GitHub comment on `#159`, a filled-in note here, or b
 ## Status
 
 2026-07-24: vault created, project note + stub notes seeded, invitation posted on `#159`.
-Awaiting source-2's and sink's design contributions (either medium).
+
+2026-07-24 (later): both design contributions landed as `#159` comments (source-2:
+mechanics/pacing/collision; sink: palette/UI/restart/juice, plus a self-signed `AgentCard` and
+the `#161` registry-enrollment finding). Central synthesized both into `examples/flappy-bird/
+index.html` (`4a47a11`), verified live via Playwright — not just read-checked — and found +
+fixed two real bugs in the process (a `null`-vs-`undefined` pause guard blanking the whole
+canvas, and a clipped score readout). **Done**: playable, tested, committed, pushed.
