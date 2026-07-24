@@ -196,7 +196,9 @@
       </div>
 
       <div class="field">
-        <label>Bird style</label>
+        <label>Bird style <span style="color:var(--muted);font-weight:400">— or paste any emoji →</span>
+          <input type="text" id="birdCustom" maxlength="6" inputmode="text" placeholder="🕶️"
+            style="width:56px;text-align:center;padding:4px 6px"></label>
         <div class="emoji-row" id="emojiRow"></div>
       </div>
 
@@ -519,10 +521,24 @@ EMOJIS.forEach((em, i) => {
   b.textContent = em; b.type = "button"; if (i === 0) b.classList.add("sel");
   b.addEventListener("click", () => {
     selEmoji = (em === "●") ? "" : em;
+    $("birdCustom").value = "";
     [...erow.children].forEach(c => c.classList.remove("sel")); b.classList.add("sel"); refresh();
   });
   erow.appendChild(b);
 });
+// Custom emoji (#169): the bird is not limited to the fixed set — any emoji works (the
+// engine draws it with fillText), so a live art agent's choice (e.g. 🕶️) is never lost.
+$("birdCustom").addEventListener("input", () => {
+  const v = $("birdCustom").value.trim();
+  if (v) { selEmoji = v; [...erow.children].forEach(c => c.classList.remove("sel")); refresh(); }
+});
+// Apply an arbitrary emoji programmatically (used by the prompt interpreter / live config).
+function setBirdEmoji(em) {
+  selEmoji = em || "";
+  const match = [...erow.children].find(c => c.textContent === (em || "●"));
+  $("birdCustom").value = match ? "" : (em || "");
+  [...erow.children].forEach(c => c.classList.toggle("sel", c === match));
+}
 
 // ---- gather the CONFIG object from the inputs ----
 function readConfig() {
@@ -616,8 +632,13 @@ function interpretPrompt(p) {
   else if (/\bday|classic sky|blue sky\b/.test(s)) theme = "day";
   if (theme) { set("theme", theme); changes.push("theme→" + theme); }
   const emojiMap = [[/rocket|space/, "🚀"], [/duck/, "🦆"], [/parrot/, "🦜"], [/fish/, "🐟"], [/bee/, "🐝"], [/alien|invader/, "👾"], [/classic|circle|dot/, ""]];
-  for (const [re, em] of emojiMap) {
-    if (re.test(s)) { selEmoji = em; [...erow.children].forEach(c => c.classList.toggle("sel", c.textContent === (em || "●"))); changes.push("bird→" + (em || "classic")); break; }
+  // any emoji pasted into the prompt wins — capture the full grapheme (variation selector + ZWJ seq)
+  const literal = p.match(/\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic})*/u);
+  if (literal) { setBirdEmoji(literal[0]); changes.push("bird→" + literal[0]); }
+  else {
+    for (const [re, em] of emojiMap) {
+      if (re.test(s)) { setBirdEmoji(em); changes.push("bird→" + (em || "classic")); break; }
+    }
   }
   const colourMap = { red: "#e23b3b", blue: "#3b7de2", green: "#3bcf5c", yellow: "#f7d51d", purple: "#8a3bff", orange: "#ff8a3b", pink: "#ff6fd0", white: "#eeeeee", black: "#222222" };
   for (const [name, hex] of Object.entries(colourMap)) { if (new RegExp("\\b" + name + "\\b").test(s)) { set("birdColor", hex); changes.push("colour→" + name); break; } }
