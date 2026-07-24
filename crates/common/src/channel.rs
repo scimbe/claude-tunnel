@@ -1338,6 +1338,16 @@ impl CapacityKind {
             CapacityKind::LocalHardware => 1,
         }
     }
+
+    /// Inverse of [`tag`](Self::tag): reconstruct the kind from its wire byte (for binary decoding),
+    /// or `None` for an unknown tag.
+    fn from_tag(tag: u8) -> Option<CapacityKind> {
+        match tag {
+            0 => Some(CapacityKind::CloudApiQuota),
+            1 => Some(CapacityKind::LocalHardware),
+            _ => None,
+        }
+    }
 }
 
 /// A **holder-signed advertisement of idle LLM capacity** (#147 L1 — the discovery/advertisement layer
@@ -1665,6 +1675,73 @@ impl UsageReceipt {
             provider_sig: provider_key.sign(&bytes).to_bytes(),
             consumer_sig: consumer_key.sign(&bytes).to_bytes(),
         }
+    }
+
+    /// Canonical binary wire form (#147-L2 on-chain escrow — the release-proof payload a settlement
+    /// block commits when escrow is folded on-chain): `provider(32) ‖ consumer(32) ‖ kind(1) ‖
+    /// model_len(u32 LE) ‖ model ‖ units_consumed(8) ‖ match_ref(32) ‖ issued_at(8) ‖ request_hash(32)
+    /// ‖ response_hash(32) ‖ provider_sig(64) ‖ consumer_sig(64)`. Variable-length only in `model`
+    /// (length-prefixed), so it round-trips losslessly. Both signatures are carried, so a decoded
+    /// receipt re-verifies with [`is_valid`](Self::is_valid) — never trusted on decode alone.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 32 + 1 + 4 + self.model.len() + 8 + 32 + 8 + 32 + 32 + 64 + 64);
+        out.extend_from_slice(&self.provider);
+        out.extend_from_slice(&self.consumer);
+        out.push(self.kind.tag());
+        out.extend_from_slice(&(self.model.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.model.as_bytes());
+        out.extend_from_slice(&self.units_consumed.to_le_bytes());
+        out.extend_from_slice(&self.match_ref);
+        out.extend_from_slice(&self.issued_at.to_le_bytes());
+        out.extend_from_slice(&self.request_hash);
+        out.extend_from_slice(&self.response_hash);
+        out.extend_from_slice(&self.provider_sig);
+        out.extend_from_slice(&self.consumer_sig);
+        out
+    }
+
+    /// Decode from [`encode`](Self::encode). `None` on truncation, a bad `kind` tag, non-UTF-8 `model`,
+    /// or any trailing bytes. Structural only — call [`is_valid`](Self::is_valid) to authenticate.
+    pub fn decode(b: &[u8]) -> Option<UsageReceipt> {
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if cur.len() < n {
+                return None;
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Some(head)
+        }
+        let mut cur = b;
+        let provider: [u8; 32] = take(&mut cur, 32)?.try_into().ok()?;
+        let consumer: [u8; 32] = take(&mut cur, 32)?.try_into().ok()?;
+        let kind = CapacityKind::from_tag(take(&mut cur, 1)?[0])?;
+        let model_len = u32::from_le_bytes(take(&mut cur, 4)?.try_into().ok()?) as usize;
+        // `take` bounds `model_len` against the actual remaining bytes, so a bogus length can't
+        // over-allocate — it just fails the read.
+        let model = String::from_utf8(take(&mut cur, model_len)?.to_vec()).ok()?;
+        let units_consumed = u64::from_le_bytes(take(&mut cur, 8)?.try_into().ok()?);
+        let match_ref: [u8; 32] = take(&mut cur, 32)?.try_into().ok()?;
+        let issued_at = u64::from_le_bytes(take(&mut cur, 8)?.try_into().ok()?);
+        let request_hash: [u8; 32] = take(&mut cur, 32)?.try_into().ok()?;
+        let response_hash: [u8; 32] = take(&mut cur, 32)?.try_into().ok()?;
+        let provider_sig: [u8; 64] = take(&mut cur, 64)?.try_into().ok()?;
+        let consumer_sig: [u8; 64] = take(&mut cur, 64)?.try_into().ok()?;
+        if !cur.is_empty() {
+            return None; // trailing bytes → malformed
+        }
+        Some(UsageReceipt {
+            provider,
+            consumer,
+            kind,
+            model,
+            units_consumed,
+            match_ref,
+            issued_at,
+            request_hash,
+            response_hash,
+            provider_sig,
+            consumer_sig,
+        })
     }
 }
 
@@ -3516,6 +3593,31 @@ mod tests {
         let back: UsageReceipt = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
         assert!(back.is_valid());
+    }
+
+    #[test]
+    fn usage_receipt_encode_round_trips_and_rejects_malformed() {
+        // #147-L2 on-chain escrow (frozen): the co-signed receipt has a canonical binary wire form (the
+        // release-proof payload a settlement block commits), round-tripping losslessly, still verifying
+        // after decode (both signatures preserved), and rejecting truncated / trailing-byte buffers.
+        use ed25519_dalek::SigningKey;
+        let provider = SigningKey::from_bytes(&[0x11u8; 32]);
+        let consumer = SigningKey::from_bytes(&[0x22u8; 32]);
+        let r = UsageReceipt::co_sign_audited(
+            &provider, &consumer, CapacityKind::LocalHardware, "claude-opus-4-8".into(), 1234, [0x9u8; 32], 5_000, [0xAu8; 32], [0xBu8; 32],
+        );
+        let bytes = r.encode();
+        let back = UsageReceipt::decode(&bytes).expect("round-trips");
+        assert_eq!(back, r, "decode is the inverse of encode");
+        assert!(back.is_valid(), "the decoded receipt still verifies (both signatures preserved)");
+        assert!(UsageReceipt::decode(&bytes[..bytes.len() - 1]).is_none(), "a truncated buffer is rejected");
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(UsageReceipt::decode(&long).is_none(), "trailing bytes are rejected");
+
+        // An empty-model, plain (zero-hash) receipt also round-trips (the length prefix handles it).
+        let r2 = UsageReceipt::co_sign(&provider, &consumer, CapacityKind::CloudApiQuota, String::new(), 0, [0u8; 32], 1);
+        assert_eq!(UsageReceipt::decode(&r2.encode()).unwrap(), r2, "empty-model receipt round-trips");
     }
 
     #[test]
