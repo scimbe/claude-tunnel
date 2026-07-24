@@ -227,12 +227,26 @@
         contains no external assets, and is entirely yours. Add it to a site, share it, or embed it. The same
         template could drive other pipelines (a different game, a form, a report): swap the engine, keep the flow.</p></div></div>
 
+    <div class="step"><div class="n">🤝</div><div>
+      <h3>Built by a cooperating agent crew (the role-chain)</h3>
+      <p>The product isn't made by one monolith — it's assembled by a <b>crew of specialized LLM agents</b>, each
+        owning a role, coordinating over the zero-knowledge tunnel. That's the same role-chain that built the
+        original game by hand:</p>
+      <ul style="margin:8px 0 0; padding-left:18px; color:var(--muted); font-size:13px; line-height:1.6">
+        <li><b>🕹️ Physics</b> — gravity, flap power, pipe gap &amp; speed (fair, tunable difficulty)</li>
+        <li><b>🎨 Art</b> — palette, bird, theme, the game's look</li>
+        <li><b>🧩 Integration</b> — assembles the parts into one self-contained product</li>
+      </ul>
+      <p style="margin-top:8px">Each role is (or becomes) a real agent discovered via
+        <code>/registry/agents?role=…</code> or provisioned by central; the marketplace clears the job and each
+        agent answers a <code>service/&lt;slug&gt;</code> call. <i>Today the crew's contributions are computed in-page
+        (the honest MVP); wiring each role to a live LLM agent over the channel is the next step.</i></p></div></div>
+
     <div class="step"><div class="n">🔒</div><div>
       <h3>Access &amp; hosting</h3>
-      <p>This demo is gated by a <b>first-layer password</b> in the page itself. For a real customer deployment the
-        authoritative protection is server-side (e.g. an HTTP auth layer in front, like the <code>help-site</code>
-        example's reverse proxy) and/or served privately over the zero-knowledge tunnel — the client gate is just
-        the demo's front door.</p></div></div>
+      <p>This demo is gated by a <b>first-layer password</b> the operator (central) sets by env — never in the source.
+        For a real customer deployment the authoritative protection is server-side (an HTTP auth layer in front, like
+        the <code>help-site</code> reverse proxy) and it is served privately over the zero-knowledge tunnel.</p></div></div>
 
     <button class="btn accent close" id="infoClose">Got it</button>
   </div>
