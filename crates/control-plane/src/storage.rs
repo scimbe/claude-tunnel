@@ -2089,6 +2089,49 @@ impl SqliteTopologyStore {
         Ok(ct_common::channel::authorized_channels(operator_pubkey, &links))
     }
 
+    /// Reverse-lookup for the admission gate (#107-enforce ii-b): does **any** topology authorize
+    /// `holder` on `channel`? Returns the authorizing topology's bound operator key iff some
+    /// topology with a **bound (authenticated, ii-a) operator** has a declared edge `(holder, other)`
+    /// whose [`channel_id_for_link`](ct_common::channel::channel_id_for_link) is exactly `channel` —
+    /// i.e. the drawn overlay contains the link that names this channel and `holder` is one of its
+    /// endpoints. This is the query that lets a declared edge **govern the wire**: the gate consults
+    /// it *additively* alongside channel-members. Only operator-bound topologies participate (an
+    /// unbound/legacy topology authorizes nothing), and the operator binding is proof-of-possession
+    /// gated, so a topology cannot claim an operator key it doesn't hold.
+    pub fn topology_authorizes(
+        &self,
+        channel: &ChannelId,
+        holder: &[u8; 32],
+    ) -> rusqlite::Result<Option<[u8; 32]>> {
+        let holder_hex: String = holder.iter().map(|b| format!("{b:02x}")).collect();
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT t.operator_pubkey, e.a, e.b \
+             FROM topology_edges e JOIN topologies t ON t.id = e.topology \
+             WHERE t.operator_pubkey IS NOT NULL AND (lower(e.a) = ?1 OR lower(e.b) = ?1)",
+        )?;
+        let rows = stmt.query_map(params![holder_hex], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        for row in rows {
+            let (op_raw, a, b) = row?;
+            let op = match <[u8; 32]>::try_from(op_raw.as_slice()) {
+                Ok(op) => op,
+                Err(_) => continue,
+            };
+            // The peer endpoint is whichever side of the edge isn't this holder.
+            let other_hex = if a.eq_ignore_ascii_case(&holder_hex) { &b } else { &a };
+            let other = match topo_node_hex32(other_hex) {
+                Some(o) => o,
+                None => continue,
+            };
+            if ct_common::channel::channel_id_for_link(&op, holder, &other) == *channel {
+                return Ok(Some(op));
+            }
+        }
+        Ok(None)
+    }
+
     /// Load the current assignment for `agent`, reconstructed from its row.
     fn load(conn: &Connection, agent: &str) -> rusqlite::Result<Option<crate::topology::AgentAssignment>> {
         let row: Option<(String, Option<String>)> = conn
@@ -2264,6 +2307,45 @@ mod tests {
             .to_bytes();
         assert!(store.set_operator("alice", "t1", &op2, &proof2).unwrap(), "owner re-binds with proof");
         assert_eq!(store.operator("t1").unwrap(), Some(op2), "re-bind overwrites");
+    }
+
+    #[test]
+    fn topology_authorizes_a_holder_only_on_a_declared_edges_channel() {
+        // #107-enforce ii-b (frozen): the admission reverse-lookup. A holder is authorized on a
+        // channel iff an OPERATOR-BOUND topology declares the edge that names it. An undeclared
+        // channel, a stranger holder, or an UNBOUND topology all authorize nothing.
+        use ed25519_dalek::{Signer, SigningKey};
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "uuid1").unwrap();
+
+        let op_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let op = op_sk.verifying_key().to_bytes();
+        let a = [0xaau8; 32];
+        let b = [0xbbu8; 32];
+        let c = [0xccu8; 32];
+        let hx = |k: &[u8; 32]| k.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        store.add_edge("alice", "t1", &hx(&a), &hx(&b)).unwrap();
+
+        let chan_ab = ct_common::channel::channel_id_for_link(&op, &a, &b);
+        let chan_ac = ct_common::channel::channel_id_for_link(&op, &a, &c);
+
+        // BEFORE the operator is bound, the topology authorizes nothing (unbound ⇒ no enforcement).
+        assert_eq!(store.topology_authorizes(&chan_ab, &a).unwrap(), None, "unbound topology authorizes nothing");
+
+        // Bind the operator (authenticated, ii-a).
+        let proof = op_sk
+            .sign(&ct_common::channel::topology_operator_binding_bytes("t1", &op))
+            .to_bytes();
+        assert!(store.set_operator("alice", "t1", &op, &proof).unwrap());
+
+        // Now the declared edge a—b authorizes BOTH its endpoints on its channel, and returns the op.
+        assert_eq!(store.topology_authorizes(&chan_ab, &a).unwrap(), Some(op), "declared endpoint a authorized");
+        assert_eq!(store.topology_authorizes(&chan_ab, &b).unwrap(), Some(op), "declared endpoint b authorized");
+
+        // A holder NOT on the channel's naming edge is refused, even on a real channel.
+        assert_eq!(store.topology_authorizes(&chan_ab, &c).unwrap(), None, "c is not an endpoint of a—b");
+        // An undeclared channel (a—c edge was never drawn) is refused for a real member.
+        assert_eq!(store.topology_authorizes(&chan_ac, &a).unwrap(), None, "a—c channel is not declared");
     }
 
     fn tenant() -> TenantId {
