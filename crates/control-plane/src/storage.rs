@@ -1830,6 +1830,12 @@ impl SqliteTopologyStore {
         // `shortcut`). Additive (#44): a pre-existing self-host DB gains the column with the
         // safe direct default, so older topologies keep working unchanged.
         ensure_column(&conn, "topologies", "overlay_mode", "TEXT NOT NULL DEFAULT 'baseline'")?;
+        // #107-enforce: the topology's bound operator public key — the ed25519 identity its overlay
+        // links derive channels under (`channel_id_for_link` is operator-bound). Nullable + additive
+        // (#44): a legacy topology has no operator bound (enforcement simply doesn't apply to it yet),
+        // and self-host DBs upgrade in place. Self-contained on the topology so enforcement needs no
+        // fragile cross-store join to discover whose operator authority governs the overlay.
+        ensure_column(&conn, "topologies", "operator_pubkey", "BLOB")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1872,6 +1878,40 @@ impl SqliteTopologyStore {
             ct_common::overlay::RoutingApproach::parse(&s)
                 .unwrap_or(ct_common::overlay::RoutingApproach::Baseline)
         }))
+    }
+
+    /// Bind a topology's **operator public key** (#107-enforce): the ed25519 operator identity its
+    /// overlay links derive channels under. Self-contained on the topology so enforcement needs no
+    /// fragile cross-store join — the overlay itself declares whose operator authority governs it.
+    /// Owner-scoped: returns `false` (no-op) if `id` doesn't exist or isn't owned by `owner`, so a
+    /// subject can never rebind a topology it doesn't own. Idempotent (re-binding overwrites).
+    pub fn set_operator(
+        &self,
+        owner: &str,
+        id: &str,
+        operator_pubkey: &[u8; 32],
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "UPDATE topologies SET operator_pubkey = ?3 WHERE id = ?1 AND owner = ?2",
+            params![id, owner, &operator_pubkey[..]],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A topology's bound operator public key (#107-enforce), or `None` if the topology doesn't
+    /// exist or has no operator bound yet (a legacy/unenforced topology). A stored value of the
+    /// wrong length degrades to `None` rather than failing the read.
+    pub fn operator(&self, id: &str) -> rusqlite::Result<Option<[u8; 32]>> {
+        let raw: Option<Option<Vec<u8>>> = self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT operator_pubkey FROM topologies WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.flatten().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
     }
 
     /// Create a topology `id` owned by `owner`, addressed by the unique `net_uuid`.
@@ -2146,6 +2186,48 @@ mod tests {
 
         // An unknown / empty topology authorizes nothing.
         assert!(store.authorized_channels("nope", &op).unwrap().is_empty(), "unknown topology → empty");
+    }
+
+    #[test]
+    fn topology_operator_binding_is_owner_scoped_and_drives_authorized_channels() {
+        // #107-enforce (frozen): a topology carries its OWN operator pubkey (self-contained, no
+        // cross-store join). set_operator is owner-scoped; operator() reads it back; a non-owner
+        // cannot rebind; unbound/unknown → None; and the bound operator is the identity the
+        // topology's authorized channels derive under.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "uuid1").unwrap();
+        let op = [0x11u8; 32];
+
+        // Unbound initially; unknown topology → None.
+        assert_eq!(store.operator("t1").unwrap(), None, "no operator bound yet");
+        assert_eq!(store.operator("nope").unwrap(), None, "unknown topology → None");
+
+        // Owner binds; reads back.
+        assert!(store.set_operator("alice", "t1", &op).unwrap(), "owner binds the operator");
+        assert_eq!(store.operator("t1").unwrap(), Some(op), "operator reads back");
+
+        // A non-owner cannot rebind (owner-scoped no-op); the binding is unchanged.
+        let other = [0x22u8; 32];
+        assert!(!store.set_operator("mallory", "t1", &other).unwrap(), "non-owner cannot rebind");
+        assert_eq!(store.operator("t1").unwrap(), Some(op), "binding unchanged after unauthorized attempt");
+
+        // The bound operator is the identity the topology's authorized channels derive under.
+        let a = [0xaau8; 32];
+        let b = [0xbbu8; 32];
+        let hx = |k: &[u8; 32]| k.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        store.add_edge("alice", "t1", &hx(&a), &hx(&b)).unwrap();
+        let bound = store.operator("t1").unwrap().unwrap();
+        assert!(
+            store
+                .authorized_channels("t1", &bound)
+                .unwrap()
+                .contains(&ct_common::channel::channel_id_for_link(&op, &a, &b)),
+            "authorized channels derive under the bound operator key"
+        );
+
+        // Re-binding overwrites (idempotent setter).
+        assert!(store.set_operator("alice", "t1", &other).unwrap(), "owner re-binds");
+        assert_eq!(store.operator("t1").unwrap(), Some(other), "re-bind overwrites");
     }
 
     fn tenant() -> TenantId {
