@@ -1403,17 +1403,17 @@ fn channel_local() -> ChannelLocal {
         // across the persistent session's calls. #144×#135: if the agent has AgentCard config
         // (CT_CHANNEL_HOLDER_KEY + CT_AGENT_CARD_*), also expose `agent/card` — its signed identity
         // over the authenticated channel; otherwise just the default `ping` tool.
-        let registry = std::sync::Arc::new(match AgentCardCliConfig::from_env() {
+        fn now_secs() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+        let mut reg = match AgentCardCliConfig::from_env() {
             Ok(cfg) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let card_json =
-                    serde_json::to_value(cfg.build_card(now)).unwrap_or(serde_json::Value::Null);
-                eprintln!(
-                    "ct-agent channel: --serve mode (MCP-over-channel; tools: ping, agent/card)"
-                );
+                let card_json = serde_json::to_value(cfg.build_card(now_secs()))
+                    .unwrap_or(serde_json::Value::Null);
+                eprintln!("ct-agent channel: --serve mode (MCP-over-channel; tools: ping, agent/card)");
                 ct_common::mcp::registry_with_card(card_json)
             }
             Err(_) => {
@@ -1422,7 +1422,25 @@ fn channel_local() -> ChannelLocal {
                 );
                 ct_common::mcp::default_registry()
             }
-        });
+        };
+        // #152: if an offer is configured (CT_AGENT_OFFER_*), also expose the #147 auction tools
+        // (`auction/offer` + `auction/bid`) over the same authenticated channel — the CLI parity that
+        // lets the marketplace be demoed live the way `agent/card` is. The seller stamps time itself
+        // (`now_secs`), never the caller.
+        if let Ok(offer_cfg) = AgentOfferCliConfig::from_env() {
+            let offer = offer_cfg.build_offer(now_secs());
+            ct_common::mcp::register_auction_tools(
+                &mut reg,
+                offer,
+                now_secs,
+                offer_cfg.max_bids_per_window,
+                offer_cfg.window_secs,
+            );
+            eprintln!(
+                "ct-agent channel: --serve also exposing auction/offer + auction/bid (CT_AGENT_OFFER_*)"
+            );
+        }
+        let registry = std::sync::Arc::new(reg);
         ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
             let registry = registry.clone();
             async move { registry.dispatch(&req) }
@@ -1780,6 +1798,122 @@ impl AgentCardCliConfig {
     /// Sign the card and write it to `<out_dir>/.well-known/agent-card.json`. Returns the written path.
     pub fn write_card(&self, now: u64) -> std::io::Result<std::path::PathBuf> {
         crate::well_known::write_agent_card_for_origin(&self.build_card(now), &self.out_dir)
+    }
+}
+
+/// CLI/env config for a **`CapacityOffer`** (#152 — the seller side of the #147 marketplace over the
+/// `ct-agent` CLI, mirroring [`AgentCardCliConfig`]). When these vars are present, `--serve` mode also
+/// exposes the `auction/offer` + `auction/bid` MCP tools so an operator can stand up a live offer and
+/// have a live bid clear against it over a real authenticated channel — the `#144`-style live proof for
+/// the marketplace. The holder key is reused from `CT_CHANNEL_HOLDER_KEY` (same as the card).
+pub struct AgentOfferCliConfig {
+    /// The holder ed25519 signing key the offer is bound to (`CT_CHANNEL_HOLDER_KEY`, hex). SECRET.
+    signing_key: SigningKey,
+    /// Capacity kind (`CT_AGENT_OFFER_KIND` = `cloud` | `local`).
+    kind: ct_common::channel::CapacityKind,
+    /// Model ids served (`CT_AGENT_OFFER_MODELS`, comma-separated) — at least one required.
+    models: Vec<String>,
+    /// Units offered (`CT_AGENT_OFFER_UNITS`).
+    units_available: u64,
+    /// The buyer's guaranteed-minimum floor (`CT_AGENT_OFFER_MIN_PRICE`).
+    min_price: u64,
+    /// Opaque settlement-currency id (`CT_AGENT_OFFER_CURRENCY`).
+    currency_id: String,
+    /// Validity window in seconds (`CT_AGENT_OFFER_TTL_SECS`, default 86400).
+    ttl_secs: u64,
+    /// #149-A.3 per-consumer bid rate limit (`CT_AGENT_OFFER_MAX_BIDS`, default 60).
+    pub max_bids_per_window: u32,
+    /// Rate-limit window (`CT_AGENT_OFFER_WINDOW_SECS`, default 60).
+    pub window_secs: u64,
+}
+
+impl AgentOfferCliConfig {
+    /// Read the config from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (the `from_env` seam — testable without touching the real env). An
+    /// absent required var is an `Err`, which the caller treats as "no offer configured" (auction tools
+    /// stay off), exactly like the card path.
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let signing_key = SigningKey::from_bytes(
+            &f("CT_CHANNEL_HOLDER_KEY")
+                .as_deref()
+                .and_then(hex32)
+                .ok_or("CT_CHANNEL_HOLDER_KEY required (64 hex)")?,
+        );
+        let kind = match f("CT_AGENT_OFFER_KIND").as_deref().map(str::trim) {
+            Some("cloud") | Some("cloud-api") | Some("CloudApiQuota") => {
+                ct_common::channel::CapacityKind::CloudApiQuota
+            }
+            Some("local") | Some("local-hardware") | Some("LocalHardware") => {
+                ct_common::channel::CapacityKind::LocalHardware
+            }
+            Some(other) if !other.is_empty() => {
+                return Err(format!("CT_AGENT_OFFER_KIND must be 'cloud' or 'local', got '{other}'"))
+            }
+            _ => return Err("CT_AGENT_OFFER_KIND required ('cloud' or 'local')".to_string()),
+        };
+        let models = split_csv(f("CT_AGENT_OFFER_MODELS").as_deref().unwrap_or_default());
+        if models.is_empty() {
+            return Err("CT_AGENT_OFFER_MODELS required (comma-separated model ids)".to_string());
+        }
+        let req_u64 = |var: &str| -> Result<u64, String> {
+            f(var)
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("{var} required"))?
+                .parse::<u64>()
+                .map_err(|e| format!("{var} invalid: {e}"))
+        };
+        let units_available = req_u64("CT_AGENT_OFFER_UNITS")?;
+        let min_price = req_u64("CT_AGENT_OFFER_MIN_PRICE")?;
+        let currency_id = f("CT_AGENT_OFFER_CURRENCY")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or("CT_AGENT_OFFER_CURRENCY required")?;
+        let opt_u64 = |var: &str, default: u64| -> Result<u64, String> {
+            match f(var).as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => s.parse::<u64>().map_err(|e| format!("{var} invalid: {e}")),
+                _ => Ok(default),
+            }
+        };
+        let ttl_secs = opt_u64("CT_AGENT_OFFER_TTL_SECS", 86_400)?;
+        let window_secs = opt_u64("CT_AGENT_OFFER_WINDOW_SECS", 60)?;
+        let max_bids_per_window = match f("CT_AGENT_OFFER_MAX_BIDS").as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => {
+                s.parse::<u32>().map_err(|e| format!("CT_AGENT_OFFER_MAX_BIDS invalid: {e}"))?
+            }
+            _ => 60,
+        };
+        Ok(Self {
+            signing_key,
+            kind,
+            models,
+            units_available,
+            min_price,
+            currency_id,
+            ttl_secs,
+            max_bids_per_window,
+            window_secs,
+        })
+    }
+
+    /// Assemble + sign the offer (`issued_at = now`, `expires_at = now + ttl_secs`). The clock is a
+    /// parameter so the assembly is deterministic + testable, exactly like [`AgentCardCliConfig::build_card`].
+    pub fn build_offer(&self, now: u64) -> ct_common::channel::CapacityOffer {
+        ct_common::channel::CapacityOffer::sign_new(
+            &self.signing_key,
+            self.kind,
+            self.models.clone(),
+            self.units_available,
+            self.min_price,
+            self.currency_id.clone(),
+            now,
+            now.saturating_add(self.ttl_secs),
+        )
     }
 }
 
@@ -2627,6 +2761,51 @@ mod tests {
         )
         .await;
         assert!(done.is_ok(), "a silent peer times out the bounded drain instead of hanging teardown");
+    }
+
+    #[test]
+    fn agent_offer_cli_config_builds_a_valid_signed_offer_from_env() {
+        // #152 (frozen): the --serve offer config parses CT_AGENT_OFFER_* + the shared holder key into
+        // a signed CapacityOffer (so channel_local can register auction/offer + auction/bid), bound to
+        // the holder, honouring the TTL. Absent required vars → Err (auction tools stay off), exactly
+        // like the agent/card path.
+        use std::collections::HashMap;
+        let key_hex = "11".repeat(32); // 64 hex → [0x11; 32]
+        let vars: HashMap<&str, String> = HashMap::from([
+            ("CT_CHANNEL_HOLDER_KEY", key_hex.clone()),
+            ("CT_AGENT_OFFER_KIND", "cloud".to_string()),
+            ("CT_AGENT_OFFER_MODELS", "claude-opus-4-8,local-llama".to_string()),
+            ("CT_AGENT_OFFER_UNITS", "1000".to_string()),
+            ("CT_AGENT_OFFER_MIN_PRICE", "50".to_string()),
+            ("CT_AGENT_OFFER_CURRENCY", "ct-llm-token-chain".to_string()),
+            ("CT_AGENT_OFFER_TTL_SECS", "3600".to_string()),
+        ]);
+        let cfg = AgentOfferCliConfig::from_lookup(|k| vars.get(k).cloned()).expect("parses a full offer config");
+        let offer = cfg.build_offer(1_000);
+        assert!(offer.is_valid(1_000), "the built offer verifies at issue time");
+        assert!(offer.is_valid(4_599), "valid up to issued_at + ttl");
+        assert!(!offer.is_valid(4_600), "expires at now + ttl (1000 + 3600)");
+        assert_eq!(offer.kind, ct_common::channel::CapacityKind::CloudApiQuota);
+        assert_eq!(offer.models, vec!["claude-opus-4-8".to_string(), "local-llama".to_string()]);
+        assert_eq!((offer.units_available, offer.min_price), (1000, 50));
+        assert_eq!(offer.currency_id, "ct-llm-token-chain");
+        assert_eq!(
+            offer.holder_pubkey,
+            SigningKey::from_bytes(&[0x11u8; 32]).verifying_key().to_bytes(),
+            "the offer is bound to CT_CHANNEL_HOLDER_KEY"
+        );
+        // Defaults applied when optional vars are absent.
+        assert_eq!((cfg.max_bids_per_window, cfg.window_secs), (60, 60), "rate-limit defaults");
+
+        // Absent required vars → Err, so channel_local leaves the auction tools off (card/ping only).
+        assert!(AgentOfferCliConfig::from_lookup(|_| None).is_err(), "no CT_AGENT_OFFER_* → no offer");
+        // A bad kind is a clear error, not a silent default.
+        let mut bad = vars.clone();
+        bad.insert("CT_AGENT_OFFER_KIND", "chatbot".to_string());
+        assert!(
+            AgentOfferCliConfig::from_lookup(|k| bad.get(k).cloned()).is_err(),
+            "an unknown CT_AGENT_OFFER_KIND is rejected"
+        );
     }
 
     #[test]
