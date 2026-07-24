@@ -37,3 +37,7 @@ agentdb.rvf.lock
 # Scratch / analysis temp files
 .tmp_analysis_*.txt
 
+
+# #168: the flappy-demo first-layer gate config (SHA-256 hash of the demo password);
+# generated at deploy time from the out-of-band FLAPPY_DEMO_PASSWORD, never committed.
+examples/flappy-demo/gate.json

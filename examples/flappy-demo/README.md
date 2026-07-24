@@ -22,8 +22,18 @@ examples/flappy-demo/run-demo.sh down
 # status:
 examples/flappy-demo/run-demo.sh status
 ```
-`up` prints `✓ LIVE` once `https://flappy-demo.bunsenbrenner.org/` serves the studio
-(first-layer password: `flappy2020`), or actionable hints (DNS / cert / agent / edge).
+`up` prints `✓ LIVE` once `https://flappy-demo.bunsenbrenner.org/` serves the studio,
+or actionable hints (DNS / cert / agent / edge).
+
+## The demo password (never committed, #168)
+The first-layer gate password is **not** in any committed file. Set it out-of-band as
+`FLAPPY_DEMO_PASSWORD` in the untracked `docker/deploy/.env`; `run-demo.sh up` derives
+its **SHA-256 hash** into a gitignored `gate.json` (from `gate.json.example`) that Caddy
+serves next to the page. The page compares `sha256(input)` to that hash client-side —
+so neither the plaintext nor git nor the served config ever carries the secret. The
+**production-grade** gate is Caddy basic auth in front of the origin (the client gate is
+just friendly first-layer UX); add a `basic_auth` block to the `Caddyfile` with a bcrypt
+hash for a real access control.
 
 ## How it works (published like help-site, payload-blind)
 ```

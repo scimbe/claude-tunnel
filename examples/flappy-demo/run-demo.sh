@@ -77,6 +77,21 @@ else
   echo "   ! edge host-auth not configured — relying on BP4a (fine for one hostname)."
 fi
 
+# --- write the untracked gate.json the page fetches (ONLY the SHA-256 hash, #168) --
+# The plaintext demo password is provided out-of-band (FLAPPY_DEMO_PASSWORD in the
+# untracked $ENV_FILE) and NEVER stored — only its hash is written to gate.json
+# (which is gitignored). The page compares sha256(input) to this hash client-side.
+if [ -n "${FLAPPY_DEMO_PASSWORD:-}" ]; then
+  command -v sha256sum >/dev/null || die "sha256sum needed to derive the gate hash."
+  HASH="$(printf %s "$FLAPPY_DEMO_PASSWORD" | sha256sum | awk '{print $1}')"
+  printf '{"sha256":"%s"}\n' "$HASH" > gate.json
+  echo "   gate.json written (hash only — plaintext is never stored on disk or in git)"
+elif [ -f gate.json ]; then
+  echo "   using existing gate.json"
+else
+  die "no demo password configured — set FLAPPY_DEMO_PASSWORD in $ENV_FILE (out-of-band), or create gate.json from gate.json.example."
+fi
+
 say "Starting the Caddy origin + Browser-Plane agent"
 FLAPPY_JOIN_TOKEN="$TOKEN" \
 FLAPPY_AGENT_TOKEN="$FLAPPY_AGENT_TOKEN" \
@@ -88,7 +103,7 @@ FLAPPY_AGENT_EDGE_CERT_URL="${FLAPPY_AGENT_EDGE_CERT_URL:-$CP_URL/pki/ca}" \
 say "Waiting for https://$HOSTNAME_FQDN/ (Caddy completes the deSEC DNS-01 challenge first) …"
 for i in $(seq 1 60); do
   if curl -fsS --max-time 5 "https://$HOSTNAME_FQDN/" >/dev/null 2>&1; then
-    printf '\033[32m✓ LIVE — https://%s/ serves the Flappy Pipeline Studio (password: flappy2020).\033[0m\n' "$HOSTNAME_FQDN"
+    printf '\033[32m✓ LIVE — https://%s/ serves the Flappy Pipeline Studio (unlock with the configured demo password).\033[0m\n' "$HOSTNAME_FQDN"
     exit 0
   fi
   sleep 5
