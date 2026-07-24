@@ -102,6 +102,31 @@ fn require_issue_admin(
     Ok(())
 }
 
+/// #161/#87 SEC87b-auth: gate agent-directory self-registration (`POST /registry/agents`) behind
+/// the shared machine-writer admin token (constant-time compare). Same semantics as
+/// [`require_issue_admin`] — `Ok(())` when no token is configured (dev/back-compat) OR the correct
+/// `x-ct-admin-token` header is presented; `401` otherwise — with a route-specific message.
+fn require_agent_registry_admin(
+    headers: &HeaderMap,
+    expected: &Option<[u8; 32]>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(exp) = expected {
+        let ok = headers
+            .get("x-ct-admin-token")
+            .and_then(|v| v.to_str().ok())
+            .and_then(hex_decode_32)
+            .map(|t| ct_token_eq(&t, exp))
+            .unwrap_or(false);
+        if !ok {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "agent-directory self-registration requires the admin token".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn issue(
     State(st): State<EnrollState>,
     headers: HeaderMap,
@@ -849,29 +874,35 @@ pub fn authed_topology_router(
         .with_state(AuthedTopologyState { topologies, verifier })
 }
 
-/// State for the searchable agent directory (#144 ②): the store + OIDC verifier.
+/// State for the searchable agent directory (#144 ②): the store + the shared
+/// machine-writer admin token that gates self-registration (#161).
 #[derive(Clone)]
 struct AgentDirectoryState {
     directory: Arc<SqliteAgentDirectory>,
-    verifier: Arc<OidcVerifier>,
+    admin_token: Option<[u8; 32]>,
 }
 
 /// #144 ②: the **searchable agent-directory** REST.
 ///
 /// * `POST /registry/agents` `{holder_pubkey, card_url, role_tags?, skill_ids?}` — an agent
-///   self-registers (upsert) its published card URL + advertised facets. **OIDC-bearer-gated**
-///   (#87 — writes need an authenticated caller; anti-anonymous-spam). Trust is NOT the registry:
-///   a searcher fetches `card_url` (`/.well-known/agent-card.json`) and re-checks the holder
-///   signature, so binding the caller's subject to `holder_pubkey` is a hardening follow.
+///   self-registers (upsert) its published card URL + advertised facets. Gated by the shared
+///   **machine-writer admin token** (`CT_CP_EDGE_ADMIN_TOKEN`, #161/#87 SEC87b-auth) — the same
+///   gate as `/enroll/issue`, `/registry/register` and `/bootstrap/mint`, NOT a *human* OIDC
+///   bearer: an autonomous agent has no browser-interactive login (the `ct-portal` client has
+///   direct-access + service-accounts disabled), so requiring a user bearer made the directory
+///   un-writable by the very agents it exists to list (#161). Trust is NOT the registry: a
+///   searcher fetches `card_url` (`/.well-known/agent-card.json`) and re-checks the holder
+///   signature, which is the actual trust anchor; the admin token is only the anti-anonymous-spam
+///   gate. `None` → open (dev/back-compat).
 /// * `GET /registry/agents?role=&skill=` — **public** search by exact role/skill token → the
 ///   matching entries (each = holder key + card URL + facets to fetch & verify).
 pub fn agent_directory_router(
     directory: Arc<SqliteAgentDirectory>,
-    verifier: Arc<OidcVerifier>,
+    admin_token: Option<[u8; 32]>,
 ) -> Router {
     Router::new()
         .route("/registry/agents", post(agent_register).get(agent_search))
-        .with_state(AgentDirectoryState { directory, verifier })
+        .with_state(AgentDirectoryState { directory, admin_token })
 }
 
 #[derive(Deserialize)]
@@ -889,9 +920,12 @@ async fn agent_register(
     headers: HeaderMap,
     Json(req): Json<RegisterAgentReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // #87: writes require a valid bearer. The authenticated subject is the anti-spam gate; the
-    // card's holder signature (checked when a peer fetches `card_url`) is the actual trust anchor.
-    let _subject = subject_of(&state.verifier, &headers)?;
+    // #161/#87 SEC87b-auth: self-registration is a machine-to-machine write, gated by the shared
+    // edge/operator admin token (the same `CT_CP_EDGE_ADMIN_TOKEN` as every other machine-writer),
+    // NOT a human OIDC bearer — an autonomous agent has no interactive-login path to obtain one.
+    // The card's holder signature (re-checked when a peer fetches `card_url`) is the actual trust
+    // anchor; this gate is only the anti-anonymous-spam control. `None` → open (dev/back-compat).
+    require_agent_registry_admin(&headers, &state.admin_token)?;
     // SSRF defence-in-depth (same class as #137): only accept https card URLs. The authoritative
     // internal/link-local/metadata-range block belongs at the (not-yet-existent) fetcher; rejecting
     // a non-https `card_url` at registration closes the door before any fetcher lands.
@@ -2296,6 +2330,14 @@ pub fn persistent_control_plane_router(
         // #90/#97 SEC90b-wire: bootstrap-token exchange — /bootstrap/mint (admin-gated)
         // + /bootstrap/redeem (public, single-use short-TTL token handed off over TLS).
         .merge(bootstrap_router(bootstrap.clone(), admin_token))
+        // #144 ②/#161: the searchable agent directory — public `GET /registry/agents` search +
+        // machine-writer-gated `POST` self-register (same `CT_CP_EDGE_ADMIN_TOKEN` as the other
+        // agent-facing writers). Mounted unconditionally (no OIDC dependency): autonomous agents
+        // self-enroll M2M and any peer searches — neither has a browser-interactive login path.
+        .merge(agent_directory_router(
+            Arc::new(SqliteAgentDirectory::open(db_path)?),
+            admin_token,
+        ))
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
         // proof-gated (operator-signed invitation + invitee redemption + Noise attest).
         .merge(channel_invite_router(channels.clone()))
@@ -2361,10 +2403,6 @@ pub fn persistent_control_plane_router(
     if let Some(oidc) = oidc {
         // #102-rest: the declarative-network REST surface (owner = verified subject).
         let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
-        // #144 ②: the searchable agent directory — public `GET /registry/agents` search +
-        // bearer-gated `POST` self-register. Mounted here (needs the OIDC verifier for the POST),
-        // so without an OIDC config it's simply absent, like the other authed surfaces.
-        let agent_directory = Arc::new(SqliteAgentDirectory::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -2373,7 +2411,6 @@ pub fn persistent_control_plane_router(
             ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone()))
-            .merge(agent_directory_router(agent_directory, oidc.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc));
@@ -3365,9 +3402,11 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_control_plane_mounts_the_agent_registry() {
-        // #144 ②: the searchable agent directory is actually MOUNTED into the composed app when an
-        // OIDC verifier is configured — `GET /registry/agents` is reachable (200, not 404) — and
-        // is absent (404) without one, like the other authed surfaces.
+        // #144 ②/#161: the searchable agent directory is MOUNTED unconditionally — its public
+        // `GET /registry/agents` search is reachable (200, not 404) with OR without an OIDC
+        // verifier. The write (`POST`) is a machine-writer gated by the admin token (not OIDC),
+        // so the directory no longer rides on the authed `/me/*` surface; both autonomous agents
+        // (self-enroll M2M) and any peer (search) reach it without a browser-interactive login.
         use axum::body::{to_bytes, Body};
         use axum::http::Request;
         use tower::ServiceExt;
@@ -3383,13 +3422,14 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
         assert!(serde_json::from_slice::<Vec<AgentDirectoryEntry>>(&body).unwrap().is_empty(), "empty directory");
 
-        // Without an OIDC verifier the whole authed surface (incl. the registry) is absent.
+        // Without an OIDC verifier the public search is STILL mounted (#161): it is a public,
+        // machine-facing surface, not part of the authed `/me/*` set that OIDC gates.
         let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", None).unwrap();
-        let miss = no_oidc
-            .oneshot(Request::get("/registry/agents").body(Body::empty()).unwrap())
+        let still = no_oidc
+            .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(miss.status(), StatusCode::NOT_FOUND, "registry absent without OIDC");
+        assert_eq!(still.status(), StatusCode::OK, "public search mounts without OIDC (#161)");
 
         let _ = std::fs::remove_file(&db);
     }
@@ -3939,27 +3979,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_directory_rest_registers_with_bearer_and_searches_publicly() {
-        // #144 ②: POST self-register is OIDC-bearer-gated (#87), GET search is public. A registered
-        // agent is discoverable by its advertised role; the response carries the card URL a peer
-        // fetches + verifies.
+    async fn agent_directory_rest_registers_with_admin_token_and_searches_publicly() {
+        // #161/#87 SEC87b-auth: POST self-register is a machine-to-machine write gated by the
+        // shared `CT_CP_EDGE_ADMIN_TOKEN` (the same gate as `/enroll/issue`, `/registry/register`,
+        // `/bootstrap/mint`) — NOT a human OIDC bearer, which an autonomous agent cannot obtain
+        // (the `ct-portal` client disables direct-access + service-accounts). GET search stays
+        // public. A registered agent is discoverable by its advertised role; the response carries
+        // the card URL a peer fetches + verifies (the holder signature is the real trust anchor).
         use axum::body::{to_bytes, Body};
         use axum::http::Request;
-        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-        use std::time::{SystemTime, UNIX_EPOCH};
         use tower::ServiceExt;
 
-        let secret = b"realm-secret";
-        let issuer = "https://kc/realms/ct";
-        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let admin = [0x5au8; 32];
         let dir = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
-        let app = agent_directory_router(dir, verifier);
+        let app = agent_directory_router(dir, Some(admin));
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
-        let jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
-
-        // POST without a bearer -> 401.
+        // POST without the admin token -> 401.
         let unauth = app
             .clone()
             .oneshot(
@@ -3970,21 +4005,35 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "self-register needs a bearer (#87)");
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "self-register needs the admin token (#161)");
 
-        // POST with a bearer -> 200.
+        // POST with a wrong admin token -> 401.
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::post("/registry/agents")
+                    .header("x-ct-admin-token", hex_encode(&[0u8; 32]))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"holder_pubkey":"aa","card_url":"https://x/.well-known/agent-card.json","role_tags":["source"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "wrong admin token -> 401");
+
+        // POST with the correct admin token -> 200.
         let reg = app
             .clone()
             .oneshot(
                 Request::post("/registry/agents")
-                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("x-ct-admin-token", hex_encode(&admin))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"holder_pubkey":"aa","card_url":"https://source-1/.well-known/agent-card.json","role_tags":["source"],"skill_ids":["transfer"]}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(reg.status(), StatusCode::OK, "authenticated self-register succeeds");
+        assert_eq!(reg.status(), StatusCode::OK, "admin-token self-register succeeds");
 
         // GET is public: search by role returns the registered agent + its card URL.
         let hit = app
@@ -3992,7 +4041,7 @@ mod tests {
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(hit.status(), StatusCode::OK, "search is public (no bearer)");
+        assert_eq!(hit.status(), StatusCode::OK, "search is public (no token)");
         let body = to_bytes(hit.into_body(), 1 << 16).await.unwrap();
         let hits: Vec<AgentDirectoryEntry> = serde_json::from_slice(&body).unwrap();
         assert_eq!(hits.len(), 1);
@@ -4013,7 +4062,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/registry/agents")
-                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("x-ct-admin-token", hex_encode(&admin))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"holder_pubkey":"bb","card_url":"http://169.254.169.254/latest/meta-data","role_tags":["x"]}"#))
                     .unwrap(),
@@ -4026,7 +4075,7 @@ mod tests {
         let injected = app
             .oneshot(
                 Request::post("/registry/agents")
-                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("x-ct-admin-token", hex_encode(&admin))
                     .header("content-type", "application/json")
                     .body(Body::from("{\"holder_pubkey\":\"cc\",\"card_url\":\"https://x/.well-known/agent-card.json\",\"role_tags\":[\"source\\nadmin\"]}"))
                     .unwrap(),
