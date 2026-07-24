@@ -16,8 +16,16 @@
 # no caching), so install the `docker-buildx` plugin if rebuilds stay cold. Cache
 # mounts are not part of the built image layer, so the binaries are copied out to
 # /build/bin for the runtime stage to COPY --from.
+#
+# #165: the builder is pinned to `-bookworm` explicitly, matching the runtime's
+# `debian:bookworm-slim` glibc (2.36). The unsuffixed `rust:1-slim` tag floats to
+# whatever Debian release upstream currently ships — it moved to trixie (glibc 2.41)
+# partway through this project, silently producing runtime-broken binaries (a fresh
+# `GLIBC_2.39' not found crash) for every build until this pin. If the runtime stage
+# below is ever bumped to a newer Debian release, bump this tag's `-bookworm` suffix
+# to match in the same change — the two stages' glibc must never drift apart again.
 
-FROM rust:1-slim AS builder
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
