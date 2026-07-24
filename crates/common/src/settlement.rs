@@ -769,8 +769,11 @@ impl Vote {
 /// retries a higher term, never a split-brain commit).
 pub fn elect_leader(votes: &[Vote], members: &[Account], term: u64) -> Option<Account> {
     let member_set: BTreeSet<&Account> = members.iter().collect();
-    let mut counted_voters: BTreeSet<Account> = BTreeSet::new();
-    let mut tally: BTreeMap<Account, usize> = BTreeMap::new();
+    // Group each member-voter's DISTINCT candidate choices among the valid votes for `term`. Using
+    // `BTreeSet`s makes the tally a pure function of the vote *set*, independent of the `votes` slice's
+    // iteration order (#157): two nodes that received the same votes over an unordered gossip channel in
+    // a different arrival order now compute the identical result — no order-dependent split-brain.
+    let mut voter_choices: BTreeMap<Account, BTreeSet<Account>> = BTreeMap::new();
     for v in votes {
         if v.term != term
             || !member_set.contains(&v.voter)
@@ -779,11 +782,20 @@ pub fn elect_leader(votes: &[Vote], members: &[Account], term: u64) -> Option<Ac
         {
             continue;
         }
-        // One vote per voter (first accepted wins) — equivocation can't inflate a tally.
-        if !counted_voters.insert(v.voter) {
-            continue;
+        voter_choices.entry(v.voter).or_default().insert(v.candidate);
+    }
+    // One vote per HONEST voter. A voter that chose **more than one** distinct candidate in the term is
+    // equivocating — provably Byzantine — and is **excluded entirely** (never counted toward any
+    // candidate), so it can't tip an election either way. A voter that merely repeated the same vote
+    // (a gossip duplicate) chose exactly one candidate and counts once. The old "first accepted in slice
+    // order" rule counted such an equivocator's arbitrary first vote, which is exactly the
+    // order-dependence #157 reported.
+    let mut tally: BTreeMap<Account, usize> = BTreeMap::new();
+    for choices in voter_choices.values() {
+        if choices.len() == 1 {
+            let candidate = *choices.iter().next().expect("len == 1");
+            *tally.entry(candidate).or_insert(0) += 1;
         }
-        *tally.entry(v.candidate).or_insert(0) += 1;
     }
     let needed = members.len() / 2 + 1; // strict majority: > members/2
     tally.into_iter().find(|&(_, count)| count >= needed).map(|(candidate, _)| candidate)
@@ -981,23 +993,47 @@ mod tests {
             "a non-member's vote doesn't count"
         );
 
-        // Equivocation: w2 votes for BOTH a and b in the term — counted once (first), so it can't push
-        // `a` to a spurious majority on its own; with w1 also for `a`, `a` still wins by two real voters.
-        let elected = elect_leader(
-            &[
-                Vote::sign_new(&w1, term, a),
-                Vote::sign_new(&w2, term, a),
-                Vote::sign_new(&w2, term, b), // w2's second (equivocating) vote — ignored
-            ],
-            &members,
-            term,
+        // #157: an equivocating voter (w2 votes for BOTH a and b) is EXCLUDED entirely (provably
+        // Byzantine) — it counts toward NO candidate, so it can't tip an election. With only w1 honestly
+        // voting `a`, that's 1 of 3 → no majority → None (the old "first accepted" rule wrongly counted
+        // w2's arbitrary first vote toward `a` and elected it).
+        assert_eq!(
+            elect_leader(
+                &[
+                    Vote::sign_new(&w1, term, a),
+                    Vote::sign_new(&w2, term, a),
+                    Vote::sign_new(&w2, term, b),
+                ],
+                &members,
+                term,
+            ),
+            None,
+            "an equivocating voter is excluded, so `a` (1 honest vote) has no majority"
         );
-        assert_eq!(elected, Some(a), "an equivocating voter counts once; a still has a real majority");
-        // And equivocation alone can't elect: w2 voting a then b, with no other votes → no majority.
+        // Equivocation alone can't elect either.
         assert_eq!(
             elect_leader(&[Vote::sign_new(&w2, term, a), Vote::sign_new(&w2, term, b)], &members, term),
             None,
             "one equivocating voter cannot elect anyone"
+        );
+
+        // #157 core: the result is a pure function of the vote SET, independent of slice order. A gossip
+        // duplicate (same voter, same candidate) still counts once; and permuting the votes — including
+        // an equivocating pair — yields the identical result every time.
+        let honest = [Vote::sign_new(&w1, term, a), Vote::sign_new(&w2, term, a), Vote::sign_new(&w2, term, a)];
+        assert_eq!(elect_leader(&honest, &members, term), Some(a), "w1 + w2 (dup) for a → a elected");
+        let mut reversed = honest.clone();
+        reversed.reverse();
+        assert_eq!(elect_leader(&reversed, &members, term), Some(a), "reversed order → same result (order-independent)");
+        // An equivocating pair permuted both ways gives the SAME answer (None) — the reported bug was
+        // that b-first vs a-first produced different results.
+        let equiv_ab = [Vote::sign_new(&w1, term, a), Vote::sign_new(&w2, term, a), Vote::sign_new(&w2, term, b)];
+        let mut equiv_ba = equiv_ab.clone();
+        equiv_ba.reverse();
+        assert_eq!(
+            elect_leader(&equiv_ab, &members, term),
+            elect_leader(&equiv_ba, &members, term),
+            "same equivocating vote set, different order → identical result (#157 fixed)"
         );
     }
 
