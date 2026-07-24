@@ -475,6 +475,45 @@ impl Hold {
             Err(_) => false,
         }
     }
+
+    /// Fixed wire length: `from(32) ‖ to(32) ‖ amount(8) ‖ match_ref(32) ‖ nonce(8) ‖ expires_at(8) ‖
+    /// signature(64)`.
+    pub const WIRE_LEN: usize = 32 + 32 + 8 + 32 + 8 + 8 + 64;
+
+    /// Canonical fixed-layout binary encoding (#147-L2 on-chain escrow — maintainer decision
+    /// 2026-07-24: escrow committed on-chain for maximum transaction security). This is the wire form a
+    /// `Hold` needs to be persisted, replicated, and committed in a settlement block — exactly as
+    /// [`Transfer::encode`] is for a transfer — so the lock becomes tamper-evident chain state rather
+    /// than in-memory-only.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&self.from);
+        out.extend_from_slice(&self.to);
+        out.extend_from_slice(&self.amount.to_le_bytes());
+        out.extend_from_slice(&self.match_ref);
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.expires_at.to_le_bytes());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// Decode from [`encode`](Self::encode). `None` on a wrong-length input. Structural only — the
+    /// signature is (re-)checked by [`verify`](Self::verify) / [`Escrow::lock`], so a decoded hold is
+    /// never trusted on its own.
+    pub fn decode(b: &[u8]) -> Option<Hold> {
+        if b.len() != Self::WIRE_LEN {
+            return None;
+        }
+        Some(Hold {
+            from: b[0..32].try_into().ok()?,
+            to: b[32..64].try_into().ok()?,
+            amount: u64::from_le_bytes(b[64..72].try_into().ok()?),
+            match_ref: b[72..104].try_into().ok()?,
+            nonce: u64::from_le_bytes(b[104..112].try_into().ok()?),
+            expires_at: u64::from_le_bytes(b[112..120].try_into().ok()?),
+            signature: b[120..184].try_into().ok()?,
+        })
+    }
 }
 
 /// Why an [`Escrow`] operation failed.
@@ -908,6 +947,26 @@ mod tests {
         let mut impersonate = LeaderAttestation::sign_new(&w2, term, bh);
         impersonate.leader = a;
         assert!(!authorize_leader_block(&impersonate, &elected, term, &bh), "claiming the leader's identity without its key fails");
+    }
+
+    #[test]
+    fn hold_encode_round_trips_and_rejects_malformed() {
+        // #147-L2 on-chain escrow (frozen): a Hold has a canonical fixed-wire form — the prerequisite
+        // for committing escrow in a settlement block (maintainer decision 2026-07-24: escrow on-chain
+        // for max transaction security). It round-trips losslessly, still verifies after decode (the
+        // signed content is preserved), and rejects a wrong-length buffer.
+        let consumer = key(1);
+        let provider = key(2);
+        let hold = Hold::sign_new(&consumer, acct(&provider), 4242, [0x3Cu8; 32], 7, 5_000);
+        let bytes = hold.encode();
+        assert_eq!(bytes.len(), Hold::WIRE_LEN, "fixed wire length");
+        let back = Hold::decode(&bytes).expect("round-trips");
+        assert_eq!(back, hold, "decode is the inverse of encode");
+        assert!(back.verify(), "the decoded hold still verifies (signed content preserved)");
+        assert!(Hold::decode(&bytes[..bytes.len() - 1]).is_none(), "a truncated buffer is rejected");
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(Hold::decode(&long).is_none(), "an over-long buffer is rejected");
     }
 
     #[test]
