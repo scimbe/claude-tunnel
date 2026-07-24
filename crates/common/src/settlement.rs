@@ -679,6 +679,33 @@ impl Escrow {
         self.balances.insert(from, credited);
         Ok(())
     }
+
+    /// Enumerate the `match_ref`s of every hold whose deadline has passed at `now` and that hasn't been
+    /// released yet (#151 — the missing reconciliation primitive). A reconciliation loop calls this to
+    /// **discover** which holds are refundable without having to track every `match_ref` it ever locked
+    /// (fragile across restarts). Read-only; deterministic order (ascending `match_ref`).
+    pub fn expired_holds(&self, now: u64) -> Vec<[u8; 32]> {
+        self.held
+            .iter()
+            .filter(|(_, rec)| now >= rec.expires_at)
+            .map(|(match_ref, _)| *match_ref)
+            .collect()
+    }
+
+    /// **Refund every expired-but-unreleased hold** at `now`, returning the `match_ref`s actually
+    /// refunded (#151 reconciliation sweep — the one call a lightweight periodic in-process loop makes
+    /// so buyer funds don't sit locked forever when a provider never delivers). Combines
+    /// [`expired_holds`](Self::expired_holds) with [`refund`](Self::refund) per match; value-conserving
+    /// and idempotent — a second sweep at the same `now` refunds nothing new (the holds are gone) and
+    /// still-current holds are untouched. No new service/DB/dependency: just a scheduled call into
+    /// existing code (the `tokio::time::interval` driver is the live-wiring follow, wherever the escrow
+    /// instance lives).
+    pub fn refund_expired(&mut self, now: u64) -> Vec<[u8; 32]> {
+        self.expired_holds(now)
+            .into_iter()
+            .filter(|match_ref| self.refund(match_ref, now).is_ok())
+            .collect()
+    }
 }
 
 /// Domain separating a [`Vote`] preimage from every other signed object in the codebase.
@@ -1040,6 +1067,46 @@ mod tests {
         let wrong_provider = UsageReceipt::co_sign(&stranger, &consumer, CapacityKind::CloudApiQuota, "m".into(), 30, m1, 1);
         assert_eq!(esc3.release(&wrong_provider), Err(EscrowError::ReceiptMismatch), "receipt naming a different provider can't drain the hold");
         assert_eq!(esc3.held_amount(&m1), 30, "the mismatched attempts left the escrow untouched");
+    }
+
+    #[test]
+    fn refund_expired_reconciles_only_past_deadline_holds_and_is_idempotent() {
+        // #151 (frozen): the reconciliation sweep discovers and refunds every expired-but-unreleased
+        // hold, leaves still-current holds locked, credits each consumer back (value-conserving), and
+        // is idempotent — a second sweep at the same time refunds nothing new. This is what makes the
+        // escrow-at-match buyer protection actual instead of theoretical.
+        let consumer = key(1);
+        let provider = key(2);
+        let (c, p) = (acct(&consumer), acct(&provider));
+        let (m1, m2, m3) = ([0x01u8; 32], [0x02u8; 32], [0x03u8; 32]);
+        let total = |e: &Escrow| e.balance(&c) + e.balance(&p) + e.held_amount(&m1) + e.held_amount(&m2) + e.held_amount(&m3);
+
+        let mut esc = Escrow::new(BTreeMap::from([(c, 100)]));
+        esc.lock(&Hold::sign_new(&consumer, p, 10, m1, 0, 1_000)).unwrap(); // expires 1_000
+        esc.lock(&Hold::sign_new(&consumer, p, 20, m2, 1, 2_000)).unwrap(); // expires 2_000
+        esc.lock(&Hold::sign_new(&consumer, p, 30, m3, 2, 1_000)).unwrap(); // expires 1_000
+        assert_eq!(esc.balance(&c), 40, "60 locked across three holds");
+        assert_eq!(total(&esc), 100, "genesis value");
+
+        // Enumeration is read-only and finds exactly the past-deadline holds at now=1_500 (m1, m3).
+        assert_eq!(esc.expired_holds(1_500), vec![m1, m3], "only the two expired holds are enumerated");
+        assert_eq!(esc.held_amount(&m1), 10, "expired_holds does not mutate");
+
+        // Sweep at 1_500: refunds m1 + m3 to the consumer; m2 (not yet expired) stays held.
+        assert_eq!(esc.refund_expired(1_500), vec![m1, m3], "the sweep refunds exactly the expired holds");
+        assert_eq!(esc.balance(&c), 80, "consumer made whole for m1(10)+m3(30)");
+        assert_eq!(esc.held_amount(&m2), 20, "the still-current hold is untouched");
+        assert_eq!(total(&esc), 100, "value conserved across the sweep");
+
+        // Idempotent: a second sweep at the same time refunds nothing (the expired holds are gone, m2
+        // isn't due yet).
+        assert!(esc.refund_expired(1_500).is_empty(), "a repeat sweep refunds nothing new");
+        assert_eq!(esc.balance(&c), 80, "no double refund");
+
+        // Later, m2's deadline passes → the sweep refunds it too.
+        assert_eq!(esc.refund_expired(2_000), vec![m2], "m2 refunds once its deadline passes");
+        assert_eq!(esc.balance(&c), 100, "consumer fully made whole; nothing sat locked forever");
+        assert!(esc.expired_holds(9_999).is_empty(), "no holds remain");
     }
 
     #[test]
