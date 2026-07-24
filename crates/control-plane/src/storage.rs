@@ -1778,6 +1778,23 @@ pub struct SqliteTopologyStore {
     conn: Mutex<Connection>,
 }
 
+/// Decode a topology node id — a 32-byte agent holder key as 64 hex chars (#107-enforce unified
+/// identity) — into raw bytes, or `None` if it is not exactly 64 valid hex characters (so a
+/// non-holder-key label is skipped by [`SqliteTopologyStore::authorized_channels`] rather than
+/// naming a bogus channel).
+fn topo_node_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 impl SqliteTopologyStore {
     /// Open (creating if needed) a durable store at `path`.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
@@ -1993,6 +2010,30 @@ impl SqliteTopologyStore {
         Ok(edges)
     }
 
+    /// The set of channels this topology's declared edges **authorize** on the wire (#107-enforce,
+    /// maintainer 2026-07-24 "most robust"): fold the edges through
+    /// [`channel_id_for_link`](ct_common::channel::channel_id_for_link) and return the `ChannelId`s
+    /// the drawn graph sanctions. Under the **unified identity model** a topology node id *is* the
+    /// agent's 32-byte holder key (hex) — the same identity `channel_members` and `channel_id_for_link`
+    /// use — so there is no node-id↔holder mapping to drift out of sync. The admission gate consults
+    /// this so a member is admissible to a channel **iff** the declared topology contains the link
+    /// that names it (removing an edge stops authorizing its channel, no per-channel bookkeeping). An
+    /// edge whose endpoint is not a valid 64-hex holder key is skipped — it cannot name a real
+    /// channel. `operator_pubkey` is the channel operator's key (from the channels table);
+    /// `channel_id_for_link` is operator-bound, so channels stay isolated across operators.
+    pub fn authorized_channels(
+        &self,
+        topology: &str,
+        operator_pubkey: &[u8; 32],
+    ) -> rusqlite::Result<std::collections::HashSet<ChannelId>> {
+        let links: Vec<([u8; 32], [u8; 32])> = self
+            .edges(topology)?
+            .iter()
+            .filter_map(|(a, b)| Some((topo_node_hex32(a)?, topo_node_hex32(b)?)))
+            .collect();
+        Ok(ct_common::channel::authorized_channels(operator_pubkey, &links))
+    }
+
     /// Load the current assignment for `agent`, reconstructed from its row.
     fn load(conn: &Connection, agent: &str) -> rusqlite::Result<Option<crate::topology::AgentAssignment>> {
         let row: Option<(String, Option<String>)> = conn
@@ -2063,6 +2104,49 @@ impl SqliteTopologyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topology_authorized_channels_fold_edges_through_link_derivation() {
+        // #107-enforce (frozen): a topology's authorized channel set = its declared edges folded
+        // through channel_id_for_link. Under the unified identity model (maintainer 2026-07-24
+        // "most robust") a node id IS the agent's 32-byte holder key (hex), so an edge names
+        // exactly its derived channel; an undeclared pair is absent (membership ≠ authorization);
+        // a non-holder-key label is skipped; and it is operator-bound + empty for unknown topos.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        let owner = "alice";
+        store.create_topology(owner, "t1", "uuid1").unwrap();
+
+        let op = [0x11u8; 32];
+        let a = [0xaau8; 32];
+        let b = [0xbbu8; 32];
+        let c = [0xccu8; 32];
+        let hx = |k: &[u8; 32]| k.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        // Declared graph: a—b and b—c (holder-hex node ids). Plus a bogus non-hex edge that the
+        // derivation must skip (it cannot name a real channel).
+        store.add_edge(owner, "t1", &hx(&a), &hx(&b)).unwrap();
+        store.add_edge(owner, "t1", &hx(&b), &hx(&c)).unwrap();
+        store.add_edge(owner, "t1", "not-a-holder-key", &hx(&a)).unwrap();
+
+        let authorized = store.authorized_channels("t1", &op).unwrap();
+        let ab = ct_common::channel::channel_id_for_link(&op, &a, &b);
+        let bc = ct_common::channel::channel_id_for_link(&op, &b, &c);
+        assert_eq!(authorized.len(), 2, "exactly the two valid declared links (bogus edge skipped)");
+        assert!(authorized.contains(&ab) && authorized.contains(&bc), "both declared links present");
+
+        // An undeclared pair a—c is NOT authorized even though both are members of the graph.
+        assert!(
+            !authorized.contains(&ct_common::channel::channel_id_for_link(&op, &a, &c)),
+            "undeclared a—c refused (membership is not authorization)"
+        );
+
+        // Operator-bound: another operator's identically-shaped topology authorizes other channels.
+        let authorized2 = store.authorized_channels("t1", &[0x22u8; 32]).unwrap();
+        assert!(!authorized2.contains(&ab), "operator-bound: op2 does not authorize op1's channel");
+
+        // An unknown / empty topology authorizes nothing.
+        assert!(store.authorized_channels("nope", &op).unwrap().is_empty(), "unknown topology → empty");
+    }
 
     fn tenant() -> TenantId {
         TenantId("tenant-1".into())
