@@ -1883,14 +1883,29 @@ impl SqliteTopologyStore {
     /// Bind a topology's **operator public key** (#107-enforce): the ed25519 operator identity its
     /// overlay links derive channels under. Self-contained on the topology so enforcement needs no
     /// fragile cross-store join — the overlay itself declares whose operator authority governs it.
-    /// Owner-scoped: returns `false` (no-op) if `id` doesn't exist or isn't owned by `owner`, so a
-    /// subject can never rebind a topology it doesn't own. Idempotent (re-binding overwrites).
+    ///
+    /// **Two independent checks, both required (#107-enforce ii-a):**
+    /// * **owner-scoping** — returns `false` (no-op) if `id` doesn't exist or isn't owned by
+    ///   `owner`, so a subject can never rebind a topology it doesn't own.
+    /// * **proof-of-possession** — `proof` must be the operator's ed25519 signature over
+    ///   [`topology_operator_binding_bytes`](ct_common::channel::topology_operator_binding_bytes);
+    ///   a binding whose proof doesn't verify under `operator_pubkey` is rejected (`false`).
+    ///   Because `operator_pubkey` is public, without this anyone could bind a *victim's* operator
+    ///   key to their own topology and (once enforcement consults it) mint admission to the
+    ///   victim's channels. Owner-scoping proves *topology* control; this proves *operator-secret*
+    ///   possession.
+    ///
+    /// Idempotent (a valid re-bind overwrites).
     pub fn set_operator(
         &self,
         owner: &str,
         id: &str,
         operator_pubkey: &[u8; 32],
+        proof: &[u8; 64],
     ) -> rusqlite::Result<bool> {
+        if !ct_common::channel::verify_topology_operator_binding(id, operator_pubkey, proof) {
+            return Ok(false);
+        }
         let n = self.conn.lock_safe().execute(
             "UPDATE topologies SET operator_pubkey = ?3 WHERE id = ?1 AND owner = ?2",
             params![id, owner, &operator_pubkey[..]],
@@ -2189,27 +2204,43 @@ mod tests {
     }
 
     #[test]
-    fn topology_operator_binding_is_owner_scoped_and_drives_authorized_channels() {
-        // #107-enforce (frozen): a topology carries its OWN operator pubkey (self-contained, no
-        // cross-store join). set_operator is owner-scoped; operator() reads it back; a non-owner
-        // cannot rebind; unbound/unknown → None; and the bound operator is the identity the
-        // topology's authorized channels derive under.
+    fn topology_operator_binding_is_owner_scoped_authenticated_and_drives_authorized_channels() {
+        // #107-enforce ii-a (frozen): a topology carries its OWN operator pubkey, bound only with
+        // BOTH (owner-scoping) AND (operator proof-of-possession) — closing the admission bypass
+        // where a public operator key could be bound to an attacker's topology. operator() reads it
+        // back; unbound/unknown → None; and the bound operator is the identity authorized_channels
+        // derives under.
+        use ed25519_dalek::{Signer, SigningKey};
         let store = SqliteTopologyStore::open_in_memory().unwrap();
         store.create_topology("alice", "t1", "uuid1").unwrap();
-        let op = [0x11u8; 32];
+
+        let op_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let op = op_sk.verifying_key().to_bytes();
+        // The operator's proof-of-possession for binding its key to topology "t1".
+        let proof = op_sk
+            .sign(&ct_common::channel::topology_operator_binding_bytes("t1", &op))
+            .to_bytes();
 
         // Unbound initially; unknown topology → None.
         assert_eq!(store.operator("t1").unwrap(), None, "no operator bound yet");
         assert_eq!(store.operator("nope").unwrap(), None, "unknown topology → None");
 
-        // Owner binds; reads back.
-        assert!(store.set_operator("alice", "t1", &op).unwrap(), "owner binds the operator");
-        assert_eq!(store.operator("t1").unwrap(), Some(op), "operator reads back");
+        // A valid proof but WRONG owner is rejected (owner-scoping), binding stays absent.
+        assert!(!store.set_operator("mallory", "t1", &op, &proof).unwrap(), "non-owner cannot bind");
+        assert_eq!(store.operator("t1").unwrap(), None, "unauthorized owner left it unbound");
 
-        // A non-owner cannot rebind (owner-scoped no-op); the binding is unchanged.
-        let other = [0x22u8; 32];
-        assert!(!store.set_operator("mallory", "t1", &other).unwrap(), "non-owner cannot rebind");
-        assert_eq!(store.operator("t1").unwrap(), Some(op), "binding unchanged after unauthorized attempt");
+        // The owner WITHOUT a valid proof is rejected (proof-of-possession) — this is the bypass
+        // guard: a forged proof (attacker key signing op's binding) cannot bind op's key.
+        let attacker = SigningKey::from_bytes(&[0x99u8; 32]);
+        let forged = attacker
+            .sign(&ct_common::channel::topology_operator_binding_bytes("t1", &op))
+            .to_bytes();
+        assert!(!store.set_operator("alice", "t1", &op, &forged).unwrap(), "forged proof rejected (no bypass)");
+        assert_eq!(store.operator("t1").unwrap(), None, "forged proof left it unbound");
+
+        // Owner + valid proof binds; reads back.
+        assert!(store.set_operator("alice", "t1", &op, &proof).unwrap(), "owner + valid proof binds");
+        assert_eq!(store.operator("t1").unwrap(), Some(op), "operator reads back");
 
         // The bound operator is the identity the topology's authorized channels derive under.
         let a = [0xaau8; 32];
@@ -2225,9 +2256,14 @@ mod tests {
             "authorized channels derive under the bound operator key"
         );
 
-        // Re-binding overwrites (idempotent setter).
-        assert!(store.set_operator("alice", "t1", &other).unwrap(), "owner re-binds");
-        assert_eq!(store.operator("t1").unwrap(), Some(other), "re-bind overwrites");
+        // A valid re-bind (to another proven operator key) overwrites (idempotent setter).
+        let op2_sk = SigningKey::from_bytes(&[0x55u8; 32]);
+        let op2 = op2_sk.verifying_key().to_bytes();
+        let proof2 = op2_sk
+            .sign(&ct_common::channel::topology_operator_binding_bytes("t1", &op2))
+            .to_bytes();
+        assert!(store.set_operator("alice", "t1", &op2, &proof2).unwrap(), "owner re-binds with proof");
+        assert_eq!(store.operator("t1").unwrap(), Some(op2), "re-bind overwrites");
     }
 
     fn tenant() -> TenantId {

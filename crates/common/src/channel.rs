@@ -576,6 +576,45 @@ pub fn verify_holder_possession(holder: &[u8; 32], challenge: &[u8], signature: 
     }
 }
 
+/// The domain-separated message an **operator** signs to prove it holds the secret for
+/// `operator_pubkey` when binding that key to topology `topology_id` (#107-enforce ii-a). Because
+/// `operator_pubkey` is *public*, topology ownership alone must not be enough to bind it: without
+/// this proof-of-possession, anyone could bind a **victim's** operator key to their own topology
+/// and — once enforcement consults the binding — mint admission to the victim's channels
+/// (`channel_id_for_link` is operator-bound, so the derived channels would be the victim's real
+/// ones). The operator signs this with its operator `SigningKey`; the control plane verifies with
+/// [`verify_topology_operator_binding`] before storing the binding. The length-prefixed
+/// `topology_id` keeps the preimage injective (no id/key boundary ambiguity).
+pub fn topology_operator_binding_bytes(topology_id: &str, operator_pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(23 + 8 + topology_id.len() + 32);
+    m.extend_from_slice(b"ct-topology-operator-v1");
+    m.extend_from_slice(&(topology_id.len() as u64).to_le_bytes());
+    m.extend_from_slice(topology_id.as_bytes());
+    m.extend_from_slice(operator_pubkey);
+    m
+}
+
+/// Verify an operator's **proof of possession** for binding `operator_pubkey` to `topology_id`
+/// (#107-enforce ii-a): `signature` must be `operator_pubkey`'s ed25519 signature over
+/// [`topology_operator_binding_bytes`]. Returns `false` on a non-key operator, a wrong
+/// `(topology_id, operator_pubkey)` binding, or a bad signature — closing the admission bypass
+/// where a public operator key could otherwise be bound to an attacker-controlled topology.
+pub fn verify_topology_operator_binding(
+    topology_id: &str,
+    operator_pubkey: &[u8; 32],
+    signature: &[u8; 64],
+) -> bool {
+    match VerifyingKey::from_bytes(operator_pubkey) {
+        Ok(vk) => vk
+            .verify(
+                &topology_operator_binding_bytes(topology_id, operator_pubkey),
+                &Signature::from_bytes(signature),
+            )
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// The domain-separated message a member signs with its **holder** key to attest that
 /// it authorized `noise_pubkey` as its Noise static key on `channel` (#72 AF4-keydist /
 /// #101). Binding the Noise key to `(channel, holder)` means a DB-controlling operator
@@ -2781,6 +2820,41 @@ mod tests {
         let mut tampered = sig;
         tampered[0] ^= 0xff;
         assert!(!verify_holder_possession(&holder, challenge, &tampered), "tampered signature rejected");
+    }
+
+    #[test]
+    fn topology_operator_binding_proves_possession_of_the_operator_key() {
+        // #107-enforce ii-a: binding an operator key to a topology requires proving possession of
+        // the operator SECRET — closing the bypass where a public operator key could be bound to
+        // an attacker's topology to mint admission to the victim's channels.
+        let op_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let op = op_sk.verifying_key().to_bytes();
+        let topo = "topology-abc";
+
+        // The genuine operator's signature over (topology_id ‖ operator_pubkey) verifies.
+        let proof = op_sk.sign(&topology_operator_binding_bytes(topo, &op)).to_bytes();
+        assert!(verify_topology_operator_binding(topo, &op, &proof), "genuine operator binding verifies");
+
+        // The ATTACK: someone who does NOT hold op's secret cannot forge a binding of op to any
+        // topology — even signing with their own key claims op as the pubkey and fails.
+        let attacker = SigningKey::from_bytes(&[0x22u8; 32]);
+        let forged = attacker.sign(&topology_operator_binding_bytes(topo, &op)).to_bytes();
+        assert!(!verify_topology_operator_binding(topo, &op, &forged), "cannot bind an operator key you don't hold");
+
+        // A proof for a DIFFERENT topology id does not carry over (id is bound into the preimage).
+        let other_topo = op_sk.sign(&topology_operator_binding_bytes("topology-xyz", &op)).to_bytes();
+        assert!(!verify_topology_operator_binding(topo, &op, &other_topo), "proof is bound to its topology id");
+
+        // A proof for a DIFFERENT operator key is rejected (preimage binds the claimed key).
+        let op2_sk = SigningKey::from_bytes(&[0x33u8; 32]);
+        let op2 = op2_sk.verifying_key().to_bytes();
+        let cross = op_sk.sign(&topology_operator_binding_bytes(topo, &op2)).to_bytes();
+        assert!(!verify_topology_operator_binding(topo, &op2, &cross), "op cannot sign a binding for op2's key");
+
+        // A tampered signature is rejected.
+        let mut tampered = proof;
+        tampered[0] ^= 0xff;
+        assert!(!verify_topology_operator_binding(topo, &op, &tampered), "tampered proof rejected");
     }
 
     #[test]
