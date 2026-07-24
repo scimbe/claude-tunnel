@@ -90,6 +90,55 @@
     border: 1px solid var(--line); border-radius: 10px; padding: 14px; overflow-x: auto; color: var(--accent2);
     white-space: pre; margin: 8px 0 18px; }
   #info .close { margin-top: 8px; }
+
+  /* ---- prompt panel (mobile-first, full width above the columns) ---- */
+  .promptwrap { max-width: 1100px; margin: 0 auto; padding: 14px 14px 0; }
+  .panel.prompt { border-color: #3a4a6a; }
+  .panel.prompt h2 { color: var(--accent); }
+  .phint { color: var(--muted); font-size: 12.5px; line-height: 1.5; margin: 0 0 12px; }
+  .promptrow { display: flex; gap: 10px; flex-wrap: wrap; }
+  #prompt { flex: 1 1 240px; min-height: 46px; resize: vertical; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: #0e1524; color: var(--ink); font-size: 15px;
+    font-family: inherit; line-height: 1.4; }
+  #buildBtn { flex: 0 0 auto; align-self: stretch; }
+  .pmsg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .pmsg.ok { color: var(--accent2); }
+  .pmsg.reject { color: #ff9a8a; }
+  @media (min-width: 860px) { #buildBtn { align-self: flex-start; } }
+
+  /* ---- build / waiting screen ---- */
+  #build { position: fixed; inset: 0; z-index: 60; display: none; align-items: center; justify-content: center;
+    background: radial-gradient(1200px 600px at 50% -10%, #14224a, #070b14 70%); padding: 20px; }
+  #build .buildcard { text-align: center; width: min(94vw, 420px); }
+  #build h2 { font-size: 18px; margin: 18px 0 20px; }
+  .spinner { width: 54px; height: 54px; margin: 0 auto; border-radius: 50%;
+    border: 5px solid rgba(247,213,29,.18); border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .crew { display: flex; gap: 10px; justify-content: center; margin-bottom: 18px; }
+  .crew .member { flex: 1 1 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 6px; opacity: .4; transition: opacity .3s, border-color .3s, transform .3s; }
+  .crew .member.active { opacity: 1; border-color: var(--accent); transform: translateY(-3px); }
+  .crew .member.done { opacity: 1; border-color: var(--accent2); }
+  .crew .ico { display: block; font-size: 24px; }
+  .crew .lbl { display: block; font-size: 11px; color: var(--muted); margin-top: 4px; letter-spacing: .04em; }
+  .crew .tick { display: block; font-size: 12px; color: var(--accent2); height: 14px; }
+  .crew .member.done .tick::after { content: "✓"; }
+  .crew .member:not(.done) .tick { color: transparent; }
+  .bar { height: 8px; background: #0e1524; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
+  .barfill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width .3s ease; }
+  .bstep { color: var(--muted); font-size: 12.5px; margin-top: 12px; min-height: 16px; }
+  /* auction / LLM-selection feed inside the waiting screen */
+  .auction { margin-top: 16px; text-align: left; background: #0e1524; border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; }
+  .ahdr { font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
+    margin-bottom: 6px; }
+  #auctionFeed { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.65;
+    max-height: 132px; overflow-y: auto; }
+  .abid { color: var(--muted); }
+  .abid .who { color: var(--ink); }
+  .awin { color: var(--accent2); }
+  .awin .who { color: var(--accent); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -119,6 +168,22 @@
     <div class="spacer"></div>
     <button class="btn info" id="infoBtn" title="How does this work?">ⓘ Info</button>
   </header>
+
+  <!-- prompt-driven build: describe a game in words, the agent crew builds it -->
+  <div class="promptwrap">
+    <div class="panel prompt">
+      <h2>🤖 Prompt the agent crew</h2>
+      <p class="phint">Describe the game you want and the crew (🕹️ physics · 🎨 art · 🧩 integration) builds it.
+        Keep prompting to refine, or download anytime. A prompt that tries to subvert the system instead of
+        describing a game is rejected — and your current game is kept.</p>
+      <div class="promptrow">
+        <textarea id="prompt" rows="2" maxlength="400"
+          placeholder="e.g. a hard night level with a rocket bird and a pink background"></textarea>
+        <button class="btn accent" id="buildBtn">🚀 Build with the crew</button>
+      </div>
+      <div id="promptMsg" class="pmsg"></div>
+    </div>
+  </div>
 
   <div class="wrap">
     <!-- customization inputs -->
@@ -240,7 +305,12 @@
       <p style="margin-top:8px">Each role is (or becomes) a real agent discovered via
         <code>/registry/agents?role=…</code> or provisioned by central; the marketplace clears the job and each
         agent answers a <code>service/&lt;slug&gt;</code> call. <i>Today the crew's contributions are computed in-page
-        (the honest MVP); wiring each role to a live LLM agent over the channel is the next step.</i></p></div></div>
+        (the honest MVP); wiring each role to a live LLM agent over the channel is the next step.</i></p>
+      <p style="margin-top:8px"><b>Prompt it.</b> Describe a game in the prompt box and the crew builds it — but the
+        prompt is <b>safety-guarded</b> first: it must read as a game change, not an <i>anti-prompt</i> trying to
+        subvert the system (those are rejected and your current game kept). The build screen shows the
+        <b>marketplace live</b>: candidate agents bid their idle LLM capacity, the <b>auction clears</b> to the best
+        offer, and you see <b>which LLM was chosen</b> per role. Keep prompting to refine, or download anytime.</p></div></div>
 
     <div class="step"><div class="n">🔒</div><div>
       <h3>Access &amp; hosting</h3>
@@ -249,6 +319,23 @@
         the <code>help-site</code> reverse proxy) and it is served privately over the zero-knowledge tunnel.</p></div></div>
 
     <button class="btn accent close" id="infoClose">Got it</button>
+  </div>
+</div>
+
+<!-- ============ BUILD / WAITING SCREEN ============ -->
+<div id="build">
+  <div class="buildcard">
+    <div class="spinner" aria-hidden="true"></div>
+    <h2 id="buildTitle">The agent crew is building your game…</h2>
+    <div class="crew">
+      <div class="member" data-role="physics"><span class="ico">🕹️</span><span class="lbl">physics</span><span class="tick">•</span></div>
+      <div class="member" data-role="art"><span class="ico">🎨</span><span class="lbl">art</span><span class="tick">•</span></div>
+      <div class="member" data-role="integration"><span class="ico">🧩</span><span class="lbl">integration</span><span class="tick">•</span></div>
+    </div>
+    <div class="bar"><div id="buildBar" class="barfill"></div></div>
+    <div id="buildStep" class="bstep">…</div>
+    <!-- live-look at the marketplace: candidate agents bid, the auction clears, an LLM is chosen -->
+    <div class="auction"><div class="ahdr">marketplace · auction &amp; LLM selection</div><div id="auctionFeed"></div></div>
   </div>
 </div>
 
@@ -477,6 +564,147 @@ function refresh() { syncLabels(); clearTimeout(refreshTimer); refreshTimer = se
   $(id).addEventListener("input", refresh));
 $("preset").addEventListener("change", () => { applyPreset(); refresh(); });
 $("playBtn").addEventListener("click", startPreview);
+
+// ---- prompt → agent-crew build ---------------------------------------------------
+// A prompt is SAFETY-GUARDED first: it must read as a game customization, not an
+// "anti-prompt" trying to subvert the system. Accepted prompts run through the crew
+// (a staged waiting screen), then the local interpreter applies the change — the
+// honest MVP standing in for the live sink/source-2 LLM agents (#169 / #flappy-demo·B).
+// A rejected prompt changes nothing: the previous game stays (the fallback).
+const ANTI_PROMPT = [
+  /ignore\s+(all\s+|the\s+|any\s+)?(previous|prior|above|earlier)/i,
+  /disregard\s+(all\s+|the\s+|your\s+)?(previous|prior|above|instruction|rule)/i,
+  /\b(system|developer)\s*(prompt|message|mode|instruction)/i,
+  /you\s+are\s+now\b|pretend\s+(to\s+be|you)|act\s+as\s+(an?|the)\b/i,
+  /\bjailbreak\b|\bDAN\b|\bsudo\b|\broot\b/i,
+  /(reveal|show|print|leak|exfiltrat|dump)\b[\s\S]*(prompt|instruction|password|secret|token|key|env)/i,
+  /\b(bypass|override|disable|turn\s+off)\b[\s\S]*(guard|filter|safety|check|security|gate|rule)/i,
+  /<\s*script|javascript:|onerror\s*=|base64|eval\(|\bfetch\(|\bimport\s+/i,
+  /rm\s+-rf|drop\s+table|;\s*--|\bcurl\b|\bwget\b/i,
+];
+const GAME_WORDS = /\b(game|bird|pipe|gap|speed|fast|slow|hard(er)?|eas(y|ier)|difficult|difficulty|gravity|float|jump|flap|level|theme|night|day|dark|sunset|retro|gameboy|candy|pink|blue|red|green|yellow|purple|orange|colou?r|rocket|duck|parrot|fish|bee|alien|title|background|sky|challenge|insane|chill|gentle|classic)\b/i;
+
+function guardPrompt(p) {
+  const s = (p || "").trim();
+  if (s.length < 3) return { ok: false, reason: "Say a bit more about the game you want." };
+  for (const re of ANTI_PROMPT) {
+    if (re.test(s)) return { ok: false, reason: "that reads like an attempt to change the system, not the game — rejected. Describe the game instead (bird, theme, difficulty)." };
+  }
+  if (!GAME_WORDS.test(s)) return { ok: false, reason: "couldn't read that as a game change — try describing the bird, colours, theme, or difficulty." };
+  return { ok: true };
+}
+
+// Map a natural-language prompt onto the form controls (the local crew stand-in).
+function interpretPrompt(p) {
+  const s = p.toLowerCase();
+  const set = (id, v) => { $(id).value = v; };
+  if (/\b(insane|brutal|very hard|really hard)\b/.test(s)) { $("preset").value = "hard"; applyPreset(); set("speed", 230); set("gap", 100); }
+  else if (/\b(hard|harder|difficult|tough)\b/.test(s)) { $("preset").value = "hard"; applyPreset(); }
+  else if (/\b(easy|easier|chill|gentle|relax)\b/.test(s)) { $("preset").value = "easy"; applyPreset(); }
+  if (/\b(fast|faster|speedy|quick)\b/.test(s)) { $("preset").value = "custom"; set("speed", Math.min(260, +$("speed").value + 50)); }
+  if (/\b(slow|slower)\b/.test(s)) { $("preset").value = "custom"; set("speed", Math.max(90, +$("speed").value - 40)); }
+  if (/\b(float|low gravity|moon|floaty)\b/.test(s)) { $("preset").value = "custom"; set("gravity", 1100); }
+  if (/\bnight|dark|midnight\b/.test(s)) set("theme", "night");
+  else if (/\bsunset|evening|dusk\b/.test(s)) set("theme", "sunset");
+  else if (/\bretro|gameboy|game boy|8-?bit\b/.test(s)) set("theme", "retro");
+  else if (/\bcandy|pink|sweet\b/.test(s)) set("theme", "candy");
+  else if (/\bday|classic sky|blue sky\b/.test(s)) set("theme", "day");
+  const emojiMap = [[/rocket|space/, "🚀"], [/duck/, "🦆"], [/parrot/, "🦜"], [/fish/, "🐟"], [/bee/, "🐝"], [/alien|invader/, "👾"], [/classic|circle|dot/, ""]];
+  for (const [re, em] of emojiMap) {
+    if (re.test(s)) { selEmoji = em; [...erow.children].forEach(c => c.classList.toggle("sel", c.textContent === (em || "●"))); break; }
+  }
+  const colourMap = { red: "#e23b3b", blue: "#3b7de2", green: "#3bcf5c", yellow: "#f7d51d", purple: "#8a3bff", orange: "#ff8a3b", pink: "#ff6fd0", white: "#eeeeee", black: "#222222" };
+  for (const [name, hex] of Object.entries(colourMap)) { if (new RegExp("\\b" + name + "\\b").test(s)) { set("birdColor", hex); break; } }
+  const m = s.match(/\b(?:called|named|titled)\s+"?([a-z0-9 ]{2,24})"?/);
+  if (m) set("title", m[1].trim().replace(/\b\w/g, (c) => c.toUpperCase()));
+  else if (p.trim().length <= 28) set("title", p.trim());
+  syncLabels();
+}
+
+let lastGoodConfig = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The marketplace: per role, candidate provider agents bid their idle LLM capacity
+// (#147 CapacityOffer/Bid); the auction clears to the best offer and that agent's LLM
+// is chosen. sink + source-2 + central are the real crew (#169); the rest are plausible
+// competing bidders so the selection is visible. (MVP figures until the live plane runs.)
+const CREW_AUCTION = {
+  physics: [
+    { who: "source-2", model: "claude-sonnet-5", units: 20, price: 50, win: true },
+    { who: "agent-β", model: "local-llama-70b", units: 20, price: 66 },
+  ],
+  art: [
+    { who: "sink", model: "claude-opus-4-8", units: 15, price: 40, win: true },
+    { who: "agent-γ", model: "mixtral-8x7b", units: 15, price: 58 },
+  ],
+  integration: [
+    { who: "central", model: "claude-opus-4-8", units: 10, price: 30, win: true },
+  ],
+};
+function feedLine(cls, html) {
+  const d = document.createElement("div");
+  d.className = cls; d.innerHTML = html;
+  $("auctionFeed").appendChild(d); $("auctionFeed").scrollTop = 1e9;
+}
+async function renderAuction(role, icon) {
+  const bids = CREW_AUCTION[role];
+  feedLine("abid", icon + " <b>" + role + "</b> — auction open (" + bids.length + " offer" + (bids.length > 1 ? "s" : "") + ")");
+  for (const b of bids) {
+    await sleep(150);
+    feedLine("abid", "&nbsp;&nbsp;bid <span class='who'>" + b.who + "</span> · " + b.units + "u @ " + b.price + " · " + b.model);
+  }
+  const w = bids.find((b) => b.win) || bids[0];
+  await sleep(230);
+  feedLine("awin", "&nbsp;&nbsp;✓ cleared → <span class='who'>" + w.who + "</span> @ " + w.price + " · LLM chosen: " + w.model);
+  return w;
+}
+
+async function runBuild(prompt) {
+  const members = [...document.querySelectorAll(".crew .member")];
+  const steps = [
+    ["physics", 34, "🕹️"],
+    ["art", 70, "🎨"],
+    ["integration", 100, "🧩"],
+  ];
+  $("build").style.display = "flex";
+  $("buildBar").style.width = "0%";
+  $("auctionFeed").innerHTML = "";
+  members.forEach((m) => m.classList.remove("active", "done"));
+  for (const [role, pct, icon] of steps) {
+    const el = members.find((m) => m.dataset.role === role);
+    el.classList.add("active");
+    const w = await renderAuction(role, icon);
+    $("buildStep").textContent = icon + " " + w.who + " (" + w.model + ") is producing the " + role + " part…";
+    await sleep(480);
+    $("buildBar").style.width = pct + "%";
+    el.classList.remove("active"); el.classList.add("done");
+  }
+  interpretPrompt(prompt);
+  startPreview();
+  await sleep(320);
+  $("build").style.display = "none";
+}
+
+$("buildBtn").addEventListener("click", async () => {
+  const p = $("prompt").value;
+  const g = guardPrompt(p);
+  const msg = $("promptMsg");
+  if (!g.ok) {
+    msg.className = "pmsg reject";
+    msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept.";
+    return;
+  }
+  lastGoodConfig = readConfig();  // fallback anchor (rejected prompts already change nothing)
+  $("buildBtn").disabled = true;
+  msg.className = "pmsg"; msg.textContent = "";
+  try {
+    await runBuild(p);
+    msg.className = "pmsg ok";
+    msg.textContent = "✓ Built by the crew. Keep prompting to refine, or download your game below.";
+  } finally {
+    $("buildBtn").disabled = false;
+  }
+});
 
 // ---- info modal ----
 $("infoBtn").addEventListener("click", () => $("info").style.display = "flex");
