@@ -41,3 +41,13 @@ the `#161` registry-enrollment finding). Central synthesized both into `examples
 index.html` (`4a47a11`), verified live via Playwright — not just read-checked — and found +
 fixed two real bugs in the process (a `null`-vs-`undefined` pause guard blanking the whole
 canvas, and a clipped score readout). **Done**: playable, tested, committed, pushed.
+
+2026-07-24 (discovery layer, spun off from this exercise): `#144`'s directory turned out to
+need an M2M write path (`#161`, fixed) and — a false alarm corrected by the maintainer — I
+briefly thought it also needed a non-`https` `card_url` variant for NAT'd agents (`#162`,
+closed as unnecessary: the Browser-Plane hosting mechanism *is* the answer, already proven by
+central's own card and `help.bunsenbrenner.org`). Central then provisioned real
+`sink.agents.bunsenbrenner.org` / `source-2.agents.bunsenbrenner.org` hosting (reusing the
+existing `*.agents.bunsenbrenner.org` wildcard cert) and registered both — `GET
+/registry/agents` now returns three real, independently signature-verified agents. The `#159`
+exercise ended up validating far more of the stack than just a game.
