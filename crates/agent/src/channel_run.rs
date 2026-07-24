@@ -1543,32 +1543,54 @@ fn channel_local() -> ChannelLocal {
         // (`auction/offer` + `auction/bid`) over the same authenticated channel — the CLI parity that
         // lets the marketplace be demoed live the way `agent/card` is. The seller stamps time itself
         // (`now_secs`), never the caller.
-        if let Ok(offer_cfg) = AgentOfferCliConfig::from_env() {
-            let offer = offer_cfg.build_offer(now_secs());
+        // #152/#167: build the offer config ONCE — the signed offer drives both the auction tools
+        // and the ceiling on which `service/<slug>` tools may be registered, so the two can't drift.
+        let offer_cfg = AgentOfferCliConfig::from_env().ok();
+        if let Some(cfg) = &offer_cfg {
+            let offer = cfg.build_offer(now_secs());
             ct_common::mcp::register_auction_tools(
                 &mut reg,
                 offer,
                 now_secs,
-                offer_cfg.max_bids_per_window,
-                offer_cfg.window_secs,
+                cfg.max_bids_per_window,
+                cfg.window_secs,
             );
             eprintln!(
                 "ct-agent channel: --serve also exposing auction/offer + auction/bid (CT_AGENT_OFFER_*)"
             );
         }
-        // #149-A.1 serve-wiring follow: if CT_AGENT_SERVICES + CT_AGENT_SERVICE_HANDLER_CMD are
-        // configured, also expose one schema-typed `service/<slug>` tool per declared service,
-        // backed by shelling out to the configured command for each call — the "live LLM
-        // integration" #149-A.1's own commit flagged as the remaining follow. The handler is a
-        // plain external process: `input` on stdin, trimmed stdout is the result, `CT_SERVICE_TYPE`
-        // tells a multi-service handler which slug was invoked. Runs synchronously (blocks this
-        // session's task for the handler's duration) — acceptable for a low-concurrency demo; a
-        // multi-tenant deployment would want `spawn_blocking` instead.
-        if let (Ok(services_str), Ok(handler_cmd)) =
-            (std::env::var("CT_AGENT_SERVICES"), std::env::var("CT_AGENT_SERVICE_HANDLER_CMD"))
-        {
-            let services: Vec<ct_common::channel::ServiceType> =
-                services_str.split(',').filter_map(|s| parse_service_type(s.trim())).collect();
+        // #149-A.1 serve-wiring + #167 declared-vs-served: expose one schema-typed `service/<slug>`
+        // tool per service, backed by shelling out to `CT_AGENT_SERVICE_HANDLER_CMD` (`input` on
+        // stdin, trimmed stdout is the result, `CT_SERVICE_TYPE` names the slug; runs synchronously —
+        // fine for a low-concurrency demo, a multi-tenant host would want `spawn_blocking`).
+        //
+        // #167: the signed offer's **declared** service catalog is the ceiling. A service is
+        // registered only if the offer declares it, so what a buyer can cryptographically verify the
+        // agent offers is exactly what it will serve. `CT_AGENT_SERVICES`, when set, is an explicit
+        // override *filtered to* the declared catalog (undeclared entries are refused loudly, never
+        // registered); when unset with an offer, the declared catalog itself is the list (one knob).
+        // With no offer configured there is no cryptographic ceiling and `CT_AGENT_SERVICES` stands
+        // alone — the unchanged self-asserted regime.
+        if let Ok(handler_cmd) = std::env::var("CT_AGENT_SERVICE_HANDLER_CMD") {
+            let requested: Vec<ct_common::channel::ServiceType> = match std::env::var("CT_AGENT_SERVICES") {
+                Ok(s) => s.split(',').filter_map(|t| parse_service_type(t.trim())).collect(),
+                Err(_) => offer_cfg.as_ref().map(|c| c.services.clone()).unwrap_or_default(),
+            };
+            let services: Vec<ct_common::channel::ServiceType> = match &offer_cfg {
+                Some(cfg) => {
+                    let (allowed, refused): (Vec<_>, Vec<_>) =
+                        requested.into_iter().partition(|s| cfg.services.contains(s));
+                    if !refused.is_empty() {
+                        eprintln!(
+                            "ct-agent channel: REFUSING {} service tool(s) not in the signed offer's declared catalog (#167): {:?}",
+                            refused.len(),
+                            refused
+                        );
+                    }
+                    allowed
+                }
+                None => requested,
+            };
             if !services.is_empty() {
                 let n = services.len();
                 ct_common::mcp::register_service_tools(&mut reg, &services, move |service, input| {
@@ -1964,6 +1986,11 @@ pub struct AgentOfferCliConfig {
     pub max_bids_per_window: u32,
     /// Rate-limit window (`CT_AGENT_OFFER_WINDOW_SECS`, default 60).
     pub window_secs: u64,
+    /// #167/#149-A.1: the service catalog this offer **declares** (`CT_AGENT_OFFER_SERVICES`,
+    /// comma-separated slugs). Empty = a generic offer that declares no services. This is the
+    /// signed, buyer-verifiable ceiling on which `service/<slug>` tools the agent may register —
+    /// so what a `CapacityOffer` claims and what the agent actually serves can no longer drift.
+    pub services: Vec<ct_common::channel::ServiceType>,
 }
 
 impl AgentOfferCliConfig {
@@ -2027,6 +2054,26 @@ impl AgentOfferCliConfig {
             }
             _ => 60,
         };
+        // #167: the offer's declared service catalog. Comma-separated slugs (same vocabulary as
+        // `CT_AGENT_SERVICES`); an unknown slug is a hard config error (fail-closed — never silently
+        // drop a service the operator believes they declared). Absent/empty = a generic offer.
+        let services = match f("CT_AGENT_OFFER_SERVICES").as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => {
+                let mut out = Vec::new();
+                for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    match parse_service_type(tok) {
+                        Some(st) => out.push(st),
+                        None => {
+                            return Err(format!(
+                                "CT_AGENT_OFFER_SERVICES has unknown service '{tok}' (valid: code_generation, security_review, safety_check, text_generation)"
+                            ))
+                        }
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
         Ok(Self {
             signing_key,
             kind,
@@ -2037,22 +2084,41 @@ impl AgentOfferCliConfig {
             ttl_secs,
             max_bids_per_window,
             window_secs,
+            services,
         })
     }
 
     /// Assemble + sign the offer (`issued_at = now`, `expires_at = now + ttl_secs`). The clock is a
     /// parameter so the assembly is deterministic + testable, exactly like [`AgentCardCliConfig::build_card`].
     pub fn build_offer(&self, now: u64) -> ct_common::channel::CapacityOffer {
-        ct_common::channel::CapacityOffer::sign_new(
-            &self.signing_key,
-            self.kind,
-            self.models.clone(),
-            self.units_available,
-            self.min_price,
-            self.currency_id.clone(),
-            now,
-            now.saturating_add(self.ttl_secs),
-        )
+        // #167: when a service catalog is declared, sign it into the offer (so a buyer can
+        // cryptographically verify which services the agent offers, and `#149-A.1`'s `match_offer`
+        // service filter actually has something to enforce). An empty catalog keeps the historical
+        // generic offer (`sign_new`) so nothing changes for offers that make no service claims.
+        if self.services.is_empty() {
+            ct_common::channel::CapacityOffer::sign_new(
+                &self.signing_key,
+                self.kind,
+                self.models.clone(),
+                self.units_available,
+                self.min_price,
+                self.currency_id.clone(),
+                now,
+                now.saturating_add(self.ttl_secs),
+            )
+        } else {
+            ct_common::channel::CapacityOffer::sign_new_with_services(
+                &self.signing_key,
+                self.kind,
+                self.models.clone(),
+                self.units_available,
+                self.min_price,
+                self.currency_id.clone(),
+                now,
+                now.saturating_add(self.ttl_secs),
+                self.services.clone(),
+            )
+        }
     }
 }
 
@@ -2944,6 +3010,51 @@ mod tests {
         assert!(
             AgentOfferCliConfig::from_lookup(|k| bad.get(k).cloned()).is_err(),
             "an unknown CT_AGENT_OFFER_KIND is rejected"
+        );
+    }
+
+    #[test]
+    fn agent_offer_declares_its_service_catalog_for_verifiable_enforcement() {
+        // #167 (frozen): CT_AGENT_OFFER_SERVICES is signed INTO the offer, so a buyer can
+        // cryptographically verify which services the agent offers and #149-A.1's match_offer
+        // service filter has something to enforce (closing the declared-vs-served gap where the
+        // offer and the registered service tools were two independent, unvalidated surfaces). An
+        // unknown slug is a hard config error (fail-closed); absent → a generic offer (services: []).
+        use ct_common::channel::ServiceType::*;
+        use std::collections::HashMap;
+        let base: HashMap<&str, String> = HashMap::from([
+            ("CT_CHANNEL_HOLDER_KEY", "11".repeat(32)),
+            ("CT_AGENT_OFFER_KIND", "cloud".to_string()),
+            ("CT_AGENT_OFFER_MODELS", "claude-opus-4-8".to_string()),
+            ("CT_AGENT_OFFER_UNITS", "1000".to_string()),
+            ("CT_AGENT_OFFER_MIN_PRICE", "50".to_string()),
+            ("CT_AGENT_OFFER_CURRENCY", "ct-llm-token-chain".to_string()),
+        ]);
+
+        // Absent → generic offer with no declared services (unchanged back-compat).
+        let generic = AgentOfferCliConfig::from_lookup(|k| base.get(k).cloned()).unwrap();
+        assert!(generic.services.is_empty(), "no CT_AGENT_OFFER_SERVICES → generic offer");
+        assert!(generic.build_offer(1_000).services.is_empty(), "generic offer declares no services");
+
+        // A declared catalog is parsed and SIGNED into the offer (order + values preserved).
+        let mut with = base.clone();
+        with.insert("CT_AGENT_OFFER_SERVICES", "code_generation, security_review".to_string());
+        let cfg = AgentOfferCliConfig::from_lookup(|k| with.get(k).cloned()).unwrap();
+        assert_eq!(cfg.services, vec![CodeGeneration, SecurityReview], "catalog parsed from env");
+        let offer = cfg.build_offer(1_000);
+        assert_eq!(
+            offer.services,
+            vec![CodeGeneration, SecurityReview],
+            "the declared catalog is signed into the offer (buyer-verifiable ceiling)"
+        );
+        assert!(offer.is_valid(1_000), "the offer still verifies with a declared catalog");
+
+        // An unknown slug is a hard error — never silently drop a service the operator declared.
+        let mut bad = base.clone();
+        bad.insert("CT_AGENT_OFFER_SERVICES", "code_generation,chatbot".to_string());
+        assert!(
+            AgentOfferCliConfig::from_lookup(|k| bad.get(k).cloned()).is_err(),
+            "an unknown CT_AGENT_OFFER_SERVICES slug is rejected (fail-closed)"
         );
     }
 
