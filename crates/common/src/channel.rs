@@ -1350,6 +1350,38 @@ impl CapacityKind {
     }
 }
 
+/// A **declared service task-type** a [`CapacityOffer`] serves (#149-A.1 — schema-typed service
+/// catalog; maintainer decision 2026-07-24: **opt-in convention**). Declaring a closed set of task
+/// types instead of a free-form chat passthrough is the biggest structural abuse mitigation: a
+/// schema-typed task is far harder to jailbreak into "ignore your task, act as an unrestricted
+/// assistant" than an open completion endpoint, and it narrows what data can flow through the channel.
+/// An offer with an **empty** `services` list is undeclared/generic (the opt-out — a generic offer
+/// stays valid); a provider that opts in advertises exactly the task types it serves (and registers
+/// one MCP tool per service — that tool-per-service wiring is the follow slice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ServiceType {
+    /// Generate code to a specification.
+    CodeGeneration,
+    /// Review code/config for security issues.
+    SecurityReview,
+    /// Check content against a safety policy.
+    SafetyCheck,
+    /// General text completion — the closest to a raw chat endpoint, so declaring it is explicit.
+    TextGeneration,
+}
+
+impl ServiceType {
+    /// The one byte representing this service in the signing preimage (stable across serde renames).
+    fn tag(self) -> u8 {
+        match self {
+            ServiceType::CodeGeneration => 0,
+            ServiceType::SecurityReview => 1,
+            ServiceType::SafetyCheck => 2,
+            ServiceType::TextGeneration => 3,
+        }
+    }
+}
+
 /// A **holder-signed advertisement of idle LLM capacity** (#147 L1 — the discovery/advertisement layer
 /// of the idle-capacity marketplace). The design-neutral foundation: it says *what an agent offers and
 /// its floor terms* so a buyer can discover + bid, WITHOUT deciding the contentious later phases —
@@ -1381,6 +1413,11 @@ pub struct CapacityOffer {
     pub currency_id: String,
     pub issued_at: UnixSeconds,
     pub expires_at: UnixSeconds,
+    /// #149-A.1 opt-in service catalog: the closed task-types this offer serves, or **empty** for an
+    /// undeclared/generic offer (the opt-out). Covered by the signature, so the advertised catalog is
+    /// tamper-evident.
+    #[serde(default)]
+    pub services: Vec<ServiceType>,
     /// The holder's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
     #[serde(with = "card_hex::b64")]
     pub signature: [u8; 64],
@@ -1388,9 +1425,10 @@ pub struct CapacityOffer {
 
 impl CapacityOffer {
     /// Domain-separated, **canonical injective** preimage: `domain ‖ holder ‖ kind(u8) ‖ ⟨models⟩ ‖
-    /// units_available(LE) ‖ min_price(LE) ‖ ⟨currency_id⟩ ‖ issued_at(LE) ‖ expires_at(LE)`, every
-    /// variable-length field length-prefixed (u32 LE count/byte-len) so no two distinct offers share a
-    /// preimage and no field can be re-partitioned to forge an equivalent signature.
+    /// units_available(LE) ‖ min_price(LE) ‖ ⟨currency_id⟩ ‖ issued_at(LE) ‖ expires_at(LE) ‖
+    /// ⟨services⟩`, every variable-length field length-prefixed (u32 LE count/byte-len) so no two
+    /// distinct offers share a preimage. `services` (#149-A.1) is appended as `count(u32 LE) ‖ ⟨tag⟩`.
+    #[allow(clippy::too_many_arguments)]
     pub fn signing_bytes(
         holder_pubkey: &[u8; 32],
         kind: CapacityKind,
@@ -1400,6 +1438,7 @@ impl CapacityOffer {
         currency_id: &str,
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
+        services: &[ServiceType],
     ) -> Vec<u8> {
         fn put_str(m: &mut Vec<u8>, s: &str) {
             m.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -1418,6 +1457,10 @@ impl CapacityOffer {
         put_str(&mut m, currency_id);
         m.extend_from_slice(&issued_at.to_le_bytes());
         m.extend_from_slice(&expires_at.to_le_bytes());
+        m.extend_from_slice(&(services.len() as u32).to_le_bytes());
+        for service in services {
+            m.push(service.tag());
+        }
         m
     }
 
@@ -1440,6 +1483,7 @@ impl CapacityOffer {
                         &self.currency_id,
                         self.issued_at,
                         self.expires_at,
+                        &self.services,
                     ),
                     &Signature::from_bytes(&self.signature),
                 )
@@ -1448,9 +1492,8 @@ impl CapacityOffer {
         }
     }
 
-    /// Construct + sign an offer from a holder `SigningKey` (the production analogue of a hand-built
-    /// offer). Derives `holder_pubkey` from the key, so a caller cannot advertise capacity under a key
-    /// it does not hold.
+    /// Construct + sign an offer with **no** declared service catalog (`services` empty — a generic
+    /// offer). Equivalent to [`sign_new_with_services`](Self::sign_new_with_services) with an empty list.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_new(
         signing_key: &ed25519_dalek::SigningKey,
@@ -1461,6 +1504,35 @@ impl CapacityOffer {
         currency_id: String,
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
+    ) -> CapacityOffer {
+        Self::sign_new_with_services(
+            signing_key,
+            kind,
+            models,
+            units_available,
+            min_price,
+            currency_id,
+            issued_at,
+            expires_at,
+            Vec::new(),
+        )
+    }
+
+    /// Construct + sign an offer that **declares a service catalog** (#149-A.1): `services` is the
+    /// closed set of task-types the offer serves (empty = generic). It rides the holder-signed preimage,
+    /// so the advertised catalog is tamper-evident. Derives `holder_pubkey` from the key, so a caller
+    /// cannot advertise capacity under a key it does not hold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_new_with_services(
+        signing_key: &ed25519_dalek::SigningKey,
+        kind: CapacityKind,
+        models: Vec<String>,
+        units_available: u64,
+        min_price: u64,
+        currency_id: String,
+        issued_at: UnixSeconds,
+        expires_at: UnixSeconds,
+        services: Vec<ServiceType>,
     ) -> CapacityOffer {
         use ed25519_dalek::Signer;
         let holder_pubkey = signing_key.verifying_key().to_bytes();
@@ -1474,6 +1546,7 @@ impl CapacityOffer {
                 &currency_id,
                 issued_at,
                 expires_at,
+                &services,
             ))
             .to_bytes();
         CapacityOffer {
@@ -1485,6 +1558,7 @@ impl CapacityOffer {
             currency_id,
             issued_at,
             expires_at,
+            services,
             signature,
         }
     }
@@ -3467,6 +3541,57 @@ mod tests {
         let back: CapacityOffer = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(back, offer);
         assert!(back.is_valid(1_000), "signature still verifies after a JSON round-trip");
+    }
+
+    #[test]
+    fn capacity_offer_service_catalog_is_opt_in_and_tamper_evident() {
+        // #149-A.1 (frozen): an offer may declare a closed service catalog (opt-in); it rides the
+        // holder-signed preimage so the advertised task-types are tamper-evident. A plain (generic)
+        // offer records an empty catalog and still verifies (backward-compatible), and the catalog
+        // genuinely changes the signature (it's covered, not decorative).
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[0x77u8; 32]);
+        let make = |services: Vec<ServiceType>| {
+            CapacityOffer::sign_new_with_services(
+                &sk,
+                CapacityKind::CloudApiQuota,
+                vec!["claude-opus-4-8".to_string()],
+                1_000,
+                50,
+                "ct-llm-token-chain".to_string(),
+                1_000,
+                5_000,
+                services,
+            )
+        };
+        let declared = make(vec![ServiceType::CodeGeneration, ServiceType::SecurityReview]);
+        assert!(declared.is_valid(1_000), "an offer declaring a catalog verifies");
+        assert_eq!(declared.services, vec![ServiceType::CodeGeneration, ServiceType::SecurityReview]);
+
+        // Tampering the catalog (adding/removing/swapping a service) breaks the signature.
+        let mut extra = declared.clone();
+        extra.services.push(ServiceType::TextGeneration);
+        assert!(!extra.is_valid(1_000), "adding a service breaks the signature");
+        let mut dropped = declared.clone();
+        dropped.services.pop();
+        assert!(!dropped.is_valid(1_000), "dropping a service breaks the signature");
+        let mut swapped = declared.clone();
+        swapped.services[0] = ServiceType::SafetyCheck;
+        assert!(!swapped.is_valid(1_000), "swapping a service breaks the signature");
+
+        // Opt-out: a plain offer (via sign_new) declares nothing, still verifies, and has a different
+        // signature than the declared one (proving the catalog is covered).
+        let generic = CapacityOffer::sign_new(
+            &sk, CapacityKind::CloudApiQuota, vec!["claude-opus-4-8".to_string()], 1_000, 50, "ct-llm-token-chain".to_string(), 1_000, 5_000,
+        );
+        assert!(generic.is_valid(1_000), "a generic (undeclared) offer stays valid");
+        assert!(generic.services.is_empty(), "no catalog = empty");
+        assert_ne!(generic.signature, declared.signature, "the catalog is covered by the signature");
+
+        // JSON round-trip preserves the catalog and still verifies.
+        let back: CapacityOffer = serde_json::from_str(&serde_json::to_string(&declared).unwrap()).unwrap();
+        assert_eq!(back, declared);
+        assert!(back.is_valid(1_000));
     }
 
     #[test]
