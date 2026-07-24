@@ -1376,6 +1376,67 @@ fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStr
     session_side
 }
 
+/// Parse a `CT_AGENT_SERVICES` entry (the same slugs `ct_common::mcp`'s `service/<slug>` tool
+/// names use) into a [`ct_common::channel::ServiceType`]. Unknown entries are silently dropped by
+/// the caller's `filter_map` — a typo just means one fewer tool exposed, not a hard error, matching
+/// this CLI's general "best-effort optional config" posture (e.g. `AgentOfferCliConfig`).
+fn parse_service_type(s: &str) -> Option<ct_common::channel::ServiceType> {
+    use ct_common::channel::ServiceType::*;
+    match s {
+        "code_generation" => Some(CodeGeneration),
+        "security_review" => Some(SecurityReview),
+        "safety_check" => Some(SafetyCheck),
+        "text_generation" => Some(TextGeneration),
+        _ => None,
+    }
+}
+
+/// Run the configured `CT_AGENT_SERVICE_HANDLER_CMD` for one `service/<slug>` call (#149-A.1
+/// serve-wiring follow): spawn it via `sh -c`, write `input` to its stdin, and return its trimmed
+/// stdout as the result. `CT_SERVICE_TYPE` is set in the child's environment so one handler script
+/// can branch on which of several registered services was actually invoked. A non-zero exit or a
+/// spawn/IO failure becomes the tool error (surfaced to the caller as a JSON-RPC error, never a panic).
+fn run_service_handler(
+    cmd: &str,
+    service: ct_common::channel::ServiceType,
+    input: &str,
+) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let slug = match service {
+        ct_common::channel::ServiceType::CodeGeneration => "code_generation",
+        ct_common::channel::ServiceType::SecurityReview => "security_review",
+        ct_common::channel::ServiceType::SafetyCheck => "safety_check",
+        ct_common::channel::ServiceType::TextGeneration => "text_generation",
+    };
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("CT_SERVICE_TYPE", slug)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("service handler spawn failed: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("service handler: no stdin pipe")?
+        .write_all(input.as_bytes())
+        .map_err(|e| format!("service handler stdin write failed: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("service handler wait failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "service handler exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
 /// → one-shot MCP **client** (invoke a peer's tool, print the reply, exit). `CT_CHANNEL_SERVE=1` → the
 /// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
@@ -1439,6 +1500,29 @@ fn channel_local() -> ChannelLocal {
             eprintln!(
                 "ct-agent channel: --serve also exposing auction/offer + auction/bid (CT_AGENT_OFFER_*)"
             );
+        }
+        // #149-A.1 serve-wiring follow: if CT_AGENT_SERVICES + CT_AGENT_SERVICE_HANDLER_CMD are
+        // configured, also expose one schema-typed `service/<slug>` tool per declared service,
+        // backed by shelling out to the configured command for each call — the "live LLM
+        // integration" #149-A.1's own commit flagged as the remaining follow. The handler is a
+        // plain external process: `input` on stdin, trimmed stdout is the result, `CT_SERVICE_TYPE`
+        // tells a multi-service handler which slug was invoked. Runs synchronously (blocks this
+        // session's task for the handler's duration) — acceptable for a low-concurrency demo; a
+        // multi-tenant deployment would want `spawn_blocking` instead.
+        if let (Ok(services_str), Ok(handler_cmd)) =
+            (std::env::var("CT_AGENT_SERVICES"), std::env::var("CT_AGENT_SERVICE_HANDLER_CMD"))
+        {
+            let services: Vec<ct_common::channel::ServiceType> =
+                services_str.split(',').filter_map(|s| parse_service_type(s.trim())).collect();
+            if !services.is_empty() {
+                let n = services.len();
+                ct_common::mcp::register_service_tools(&mut reg, &services, move |service, input| {
+                    run_service_handler(&handler_cmd, service, input)
+                });
+                eprintln!(
+                    "ct-agent channel: --serve also exposing {n} service tool(s) via CT_AGENT_SERVICE_HANDLER_CMD"
+                );
+            }
         }
         let registry = std::sync::Arc::new(reg);
         ChannelLocal::Serve(serve_local(move |req: Vec<u8>| {
@@ -2806,6 +2890,34 @@ mod tests {
             AgentOfferCliConfig::from_lookup(|k| bad.get(k).cloned()).is_err(),
             "an unknown CT_AGENT_OFFER_KIND is rejected"
         );
+    }
+
+    #[test]
+    fn service_type_parsing_and_handler_shell_out_round_trip() {
+        // #149-A.1 serve-wiring follow (frozen): parse_service_type covers every real slug and
+        // rejects an unknown one (so a typo in CT_AGENT_SERVICES just drops that tool, per the
+        // filter_map call site, not a hard error); run_service_handler actually spawns the
+        // configured command, pipes `input` on stdin, and returns trimmed stdout — the shell-out
+        // seam a real LLM CLI plugs into.
+        use ct_common::channel::ServiceType::*;
+        assert_eq!(parse_service_type("code_generation"), Some(CodeGeneration));
+        assert_eq!(parse_service_type("security_review"), Some(SecurityReview));
+        assert_eq!(parse_service_type("safety_check"), Some(SafetyCheck));
+        assert_eq!(parse_service_type("text_generation"), Some(TextGeneration));
+        assert_eq!(parse_service_type("not-a-real-service"), None);
+
+        // `cat` echoes stdin back — proves input actually reaches the child and stdout is
+        // captured + trimmed (a trailing newline from `echo`-style output must not leak through).
+        let out = run_service_handler("cat", CodeGeneration, "hello from the caller").unwrap();
+        assert_eq!(out, "hello from the caller");
+
+        // CT_SERVICE_TYPE is set in the child's env so a multi-service handler can branch.
+        let out = run_service_handler("echo \"got:$CT_SERVICE_TYPE\"", SecurityReview, "ignored").unwrap();
+        assert_eq!(out, "got:security_review");
+
+        // A non-zero exit surfaces as a tool error, not a panic or a silently-empty result.
+        let err = run_service_handler("exit 7", TextGeneration, "x").unwrap_err();
+        assert!(err.contains("exited"), "the exit status is reported: {err}");
     }
 
     #[test]
