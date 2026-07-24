@@ -82,8 +82,9 @@ const PIPE_INTERVAL_PX = 170; // horizontal distance between pipe pairs
 const INPUT_LOCKOUT_MS = 400; // sink: dead-tap protection after death
 
 // ---------- State ----------
-const STATE = { START: 0, PLAY: 1, DEAD: 2 };
+const STATE = { START: 0, PLAY: 1, DEAD: 2, PAUSE: 3 };
 let state = STATE.START;
+const PAUSE_BTN = { x: 8, y: 8, w: 28, h: 28 };
 let bird, pipes, score, best, frameShakeT, deathFlashT, lockoutUntil;
 let tabHiddenAt = null;
 
@@ -135,11 +136,41 @@ function onFlap() {
     state = STATE.START;
   }
 }
+function togglePause() {
+  if (state === STATE.PLAY) state = STATE.PAUSE;
+  else if (state === STATE.PAUSE) state = STATE.PLAY;
+}
+
+function canvasPos(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left) * (LOGICAL_W / rect.width),
+    y: (clientY - rect.top) * (LOGICAL_H / rect.height),
+  };
+}
+function inPauseBtn(pos) {
+  return pos.x >= PAUSE_BTN.x && pos.x <= PAUSE_BTN.x + PAUSE_BTN.w &&
+         pos.y >= PAUSE_BTN.y && pos.y <= PAUSE_BTN.y + PAUSE_BTN.h;
+}
+function handlePointer(clientX, clientY) {
+  const pos = canvasPos(clientX, clientY);
+  if ((state === STATE.PLAY || state === STATE.PAUSE) && inPauseBtn(pos)) {
+    togglePause();
+    return;
+  }
+  onFlap();
+}
+
 window.addEventListener("keydown", (e) => {
   if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); onFlap(); }
+  else if (e.code === "KeyP" || e.code === "Escape") { e.preventDefault(); togglePause(); }
 });
-canvas.addEventListener("mousedown", onFlap);
-canvas.addEventListener("touchstart", (e) => { e.preventDefault(); onFlap(); }, { passive: false });
+canvas.addEventListener("mousedown", (e) => handlePointer(e.clientX, e.clientY));
+canvas.addEventListener("touchstart", (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  handlePointer(t.clientX, t.clientY);
+}, { passive: false });
 
 // Pause on tab-blur (sink)
 document.addEventListener("visibilitychange", () => {
@@ -175,7 +206,7 @@ function update(dt) {
     bird.rot = 0;
     return;
   }
-  if (state !== STATE.PLAY) return;
+  if (state !== STATE.PLAY) return; // also covers PAUSE — freezes bird/pipes in place
 
   bird.vy = Math.min(bird.vy + GRAVITY * dt, TERMINAL_VELOCITY);
   bird.y += bird.vy * dt;
@@ -297,6 +328,20 @@ function medalFor(s) {
   return null;
 }
 
+function drawPauseButton() {
+  const { x, y, w, h } = PAUSE_BTN;
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  roundRect(x, y, w, h, 6);
+  ctx.fill();
+  ctx.fillStyle = COLORS.white;
+  const barW = 4, barH = h - 12, gap = 4;
+  const barY = y + 6;
+  ctx.fillRect(x + w / 2 - gap / 2 - barW, barY, barW, barH);
+  ctx.fillRect(x + w / 2 + gap / 2, barY, barW, barH);
+  ctx.restore();
+}
+
 function draw() {
   ctx.save();
   if (frameShakeT > 0) {
@@ -309,7 +354,7 @@ function draw() {
   drawGround(state === STATE.PLAY ? currentSpeed() : 0);
   drawBird();
 
-  if (state === STATE.PLAY || state === STATE.DEAD) {
+  if (state === STATE.PLAY || state === STATE.DEAD || state === STATE.PAUSE) {
     if (score !== lastScoreForPop) { scorePopT = 0.15; lastScoreForPop = score; }
     const popScale = 1 + (scorePopT > 0 ? (scorePopT / 0.15) * 0.2 : 0);
     if (scorePopT > 0) scorePopT -= 1 / 60;
@@ -322,9 +367,18 @@ function draw() {
 
   outlinedText("best " + best, LOGICAL_W - 6, 14, 10, COLORS.white, "right");
 
+  if (state === STATE.PLAY || state === STATE.PAUSE) drawPauseButton();
+
   if (state === STATE.START) {
     outlinedText("Flappy Bird", LOGICAL_W / 2, LOGICAL_H * 0.32, 22, COLORS.white);
     outlinedText("tap / space to flap", LOGICAL_W / 2, LOGICAL_H * 0.4, 11, COLORS.white);
+  }
+
+  if (state === STATE.PAUSE) {
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    outlinedText("Paused", LOGICAL_W / 2, LOGICAL_H * 0.45, 22, COLORS.white);
+    outlinedText("tap pause icon or press P to resume", LOGICAL_W / 2, LOGICAL_H * 0.52, 10, COLORS.white);
   }
 
   if (state === STATE.DEAD) {
