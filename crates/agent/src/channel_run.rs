@@ -1391,17 +1391,35 @@ fn parse_service_type(s: &str) -> Option<ct_common::channel::ServiceType> {
     }
 }
 
+/// Bound how long a `CT_AGENT_SERVICE_HANDLER_CMD` child may run before it's killed (#149-A.1
+/// serve-wiring: every other blocking step in this file is timed — `A2A_HANDSHAKE_TIMEOUT`,
+/// `DIRECT_STREAM_SETUP_TIMEOUT`, `*_DRAIN_TIMEOUT` — this was the one unbounded exception, flagged
+/// in review). Generous: a real LLM-backed handler can legitimately take tens of seconds.
+const SERVICE_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Run the configured `CT_AGENT_SERVICE_HANDLER_CMD` for one `service/<slug>` call (#149-A.1
 /// serve-wiring follow): spawn it via `sh -c`, write `input` to its stdin, and return its trimmed
 /// stdout as the result. `CT_SERVICE_TYPE` is set in the child's environment so one handler script
-/// can branch on which of several registered services was actually invoked. A non-zero exit or a
-/// spawn/IO failure becomes the tool error (surfaced to the caller as a JSON-RPC error, never a panic).
-fn run_service_handler(
+/// can branch on which of several registered services was actually invoked. A non-zero exit, a
+/// spawn/IO failure, or exceeding `timeout` becomes the tool error (surfaced to the caller as a
+/// JSON-RPC error, never a panic). `timeout` is a parameter (the real call site below always passes
+/// [`SERVICE_HANDLER_TIMEOUT`]) so the kill-on-timeout path is unit-testable without an actual
+/// 120-second wait.
+///
+/// Two fixes from review, both real (caught reading `#149`'s wiring, not hypothetical):
+/// - **stdin is written on its own thread**, concurrently with the wait/output-read below — writing
+///   it inline, then calling `wait_with_output()`, is the textbook `std::process` pipe deadlock: an
+///   `input` over the OS pipe buffer (~64 KiB) whose handler writes to stdout *before* finishing its
+///   stdin read blocks both sides forever, and a consumer fully controls `input`'s size (`register_service_tools`
+///   reads `args["input"]` with no cap) — a remote DoS on the provider, not just a footgun.
+/// - **the child is bounded by `timeout` and killed if it's exceeded**, closing the one unbounded
+///   blocking step in this file.
+fn run_service_handler_with_timeout(
     cmd: &str,
     service: ct_common::channel::ServiceType,
     input: &str,
+    timeout: std::time::Duration,
 ) -> Result<String, String> {
-    use std::io::Write;
     use std::process::{Command, Stdio};
     let slug = match service {
         ct_common::channel::ServiceType::CodeGeneration => "code_generation",
@@ -1418,15 +1436,42 @@ fn run_service_handler(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("service handler spawn failed: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("service handler: no stdin pipe")?
-        .write_all(input.as_bytes())
-        .map_err(|e| format!("service handler stdin write failed: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("service handler wait failed: {e}"))?;
+    let pid = child.id();
+
+    // Write stdin on its own thread so it can proceed concurrently with the wait/output-read
+    // below (the deadlock fix). Best-effort: a handler that never reads stdin (or exits before
+    // fully consuming it) makes this fail with a broken-pipe error, which we deliberately ignore
+    // here — the child's own exit status/output is the actual verdict, not whether every stdin
+    // byte landed.
+    let mut stdin = child.stdin.take().ok_or("service handler: no stdin pipe")?;
+    let input_owned = input.to_string();
+    let _stdin_writer = std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(input_owned.as_bytes());
+    });
+
+    // Run wait_with_output() (which itself reads stdout/stderr concurrently on its own threads —
+    // std's own implementation, not reproduced here) on a background thread so this call can be
+    // bounded: recv_timeout enforces SERVICE_HANDLER_TIMEOUT, and on timeout we kill the child by
+    // pid (captured above, before ownership moved into the thread) so the still-running background
+    // wait unblocks on its own rather than leaking a wedged process.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(|e| format!("service handler wait failed: {e}"))?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            return Err(format!(
+                "service handler timed out after {}s (pid {pid} killed)",
+                timeout.as_secs()
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("service handler: wait thread disconnected unexpectedly".to_string())
+        }
+    };
     if !output.status.success() {
         return Err(format!(
             "service handler exited {}: {}",
@@ -1435,6 +1480,16 @@ fn run_service_handler(
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// [`run_service_handler_with_timeout`] bound to the real [`SERVICE_HANDLER_TIMEOUT`] — the seam
+/// every non-test call site uses.
+fn run_service_handler(
+    cmd: &str,
+    service: ct_common::channel::ServiceType,
+    input: &str,
+) -> Result<String, String> {
+    run_service_handler_with_timeout(cmd, service, input, SERVICE_HANDLER_TIMEOUT)
 }
 
 /// Build the channel session's local app duplex from the environment (#135 L2.x). `CT_CHANNEL_CALL=<method>`
@@ -2918,6 +2973,45 @@ mod tests {
         // A non-zero exit surfaces as a tool error, not a panic or a silently-empty result.
         let err = run_service_handler("exit 7", TextGeneration, "x").unwrap_err();
         assert!(err.contains("exited"), "the exit status is reported: {err}");
+    }
+
+    #[test]
+    fn run_service_handler_does_not_deadlock_on_input_larger_than_the_pipe_buffer() {
+        // #149-A.1 serve-wiring (frozen, regression from review): writing stdin inline then calling
+        // wait_with_output() is the classic std::process pipe deadlock — an `input` over the OS pipe
+        // buffer (~64 KiB) whose handler (`cat`) writes to stdout before it has drained stdin blocks
+        // both sides forever. A consumer fully controls `input`'s size, so this was a remote DoS on
+        // the provider, not just a footgun. 200 KiB comfortably exceeds every common pipe buffer size.
+        // Bounded by the test harness's own timeout — a real deadlock here means the test hangs, not
+        // panics, which is exactly the failure mode being guarded against.
+        use ct_common::channel::ServiceType::CodeGeneration;
+        let big = "x".repeat(200_000);
+        let out = run_service_handler("cat", CodeGeneration, &big).unwrap();
+        assert_eq!(out, big, "the full oversized input round-trips without hanging");
+    }
+
+    #[test]
+    fn run_service_handler_kills_and_errors_a_child_that_exceeds_its_timeout() {
+        // #149-A.1 serve-wiring (frozen, regression from review): every other blocking step in this
+        // file is timed; this closes the one that wasn't. A handler that never exits (simulating a
+        // stalled LLM API call / wedged subprocess) must be killed and reported as a timeout, not
+        // block the caller forever. Uses the injectable-timeout seam (a real 120s wait would make
+        // this test itself the problem it's guarding against).
+        use ct_common::channel::ServiceType::CodeGeneration;
+        let start = std::time::Instant::now();
+        let err = run_service_handler_with_timeout(
+            "sleep 30",
+            CodeGeneration,
+            "x",
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "the timeout is reported: {err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the call returns promptly after the timeout, not after the child's own 30s sleep: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
