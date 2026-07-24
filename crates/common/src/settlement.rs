@@ -858,6 +858,67 @@ pub fn authorize_leader_block(
     att.term == term && &att.leader == elected_leader && &att.block_hash == block_hash && att.verify()
 }
 
+/// A single **settlement operation** a block commits (#147-L2 on-chain escrow (b) — maintainer
+/// decision 2026-07-24: escrow on-chain as first-class tamper-evident ops). Unifies value transfers
+/// with the escrow lifecycle so a block's `Vec<SettlementOp>` is the one tamper-evident record of
+/// everything that moved or locked value:
+/// - `Transfer` — a signed value transfer (authorized by `from`'s signature);
+/// - `Hold` — a consumer's signed escrow lock;
+/// - `Release` — release an escrowed hold to the provider, authorized by a co-signed [`UsageReceipt`];
+/// - `Refund` — refund an expired, unreleased hold to its consumer (expiry-authorized at apply time,
+///   so it carries only the `match_ref`, no signature).
+///
+/// Each op's payload is its own canonical wire form; [`encode`](Self::encode) prefixes a one-byte tag
+/// so a decoder dispatches to the right payload. Structural only — signatures/expiry are re-checked
+/// when the op is applied ([`Chain`]/[`Escrow`]), never trusted on decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettlementOp {
+    Transfer(Transfer),
+    Hold(Hold),
+    Release(UsageReceipt),
+    Refund([u8; 32]),
+}
+
+impl SettlementOp {
+    fn tag(&self) -> u8 {
+        match self {
+            SettlementOp::Transfer(_) => 0,
+            SettlementOp::Hold(_) => 1,
+            SettlementOp::Release(_) => 2,
+            SettlementOp::Refund(_) => 3,
+        }
+    }
+
+    /// Encode as `tag(1) ‖ <payload>`, where the payload is the op's own canonical wire form
+    /// ([`Transfer::encode`]/[`Hold::encode`]/[`UsageReceipt::encode`], or the bare 32-byte `match_ref`
+    /// for a refund).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![self.tag()];
+        match self {
+            SettlementOp::Transfer(t) => out.extend_from_slice(&t.encode()),
+            SettlementOp::Hold(h) => out.extend_from_slice(&h.encode()),
+            SettlementOp::Release(r) => out.extend_from_slice(&r.encode()),
+            SettlementOp::Refund(match_ref) => out.extend_from_slice(match_ref),
+        }
+        out
+    }
+
+    /// Decode a single op from a buffer that is **exactly** one op (`tag ‖ payload`). `None` on an empty
+    /// buffer, an unknown tag, or a payload that isn't exactly the tagged op's wire form (each payload
+    /// decoder is exact-length / self-delimiting, so trailing bytes are rejected). Block framing of a
+    /// `Vec<SettlementOp>` (length-prefixing each op) is the follow slice.
+    pub fn decode(b: &[u8]) -> Option<SettlementOp> {
+        let (tag, payload) = b.split_first()?;
+        match tag {
+            0 => Transfer::decode(payload).map(SettlementOp::Transfer),
+            1 => Hold::decode(payload).map(SettlementOp::Hold),
+            2 => UsageReceipt::decode(payload).map(SettlementOp::Release),
+            3 => (payload.len() == 32).then(|| SettlementOp::Refund(payload.try_into().unwrap())),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1055,49 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert!(Hold::decode(&long).is_none(), "an over-long buffer is rejected");
+    }
+
+    #[test]
+    fn settlement_op_encode_round_trips_every_variant_and_rejects_bad_tags() {
+        // #147-L2 on-chain escrow (b, frozen): each of the four block-committable ops round-trips
+        // through the tagged SettlementOp wire form, the tag distinguishes variants, and a bad tag /
+        // truncated / trailing-byte buffer is rejected.
+        use crate::channel::{CapacityKind, UsageReceipt};
+        let consumer = key(1);
+        let provider = key(2);
+        let (_c, p) = (acct(&consumer), acct(&provider));
+        let m = [0x77u8; 32];
+
+        let ops = vec![
+            SettlementOp::Transfer(Transfer::sign_new(&consumer, p, 40, 0)),
+            SettlementOp::Hold(Hold::sign_new(&consumer, p, 40, m, 0, 5_000)),
+            SettlementOp::Release(UsageReceipt::co_sign(
+                &provider, &consumer, CapacityKind::CloudApiQuota, "claude-opus-4-8".into(), 40, m, 1,
+            )),
+            SettlementOp::Refund(m),
+        ];
+        for op in &ops {
+            let bytes = op.encode();
+            assert_eq!(SettlementOp::decode(&bytes).as_ref(), Some(op), "op round-trips through the tagged wire form");
+            assert!(SettlementOp::decode(&bytes[..bytes.len() - 1]).is_none(), "a truncated op is rejected");
+            let mut long = bytes.clone();
+            long.push(0);
+            assert!(SettlementOp::decode(&long).is_none(), "trailing bytes are rejected");
+        }
+
+        // The tag distinguishes variants: a Hold's payload under the Transfer tag doesn't decode as a
+        // Transfer (different fixed length), and vice-versa.
+        let hold_bytes = ops[1].encode();
+        let mut mistagged = hold_bytes.clone();
+        mistagged[0] = 0; // claim Transfer over a Hold payload
+        assert!(SettlementOp::decode(&mistagged).is_none(), "a Hold payload can't masquerade as a Transfer");
+
+        // Unknown tag and empty buffer → None.
+        assert!(SettlementOp::decode(&[9u8; 40]).is_none(), "an unknown tag is rejected");
+        assert!(SettlementOp::decode(&[]).is_none(), "an empty buffer is rejected");
+
+        // A refund is exactly tag ‖ 32-byte match_ref.
+        assert_eq!(SettlementOp::Refund(m).encode().len(), 33, "refund is tag + 32-byte match_ref");
     }
 
     #[test]
