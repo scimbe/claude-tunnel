@@ -66,6 +66,40 @@ pub fn channel_id_for_link(
     ChannelId(h.finalize().into())
 }
 
+/// The set of channels an operator's declared overlay **authorizes** (#107-enforce /
+/// #102-broker-enforce): given the overlay as its holder-pair links, the `ChannelId`s those
+/// links derive via [`channel_id_for_link`]. This is the *enforcement* counterpart to grant
+/// *minting* (`compile_overlay_grants`) — the inverse question: not "mint the grants for these
+/// links" but "which channels does this overlay sanction at all". The admission gate consults it
+/// to refuse any channel the declared topology does not describe. Pure + canonical (identical
+/// derivation to `channel_id_for_link`), so the controller that authored the overlay and the gate
+/// that enforces it agree with no round-trip. Duplicate/reversed links collapse (set semantics).
+pub fn authorized_channels(
+    operator_pubkey: &[u8; 32],
+    links: &[([u8; 32], [u8; 32])],
+) -> std::collections::HashSet<ChannelId> {
+    links
+        .iter()
+        .map(|(a, b)| channel_id_for_link(operator_pubkey, a, b))
+        .collect()
+}
+
+/// Whether an operator's declared overlay authorizes `channel` — true iff some declared link
+/// `(a, b)` derives exactly it (#107-enforce / #102-broker-enforce). The predicate the
+/// broker-enforce admission gate calls so a member is admissible to a channel only when the
+/// declared topology actually contains the link that names it; an edge removed from the overlay
+/// stops authorizing its channel with no per-channel bookkeeping. Canonical order-independent, so
+/// `(a, b)` and `(b, a)` authorize the same channel.
+pub fn overlay_authorizes_channel(
+    operator_pubkey: &[u8; 32],
+    links: &[([u8; 32], [u8; 32])],
+    channel: &ChannelId,
+) -> bool {
+    links
+        .iter()
+        .any(|(a, b)| &channel_id_for_link(operator_pubkey, a, b) == channel)
+}
+
 /// The direction a grant authorizes on its channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -3173,6 +3207,58 @@ mod tests {
 
         // Sanity: it is a full 32-byte id and not the trivially-zero value.
         assert_ne!(id_ab.0, [0u8; 32], "a derived id is a real hash, not zero");
+    }
+
+    #[test]
+    fn overlay_authorized_channels_are_exactly_the_declared_links() {
+        // #107-enforce (frozen): the enforcement counterpart to `channel_id_for_link`. Given an
+        // operator's declared overlay as its holder-pair links, `authorized_channels` is exactly
+        // the set of channels those links derive, and `overlay_authorizes_channel` admits a
+        // channel iff a declared link names it. This is what makes a drawn topology GOVERN the
+        // wire: an undeclared pair's channel is refused; removing an edge stops authorizing it.
+        let op = [0x01u8; 32];
+        let a = [0xaau8; 32];
+        let b = [0xbbu8; 32];
+        let c = [0xccu8; 32];
+        let d = [0xddu8; 32];
+
+        // Declared overlay: a—b and b—c (a path); note (b, a) reversed + a duplicate to prove
+        // canonicalization + set-collapse.
+        let links = [(a, b), (b, c), (b, a), (a, b)];
+        let authorized = authorized_channels(&op, &links);
+
+        let ab = channel_id_for_link(&op, &a, &b);
+        let bc = channel_id_for_link(&op, &b, &c);
+        // Exactly the two distinct declared channels — reversed/duplicate links collapsed.
+        assert_eq!(authorized.len(), 2, "distinct declared links only (reversed + dup collapse)");
+        assert!(authorized.contains(&ab) && authorized.contains(&bc), "both declared links present");
+
+        // The predicate authorizes exactly the declared links (order-independent) and nothing else.
+        assert!(overlay_authorizes_channel(&op, &links, &ab), "a—b is declared → authorized");
+        assert!(
+            overlay_authorizes_channel(&op, &links, &channel_id_for_link(&op, &c, &b)),
+            "b—c authorized regardless of the order the channel is queried in"
+        );
+        // An undeclared pair (a—c, a—d, c—d) is NOT authorized even though its endpoints are members.
+        assert!(
+            !overlay_authorizes_channel(&op, &links, &channel_id_for_link(&op, &a, &c)),
+            "a—c is not a declared edge → refused (membership alone is not authorization)"
+        );
+        assert!(
+            !overlay_authorizes_channel(&op, &links, &channel_id_for_link(&op, &a, &d)),
+            "a link to a non-member is refused"
+        );
+
+        // Operator-bound: another operator's identically-shaped overlay authorizes different channels.
+        let op2 = [0x02u8; 32];
+        assert!(
+            !overlay_authorizes_channel(&op2, &links, &ab),
+            "the a—b channel of operator 1 is not authorized under operator 2's overlay"
+        );
+
+        // Empty overlay authorizes nothing.
+        assert!(authorized_channels(&op, &[]).is_empty(), "an empty overlay authorizes no channel");
+        assert!(!overlay_authorizes_channel(&op, &[], &ab), "empty overlay refuses every channel");
     }
 
     // ---- #132: optional agent-verifiable A2A billing commitment --------------------------
