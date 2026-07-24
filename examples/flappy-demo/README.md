@@ -25,6 +25,16 @@ examples/flappy-demo/run-demo.sh status
 `up` prints `✓ LIVE` once `https://flappy-demo.bunsenbrenner.org/` serves the studio,
 or actionable hints (DNS / cert / agent / edge).
 
+> **Public hostname? Create the tunnel via the portal, not just this script.** For a
+> real public `flappy-demo.<zone>`, use the portal tunnel-creation flow
+> (`POST /portal/tunnels` with the hostname) — it **atomically** does edge
+> host-authorization **and** the deSEC **A-record** creation. `run-demo.sh`'s
+> standalone BP4b admin path can bind the hostname at the edge but **cannot** create
+> the public DNS A-record from outside the docker network, so on its own the name
+> won't resolve. (Verified live 2026-07-24: the portal flow is what brought
+> `flappy-demo.bunsenbrenner.org` up end-to-end.) Once the tunnel + DNS exist, this
+> script's origin+agent bring-up and cert issuance work as described.
+
 ## The demo password (never committed, #168)
 The first-layer gate password is **not** in any committed file. Set it out-of-band as
 `FLAPPY_DEMO_PASSWORD` in the untracked `docker/deploy/.env`; `run-demo.sh up` derives
