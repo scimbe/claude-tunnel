@@ -9157,6 +9157,7 @@ mod tests {
             let off = unified_pairer_startup_line_for(None, true);
             assert!(off.contains("QUIC-native") && off.contains("default"), "{off}");
         }
+    }
 
     // ---- #763: channel presence ------------------------------------------------------
 
