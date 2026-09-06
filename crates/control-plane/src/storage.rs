@@ -2681,6 +2681,41 @@ impl SqliteTunnelStore {
                 dup_hostnames
             );
         }
+        // ===== #777 dead-man alerts (begin) =====
+        // Owner-configured webhook per tunnel plus a bounded delivery log (the last
+        // `ALERT_DELIVERY_KEEP` rows per tunnel, pruned on insert). `secret_hex` is the
+        // outbound HMAC key shown to the owner exactly once at creation (`alerts.rs`
+        // module doc has the wire contract); `alert_for` never returns it, only the
+        // loop/test-delivery path (`alert_row_for`/`all_enabled_alerts`) reads it.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tunnel_alerts (
+                 tunnel_id            TEXT PRIMARY KEY,
+                 subject              TEXT NOT NULL,
+                 webhook_url          TEXT NOT NULL,
+                 secret_hex           TEXT NOT NULL,
+                 threshold_secs       INTEGER NOT NULL,
+                 enabled              INTEGER NOT NULL DEFAULT 1,
+                 state                TEXT NOT NULL DEFAULT 'unknown',
+                 state_since          INTEGER NOT NULL,
+                 last_seen_hint       INTEGER,
+                 last_delivery_at     INTEGER,
+                 last_delivery_status TEXT,
+                 failures             INTEGER NOT NULL DEFAULT 0,
+                 created_at           INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_tunnel_alerts_subject ON tunnel_alerts (subject);
+             CREATE TABLE IF NOT EXISTS tunnel_alert_deliveries (
+                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tunnel_id TEXT NOT NULL,
+                 ts        INTEGER NOT NULL,
+                 event     TEXT NOT NULL,
+                 status    TEXT NOT NULL,
+                 detail    TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_tunnel_alert_deliveries_tunnel_ts
+                 ON tunnel_alert_deliveries (tunnel_id, ts);",
+        )?;
+        // ===== #777 dead-man alerts (end) =====
         Ok(Self {
             writer: Mutex::new(conn),
             readers: None,
@@ -4430,6 +4465,323 @@ impl SqliteTunnelStore {
         Ok(granted.is_some())
     }
 }
+
+// ===== #777 dead-man alerts (begin) =====
+
+/// How many `tunnel_alert_deliveries` rows [`SqliteTunnelStore::record_delivery`] keeps
+/// per tunnel -- a card shows the last five, an owner debugging a broken receiver
+/// wants a bit more, nobody needs an unbounded log of a flapping tunnel.
+pub const ALERT_DELIVERY_KEEP: i64 = 50;
+
+/// One owner-facing `tunnel_alerts` row (#777). Holds **no secret**: the outbound
+/// signing key is shown once at creation and only ever read again by the delivery
+/// path ([`AlertRow`]), never by a listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelAlert {
+    pub tunnel_id: String,
+    pub subject: String,
+    pub webhook_url: String,
+    pub threshold_secs: i64,
+    pub enabled: bool,
+    /// `"unknown"` (never evaluated) | `"up"` | `"down"`.
+    pub state: String,
+    /// Unix seconds the current `state` began -- for `"down"` that is the moment the
+    /// tunnel was last known up (the outage start), not when the alert fired.
+    pub state_since: i64,
+    /// Unix seconds the loop last observed the tunnel up, if ever.
+    pub last_seen_hint: Option<i64>,
+    pub last_delivery_at: Option<i64>,
+    pub last_delivery_status: Option<String>,
+    /// Consecutive failed deliveries; reset by the next successful one.
+    pub failures: i64,
+    pub created_at: i64,
+}
+
+/// A [`TunnelAlert`] plus what the delivery path additionally needs: the signing
+/// secret and the tunnel's own name + routing token (joined from `subject_tunnels`, so
+/// an alert whose tunnel has since been revoked simply never appears here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertRow {
+    pub alert: TunnelAlert,
+    pub secret_hex: String,
+    pub name: String,
+    pub routing_token: String,
+}
+
+/// One `tunnel_alert_deliveries` row: what was sent (or refused) when, and how it went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDelivery {
+    pub id: i64,
+    pub tunnel_id: String,
+    pub ts: i64,
+    /// `"tunnel.down"` | `"tunnel.up"` | `"tunnel.test"`.
+    pub event: String,
+    /// `"ok"` | `"failed"` | `"skipped"` (rate limit).
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+/// How [`SqliteTunnelStore::upsert_alert`] resolved for an owned tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertUpsert {
+    /// A brand-new alert; `secret_hex` is the freshly minted signing secret -- the ONLY
+    /// time the store hands it to an owner-facing caller.
+    Created { secret_hex: String },
+    /// An existing alert had its URL/threshold replaced; the secret is unchanged and
+    /// deliberately not returned.
+    Updated,
+}
+
+/// The `tunnel_alerts` column list every alert read below selects, in
+/// `SqliteTunnelStore::alert_from_row`'s index order (alias `a`).
+const ALERT_COLUMNS: &str = "a.tunnel_id, a.subject, a.webhook_url, a.threshold_secs, a.enabled, a.state, \
+     a.state_since, a.last_seen_hint, a.last_delivery_at, a.last_delivery_status, a.failures, a.created_at";
+
+impl SqliteTunnelStore {
+    /// Create or replace the dead-man alert for a tunnel the caller owns (#777). Mints a
+    /// 32-byte hex secret on create and KEEPS the existing one on update (rotating it
+    /// silently would break the owner's receiver without telling them -- delete and
+    /// re-create is the explicit way to rotate). `Ok(None)` for an unknown/foreign
+    /// tunnel id, same "existence leaks nothing" posture as `set_bridge_grant`. Does
+    /// not validate `webhook_url` -- the portal handler does, before this is called.
+    /// An update also resets the observed state to `unknown`, so a changed threshold is
+    /// evaluated fresh on the next tick instead of against a stale outage start.
+    pub fn upsert_alert(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+        webhook_url: &str,
+        threshold_secs: i64,
+        now: i64,
+    ) -> rusqlite::Result<Option<AlertUpsert>> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let owned: bool = tx
+            .query_row(
+                "SELECT 1 FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owned {
+            return Ok(None);
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT secret_hex FROM tunnel_alerts WHERE tunnel_id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let outcome = match existing {
+            Some(_) => {
+                tx.execute(
+                    "UPDATE tunnel_alerts
+                     SET webhook_url = ?1, threshold_secs = ?2, enabled = 1, state = 'unknown', state_since = ?3
+                     WHERE tunnel_id = ?4 AND subject = ?5",
+                    params![webhook_url, threshold_secs, now, tunnel_id, subject],
+                )?;
+                AlertUpsert::Updated
+            }
+            None => {
+                let mut bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut bytes);
+                let secret_hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                tx.execute(
+                    "INSERT INTO tunnel_alerts
+                     (tunnel_id, subject, webhook_url, secret_hex, threshold_secs, enabled, state, state_since, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 'unknown', ?6, ?6)",
+                    params![tunnel_id, subject, webhook_url, secret_hex, threshold_secs, now],
+                )?;
+                AlertUpsert::Created { secret_hex }
+            }
+        };
+        tx.commit()?;
+        Ok(Some(outcome))
+    }
+
+    /// Remove a tunnel's alert and its delivery log, owner-scoped: `Ok(false)` when
+    /// there is no alert, the id is unknown, or the tunnel is someone else's.
+    pub fn delete_alert(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let n = tx.execute(
+            "DELETE FROM tunnel_alerts WHERE tunnel_id = ?1 AND subject = ?2",
+            params![tunnel_id, subject],
+        )?;
+        if n > 0 {
+            tx.execute("DELETE FROM tunnel_alert_deliveries WHERE tunnel_id = ?1", params![tunnel_id])?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelAlert> {
+        Ok(TunnelAlert {
+            tunnel_id: r.get(0)?,
+            subject: r.get(1)?,
+            webhook_url: r.get(2)?,
+            threshold_secs: r.get(3)?,
+            enabled: r.get::<_, i64>(4)? != 0,
+            state: r.get(5)?,
+            state_since: r.get(6)?,
+            last_seen_hint: r.get(7)?,
+            last_delivery_at: r.get(8)?,
+            last_delivery_status: r.get(9)?,
+            failures: r.get(10)?,
+            created_at: r.get(11)?,
+        })
+    }
+
+    /// The owner-facing alert for a tunnel the caller owns, without its secret. `None`
+    /// when none is configured or the tunnel is unknown/foreign.
+    pub fn alert_for(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<TunnelAlert>> {
+        self.read()
+            .query_row(
+                &format!("SELECT {ALERT_COLUMNS} FROM tunnel_alerts a WHERE a.tunnel_id = ?1 AND a.subject = ?2"),
+                params![tunnel_id, subject],
+                Self::alert_from_row,
+            )
+            .optional()
+    }
+
+    fn alert_row_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRow> {
+        Ok(AlertRow {
+            alert: Self::alert_from_row(r)?,
+            secret_hex: r.get(12)?,
+            name: r.get(13)?,
+            routing_token: r.get(14)?,
+        })
+    }
+
+    /// The delivery-path view (secret + tunnel name/token) of one owned tunnel's alert
+    /// -- the portal's "Test" button. Same owner scoping as [`Self::alert_for`].
+    pub fn alert_row_for(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<AlertRow>> {
+        self.read()
+            .query_row(
+                &format!(
+                    "SELECT {ALERT_COLUMNS}, a.secret_hex, t.name, t.routing_token
+                     FROM tunnel_alerts a JOIN subject_tunnels t ON t.id = a.tunnel_id AND t.subject = a.subject
+                     WHERE a.tunnel_id = ?1 AND a.subject = ?2"
+                ),
+                params![tunnel_id, subject],
+                Self::alert_row_from_row,
+            )
+            .optional()
+    }
+
+    /// Every enabled alert whose tunnel still exists under the same owner -- the loop's
+    /// per-tick work list. Not owner-scoped by design (it IS the cross-owner sweep).
+    pub fn all_enabled_alerts(&self) -> rusqlite::Result<Vec<AlertRow>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ALERT_COLUMNS}, a.secret_hex, t.name, t.routing_token
+             FROM tunnel_alerts a JOIN subject_tunnels t ON t.id = a.tunnel_id AND t.subject = a.subject
+             WHERE a.enabled = 1 ORDER BY a.tunnel_id"
+        ))?;
+        let rows = stmt.query_map([], Self::alert_row_from_row)?;
+        rows.collect()
+    }
+
+    /// Record an observed state transition (`"up"` / `"down"` / `"unknown"`) and when
+    /// that state began. Not owner-scoped: only the loop calls it, on rows it read from
+    /// [`Self::all_enabled_alerts`].
+    pub fn set_alert_state(&self, tunnel_id: &str, state: &str, since: i64) -> rusqlite::Result<()> {
+        self.writer.lock_safe().execute(
+            "UPDATE tunnel_alerts SET state = ?1, state_since = ?2 WHERE tunnel_id = ?3",
+            params![state, since, tunnel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Note that the loop just observed the tunnel up at `seen_at` -- the reference
+    /// point a later outage's threshold is measured from.
+    pub fn touch_alert_seen(&self, tunnel_id: &str, seen_at: i64) -> rusqlite::Result<()> {
+        self.writer.lock_safe().execute(
+            "UPDATE tunnel_alerts SET last_seen_hint = ?1 WHERE tunnel_id = ?2",
+            params![seen_at, tunnel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Append one delivery-log row, prune the tunnel's log to [`ALERT_DELIVERY_KEEP`]
+    /// rows, and fold the outcome into the alert row's own `last_delivery_*`/`failures`
+    /// columns (`ok` resets the failure streak, `failed` extends it, anything else --
+    /// a rate-limit `skipped` -- leaves it alone). `detail` must never carry the secret
+    /// or the webhook URL's query string; callers sanitize before this point.
+    pub fn record_delivery(
+        &self,
+        tunnel_id: &str,
+        ts: i64,
+        event: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        tx.execute(
+            "INSERT INTO tunnel_alert_deliveries (tunnel_id, ts, event, status, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![tunnel_id, ts, event, status, detail],
+        )?;
+        tx.execute(
+            "DELETE FROM tunnel_alert_deliveries
+             WHERE tunnel_id = ?1
+               AND id NOT IN (
+                   SELECT id FROM tunnel_alert_deliveries WHERE tunnel_id = ?1 ORDER BY id DESC LIMIT ?2
+               )",
+            params![tunnel_id, ALERT_DELIVERY_KEEP],
+        )?;
+        tx.execute(
+            "UPDATE tunnel_alerts
+             SET last_delivery_at = ?1,
+                 last_delivery_status = ?2,
+                 failures = CASE ?2 WHEN 'ok' THEN 0 WHEN 'failed' THEN failures + 1 ELSE failures END
+             WHERE tunnel_id = ?3",
+            params![ts, status, tunnel_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` delivery-log rows of a tunnel the caller owns, newest first.
+    /// Empty (not an error) for a foreign/unknown tunnel or one without an alert.
+    pub fn deliveries_for(&self, subject: &str, tunnel_id: &str, limit: u32) -> rusqlite::Result<Vec<AlertDelivery>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.tunnel_id, d.ts, d.event, d.status, d.detail
+             FROM tunnel_alert_deliveries d JOIN tunnel_alerts a ON a.tunnel_id = d.tunnel_id
+             WHERE d.tunnel_id = ?1 AND a.subject = ?2
+             ORDER BY d.id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![tunnel_id, subject, limit], |r| {
+            Ok(AlertDelivery {
+                id: r.get(0)?,
+                tunnel_id: r.get(1)?,
+                ts: r.get(2)?,
+                event: r.get(3)?,
+                status: r.get(4)?,
+                detail: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// How many deliveries actually went out (`ok` or `failed` -- a rate-limit `skipped`
+    /// row does not count, or the limit would extend itself) for ALL of `subject`'s
+    /// alerts since `since` -- the per-owner rate limit's input.
+    pub fn delivery_count_since(&self, subject: &str, since: i64) -> rusqlite::Result<i64> {
+        self.read().query_row(
+            "SELECT COUNT(*)
+             FROM tunnel_alert_deliveries d JOIN tunnel_alerts a ON a.tunnel_id = d.tunnel_id
+             WHERE a.subject = ?1 AND d.ts >= ?2 AND d.status IN ('ok', 'failed')",
+            params![subject, since],
+            |r| r.get(0),
+        )
+    }
+}
+
+// ===== #777 dead-man alerts (end) =====
 
 /// Agent Fabric channel registry (ADR-0020, #72 AF2d). Under **agent-held** key
 /// custody the operator agent holds its channel signing key and signs grants; the
