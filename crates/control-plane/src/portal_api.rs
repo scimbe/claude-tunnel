@@ -28,6 +28,8 @@ use ct_dns::provider::DesecClient;
 /// #778/#783: per-tunnel uptime page + public badge, account usage page + CSV -- a
 /// child module so it can use this file's private state and helpers; see its own doc.
 mod uptime;
+/// #781: the fleet view (`GET /portal/fleet`) -- see `portal_api/fleet.rs`.
+mod fleet;
 
 /// #297: map a storage/DB error to a generic 500 instead of leaking `e`'s `Display`
 /// (SQLite internals — constraint/table/column names, schema state) to the caller.
@@ -335,7 +337,8 @@ pub fn portal_api_router_with_verifier(
         .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
         .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
         // #778/#783: uptime page, badge routes, usage page + CSV (see `uptime.rs`).
-        .merge(uptime::routes());
+        .merge(uptime::routes())
+        .merge(fleet::routes());
     if verifier.is_some() {
         router = router
             .route("/me/signup", post(me_signup))
@@ -4834,7 +4837,15 @@ async fn dial_bridge_tool(
     )
     .await
     {
-        Ok(result) => Html(bridge_call_result_html(&id, &tool, Ok(&result), &noise_hex, claims_email.as_deref())).into_response(),
+        Ok(result) => {
+            // #781: a successful `bridge/status`/`bridge/config` reply is the only place
+            // the fleet page can learn the agent version / readiness from, so cache it
+            // here -- best-effort, a cache write failure never fails the call itself.
+            if let Err(e) = st.tunnels.record_bridge_probe(&subject, &id, &tool, &result, fleet::unix_now()) {
+                eprintln!("ct-cp portal: dial_bridge_tool/record_bridge_probe: {e}");
+            }
+            Html(bridge_call_result_html(&id, &tool, Ok(&result), &noise_hex, claims_email.as_deref())).into_response()
+        }
         Err(e) => Html(bridge_call_result_html(&id, &tool, Err(&e), &noise_hex, claims_email.as_deref())).into_response(),
     }
 }
@@ -6545,7 +6556,7 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><div class="nav-links"><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/usage">Usage</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/agent-bridges">Agent bridges</a></div><div class="nav-account">{signed_in_as}<a class="nav-signout" href="/portal/logout">Sign out</a></div></nav>
+<nav><div class="nav-links"><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/usage">Usage</a><a href="/portal/fleet">Fleet</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/agent-bridges">Agent bridges</a></div><div class="nav-account">{signed_in_as}<a class="nav-signout" href="/portal/logout">Sign out</a></div></nav>
 {body}
 </div>
 <script>

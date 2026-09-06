@@ -2340,6 +2340,79 @@ impl From<rusqlite::Error> for GrantError {
     }
 }
 
+/// #781: one tunnel's cached last bridge probe (see
+/// [`SqliteTunnelStore::record_bridge_probe`]). Either half may be absent -- only the
+/// tool that was actually called fills its half -- but `probed_at` is always the newer
+/// of the two calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeProbe {
+    /// `bridge/status`'s `version` string, as the agent reported it.
+    pub agent_version: Option<String>,
+    /// `bridge/config`'s readiness flags, restricted to the keys [`probe_from_result`]
+    /// allows -- always a JSON object when `Some`.
+    pub readiness: Option<serde_json::Value>,
+    /// Unix seconds of the newest recorded probe.
+    pub probed_at: i64,
+}
+
+/// #781: what one successful bridge call contributes to the probe cache.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeUpdate {
+    /// `bridge/status` -> the agent's own version string.
+    Version(String),
+    /// `bridge/config` -> the readiness flags, already filtered to the allowed keys.
+    Readiness(serde_json::Map<String, serde_json::Value>),
+}
+
+/// #781: cap on any single cached string (the agent's reply is untrusted output; a
+/// version or a readiness value is never legitimately longer than this).
+const PROBE_STRING_MAX_CHARS: usize = 64;
+
+/// #781: whether a `bridge/config` key names a readiness flag the fleet page may cache.
+/// Deliberately an allow-list by shape (`*_configured`, `*_available`, `*_disabled`) plus
+/// the two named keys, so an agent that adds new flags of the same shape is picked up
+/// while anything else in the reply (paths, URLs, tool lists, future secrets) never is.
+fn is_readiness_key(key: &str) -> bool {
+    key.ends_with("_configured")
+        || key.ends_with("_available")
+        || key.ends_with("_disabled")
+        || key == "oidc_credential"
+        || key == "role"
+}
+
+/// #781: the cacheable part of one successful bridge call's `result`, or `None` when
+/// the tool is not one the cache tracks or the reply lacks the expected shape.
+/// `bridge/status` needs a string `version`; `bridge/config` needs an object, of which
+/// only boolean/string fields under [`is_readiness_key`] survive (strings capped to
+/// [`PROBE_STRING_MAX_CHARS`]) -- an object with none of them still records an empty
+/// readiness set, which the page reads as "all ok" (nothing reported false).
+pub fn probe_from_result(tool: &str, result: &serde_json::Value) -> Option<ProbeUpdate> {
+    let cap = |s: &str| s.chars().take(PROBE_STRING_MAX_CHARS).collect::<String>();
+    match tool {
+        "bridge/status" => {
+            let version = result.get("version")?.as_str()?.trim();
+            if version.is_empty() {
+                return None;
+            }
+            Some(ProbeUpdate::Version(cap(version)))
+        }
+        "bridge/config" => {
+            let readiness = result
+                .as_object()?
+                .iter()
+                .filter(|(k, _)| is_readiness_key(k))
+                .filter_map(|(k, v)| match v {
+                    serde_json::Value::Bool(_) => Some((k.clone(), v.clone())),
+                    serde_json::Value::String(s) => Some((k.clone(), serde_json::Value::String(cap(s)))),
+                    _ => None,
+                })
+                .collect();
+            Some(ProbeUpdate::Readiness(readiness))
+        }
+        _ => None,
+    }
+}
+
 /// SQLite-backed per-subject tunnel store (#27): a customer creates, lists and
 /// revokes their **own** tunnels. Every operation is scoped by `subject` (from
 /// the verified token), so one customer can never see or revoke another's tunnel.
@@ -2716,6 +2789,22 @@ impl SqliteTunnelStore {
                  ON tunnel_alert_deliveries (tunnel_id, ts);",
         )?;
         // ===== #777 dead-man alerts (end) =====
+        // #781 (fleet view): the last successful bridge probe per tunnel -- the agent
+        // version `bridge/status` reported and the readiness flags `bridge/config`
+        // reported -- so the fleet page can show them WITHOUT dialing any agent on page
+        // load. Written only from `portal_api::dial_bridge_tool`'s success path
+        // (`record_bridge_probe`), read by `bridge_probe`, deleted with the tunnel
+        // (`revoke`). `subject` is denormalized so a read stays owner-scoped without a
+        // join, same posture as every other per-tunnel lookup here.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bridge_probe_cache (
+                 tunnel_id      TEXT PRIMARY KEY,
+                 subject        TEXT NOT NULL,
+                 agent_version  TEXT,
+                 readiness_json TEXT,
+                 probed_at      INTEGER NOT NULL
+             );",
+        )?;
         Ok(Self {
             writer: Mutex::new(conn),
             readers: None,
@@ -2912,6 +3001,7 @@ impl SqliteTunnelStore {
             tx.execute("DELETE FROM tunnel_grants WHERE tunnel_id = ?1", params![id])?;
             // #778: a public badge must not outlive its tunnel.
             tx.execute("DELETE FROM tunnel_badges WHERE tunnel_id = ?1", params![id])?;
+            tx.execute("DELETE FROM bridge_probe_cache WHERE tunnel_id = ?1", params![id])?;
             tx.execute(
                 "INSERT OR REPLACE INTO revoked_tokens (token, revoked_at) VALUES (?1, ?2)",
                 params![tok, now as i64],
@@ -3148,6 +3238,84 @@ impl SqliteTunnelStore {
                         hostname: r.get(2)?,
                         created_at: r.get(3)?,
                         routing_token: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    // ---- #781 fleet view: bridge probe cache ------------------------------------------
+
+    /// #781: record what a successful `tool` call against `tunnel_id`'s agent revealed
+    /// (see [`probe_from_result`] for exactly which part of `result` is kept -- the
+    /// reply is untrusted agent output and only an allow-listed subset is ever stored).
+    /// `bridge/status` refreshes the agent version, `bridge/config` the readiness flags;
+    /// both stamp `probed_at = now`; every other tool is ignored (`Ok(false)`). Owner-
+    /// scoped like every write here: `Ok(false)` for an unknown/foreign tunnel id,
+    /// nothing stored.
+    pub fn record_bridge_probe(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+        tool: &str,
+        result: &serde_json::Value,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let Some(update) = probe_from_result(tool, result) else {
+            return Ok(false);
+        };
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let owned: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+            params![tunnel_id, subject],
+            |r| r.get(0),
+        )?;
+        if owned == 0 {
+            return Ok(false);
+        }
+        match update {
+            ProbeUpdate::Version(version) => tx.execute(
+                "INSERT INTO bridge_probe_cache (tunnel_id, subject, agent_version, readiness_json, probed_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4)
+                 ON CONFLICT(tunnel_id) DO UPDATE SET
+                     subject = excluded.subject,
+                     agent_version = excluded.agent_version,
+                     probed_at = excluded.probed_at",
+                params![tunnel_id, subject, version, now],
+            )?,
+            ProbeUpdate::Readiness(readiness) => tx.execute(
+                "INSERT INTO bridge_probe_cache (tunnel_id, subject, agent_version, readiness_json, probed_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4)
+                 ON CONFLICT(tunnel_id) DO UPDATE SET
+                     subject = excluded.subject,
+                     readiness_json = excluded.readiness_json,
+                     probed_at = excluded.probed_at",
+                params![tunnel_id, subject, serde_json::Value::Object(readiness).to_string(), now],
+            )?,
+        };
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// #781: the cached last probe of a tunnel the caller owns -- `None` when no
+    /// successful `bridge/status`/`bridge/config` call has been recorded yet, or the
+    /// tunnel id is unknown/foreign (same "existence leaks nothing" posture as
+    /// [`Self::bridge_grant`]).
+    pub fn bridge_probe(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<BridgeProbe>> {
+        self.read()
+            .query_row(
+                "SELECT agent_version, readiness_json, probed_at FROM bridge_probe_cache
+                 WHERE tunnel_id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| {
+                    Ok(BridgeProbe {
+                        agent_version: r.get::<_, Option<String>>(0)?,
+                        readiness: r
+                            .get::<_, Option<String>>(1)?
+                            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                            .filter(serde_json::Value::is_object),
+                        probed_at: r.get(2)?,
                     })
                 },
             )
@@ -11328,5 +11496,128 @@ mod tests {
         let rows = store.list_hostname_certs().unwrap();
         assert_eq!(rows.len(), 1, "re-issuing the same hostname's cert must not duplicate the row");
         assert_eq!(rows[0].issued_at, 2000);
+    }
+
+    #[test]
+    fn probe_from_result_extracts_only_what_the_fleet_page_may_cache_781() {
+        // `bridge/status`: the version string, nothing else; missing/blank/non-string -> None.
+        let status = serde_json::json!({ "version": " 0.7.26 ", "bridge_gated": true, "uptime_secs": 12 });
+        assert_eq!(probe_from_result("bridge/status", &status), Some(ProbeUpdate::Version("0.7.26".to_string())));
+        assert_eq!(probe_from_result("bridge/status", &serde_json::json!({ "bridge_gated": true })), None);
+        assert_eq!(probe_from_result("bridge/status", &serde_json::json!({ "version": "" })), None);
+        assert_eq!(probe_from_result("bridge/status", &serde_json::json!({ "version": 7 })), None);
+        let long = "9".repeat(200);
+        assert_eq!(
+            probe_from_result("bridge/status", &serde_json::json!({ "version": long })),
+            Some(ProbeUpdate::Version("9".repeat(64))),
+            "an oversized agent-supplied string is capped, never stored whole"
+        );
+
+        // `bridge/config`: only boolean/string fields under the allow-listed key shapes.
+        let config = serde_json::json!({
+            "role": "serve",
+            "cp_url_configured": true,
+            "oidc_credential": "none",
+            "manifest_registry_configured": false,
+            "docker_available": false,
+            "manifest_install_disabled": true,
+            "manifest_work_dir": "/srv/agent/work",
+            "cp_url": "https://cp.example",
+            "tools": ["bridge/status", "bridge/config"],
+            "nested_configured": { "x": 1 },
+            "count_configured": 3
+        });
+        let Some(ProbeUpdate::Readiness(readiness)) = probe_from_result("bridge/config", &config) else {
+            panic!("config must yield a readiness update");
+        };
+        let mut keys: Vec<&str> = readiness.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "cp_url_configured",
+                "docker_available",
+                "manifest_install_disabled",
+                "manifest_registry_configured",
+                "oidc_credential",
+                "role",
+            ],
+            "paths, URLs, tool lists and non-scalar/numeric fields never reach the cache"
+        );
+        assert_eq!(readiness["oidc_credential"], serde_json::json!("none"));
+        assert_eq!(readiness["docker_available"], serde_json::json!(false));
+        assert_eq!(probe_from_result("bridge/config", &serde_json::json!("not an object")), None);
+        assert_eq!(
+            probe_from_result("bridge/config", &serde_json::json!({ "cp_url": "x" })),
+            Some(ProbeUpdate::Readiness(serde_json::Map::new())),
+            "an object without any readiness flag records an empty set (reads as 'all ok')"
+        );
+
+        // Every other tool is ignored.
+        assert_eq!(probe_from_result("bridge/channel-members", &serde_json::json!({ "version": "1" })), None);
+        assert_eq!(probe_from_result("bridge/manifest-list", &serde_json::json!([])), None);
+    }
+
+    #[test]
+    fn bridge_probe_cache_round_trips_and_is_owner_scoped_and_deleted_with_the_tunnel_781() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "agent-1", None).unwrap().created().expect("hostname free");
+        assert_eq!(store.bridge_probe("alice", &t.id).unwrap(), None, "nothing cached yet");
+
+        // A status probe stores the version and the probe time.
+        let status = serde_json::json!({ "version": "0.7.26", "bridge_gated": true });
+        assert!(store.record_bridge_probe("alice", &t.id, "bridge/status", &status, 1_000).unwrap());
+        assert_eq!(
+            store.bridge_probe("alice", &t.id).unwrap(),
+            Some(BridgeProbe { agent_version: Some("0.7.26".to_string()), readiness: None, probed_at: 1_000 })
+        );
+
+        // A config probe stores only the allowed keys, keeps the version, bumps the time.
+        let config = serde_json::json!({
+            "role": "serve",
+            "cp_url_configured": true,
+            "oidc_credential": "none",
+            "docker_available": false,
+            "manifest_work_dir": "/srv/agent/work",
+            "tools": ["bridge/status"]
+        });
+        assert!(store.record_bridge_probe("alice", &t.id, "bridge/config", &config, 2_000).unwrap());
+        let probe = store.bridge_probe("alice", &t.id).unwrap().expect("cached");
+        assert_eq!(probe.agent_version.as_deref(), Some("0.7.26"), "the status half survives a config probe");
+        assert_eq!(probe.probed_at, 2_000);
+        assert_eq!(
+            probe.readiness,
+            Some(serde_json::json!({
+                "role": "serve",
+                "cp_url_configured": true,
+                "oidc_credential": "none",
+                "docker_available": false
+            })),
+            "paths and tool lists never reach the cache"
+        );
+
+        // A newer status probe replaces the version, keeps the readiness half.
+        let newer = serde_json::json!({ "version": "0.7.27" });
+        assert!(store.record_bridge_probe("alice", &t.id, "bridge/status", &newer, 3_000).unwrap());
+        let probe = store.bridge_probe("alice", &t.id).unwrap().expect("cached");
+        assert_eq!(probe.agent_version.as_deref(), Some("0.7.27"));
+        assert_eq!(probe.probed_at, 3_000);
+        assert!(probe.readiness.is_some(), "the config half survives a status probe");
+
+        // Tools the cache doesn't track are ignored and leave the row untouched.
+        assert!(!store
+            .record_bridge_probe("alice", &t.id, "bridge/channel-members", &serde_json::json!([]), 4_000)
+            .unwrap());
+        assert_eq!(store.bridge_probe("alice", &t.id).unwrap().unwrap().probed_at, 3_000);
+
+        // Owner-scoped both ways: a stranger neither reads nor writes it.
+        assert_eq!(store.bridge_probe("bob", &t.id).unwrap(), None, "foreign subject reads None");
+        assert!(!store.record_bridge_probe("bob", &t.id, "bridge/status", &newer, 5_000).unwrap());
+        assert_eq!(store.bridge_probe("alice", &t.id).unwrap().unwrap().probed_at, 3_000, "bob's write was refused");
+        assert!(!store.record_bridge_probe("alice", "no-such-tunnel", "bridge/status", &newer, 5_000).unwrap());
+
+        // Deleted with the tunnel.
+        assert!(store.revoke("alice", &t.id, 6_000).unwrap().is_some());
+        assert_eq!(store.bridge_probe("alice", &t.id).unwrap(), None, "the cache row goes with the tunnel");
     }
 }
