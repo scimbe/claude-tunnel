@@ -8,6 +8,24 @@
 //! with compatible directions, and returns which side initiates and which accepts.
 //! The socket-level QUIC brokering (generalising `rendezvous.rs` to relay between
 //! two agents) and where the operator key comes from are later sub-packets.
+//!
+//! # `CT_EDGE_UNIFIED_PAIRER` (#591, #495 U2 slice 2)
+//!
+//! Two pairing paths exist: the QUIC-native one (`:4436` relay / `:4435` rendezvous,
+//! [`run_channel_broker_loop`] over [`AdmittedMember`] + `finish_relay_pair` /
+//! `finish_rendezvous_pair`) and the shared stream-generic one (`:443` TLS-TCP and the
+//! WebSocket listener, one [`SharedChannelPairer`] over [`AdmittedStreamMember`] +
+//! `finish_relay_pair_over_streams`). Members on different paths can never meet.
+//! `CT_EDGE_UNIFIED_PAIRER=1` (only the literal `1`; default **off**) parks the `:4436`
+//! RELAY loop's members in the shared pairer too, tagged [`SessionSource::QuicNextBiStream`]
+//! so the shared completer keeps their wire contract per side: ack without newline, then
+//! FIN on the admission stream, then the session on a FRESH bi-stream (initiator
+//! `accept_bi`, acceptor `open_bi`) — while a `:443` partner is spliced on its own
+//! admission stream. Off (or `1` without a front-door channel broker to route into) is the
+//! QUIC-native path unchanged. The `:4435` rendezvous loop is never routed. Flipping this in
+//! production is gated on a run with a REAL deployed ct-agent client against a flagged-on
+//! edge, not on this module's unit tests: it changes which code path every fielded `:4436`
+//! client is completed by, and the flag exists so that can be reverted instantly.
 
 use ct_common::sync::MutexExt;
 use ct_common::channel::{
@@ -1935,19 +1953,33 @@ pub type BoxedChannelStream = std::pin::Pin<Box<dyn AsyncDuplex>>;
 /// clone of the connection being dropped elsewhere — the "conn-liveness, not a pump task"
 /// the U2 plan calls for. quinn's `SendStream`/`RecvStream` already implement
 /// tokio's `AsyncWrite`/`AsyncRead` (runtime-tokio), so this is a thin, allocation-free
-/// combiner. Not yet wired: the `:4436` relay offer path (a later U2 slice) constructs one
-/// and hands it to the shared pairer behind `CT_EDGE_UNIFIED_PAIRER`.
+/// combiner. #591 (U2 slice 2) wires it: the `:4436` relay accept loop boxes each admitted
+/// member's ADMISSION stream via [`QuicBi::admission`] and offers it to the shared pairer
+/// when `CT_EDGE_UNIFIED_PAIRER=1` (see [`unified_pairer_enabled`]); the session itself
+/// then runs on a fresh bi-stream ([`SessionSource::QuicNextBiStream`]), wrapped by
+/// [`QuicBi::new`] at splice time.
 pub struct QuicBi {
     _conn: quinn::Connection,
     send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    /// `None` for an admission-stream wrapper ([`QuicBi::admission`]): the join reader
+    /// already consumed the client's half (the client `finish()`ed it at the possession
+    /// signature), so the read half is exhausted by contract and reads as EOF.
+    recv: Option<quinn::RecvStream>,
 }
 
 impl QuicBi {
     /// Wrap a QUIC bi-stream (its `send`/`recv` halves) plus the owning `conn` (kept alive
     /// for this duplex's whole life) as an [`AsyncDuplex`].
     pub fn new(conn: quinn::Connection, send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { _conn: conn, send, recv }
+        Self { _conn: conn, send, recv: Some(recv) }
+    }
+
+    /// #591: wrap an admitted member's ADMISSION stream — the `SendStream` the join reader
+    /// returned, whose peer half is already at EOF — so a `:4436` member can be parked in the
+    /// stream-typed shared pairer. Writes (the ack, a `pairing` refusal) go to the client
+    /// exactly as [`quic_ack_member`] wrote them; reads yield EOF.
+    pub fn admission(conn: quinn::Connection, send: quinn::SendStream) -> Self {
+        Self { _conn: conn, send, recv: None }
     }
 }
 
@@ -1961,7 +1993,91 @@ impl tokio::io::AsyncRead for QuicBi {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.recv), cx, buf)
+        match self.recv.as_mut() {
+            Some(recv) => tokio::io::AsyncRead::poll_read(std::pin::Pin::new(recv), cx, buf),
+            None => std::task::Poll::Ready(Ok(())),
+        }
+    }
+}
+
+/// #591: one side's SESSION leg at splice time — either the very stream the member was
+/// admitted over ([`SessionSource::SameStream`]) or the fresh QUIC bi-stream opened/accepted
+/// for it ([`SessionSource::QuicNextBiStream`]). Lets [`finish_stream_pair_inner`] stay
+/// generic over the two admitted stream types while resolving each side's leg on its own,
+/// so a mixed `:4436`↔`:443` pair splices the RIGHT stream on each side.
+enum SessionLeg<S> {
+    Same(S),
+    Fresh(QuicBi),
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for SessionLeg<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SessionLeg::Same(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            SessionLeg::Fresh(q) => std::pin::Pin::new(q).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for SessionLeg<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            SessionLeg::Same(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            SessionLeg::Fresh(q) => std::pin::Pin::new(q).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SessionLeg::Same(s) => std::pin::Pin::new(s).poll_flush(cx),
+            SessionLeg::Fresh(q) => std::pin::Pin::new(q).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SessionLeg::Same(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            SessionLeg::Fresh(q) => std::pin::Pin::new(q).poll_shutdown(cx),
+        }
+    }
+}
+
+/// #591: is the `:4436` relay routed through the shared `:443`/WS pairer? Default **off**
+/// — only the literal `1` arms it, the same vocabulary as `CT_EDGE_REQUIRE_ATTESTED_ENDPOINT`
+/// (#546). See the flag's semantics in [`run_channel_broker_loop`]'s `unified` parameter.
+pub fn unified_pairer_enabled() -> bool {
+    std::env::var("CT_EDGE_UNIFIED_PAIRER").ok().as_deref() == Some("1")
+}
+
+/// #591: the startup line for [`unified_pairer_enabled`], stated in both directions (the
+/// #552 rule: an OFF that never speaks cannot be checked by reading the log). Pure core over
+/// the raw env value + whether the `:443` shared pairer exists to route INTO — the flag alone
+/// is not enough: without a front-door channel broker there is no shared pairer, and the
+/// relay stays on its QUIC-native path with the reason said out loud.
+pub fn unified_pairer_startup_line_for(raw: Option<&str>, shared_pairer_present: bool) -> String {
+    match raw {
+        Some("1") if shared_pairer_present => {
+            "ct-edge: channel relay :4436 parks in the UNIFIED :443/WS pairer -- cross-transport \
+             pairs form, sessions on a fresh bi-stream (CT_EDGE_UNIFIED_PAIRER=1, #591)"
+                .to_string()
+        }
+        Some("1") => "ct-edge: channel relay :4436 on the QUIC-native pairer -- \
+                      CT_EDGE_UNIFIED_PAIRER=1 is set but no :443 front-door channel broker is \
+                      configured, so there is no shared pairer to route into (#591)"
+            .to_string(),
+        Some(v) => format!(
+            "ct-edge: channel relay :4436 on the QUIC-native pairer -- CT_EDGE_UNIFIED_PAIRER is \
+             set to {v:?}, and ONLY the literal \"1\" arms the unified pairer (#591)"
+        ),
+        None => "ct-edge: channel relay :4436 on the QUIC-native pairer (default). Set \
+                 CT_EDGE_UNIFIED_PAIRER=1 to park it in the shared :443/WS pairer (#591)"
+            .to_string(),
     }
 }
 
@@ -2066,7 +2182,16 @@ pub fn quic_park_expired_reason(why: &str) -> String {
 ///   alone would splice — splicing an EOF'd admission stream would resurrect the
 ///   phase-mixed early-eof class (#495 2a) for cross-transport pairs.
 ///
-/// U3 adds the third variant (QUIC relay: session on the connection's NEXT bi-stream).
+/// - [`SessionSource::QuicNextBiStream`] (`:4436` QUIC relay, #591 / U2 slice 2): the
+///   admission stream ends after the ack — acked WITHOUT a newline and then
+///   `finish()`ed, exactly as [`quic_ack_member`] has always done — and the session runs
+///   on a FRESH bi-stream of the member's `quinn::Connection`, under the direct-path
+///   role contract of [`crate::relay::relay_initiator_to_acceptor`]: the initiator
+///   opens (the edge `accept_bi()`s), the acceptor accepts (the edge `open_bi()`s). The
+///   variant is honoured PER SIDE, so its partner may be a plain `:443` `SameStream`
+///   member spliced on its own admission stream — the cross-transport pair this slice
+///   exists for. A pair of two such members is wire-identical to the QUIC-native
+///   `finish_relay_pair` (same ack bytes, same open/accept order, same setup bound).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSource {
     /// The session continues on the admission stream (splice on pairing).
@@ -2074,9 +2199,18 @@ pub enum SessionSource {
     /// The admission stream ends after the ack; the session forms out-of-band via
     /// the exchanged endpoints (ack-then-close on pairing).
     EndpointSwap,
+    /// The admission stream ends after the ack (no newline, then FIN); the session is a
+    /// fresh bi-stream on the member's own QUIC connection, spliced by the edge.
+    QuicNextBiStream,
 }
 
 pub struct AdmittedStreamMember<S> {
+    /// #591: the raw QUIC connection, `Some` ONLY for [`SessionSource::QuicNextBiStream`]
+    /// — what the completer opens/accepts the fresh session bi-stream on, what a
+    /// `pairing` refusal holds open until the peer has read it (#753), and what a park
+    /// expiry closes with the named `park-expired:` reason (ct-agent#21). `None` on every
+    /// stream-transport member.
+    conn: Option<quinn::Connection>,
     stream: S,
     req: ChannelJoinRequest,
     operator: [u8; 32],
@@ -2111,7 +2245,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AdmittedStreamMember<S> {
     /// ignored: the member may already be gone, which is fine, the write existed to help a
     /// live one). Consumes the member; dropping the stream afterwards closes the connection
     /// and releases the #451 permit, exactly as the silent drop did.
-    pub async fn notify_park_expired(mut self) {
+    pub async fn notify_park_expired(self) {
+        self.end_park("no partner within the park TTL").await;
+    }
+
+    /// #499 slice A: the supersede twin of [`Self::notify_park_expired`] — same wire event
+    /// for a stream member (`EX`), the same-holder-retry close reason for a QUIC one.
+    pub async fn notify_park_superseded(self) {
+        self.end_park("superseded by a newer join from the same holder").await;
+    }
+
+    async fn end_park(mut self, why: &str) {
+        // #591: a `:4436` member parked in the shared pairer is ended EXACTLY as the QUIC-native
+        // loop ends a reaped/superseded park -- a connection close carrying the named
+        // `park-expired:` reason, which is what a deployed ct-agent classifies as "re-park on
+        // the same rung" (`error_names_park_expiry`). No `EX` on the admission stream: that is
+        // the stream leg's token, and today's QUIC clients never see one.
+        if let Some(conn) = &self.conn {
+            conn.close(0u32.into(), quic_park_expired_reason(why).as_bytes());
+            return;
+        }
         let _ = self.stream.write_all(PARK_EXPIRED_TOKEN).await;
         // Graceful close (found here first, 2026-08-14: v0.4.11 clients half-close their
         // leg right after the possession signature, so by reap time this socket holds
@@ -2286,6 +2439,75 @@ pub fn completion_for(a: ParkPhase, b: ParkPhase) -> StreamPairCompletion {
     }
 }
 
+/// #591: ack one side the way ITS transport expects. A [`SessionSource::QuicNextBiStream`]
+/// member gets the QUIC-native bytes — `OK <peer…> r=<own> sp=<0|1>` with NO trailing
+/// newline, then the admission stream is `finish()`ed (`shutdown` on the [`QuicBi`]) —
+/// byte-for-byte [`finish_quic_pair_inner`]'s ack via [`quic_ack_member`]: a deployed
+/// ct-agent reads that ack to the stream's EOF and then opens/accepts its session
+/// bi-stream. Every other member keeps [`write_member_ack`]'s `\n`-delimited line, the
+/// delimiter the same-stream session needs. Failures carry the side (#148) either way.
+#[allow(clippy::too_many_arguments)]
+async fn ack_member_for_session<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    session: SessionSource,
+    peer_endpoint: &str,
+    peer_noise: Option<[u8; 32]>,
+    peer_holder: &[u8; 32],
+    peer_attest: Option<[u8; 64]>,
+    own_observed: std::net::SocketAddr,
+    sp: bool,
+    side: PairSide,
+) -> Result<(), RelayHandoffError> {
+    if session != SessionSource::QuicNextBiStream {
+        return write_member_ack(stream, peer_endpoint, peer_noise, peer_holder, peer_attest, own_observed, sp, side)
+            .await;
+    }
+    let ack = format!(
+        "OK {}{} r={} sp={}",
+        peer_endpoint,
+        member_ack_suffix(peer_noise, peer_holder, peer_attest),
+        own_observed,
+        sp as u8
+    );
+    stream
+        .write_all(ack.as_bytes())
+        .await
+        .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| RelayHandoffError { failed_side: side, source: e.into() })?;
+    Ok(())
+}
+
+/// #591: one side's session leg for the splice (see [`SessionLeg`]). `initiator` selects
+/// the QUIC role per [`crate::relay::next_session_bi`]; a non-QUIC member's leg is simply
+/// the stream it was admitted over, `initiator` unused.
+async fn session_leg<S>(
+    stream: S,
+    session: SessionSource,
+    conn: Option<quinn::Connection>,
+    initiator: bool,
+    label: &str,
+) -> std::io::Result<SessionLeg<S>> {
+    match (session, conn) {
+        (SessionSource::QuicNextBiStream, Some(conn)) => {
+            let (send, recv) = crate::relay::next_session_bi(&conn, initiator, label).await?;
+            Ok(SessionLeg::Fresh(QuicBi::new(conn, send, recv)))
+        }
+        _ => Ok(SessionLeg::Same(stream)),
+    }
+}
+
+/// #591/#753: keep a QUIC member's connection alive until its peer has read what was
+/// just enqueued and closed, bounded (2 s -- the same bound as `finish_quic_pair_inner`'s
+/// refusal hold and `accept_and_read_join`'s #129-follow hold). A no-op for `None`.
+async fn hold_quic_until_peer_closes(conn: Option<&quinn::Connection>) {
+    if let Some(conn) = conn {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn.closed()).await;
+    }
+}
+
 async fn finish_stream_pair_inner<A, B>(
     mut a: AdmittedStreamMember<A>,
     mut b: AdmittedStreamMember<B>,
@@ -2300,10 +2522,12 @@ where
     // of what the phases alone decided -- there is no stream to splice on that side,
     // and splicing its EOF'd admission stream against a live partner would hand the
     // partner an instant early-eof (the resurrected 2a mixed-phase class).
-    let completion = if a.session == SessionSource::SameStream && b.session == SessionSource::SameStream {
-        completion
-    } else {
+    // #591: a QuicNextBiStream side has a session leg of its own (a fresh bi-stream), so
+    // it keeps the phases' decision like a SameStream side does.
+    let completion = if a.session == SessionSource::EndpointSwap || b.session == SessionSource::EndpointSwap {
         StreamPairCompletion::RendezvousClose
+    } else {
+        completion
     };
     match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
         Ok(pairing) => {
@@ -2319,8 +2543,9 @@ where
             // `RelayHandoffError` naming the dead side — so the caller can log "handoff race, side X"
             // instead of a bare "connection lost" that reads like the healthy peer was refused.
             let sp = same_public_ip(a.observed, b.observed);
-            write_member_ack(
+            ack_member_for_session(
                 &mut a.stream,
+                a.session,
                 &b.req.endpoint,
                 b.noise,
                 &b.req.grant.grant.holder,
@@ -2330,8 +2555,9 @@ where
                 PairSide::A,
             )
             .await?;
-            write_member_ack(
+            ack_member_for_session(
                 &mut b.stream,
+                b.session,
                 &a.req.endpoint,
                 a.noise,
                 &a.req.grant.grant.holder,
@@ -2349,10 +2575,37 @@ where
                     // cannot tell which transport a given participant arrived on.
                     let _ga = register_live_splice(&a.req.grant.grant.channel, &a.req.grant.grant.holder);
                     let _gb = register_live_splice(&b.req.grant.grant.channel, &b.req.grant.grant.holder);
+                    // #591: resolve each side's SESSION leg on its own -- the admission stream
+                    // for a SameStream member, a fresh bi-stream for a QuicNextBiStream one --
+                    // in the QUIC-native order (initiator's `accept_bi` first, then the
+                    // acceptor's `open_bi`), then pump the two legs through the same
+                    // per-direction core `relay_quic` uses. The label keeps the QUIC-native
+                    // spelling whenever a QUIC side is involved so its stage-tagged setup
+                    // errors read exactly as `finish_relay_pair`'s always have.
+                    let initiator_is_a = pairing.initiator_holder == a.req.grant.grant.holder;
+                    let label = if a.session == SessionSource::QuicNextBiStream || b.session == SessionSource::QuicNextBiStream {
+                        "channel-relay"
+                    } else {
+                        "channel-relay-443"
+                    };
+                    let (a_stream, a_session, a_conn) = (a.stream, a.session, a.conn.take());
+                    let (b_stream, b_session, b_conn) = (b.stream, b.session, b.conn.take());
+                    let splice = async move {
+                        let (leg_a, leg_b) = if initiator_is_a {
+                            let la = session_leg(a_stream, a_session, a_conn, true, label).await?;
+                            let lb = session_leg(b_stream, b_session, b_conn, false, label).await?;
+                            (la, lb)
+                        } else {
+                            let lb = session_leg(b_stream, b_session, b_conn, true, label).await?;
+                            let la = session_leg(a_stream, a_session, a_conn, false, label).await?;
+                            (la, lb)
+                        };
+                        crate::relay::relay_streams(leg_a, leg_b, label).await
+                    };
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
                     let bytes = tokio::select! {
-                        r = crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443") => {
+                        r = splice => {
                             r.map_err(|e| -> BoxError {
                                 format!("channel relay splice ended after both sides acked: {e}").into()
                             })?
@@ -2373,6 +2626,11 @@ where
                     // gracefully (#511): for this completer the ack IS the in-flight
                     // final record the RST race would discard, see [`graceful_close`].
                     tokio::join!(graceful_close(&mut a.stream), graceful_close(&mut b.stream));
+                    // #591/#753: a QUIC side's ack is still in quinn's send buffer; dropping
+                    // the last connection handle now would discard it (unreachable for a
+                    // `:4436` Relay park today -- it never pairs with a Rendezvous mark -- but
+                    // the completer must not depend on that).
+                    tokio::join!(hold_quic_until_peer_closes(a.conn.as_ref()), hold_quic_until_peer_closes(b.conn.as_ref()));
                 }
             }
             Ok(pairing)
@@ -2386,6 +2644,11 @@ where
             let _ = b.stream.write_all(&refusal).await;
             let _ = a.stream.shutdown().await;
             let _ = b.stream.shutdown().await;
+            // #591: the #753 hold for a QUIC side -- exactly `finish_quic_pair_inner`'s: the
+            // refusal only ENQUEUED above, and returning would drop the last connection handle
+            // and close before it is transmitted, turning a definitive `pairing` refusal into
+            // a retryable dropped leg on the client. A stream side (`None`) is unaffected.
+            tokio::join!(hold_quic_until_peer_closes(a.conn.as_ref()), hold_quic_until_peer_closes(b.conn.as_ref()));
             let refusal_label = match completion {
                 StreamPairCompletion::Splice => "channel relay pair refused",
                 // #511: a rendezvous pairing used to report itself as a "relay pair" here.
@@ -2465,7 +2728,7 @@ where
     // the relay finisher relays each side the PEER's, so a `:443`-only pair can pin each other.
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: permit };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, conn: None, _permit: permit };
     // Unmarked: this generic path (WS + tests) has no phase peek -- historical behavior.
     Ok(offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked, Some(observed.ip()))
         .await?
@@ -2539,7 +2802,7 @@ where
             // notify's graceful close drains up to 2s, and this is the NEW member's
             // admission path — the fresh park must not wait out the stale leg's teardown.
             note_channel_park_superseded();
-            tokio::spawn(stale.payload.notify_park_expired());
+            tokio::spawn(stale.payload.notify_park_superseded());
             Ok(None)
         }
     }
@@ -2740,7 +3003,7 @@ where
     // #558: counted here, from the same flag the pump and the TTL read.
     note_channel_park_leg(keepalive);
     let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: permit };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, conn: None, _permit: permit };
     offer_admitted_stream_member(pairer, deadline, member, liveness, phase, Some(observed.ip())).await
 }
 
@@ -2839,6 +3102,19 @@ where
 /// long as every other still-open connection does, and is force-closed together with
 /// them only when `run_edge` itself finally returns.
 ///
+/// `unified` (#591, #495 U2 slice 2): `Some(shared)` routes every member THIS loop admits
+/// into the shared `:443`/WS [`SharedChannelPairer`] instead of `pairer`, parked as an
+/// [`AdmittedStreamMember`] with [`SessionSource::QuicNextBiStream`] and completed by the
+/// shared stream completer -- so a `:4436` member and a `:443` member of the same channel
+/// pair with each other, and two `:4436` members still get today's wire (same ack bytes,
+/// fresh session bi-stream in the same open/accept order). `complete` is then never called.
+/// `None` is the QUIC-native path, byte-for-byte what ran before this parameter existed.
+/// `serve.rs` passes `Some` for the RELAY loop only when `CT_EDGE_UNIFIED_PAIRER=1` AND a
+/// front-door channel broker exists (the pairer to route into); the rendezvous loop always
+/// passes `None`. Default off: this touches wire compatibility with every deployed ct-agent
+/// dialing `:4436`, so a real ct-agent client run against a flagged-on edge is the gate
+/// before any production flip -- Rust unit tests alone are not.
+///
 /// Otherwise never returns: it *is* the endpoint's accept loop, spawned by `run_edge`.
 pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     endpoint: &Endpoint,
@@ -2852,6 +3128,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     cap: Option<crate::state::ConnectionCap>,
     shutdown: crate::shutdown::ShutdownSignal,
     pairer: SharedQuicChannelPairer,
+    unified: Option<SharedChannelPairer>,
     penalty: std::sync::Arc<crate::state::JoinRefusalPenalty>,
     heartbeat: std::sync::Arc<crate::state::BrokerHeartbeat>,
     // #603 step 2: `None` from every call site until step 6 wires the real store +
@@ -2967,6 +3244,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             None => None,
         };
         let pairer = pairer.clone();
+        let unified = unified.clone();
         let now_fn = now_fn.clone();
         let authorize = authorize.clone();
         let complete = complete.clone();
@@ -3017,6 +3295,48 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 ) {
                     eprintln!("ct-edge: audit-log record failed: {e} (#603)");
                 }
+            }
+
+            // #591: under CT_EDGE_UNIFIED_PAIRER the member parks in the SHARED :443/WS pairer
+            // (see the `unified` parameter's doc). The admission stream is boxed write-only (its
+            // read half is at EOF by contract), the raw connection rides along for the fresh
+            // session bi-stream, and the phase/deadline/observed-IP are exactly what the QUIC
+            // pairer's offer below would carry. Completion goes through the shared stream
+            // completer with the same `completion_for` rule the :443 arm applies.
+            if let Some(shared) = &unified {
+                let AdmittedMember { conn, send, req, operator, noise, attest, observed, _permit } = member;
+                let stream: BoxedChannelStream = Box::pin(QuicBi::admission(conn.clone(), send));
+                let observed_ip = observed.ip();
+                let m = AdmittedStreamMember {
+                    conn: Some(conn),
+                    stream,
+                    req,
+                    operator,
+                    noise,
+                    attest,
+                    observed,
+                    session: SessionSource::QuicNextBiStream,
+                    _permit,
+                };
+                let outcome = offer_admitted_stream_member(
+                    shared,
+                    now.saturating_add(park_ttl),
+                    m,
+                    ParkLiveness::default(),
+                    phase,
+                    Some(observed_ip),
+                )
+                .await;
+                match outcome {
+                    Ok(None) => {}
+                    Ok(Some(((a, pa), (b, pb)))) => {
+                        if let Err(e) = finish_stream_pair_inner(a, b, now, completion_for(pa, pb)).await {
+                            eprintln!("ct-edge: channel pair ended (unified pairer, #591): {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("ct-edge: channel offer failed (unified pairer, #591): {e}"),
+                }
+                return;
             }
 
             // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
@@ -3700,6 +4020,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
             session: SessionSource::SameStream,
+            conn: None,
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -3713,6 +4034,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
             session: SessionSource::SameStream,
+            conn: None,
             _permit: None,
         };
 
@@ -4197,6 +4519,7 @@ mod tests {
                 None,
                 crate::shutdown::ShutdownSignal::never(),
                 pairer_loop,
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 hb_loop,
                 None, // #603: step 6 wires the real store
@@ -4255,6 +4578,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
             session: SessionSource::SameStream,
+            conn: None,
             _permit: None,
         };
         member.notify_park_expired().await;
@@ -4532,6 +4856,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.4:4004".parse().unwrap(),
             session: SessionSource::EndpointSwap,
+            conn: None,
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -4545,6 +4870,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.5:5005".parse().unwrap(),
             session: SessionSource::SameStream,
+            conn: None,
             _permit: None,
         };
         let done = tokio::spawn(finish_relay_pair_over_streams(a, b, 500));
@@ -5509,8 +5835,8 @@ mod tests {
                     .await
                     .expect("admit 2");
             finish_relay_pair_over_streams(
-                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, observed: "203.0.113.1:1111".parse().unwrap(), session: SessionSource::SameStream, _permit: None },
-                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, observed: "203.0.113.2:2222".parse().unwrap(), session: SessionSource::SameStream, _permit: None },
+                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, observed: "203.0.113.1:1111".parse().unwrap(), session: SessionSource::SameStream, conn: None, _permit: None },
+                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, observed: "203.0.113.2:2222".parse().unwrap(), session: SessionSource::SameStream, conn: None, _permit: None },
                 500,
             )
             .await
@@ -6406,6 +6732,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -6531,6 +6858,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -6620,6 +6948,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -6692,6 +7021,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -6951,6 +7281,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
             session: SessionSource::SameStream,
+            conn: None,
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -6964,6 +7295,7 @@ mod tests {
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
             session: SessionSource::SameStream,
+            conn: None,
             _permit: None,
         };
 
@@ -7296,6 +7628,7 @@ mod tests {
                 Some(cap_loop),
                 crate::shutdown::ShutdownSignal::never(),
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -7400,6 +7733,7 @@ mod tests {
                 Some(cap_loop),
                 shutdown,
                 pairer_loop,
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -7458,6 +7792,7 @@ mod tests {
                 Some(cap_loop),
                 crate::shutdown::ShutdownSignal::never(),
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                None, // #591: no unified pairer -- the QUIC-native path
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
                 None, // #603: step 6 wires the real store
@@ -8041,7 +8376,7 @@ mod tests {
                         admit_channel_join_on_duplex(stream, observed, 500, BOUND, &authorize)
                             .await
                             .expect("the real edge admits the shared relay-leg client");
-                    members.push(AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: None });
+                    members.push(AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, conn: None, _permit: None });
                 }
                 let b = members.pop().unwrap();
                 let a = members.pop().unwrap();
@@ -8172,7 +8507,7 @@ mod tests {
                         admit_channel_join_on_duplex(tls, peer, 500, BOUND, &authorize)
                             .await
                             .expect("the real edge admits the shared relay-leg client over TLS-TCP");
-                    members.push(AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: None });
+                    members.push(AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, conn: None, _permit: None });
                 }
                 let b = members.pop().unwrap();
                 let a = members.pop().unwrap();
@@ -8235,6 +8570,448 @@ mod tests {
             conn.close(0u32.into(), b"done");
             within("edge", edge).await.expect("edge task");
             assert_eq!(outcome, ChannelJoinOutcome::ParkExpired, "the named close reason classifies as ParkExpired (#21), not a refusal");
+        }
+    }
+
+    /// #591 (#495 U2 slice 2): the `:4436` relay routed through the shared `:443`/WS pairer
+    /// behind `CT_EDGE_UNIFIED_PAIRER`. The loop is driven with `unified: Some(..)` directly
+    /// (the flag is read once in `serve.rs`; tests never mutate process env).
+    mod unified_pairer_591 {
+        use super::*;
+        use ct_common::channel_quic::present_channel_join_quic;
+        use ct_common::channel_wire::io::present_channel_relay_join_on_stream;
+        use ct_common::channel_wire::ChannelJoinOutcome;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+        async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+            tokio::time::timeout(BOUND, f)
+                .await
+                .unwrap_or_else(|_| panic!("{what}: exceeded the {BOUND:?} test bound"))
+        }
+
+        fn request(channel: [u8; 32], holder: &SigningKey, dir: Direction, endpoint: &str) -> ChannelJoinRequest {
+            ChannelJoinRequest { grant: grant_h(channel, holder, dir, 1_000), endpoint: endpoint.to_string() }
+        }
+
+        /// The RELAY loop exactly as `serve.rs` spawns it, with `unified` injectable and the
+        /// QUIC-native completer instrumented so a test can prove which path completed.
+        struct Loop {
+            addr: std::net::SocketAddr,
+            cert: rustls::pki_types::CertificateDer<'static>,
+            quic_pairer: SharedQuicChannelPairer,
+            old_completer_hit: Arc<AtomicBool>,
+            driver: tokio::task::JoinHandle<()>,
+        }
+
+        fn spawn_relay_loop(chan: [u8; 32], unified: Option<SharedChannelPairer>) -> Loop {
+            let pk = operator_pubkey();
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let quic_pairer: SharedQuicChannelPairer = Arc::new(Mutex::new(ChannelPairer::new()));
+            let old_completer_hit = Arc::new(AtomicBool::new(false));
+            let hit = old_completer_hit.clone();
+            let qp = quic_pairer.clone();
+            let driver = tokio::spawn(async move {
+                run_channel_broker_loop(
+                    &server,
+                    || 500u64,
+                    move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
+                    10_000,
+                    ParkPhase::Relay, // the :4436 loop's constant phase
+                    move |a, b, now| {
+                        hit.store(true, Ordering::SeqCst);
+                        finish_relay_pair(a, b, now)
+                    },
+                    None,
+                    crate::shutdown::ShutdownSignal::never(),
+                    qp,
+                    unified,
+                    Arc::new(crate::state::JoinRefusalPenalty::new()),
+                    Arc::new(crate::state::BrokerHeartbeat::new()),
+                    None,
+                )
+                .await;
+            });
+            Loop { addr, cert, quic_pairer, old_completer_hit, driver }
+        }
+
+        /// A QUIC member's admission up to (and including) the possession signature + FIN,
+        /// returning the recv half so the caller decides WHEN to read the ack (a parked
+        /// member gets none until its partner arrives).
+        async fn quic_join_no_ack(
+            conn: &quinn::Connection,
+            req: &ChannelJoinRequest,
+            holder: &SigningKey,
+        ) -> quinn::RecvStream {
+            let (mut send, mut recv) = within("open_bi", conn.open_bi()).await.expect("open bi");
+            let bytes = req.encode();
+            send.write_all(&(bytes.len() as u16).to_be_bytes()).await.expect("len");
+            send.write_all(&bytes).await.expect("req");
+            let mut challenge = [0u8; 32];
+            within("challenge", recv.read_exact(&mut challenge)).await.expect("challenge");
+            send.write_all(&holder.sign(&challenge).to_bytes()).await.expect("sig");
+            send.finish().expect("finish");
+            recv
+        }
+
+        async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+            within(what, async {
+                while !cond() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        }
+
+        /// Drive two QUIC members (A initiates, B accepts) through the relay loop at `addr`
+        /// the way a deployed ct-agent does: join, read the ack to EOF, then the session on
+        /// a FRESH bi-stream (A opens, B accepts). Returns both raw acks and what each side
+        /// received through the splice. `parked_in` is polled after A's admission so the
+        /// test can name WHICH pairer parked the lone member.
+        async fn drive_quic_relay_pair(
+            l: &Loop,
+            chan: [u8; 32],
+            parked_in: impl Fn() -> usize,
+        ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, std::net::SocketAddr, std::net::SocketAddr) {
+            let holder_a = holder_sk(0x91);
+            let holder_b = holder_sk(0x92);
+            let req_a = request(chan, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(chan, &holder_b, Direction::Accept, "203.0.113.2:7002");
+
+            let client_a = build_client_endpoint(l.cert.clone()).expect("client a");
+            let src_a = client_a.local_addr().expect("a local");
+            let conn_a = within("connect a", client_a.connect(l.addr, "localhost").expect("cfg")).await.expect("conn a");
+            let mut recv_a = quic_join_no_ack(&conn_a, &req_a, &holder_a).await;
+            wait_until("A parks", || parked_in() == 1).await;
+
+            let client_b = build_client_endpoint(l.cert.clone()).expect("client b");
+            let src_b = client_b.local_addr().expect("b local");
+            let conn_b = within("connect b", client_b.connect(l.addr, "localhost").expect("cfg")).await.expect("conn b");
+            let mut recv_b = quic_join_no_ack(&conn_b, &req_b, &holder_b).await;
+
+            let ack_a = within("ack a", recv_a.read_to_end(512)).await.expect("ack a");
+            let ack_b = within("ack b", recv_b.read_to_end(512)).await.expect("ack b");
+
+            let b_task = tokio::spawn(async move {
+                let (mut s, mut r) = within("B accept_bi", conn_b.accept_bi()).await.expect("b data bi");
+                let mut got = [0u8; 4];
+                within("B read", r.read_exact(&mut got)).await.expect("b read");
+                s.write_all(b"B->A").await.expect("b write");
+                s.finish().expect("b finish");
+                within("B sees teardown", conn_b.closed()).await;
+                got.to_vec()
+            });
+            let (mut s, mut r) = within("A open_bi", conn_a.open_bi()).await.expect("a data bi");
+            s.write_all(b"A->B").await.expect("a write");
+            let mut got_a = [0u8; 4];
+            within("A read", r.read_exact(&mut got_a)).await.expect("a read");
+            conn_a.close(0u32.into(), b"done");
+            let got_b = within("B task", b_task).await.expect("b task");
+            (ack_a, ack_b, got_a.to_vec(), got_b, src_a, src_b)
+        }
+
+        /// What `finish_quic_pair_inner` has always acked a `:4436` member: no newline, then
+        /// FIN -- the bytes a deployed ct-agent's `read_to_end` ack reader parses.
+        fn expect_quic_native_ack(ack: &[u8], peer_endpoint: &str, own: std::net::SocketAddr) {
+            let want = format!("OK {peer_endpoint} r={own} sp=1");
+            assert_eq!(
+                String::from_utf8_lossy(ack),
+                want,
+                "the :4436 ack must be byte-identical to the QUIC-native completer's (no trailing newline)"
+            );
+        }
+
+        #[tokio::test]
+        async fn unified_pairer_relays_two_quic_members_on_fresh_bistreams_591() {
+            // (a) :4436 <-> :4436 under the flag: parks in the SHARED pairer (the QUIC pairer
+            // stays empty), the QUIC-native completer is never called, both acks are the
+            // QUIC-native bytes, and the session crosses on fresh bi-streams both ways.
+            let chan = [0x91u8; 32];
+            let shared = new_shared_channel_pairer();
+            let l = spawn_relay_loop(chan, Some(shared.clone()));
+            let shared_len = { let s = shared.clone(); move || s.lock().unwrap().len() };
+            let (ack_a, ack_b, got_a, got_b, src_a, src_b) = drive_quic_relay_pair(&l, chan, shared_len).await;
+            assert_eq!(l.quic_pairer.lock().unwrap().len(), 0, "the QUIC-native pairer never saw the member");
+            expect_quic_native_ack(&ack_a, "203.0.113.2:7002", src_a);
+            expect_quic_native_ack(&ack_b, "203.0.113.1:7001", src_b);
+            assert_eq!(got_a, b"B->A", "A receives B's bytes through the edge splice");
+            assert_eq!(got_b, b"A->B", "B receives A's bytes through the edge splice");
+            assert!(!l.old_completer_hit.load(Ordering::SeqCst), "the QUIC-native completer must not run under the flag");
+            assert_eq!(shared.lock().unwrap().len(), 0, "the pair left the shared pairer");
+            l.driver.abort();
+        }
+
+        #[tokio::test]
+        async fn flag_off_keeps_the_quic_native_pairer_and_completer_591() {
+            // (c) regression guard: `unified: None` is today's path -- parks in the QUIC pairer,
+            // completes via `finish_relay_pair`, and the wire is the SAME bytes the flagged
+            // path above is held to.
+            let chan = [0x92u8; 32];
+            let l = spawn_relay_loop(chan, None);
+            let quic_len = { let q = l.quic_pairer.clone(); move || q.lock().unwrap().len() };
+            let (ack_a, ack_b, got_a, got_b, src_a, src_b) = drive_quic_relay_pair(&l, chan, quic_len).await;
+            expect_quic_native_ack(&ack_a, "203.0.113.2:7002", src_a);
+            expect_quic_native_ack(&ack_b, "203.0.113.1:7001", src_b);
+            assert_eq!(got_a, b"B->A");
+            assert_eq!(got_b, b"A->B");
+            assert!(l.old_completer_hit.load(Ordering::SeqCst), "flag off: the QUIC-native completer ran");
+            l.driver.abort();
+        }
+
+        /// The `:443`/WS edge arm for ONE stream member on `shared` (what `serve.rs`'s
+        /// ChannelBroker arm does): admit over a boxed duplex, offer, and -- if this arrival
+        /// completed a pair -- run the shared completer. `Ok(true)` = paired here.
+        async fn stream_member_edge_arm(
+            server_half: tokio::io::DuplexStream,
+            chan: [u8; 32],
+            shared: SharedChannelPairer,
+        ) -> Result<bool, String> {
+            let pk = operator_pubkey();
+            let authorize = move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) };
+            let paired = admit_and_pair_on_boxed_stream(
+                Box::pin(server_half),
+                "203.0.113.2:2222".parse().unwrap(),
+                500,
+                std::time::Duration::from_secs(5),
+                &authorize,
+                10_500,
+                &shared,
+                None,
+                false,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            match paired {
+                None => Ok(false),
+                Some(((a, pa), (b, pb))) => finish_stream_pair_inner(a, b, 500, completion_for(pa, pb))
+                    .await
+                    .map(|_| true)
+                    .map_err(|e| e.to_string()),
+            }
+        }
+
+        #[tokio::test]
+        async fn unified_pairer_splices_a_quic_initiator_with_a_443_stream_acceptor_591() {
+            // (b) the cross-transport pair this issue exists for, QUIC first: a :4436 member
+            // parks in the shared pairer, a :443 stream member of the same channel arrives on
+            // the :443 arm and completes it there. The QUIC side gets its native ack + a fresh
+            // bi-stream (A initiates -> `accept_bi` on the edge); the stream side is spliced
+            // on its own admission stream after its `\n`-delimited ack. Payload both ways.
+            let chan = [0x93u8; 32];
+            let shared = new_shared_channel_pairer();
+            let l = spawn_relay_loop(chan, Some(shared.clone()));
+            let holder_a = holder_sk(0x93);
+            let holder_b = holder_sk(0x94);
+            let req_a = request(chan, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(chan, &holder_b, Direction::Accept, "relay-only");
+
+            let client_a = build_client_endpoint(l.cert.clone()).expect("client a");
+            let src_a = client_a.local_addr().expect("a local");
+            let conn_a = within("connect a", client_a.connect(l.addr, "localhost").expect("cfg")).await.expect("conn a");
+            let mut recv_a = quic_join_no_ack(&conn_a, &req_a, &holder_a).await;
+            wait_until("QUIC member parks in the shared pairer", || shared.lock().unwrap().len() == 1).await;
+
+            let (client_half, server_half) = tokio::io::duplex(16 * 1024);
+            let edge_b = tokio::spawn(stream_member_edge_arm(server_half, chan, shared.clone()));
+            let b_task = tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(client_half);
+                let outcome = within("stream join", present_channel_relay_join_on_stream(&mut w, &mut r, &req_b, &holder_b, None))
+                    .await
+                    .expect("stream member joins");
+                assert!(matches!(outcome, ChannelJoinOutcome::Admitted { .. }), "stream member admitted + paired, got {outcome:?}");
+                let mut got = [0u8; 4];
+                within("B read", r.read_exact(&mut got)).await.expect("b read");
+                w.write_all(b"B->A").await.expect("b write");
+                w.flush().await.expect("b flush");
+                // EOF arrives once A finishes its fresh stream (after reading this reply).
+                let mut tail = Vec::new();
+                within("B drains", r.read_to_end(&mut tail)).await.expect("b eof");
+                let _ = w.shutdown().await;
+                got.to_vec()
+            });
+
+            let ack_a = within("ack a", recv_a.read_to_end(512)).await.expect("ack a");
+            assert_eq!(
+                String::from_utf8_lossy(&ack_a),
+                format!("OK relay-only r={src_a} sp=0"),
+                "QUIC side: native ack bytes, peer's relay-only endpoint, distinct observed IPs -> sp=0"
+            );
+            let (mut s, mut r) = within("A open_bi", conn_a.open_bi()).await.expect("a data bi");
+            s.write_all(b"A->B").await.expect("a write");
+            let mut got_a = [0u8; 4];
+            within("A read", r.read_exact(&mut got_a)).await.expect("a read");
+            // A's FIN ends the A->B direction; the :443 side's EOF then ends B->A and the
+            // splice completes. The completer returns and drops the edge's last handles on
+            // A's connection -- quinn's implicit close (code 0, no reason), exactly how the
+            // QUIC-native completer has always torn a finished relay pair down (its tests
+            // wait `conn.closed()` too, never a post-splice EOF on the data stream).
+            s.finish().expect("a finish");
+            let got_b = within("B task", b_task).await.expect("b task");
+            assert_eq!(got_a, *b"B->A", "the QUIC initiator receives the :443 member's bytes");
+            assert_eq!(got_b, b"A->B", "the :443 member receives the QUIC initiator's bytes");
+            assert_eq!(
+                within("edge arm", edge_b).await.expect("edge task"),
+                Ok(true),
+                "the :443 arm completed the cross-transport pair and its splice ended cleanly"
+            );
+            let closed = within("A sees the edge's teardown", conn_a.closed()).await;
+            assert!(
+                matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+                "the edge tears the QUIC leg down after the splice, got {closed:?}"
+            );
+            assert!(!l.old_completer_hit.load(Ordering::SeqCst));
+            l.driver.abort();
+        }
+
+        #[tokio::test]
+        async fn unified_pairer_splices_a_443_stream_initiator_with_a_quic_acceptor_591() {
+            // (b') reverse order and reverse roles: the :443 member parks first, the :4436
+            // member's arrival completes the pair inside the relay loop's own task, and the
+            // QUIC side is the ACCEPTOR -- the edge `open_bi`s toward it and the stream
+            // initiator's first bytes make that stream visible to the member's `accept_bi`.
+            let chan = [0x95u8; 32];
+            let shared = new_shared_channel_pairer();
+            let l = spawn_relay_loop(chan, Some(shared.clone()));
+            let holder_a = holder_sk(0x95); // :443, initiates
+            let holder_b = holder_sk(0x96); // :4436, accepts
+            let req_a = request(chan, &holder_a, Direction::Initiate, "relay-only");
+            let req_b = request(chan, &holder_b, Direction::Accept, "203.0.113.2:7002");
+
+            let (client_half, server_half) = tokio::io::duplex(16 * 1024);
+            let edge_a = tokio::spawn(stream_member_edge_arm(server_half, chan, shared.clone()));
+            let a_task = tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(client_half);
+                let outcome = within("stream join", present_channel_relay_join_on_stream(&mut w, &mut r, &req_a, &holder_a, None))
+                    .await
+                    .expect("stream member joins");
+                assert!(matches!(outcome, ChannelJoinOutcome::Admitted { .. }), "got {outcome:?}");
+                w.write_all(b"A->B").await.expect("a write");
+                w.flush().await.expect("a flush");
+                let mut got = [0u8; 4];
+                within("A read", r.read_exact(&mut got)).await.expect("a read");
+                let mut tail = Vec::new();
+                within("A drains", r.read_to_end(&mut tail)).await.expect("a eof");
+                let _ = w.shutdown().await;
+                got.to_vec()
+            });
+            wait_until("stream member parks in the shared pairer", || shared.lock().unwrap().len() == 1).await;
+            assert_eq!(within("edge arm", edge_a).await.expect("edge task"), Ok(false), "first arrival parks");
+
+            let client_b = build_client_endpoint(l.cert.clone()).expect("client b");
+            let src_b = client_b.local_addr().expect("b local");
+            let conn_b = within("connect b", client_b.connect(l.addr, "localhost").expect("cfg")).await.expect("conn b");
+            let mut recv_b = quic_join_no_ack(&conn_b, &req_b, &holder_b).await;
+            let ack_b = within("ack b", recv_b.read_to_end(512)).await.expect("ack b");
+            assert_eq!(String::from_utf8_lossy(&ack_b), format!("OK relay-only r={src_b} sp=0"));
+            let (mut s, mut r) = within("B accept_bi", conn_b.accept_bi()).await.expect("edge opened toward the acceptor");
+            let mut got_b = [0u8; 4];
+            within("B read", r.read_exact(&mut got_b)).await.expect("b read");
+            s.write_all(b"B->A").await.expect("b write");
+            // Same teardown contract as the QUIC-native path (see the sibling test above): B's
+            // FIN completes the splice inside the relay loop's task, and the edge then drops
+            // B's connection -- observed as the close, not as a post-splice EOF.
+            s.finish().expect("b finish");
+            let got_a = within("A task", a_task).await.expect("a task");
+            assert_eq!(got_a, b"B->A", "the :443 initiator receives the QUIC acceptor's bytes");
+            assert_eq!(got_b, *b"A->B", "the QUIC acceptor receives the :443 initiator's bytes");
+            let closed = within("B sees the edge's teardown", conn_b.closed()).await;
+            assert!(
+                matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+                "the edge tears the QUIC leg down after the splice, got {closed:?}"
+            );
+            assert!(!l.old_completer_hit.load(Ordering::SeqCst));
+            l.driver.abort();
+        }
+
+        #[tokio::test]
+        async fn unified_pairer_frames_the_pairing_refusal_for_quic_members_591() {
+            // #524/#753 parity on the new path: two :4436 members whose grants cannot pair
+            // (both Initiate) must each read the FRAMED `pairing` refusal -- which requires
+            // the completer to hold both connections open until the peer has read it, or
+            // the refusal is discarded with the dropped connection and the shared client
+            // misreads a definitive refusal as a retryable dropped leg.
+            let chan = [0x97u8; 32];
+            let shared = new_shared_channel_pairer();
+            let l = spawn_relay_loop(chan, Some(shared.clone()));
+            let join = |seed: u8, cert: rustls::pki_types::CertificateDer<'static>, addr: std::net::SocketAddr| async move {
+                let holder = holder_sk(seed);
+                let req = request(chan, &holder, Direction::Initiate, "203.0.113.9:7000");
+                let client = build_client_endpoint(cert).expect("client");
+                let conn = within("connect", client.connect(addr, "localhost").expect("cfg")).await.expect("conn");
+                within("shared QUIC join", present_channel_join_quic(&conn, &req, &holder, None))
+                    .await
+                    .expect("drives to an outcome")
+            };
+            let first = tokio::spawn(join(0x97, l.cert.clone(), l.addr));
+            wait_until("first parks", || shared.lock().unwrap().len() == 1).await;
+            let second = tokio::spawn(join(0x98, l.cert.clone(), l.addr));
+            for (who, task) in [("first", first), ("second", second)] {
+                let outcome = within(who, task).await.expect("join task");
+                assert_eq!(
+                    outcome,
+                    ChannelJoinOutcome::Refused { category: Some("pairing".to_string()) },
+                    "{who}: the framed pairing refusal reaches a QUIC member on the unified path"
+                );
+            }
+            l.driver.abort();
+        }
+
+        #[tokio::test]
+        async fn quic_member_park_expiry_closes_the_connection_with_the_named_reason_591() {
+            // ct-agent#21 parity: the shared pairer's reaper ends a park via
+            // `notify_park_expired`; for a :4436 member that must be the QUIC-native close
+            // reason (what a deployed ct-agent classifies as re-park), not the stream leg's EX.
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let edge = tokio::spawn(async move {
+                let conn = server.accept().await.expect("incoming").await.expect("conn");
+                let (send, _recv) = conn.accept_bi().await.expect("admission bi");
+                let keep_endpoint_alive = server;
+                let member = AdmittedStreamMember {
+                    conn: Some(conn.clone()),
+                    stream: Box::pin(QuicBi::admission(conn, send)) as BoxedChannelStream,
+                    req: join_request([0x99u8; 32], 0x99, "203.0.113.9:7000"),
+                    operator: operator_pubkey(),
+                    noise: None,
+                    attest: None,
+                    observed: "127.0.0.1:1".parse().unwrap(),
+                    session: SessionSource::QuicNextBiStream,
+                    _permit: None,
+                };
+                member.notify_park_expired().await;
+                keep_endpoint_alive
+            });
+            let client = build_client_endpoint(cert).expect("client");
+            let conn = within("connect", client.connect(addr, "localhost").expect("cfg")).await.expect("conn");
+            let (mut send, _recv) = conn.open_bi().await.expect("open bi");
+            send.write_all(b"x").await.expect("actualise the stream");
+            // The edge task returns right after enqueueing the close; keep its endpoint alive
+            // here until the client has observed the close frame.
+            let _server = within("edge", edge).await.expect("edge task");
+            let err = within("closed", conn.closed()).await;
+            match err {
+                quinn::ConnectionError::ApplicationClosed(ac) => {
+                    let reason = String::from_utf8_lossy(&ac.reason).to_string();
+                    assert_eq!(reason, quic_park_expired_reason("no partner within the park TTL"));
+                    assert!(reason.starts_with(QUIC_PARK_EXPIRED_REASON_PREFIX));
+                }
+                other => panic!("expected the named ApplicationClose, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn unified_pairer_startup_line_states_every_case_591() {
+            let on = unified_pairer_startup_line_for(Some("1"), true);
+            assert!(on.contains("UNIFIED") && on.contains("CT_EDGE_UNIFIED_PAIRER=1"), "{on}");
+            let no_pairer = unified_pairer_startup_line_for(Some("1"), false);
+            assert!(no_pairer.contains("QUIC-native") && no_pairer.contains("no :443 front-door"), "{no_pairer}");
+            let wrong_word = unified_pairer_startup_line_for(Some("true"), true);
+            assert!(wrong_word.contains("QUIC-native") && wrong_word.contains("\"true\""), "{wrong_word}");
+            let off = unified_pairer_startup_line_for(None, true);
+            assert!(off.contains("QUIC-native") && off.contains("default"), "{off}");
         }
     }
 }

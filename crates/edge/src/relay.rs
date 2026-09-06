@@ -254,6 +254,38 @@ async fn relay_initiator_to_acceptor_with_timeout(
     label: &str,
     setup_timeout: std::time::Duration,
 ) -> std::io::Result<(u64, u64)> {
+    // Initiator opened its data stream (actualised by Noise msg1) — accept it.
+    let (send_i, recv_i) = next_session_bi_with_timeout(initiator_conn, true, label, setup_timeout).await?;
+    // Open the data stream toward the acceptor; it becomes visible to the acceptor's
+    // accept_bi as soon as relay_quic writes the first relayed bytes into it.
+    let (send_a, recv_a) = next_session_bi_with_timeout(acceptor_conn, false, label, setup_timeout).await?;
+    // a = initiator, b = acceptor: recv_i (msg1…) → send_a, recv_a (msg2…) → send_i.
+    relay_quic(send_i, recv_i, send_a, recv_a, label).await
+}
+
+/// #591 (#495 U2 slice 2): ONE side's fresh session bi-stream under the direct-path role
+/// contract [`relay_initiator_to_acceptor`] has always applied — the **initiator** opened
+/// its stream, so the edge `accept_bi()`s it; the **acceptor** expects the edge to open,
+/// so the edge `open_bi()`s toward it. Split out of the two-connection splice so the
+/// unified pairer (`channel_broker::finish_stream_pair_inner`) can resolve each QUIC
+/// side's leg INDEPENDENTLY of what transport the other side arrived on (a `:443` stream
+/// member has no bi-stream to open) while keeping the per-side wire behaviour, the
+/// [`RELAY_SETUP_TIMEOUT`] bound and the stage-tagged error text (#214/#257) byte-identical
+/// to the QUIC-native path — which now goes through this very function.
+pub async fn next_session_bi(
+    conn: &quinn::Connection,
+    initiator: bool,
+    label: &str,
+) -> std::io::Result<(SendStream, RecvStream)> {
+    next_session_bi_with_timeout(conn, initiator, label, RELAY_SETUP_TIMEOUT).await
+}
+
+async fn next_session_bi_with_timeout(
+    conn: &quinn::Connection,
+    initiator: bool,
+    label: &str,
+    setup_timeout: std::time::Duration,
+) -> std::io::Result<(SendStream, RecvStream)> {
     // Name the stage as well as the ConnectionError: "connection lost" during
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
@@ -264,19 +296,17 @@ async fn relay_initiator_to_acceptor_with_timeout(
     let timed_out = |stage: &'static str| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{label} {stage}: relay setup timed out"))
     };
-    // Initiator opened its data stream (actualised by Noise msg1) — accept it.
-    let (send_i, recv_i) = tokio::time::timeout(setup_timeout, initiator_conn.accept_bi())
-        .await
-        .map_err(|_| timed_out("accept_bi(initiator)"))?
-        .map_err(to_io("accept_bi(initiator)"))?;
-    // Open the data stream toward the acceptor; it becomes visible to the acceptor's
-    // accept_bi as soon as relay_quic writes the first relayed bytes into it.
-    let (send_a, recv_a) = tokio::time::timeout(setup_timeout, acceptor_conn.open_bi())
-        .await
-        .map_err(|_| timed_out("open_bi(acceptor)"))?
-        .map_err(to_io("open_bi(acceptor)"))?;
-    // a = initiator, b = acceptor: recv_i (msg1…) → send_a, recv_a (msg2…) → send_i.
-    relay_quic(send_i, recv_i, send_a, recv_a, label).await
+    if initiator {
+        tokio::time::timeout(setup_timeout, conn.accept_bi())
+            .await
+            .map_err(|_| timed_out("accept_bi(initiator)"))?
+            .map_err(to_io("accept_bi(initiator)"))
+    } else {
+        tokio::time::timeout(setup_timeout, conn.open_bi())
+            .await
+            .map_err(|_| timed_out("open_bi(acceptor)"))?
+            .map_err(to_io("open_bi(acceptor)"))
+    }
 }
 
 /// Splice two **generic** duplex byte streams through the edge relay (#106
