@@ -170,7 +170,7 @@
       "alias": "google",
       "providerId": "google",
       "enabled": true,
-      "trustEmail": true,
+      "trustEmail": false,
       "storeToken": false,
       "linkOnly": false,
       "config": {
@@ -183,7 +183,7 @@
       "alias": "github",
       "providerId": "github",
       "enabled": true,
-      "trustEmail": true,
+      "trustEmail": false,
       "storeToken": false,
       "linkOnly": false,
       "config": {
@@ -196,7 +196,7 @@
       "alias": "gitlab",
       "providerId": "gitlab",
       "enabled": true,
-      "trustEmail": true,
+      "trustEmail": false,
       "storeToken": false,
       "linkOnly": false,
       "config": {
