@@ -42,6 +42,15 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // prefers an exact literal match over a same-position dynamic segment, so
         // this never collides with a (63-hex-char-short, in any case) real token.
         .route("/admin/tunnel-status/bulk", post(tunnel_status_bulk))
+        // #763: read-only channel presence for the portal's Agent-bridges card. Served
+        // on THIS (admin-token-gated, private-interface) listener -- the path keeps the
+        // `/internal/channel/...` prefix the control plane's own edge<->CP channel
+        // routes use, since the CP is its only caller. The `:channel_hex` list form
+        // comes first: the portal's stored bridge grant binds the portal's OWN holder,
+        // so the serving sidecar's holder is not derivable from it and the card asks
+        // "who ELSE was here?" instead (see `channel_broker::ChannelPresence::holders_of`).
+        .route("/internal/channel/presence/:channel_hex", get(channel_presence_list))
+        .route("/internal/channel/presence/:channel_hex/:holder_hex", get(channel_presence_one))
         .with_state(state)
 }
 
@@ -327,6 +336,99 @@ async fn tunnel_status_bulk(
         })
         .collect();
     Ok(Json(out))
+}
+
+/// `GET /internal/channel/presence/:channel_hex/:holder_hex` (#763): when `holder` was
+/// last admitted (parked or paired) on `channel`, on any channel transport. Read-only
+/// and admin-token-gated like every other route here; reveals only "seen / how long
+/// ago" for a `(channel, holder)` the caller already names, never members' material
+/// or payload (ADR-0016 posture). Response: `{"seen":true,"parked_now":bool,
+/// "last_seen_secs_ago":n}` or `{"seen":false}` -- `parked_now` is the
+/// [`crate::channel_broker::PRESENCE_SERVING_WINDOW_SECS`] window ("parked now or
+/// within the last 60 s"), derived from the last admission rather than a live scan of
+/// each transport's pairer (see `ChannelPresence`'s own doc for why that is the
+/// faithful answer for a re-parking sidecar).
+async fn channel_presence_one(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Path((channel_hex, holder_hex)): Path<(String, String)>,
+) -> Result<Json<ChannelPresenceResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let (Some(channel), Some(holder)) = (parse_token_hex(&channel_hex), parse_token_hex(&holder_hex)) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let now = crate::channel_broker::presence_unix_now();
+    let ago = crate::channel_broker::channel_presence_last_seen(&ct_common::channel::ChannelId(channel), &holder, now);
+    Ok(Json(ChannelPresenceResp::from_last_seen(ago)))
+}
+
+/// `GET /internal/channel/presence/:channel_hex` (#763): every holder admitted on
+/// `channel` within the presence window, most recent first -- the form the portal
+/// actually uses (its own bridge holder is excluded CP-side). Same gate and the same
+/// disclosure bound as [`channel_presence_one`]: holder pubkeys are public identities
+/// the caller (the CP) already holds in its own channel roster.
+async fn channel_presence_list(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+) -> Result<Json<ChannelPresenceListResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(channel) = parse_token_hex(&channel_hex) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let now = crate::channel_broker::presence_unix_now();
+    let holders = crate::channel_broker::channel_presence_holders(&ct_common::channel::ChannelId(channel), now)
+        .into_iter()
+        .map(|(holder, ago)| ChannelPresenceHolder {
+            holder: holder.iter().map(|b| format!("{b:02x}")).collect(),
+            parked_now: crate::channel_broker::presence_is_serving(ago),
+            last_seen_secs_ago: ago,
+        })
+        .collect();
+    Ok(Json(ChannelPresenceListResp { holders }))
+}
+
+/// #763: one `(channel, holder)`'s presence. The two optional fields are omitted (not
+/// `null`) when unseen, so the unseen shape is exactly `{"seen":false}`.
+#[derive(Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct ChannelPresenceResp {
+    seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parked_now: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen_secs_ago: Option<u64>,
+}
+
+impl ChannelPresenceResp {
+    fn from_last_seen(ago: Option<u64>) -> Self {
+        match ago {
+            Some(ago) => Self {
+                seen: true,
+                parked_now: Some(crate::channel_broker::presence_is_serving(ago)),
+                last_seen_secs_ago: Some(ago),
+            },
+            None => Self { seen: false, parked_now: None, last_seen_secs_ago: None },
+        }
+    }
+}
+
+/// #763: one row of [`ChannelPresenceListResp`].
+#[derive(Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct ChannelPresenceHolder {
+    /// The holder's ed25519 pubkey, lowercase hex.
+    holder: String,
+    parked_now: bool,
+    last_seen_secs_ago: u64,
+}
+
+/// #763: the `:channel_hex` list form's body.
+#[derive(Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct ChannelPresenceListResp {
+    holders: Vec<ChannelPresenceHolder>,
 }
 
 /// Parse a 64-hex string into 32 bytes.
@@ -624,6 +726,83 @@ mod tests {
         // Malformed token hex -> 400, not a panic.
         assert_eq!(
             get(Some(secret_hex), "/admin/tunnel-status/not-hex".to_string()).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_presence_is_admin_gated_and_reports_unknown_as_not_seen_763() {
+        // #763: the presence read the portal's Agent-bridges card renders "Sidecar:
+        // serving / not connected" from. Must require the admin token (401 without it),
+        // answer an unknown (channel, holder) with exactly `{"seen":false}` (no `null`
+        // fields for the CP to trip over), 400 malformed hex instead of panicking, and
+        // -- once the broker has admitted that holder -- report it seen, parked now, and
+        // fresh. The map's own ageing/bounding is proven against `ChannelPresence`
+        // directly in channel_broker.rs; this covers the HTTP/auth layer.
+        use ct_common::channel::ChannelId;
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x77u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        // Unique to this test: the presence map is process-wide.
+        let channel = [0x76u8; 32];
+        let channel_hex = "76".repeat(32);
+        let holder = [0x75u8; 32];
+        let holder_hex = "75".repeat(32);
+
+        let get = |auth: Option<String>, path: String| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get(path);
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+        let one = format!("/internal/channel/presence/{channel_hex}/{holder_hex}");
+        let list = format!("/internal/channel/presence/{channel_hex}");
+
+        // No admin token -> 401 on both forms, nothing disclosed.
+        assert_eq!(get(None, one.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(get(None, list.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // Never admitted -> seen:false, and the list form is empty.
+        let resp = get(Some(secret_hex.clone()), one.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), r#"{"seen":false}"#, "the unseen shape is exactly this");
+        let resp = get(Some(secret_hex.clone()), list.clone()).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: ChannelPresenceListResp = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.holders.is_empty());
+
+        // The broker admits this holder (what both live offer sites do) -> seen, parked now.
+        crate::channel_broker::note_channel_presence(
+            ChannelId(channel),
+            holder,
+            crate::channel_broker::presence_unix_now(),
+        );
+        let resp = get(Some(secret_hex.clone()), one.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: ChannelPresenceResp = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.seen);
+        assert_eq!(parsed.parked_now, Some(true));
+        assert!(parsed.last_seen_secs_ago.unwrap() <= 2, "just admitted -> fresh: {parsed:?}");
+        let resp = get(Some(secret_hex.clone()), list.clone()).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: ChannelPresenceListResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.holders.len(), 1);
+        assert_eq!(parsed.holders[0].holder, holder_hex);
+        assert!(parsed.holders[0].parked_now);
+
+        // Malformed hex -> 400, not a panic (either segment).
+        assert_eq!(
+            get(Some(secret_hex.clone()), format!("/internal/channel/presence/not-hex/{holder_hex}")).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(Some(secret_hex), format!("/internal/channel/presence/{channel_hex}/not-hex")).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
     }
