@@ -1354,6 +1354,10 @@ Env bleibt der Revoke „nur DB-Zeile weg" (Legacy-Verhalten) — mit ihnen fäl
 - **PP2** ⏳ Authed HTTP: `POST /portal/tunnels` (Anlage → einmalige Token/Capability-Anzeige), `GET /portal/tunnels` (Liste), `DELETE /portal/tunnels/:id` (Widerruf) — Subject aus Session/Token.
 - **PP3** ⏳ Live-Status je Tunnel via Edge `/metrics` (`ct_edge_active_tunnels`, #17) + Widerruf nutzt Token-Rotation (#12).
 ### #28 Per-OS One-Liner-Installer — ✅ **fix-ready** (Portal-Seite)
+> **Nachtrag #620 (2026-09-06):** Die `installer.rs`-Renderer `install_one_liner`, `install_one_liner_bootstrap`,
+> `install_bundle_secret`/`parse_install_bundle` und `InstallOs` wurden **gelöscht**. Die live verdrahtete Install-Seite
+> (`install_page` in `portal_api.rs`) rendert ihren Befehl eigenständig und hat diese Funktionen nie aufgerufen; ihre
+> unquotierte Shell-Interpolation war eine latente RCE-Form. Die Einträge unten sind Historie.
 - **PP2** ✅ `GET /portal/tunnels/:id/install?os=` (session-gated, **owner-only** via `SqliteTunnelStore::owns`):
   prägt pro Anforderung ein **frisches, einmaliges** Join-Token (`enrollment.issue_join_token`, Subject als Tenant),
   rendert die Per-OS-One-Liner (`installer::install_one_liner`, Token via Env). Token wird einmalig dem eingeloggten
@@ -1804,6 +1808,11 @@ Decomposed:
     cert hex for the peer to trust) or initiator (`dial_quic` trusting the configured peer cert) and pipes
     **stdin/stdout** over the A2A tunnel via `run_channel_session`. `main.rs` dispatches `channel`. Frozen test
     `channel_config_parses_roles_keys_and_the_initiator_cert_requirement`. Gate green (added tokio `io-std`).
+  - > **Nachtrag #620 (2026-09-06):** `channel_one_liner`, `channel_bundle_secret`, `channel_one_liner_bootstrap`,
+    > `brokered_channel_one_liner` und die Structs `ChannelOneLiner`/`BrokeredChannelOneLiner`/`ChannelSide` wurden
+    > **gelöscht** — kein Aufrufer außerhalb ihrer Tests, unquotierte Interpolation peer-gelieferter `host:port`-Werte.
+    > Die gedienten `/channel.sh`/`/channel.ps1` (`render_channel_sh`/`render_channel_ps1`, `installer_router`) bleiben.
+    > Die drei folgenden one-liner-Einträge sind Historie.
   - **#100 one-liner-gen** ✅ **`installer::channel_one_liner(ChannelOneLiner, os)`** renders the copy-paste
     command that brings a machine up as a channel `Responder`/`Initiator` and pipes stdio over the tunnel —
     the `CT_CHANNEL_*=… ct-agent channel` form (POSIX) + `$env:` PowerShell analog, targeting the shipped
@@ -2346,6 +2355,9 @@ Two secret-exposure observations. Decomposed:
     wall-clock `now_secs()` over the deterministic store core. Merged into `persistent_control_plane_router`.
     Frozen test `bootstrap_mint_is_admin_gated_and_redeem_hands_off_once` (mint 401 without admin / 200 with;
     redeem hands off the exact secret once, 409 on reuse, 404 unknown; open when unset). Gate green.
+  - > **Nachtrag #620 (2026-09-06):** Renderer + Codec aus `installer.rs` (`install_one_liner_bootstrap`,
+    > `install_bundle_secret`/`parse_install_bundle`) wurden **gelöscht**; `install_page` in `portal_api.rs` nutzt eine
+    > eigene Implementierung und hat sie nie aufgerufen. Der folgende Eintrag ist Historie.
   - **SEC90b-installer-render** ✅ **Bootstrap one-liner renderer + install-bundle codec** (`installer.rs`,
     pure): `install_one_liner_bootstrap(portal_base, bootstrap_token, os)` renders the copy-paste command
     carrying **only** `CT_BOOTSTRAP=<token>` (Unix `curl … | CT_BOOTSTRAP=… sh`; Windows `$env:CT_BOOTSTRAP=…;
