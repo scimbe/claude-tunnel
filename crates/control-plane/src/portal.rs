@@ -1534,7 +1534,12 @@ mod tests {
                 .find(|p| p["alias"] == want)
                 .unwrap_or_else(|| panic!("{want} broker declared"));
             assert_eq!(idp["providerId"], want, "{want} providerId");
-            assert_eq!(idp["trustEmail"], true, "{want} trustEmail (so #43's email gate works)");
+            // #669: the brokered e-mail is NOT trusted any more. Keycloak then runs its own
+            // VERIFY_EMAIL required action for a new social user (smtpServer + verifyEmail are
+            // set below), and only after that does the id_token carry `email_verified: true`
+            // for #43's/#527's gate -- so the gate keeps working, it just no longer delegates
+            // the verification to whatever the upstream IdP asserted.
+            assert_eq!(idp["trustEmail"], false, "{want} trustEmail must be off (#669)");
             let cid = idp["config"]["clientId"].as_str().unwrap_or("");
             let sec = idp["config"]["clientSecret"].as_str().unwrap_or("");
             assert!(cid.starts_with("${KC_") && cid.ends_with(":}"), "{want} clientId from a resolvable ${{KC_*:}} placeholder, not baked/env-prefixed: {cid}");
