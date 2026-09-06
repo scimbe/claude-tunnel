@@ -309,7 +309,23 @@ impl ChannelAuthorizer {
         // request, and definitely said this holder isn't (or can't be proven to be) a
         // member. Anything else non-success is an infrastructure problem, not an
         // answer, and falls through to Unresolved below.
+        //
+        // #696 follow-up: this branch used to return silently, same gap #231 already
+        // fixed for the Unresolved branches above. A CP-side incident lasting longer
+        // than CACHE_TTL is invisible to `authorize()`'s Option<[u8;32]> return value —
+        // it collapses to the SAME None a genuine Refused produces — so this is the one
+        // place in the whole call chain that can still tell the two apart, from the
+        // actual HTTP status the CP returned. Also names 404 vs. 401 explicitly: they're
+        // handled identically by this function today, but a run of 401s (a drifted/
+        // misconfigured x-ct-admin-token on this edge) has a very different fix than a
+        // run of genuine 404s (this holder really isn't a member).
         if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            eprintln!(
+                "ct-edge: channel-authorize REFUSED [status={}] channel={} holder={}",
+                resp.status(),
+                hex(&channel.0),
+                hex(holder)
+            );
             return Outcome::Refused;
         }
         if !resp.status().is_success() {
