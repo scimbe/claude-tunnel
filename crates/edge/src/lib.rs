@@ -12,6 +12,8 @@ pub mod ja4;
 pub mod log_throttle;
 pub mod observe;
 pub mod pki;
+/// #782: the dedicated receipts signing key (`edge-receipts-key.bin`) and its env toggle.
+pub mod receipts;
 pub mod relay;
 pub mod relay_gate;
 pub mod serve;

@@ -55,6 +55,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # "0.10"), so this adds no new crate to the dependency tree -- just a direct
 # edge, matching the version already in use.
 sha2 = "0.10"
+# #782: receipt payloads (`serde_json::Value`) in tunnel_history.rs / admin.rs. Was a
+# dev-only dependency (test fixtures); already resolved transitively via axum's `json`
+# feature, so this adds no crate to the tree -- just a direct edge.
+serde_json = "1"
 
 [dev-dependencies]
 # Phase-2 PR3 (CADS-Tunnel/ct-agent consolidation): the channel-wire contract tests in
@@ -75,7 +79,6 @@ tower = { version = "0.5", features = ["util"] }
 x509-parser = "0.17"
 http-body-util = "0.1"
 ed25519-dalek = "2"
-serde_json = "1"
 # ws_channel.rs's end-to-end test: real WebSocket clients (not the axum handler side --
 # tokio-tungstenite's own client, driving a real TCP connection against a real bound
 # listener) proving two browser-shaped members actually admit, pair, and relay through

@@ -382,7 +382,10 @@ fn tunnel_uptime_html(
 <h2>Last 30 days</h2>
 {stats}
 <h2>Public status badge</h2>
-{badge}"#
+{badge}
+<h2>Signed receipts</h2>
+<p class="help">The edge records every session start and end for this tunnel, plus an hourly byte snapshot while it is connected, as a hash-chained receipt signed with the edge's own receipts key. The download is JSON lines: a header with the edge's public key, then one receipt per line. Verify it offline with <code>verify_receipts &lt;file&gt;</code> (crates/agent-tools) -- no trust in this portal required. A receipt proves the edge attested these metadata events in this order; it never contains payload, hostnames or addresses, and its timestamps are the edge's own clock.</p>
+<p><a class="btn sec" href="/portal/tunnels/{id}/receipts.jsonl">Download receipts</a></p>"#
     );
     page("uptime", &body, email)
 }
