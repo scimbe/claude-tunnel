@@ -107,8 +107,15 @@ pub enum DialError {
     DroppedLeg { leg: &'static str },
     /// The Noise_IK handshake or the encrypted call itself failed.
     Session(String),
-    /// The peer's JSON-RPC reply wasn't well-formed, or the call returned a JSON-RPC error.
+    /// The peer's reply was not a well-formed JSON-RPC response at all (not JSON, or a JSON
+    /// document with neither `result` nor `error`). A wire/protocol problem, never a tool
+    /// outcome — a well-formed `error` object is [`DialError::ToolError`] instead.
     BadReply(String),
+    /// The peer answered with a well-formed JSON-RPC `error` object: the tool refused or
+    /// failed the call (a missing sidecar setting, an unknown tool, a rejected install).
+    /// NOT a transport problem — the dial, both admissions and the Noise session all
+    /// worked; `message` is the agent's own text and `code` its JSON-RPC error code.
+    ToolError { code: i64, message: String },
     /// One of the bounded phases (a hop's admission exchange, the session stream open, the
     /// Noise handshake, or the call itself) exceeded its deadline.
     TimedOut,
@@ -128,6 +135,9 @@ impl std::fmt::Display for DialError {
             ),
             DialError::Session(e) => write!(f, "channel session error: {e}"),
             DialError::BadReply(e) => write!(f, "malformed reply from peer: {e}"),
+            DialError::ToolError { message, code } => {
+                write!(f, "the agent refused the call: {message} (JSON-RPC code {code})")
+            }
             DialError::TimedOut => write!(f, "timed out"),
         }
     }
@@ -403,10 +413,28 @@ pub async fn dial_and_call(
     // the reply is already received, so no drain wait is needed for a one-shot call).
     let _ = send.finish();
 
-    let reply: serde_json::Value = serde_json::from_slice(&reply_bytes)
-        .map_err(|e| DialError::BadReply(format!("not valid JSON: {e}")))?;
+    parse_call_reply(&reply_bytes)
+}
+
+/// Split the peer's one JSON-RPC reply frame into the tool's `result` or a typed error.
+///
+/// Not JSON → [`DialError::BadReply`]; a well-formed `error` member → [`DialError::ToolError`]
+/// (`code` defaults to `-32000` when absent or not a number, `message` to the error value's
+/// compact JSON when it carries no `message` string — a bare-string error IS its message);
+/// a `result` member → `Ok`; neither → [`DialError::BadReply`].
+pub fn parse_call_reply(reply_bytes: &[u8]) -> Result<serde_json::Value, DialError> {
+    let reply: serde_json::Value =
+        serde_json::from_slice(reply_bytes).map_err(|e| DialError::BadReply(format!("not valid JSON: {e}")))?;
     if let Some(err) = reply.get("error") {
-        return Err(DialError::BadReply(err.to_string()));
+        let code = err.get("code").and_then(serde_json::Value::as_i64).unwrap_or(-32000);
+        let message = match err {
+            serde_json::Value::String(s) => s.clone(),
+            other => match other.get("message").and_then(serde_json::Value::as_str) {
+                Some(m) => m.to_string(),
+                None => other.to_string(),
+            },
+        };
+        return Err(DialError::ToolError { code, message });
     }
     reply
         .get("result")
@@ -445,6 +473,60 @@ mod tests {
 
     use crate::channel::{PARK_EXPIRED_REASON_PREFIX, PARK_EXPIRED_TOKEN};
     use crate::channel_wire::{decode_refusal_category, PHASE_PREAMBLE_MAGIC, POSSESSION_CHALLENGE_LEN};
+
+    /// #763: a JSON-RPC error object is the tool's own answer (`ToolError`), not a malformed
+    /// reply; `code`/`message` come through verbatim.
+    #[test]
+    fn parse_call_reply_maps_a_json_rpc_error_object_to_tool_error_763() {
+        let reply = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"bridge/manifest-list: this agent has no CT_MANIFEST_REGISTRY_URL configured"}}"#;
+        assert_eq!(
+            parse_call_reply(reply),
+            Err(DialError::ToolError {
+                code: -32000,
+                message: "bridge/manifest-list: this agent has no CT_MANIFEST_REGISTRY_URL configured".to_string(),
+            })
+        );
+        let shown = parse_call_reply(reply).unwrap_err().to_string();
+        assert!(shown.starts_with("the agent refused the call: bridge/manifest-list"), "{shown}");
+        assert!(shown.ends_with("(JSON-RPC code -32000)"), "{shown}");
+        assert!(!shown.contains("malformed"), "{shown}");
+    }
+
+    /// #763: a bare-string `error` is its own message; a missing/non-numeric code defaults
+    /// to -32000; an object without `message` falls back to its compact JSON.
+    #[test]
+    fn parse_call_reply_tolerates_string_and_message_less_errors_763() {
+        assert_eq!(
+            parse_call_reply(br#"{"id":1,"error":"unknown tool: bridge/nope"}"#),
+            Err(DialError::ToolError { code: -32000, message: "unknown tool: bridge/nope".to_string() })
+        );
+        assert_eq!(
+            parse_call_reply(br#"{"id":1,"error":{"code":"x","data":{"step":"verify"}}}"#),
+            Err(DialError::ToolError { code: -32000, message: r#"{"code":"x","data":{"step":"verify"}}"#.to_string() })
+        );
+        assert_eq!(
+            parse_call_reply(br#"{"id":1,"error":{"code":7,"message":"m"}}"#),
+            Err(DialError::ToolError { code: 7, message: "m".to_string() })
+        );
+    }
+
+    /// #763: `result` is handed back as-is; garbage and result-less/error-less documents stay
+    /// `BadReply` (the genuinely malformed cases).
+    #[test]
+    fn parse_call_reply_returns_result_and_keeps_bad_reply_for_malformed_frames_763() {
+        assert_eq!(
+            parse_call_reply(br#"{"jsonrpc":"2.0","id":1,"result":{"version":"0.7.26","bridge_gated":true}}"#),
+            Ok(serde_json::json!({"version": "0.7.26", "bridge_gated": true}))
+        );
+        match parse_call_reply(b"\x7b\x22 not json") {
+            Err(DialError::BadReply(e)) => assert!(e.starts_with("not valid JSON:"), "{e}"),
+            other => panic!("expected BadReply, got {other:?}"),
+        }
+        assert_eq!(
+            parse_call_reply(br#"{"jsonrpc":"2.0","id":1}"#),
+            Err(DialError::BadReply("reply had neither `result` nor `error`".to_string()))
+        );
+    }
 
     /// The reply frame is reassembled even when the acceptor's pump sealed it as two records.
     #[tokio::test]
