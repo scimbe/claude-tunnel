@@ -503,12 +503,23 @@ struct OwnerResp {
 struct OwnedPair {
     token: String,
     hostname: Option<String>,
+    /// #779: the tunnel's access window, when the owner set one. Omitted from the JSON
+    /// entirely when absent (and `default` when parsing), so an edge and a control
+    /// plane on either side of this change still understand each other: absent =
+    /// unrestricted, exactly what every pair meant before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy: Option<ct_common::access_window::AccessPolicy>,
 }
 
 #[derive(Clone)]
 struct MeshState {
     store: Arc<SqliteEdgeMesh>,
     admin_token: Option<[u8; 32]>,
+    /// #779: where the access windows live (`tunnel_access_policies`, keyed by tunnel
+    /// and joined to the routing token). `None` (the original [`edge_mesh_router`]
+    /// constructor, every pre-existing test) = rehydrate answers without policies,
+    /// byte-for-byte what it answered before.
+    tunnels: Option<Arc<crate::storage::SqliteTunnelStore>>,
 }
 
 fn now_secs() -> i64 {
@@ -594,12 +605,29 @@ async fn rehydrate(
     Path(edge_id): Path<String>,
 ) -> Result<Json<Vec<OwnedPair>>, (StatusCode, String)> {
     crate::service::require_admin(&headers, &st.admin_token, "rehydration requires the admin token")?;
+    // #779: attach each pair's access window so a restarted edge enforces it from its
+    // first accepted connection, not from the next portal change. Best-effort: a
+    // policy-store read failure is logged and the pairs go out without policies (the
+    // hostname authorizations are the part a boot cannot do without).
+    let mut policies = match st.tunnels.as_ref().map(|t| t.access_policies_by_token()) {
+        Some(Ok(map)) => map,
+        Some(Err(e)) => {
+            eprintln!(
+                "ct-cp: rehydrate for {edge_id}: access policies unreadable ({e}) -- replayed without them (#779)"
+            );
+            std::collections::HashMap::new()
+        }
+        None => std::collections::HashMap::new(),
+    };
     let pairs = st
         .store
         .owned_by(&edge_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .into_iter()
-        .map(|(token, hostname)| OwnedPair { token, hostname })
+        .map(|(token, hostname)| {
+            let policy = policies.remove(&token);
+            OwnedPair { token, hostname, policy }
+        })
         .collect();
     Ok(Json(pairs))
 }
@@ -609,12 +637,23 @@ async fn rehydrate(
 /// Gated by the same shared admin token as every other admin-facing writer
 /// here (`#186`'s one extract-and-compare) — `None` disables the gate (dev/test).
 pub fn edge_mesh_router(store: Arc<SqliteEdgeMesh>, admin_token: Option<[u8; 32]>) -> Router {
+    edge_mesh_router_with_policies(store, admin_token, None)
+}
+
+/// #779: [`edge_mesh_router`] plus the tunnel store, so `GET /internal/edges/rehydrate/
+/// :edge_id` can attach each pair's access window. Production wiring (`service.rs`)
+/// uses this; `tunnels: None` behaves exactly like [`edge_mesh_router`].
+pub fn edge_mesh_router_with_policies(
+    store: Arc<SqliteEdgeMesh>,
+    admin_token: Option<[u8; 32]>,
+    tunnels: Option<Arc<crate::storage::SqliteTunnelStore>>,
+) -> Router {
     Router::new()
         .route("/internal/edges/heartbeat", post(heartbeat))
         .route("/internal/edges/lookup", get(lookup))
         .route("/internal/edges/rehydrate/:edge_id", get(rehydrate))
         .route("/internal/edges/:id/rebind", post(rebind))
-        .with_state(MeshState { store, admin_token })
+        .with_state(MeshState { store, admin_token, tunnels })
 }
 
 #[cfg(test)]
@@ -1252,5 +1291,39 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].token, "tok-a");
         assert_eq!(pairs[0].hostname.as_deref(), Some("a.example.com"));
+        // #779: without a tunnel store the response is byte-for-byte the pre-#779 shape.
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(raw[0].get("policy").is_none(), "no `policy` key at all when absent: {raw}");
+    }
+
+    #[tokio::test]
+    async fn rehydrate_endpoint_attaches_the_access_policy_per_pair_779() {
+        // #779: a pair whose tunnel has an access window carries it as `policy` (the
+        // exact JSON the portal stored); pairs without one carry no key at all, so an
+        // older edge's parser is untouched.
+        use ct_common::access_window::AccessPolicy;
+        let store = store();
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let app = edge_mesh_router_with_policies(store.clone(), None, Some(tunnels.clone()));
+        let limited = tunnels.create("alice", "limited", Some("a.example.com")).unwrap().created().unwrap();
+        let open = tunnels.create("alice", "open", Some("b.example.com")).unwrap().created().unwrap();
+        let policy = AccessPolicy { expires_at: Some(1_789_084_800), schedule: None };
+        assert!(tunnels.set_access_policy("alice", &limited.id, &policy, 1_000).unwrap());
+        store.record_ownership(&limited.routing_token, Some("a.example.com"), "edge-1", now_secs()).unwrap();
+        store.record_ownership(&open.routing_token, Some("b.example.com"), "edge-1", now_secs()).unwrap();
+
+        let resp = app
+            .oneshot(Request::get("/internal/edges/rehydrate/edge-1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(raw.len(), 2);
+        let by_token = |t: &str| raw.iter().find(|p| p["token"] == t).expect("pair present").clone();
+        assert_eq!(by_token(&limited.routing_token)["policy"], serde_json::json!({"expires_at": 1_789_084_800}));
+        assert!(by_token(&open.routing_token).get("policy").is_none(), "unrestricted -> no key, not null");
+        let pairs: Vec<OwnedPair> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pairs.iter().find(|p| p.token == limited.routing_token).unwrap().policy, Some(policy));
     }
 }

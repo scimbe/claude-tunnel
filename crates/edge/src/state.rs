@@ -552,6 +552,18 @@ pub struct EdgeState<H> {
     /// decision on the connection-accept hot path), written only when the
     /// control plane pushes a tier change.
     gelb_hosts: RwLock<HashSet<String>>,
+    /// #779: access window per routing token -- the policy the control plane pushed
+    /// (`POST /internal/tunnel/access-policy`, admin listener) or the boot-time
+    /// rehydration replayed (`edge_mesh_client::rehydrate`). Consulted at both `:443`
+    /// front-door lookups (`serve_sni_passthrough` / `serve_gelb_terminated`) and
+    /// evaluated LOCALLY against the wall clock -- no per-request control-plane call.
+    /// A token with no entry is unrestricted, exactly today's behavior. Cleared on
+    /// revoke together with the token's host authorizations.
+    /// `RwLock`: read on every front-door connection, written only on a policy push.
+    access_policies: RwLock<HashMap<RoutingToken, ct_common::access_window::AccessPolicy>>,
+    /// #779: `ct_edge_access_window_refused_total` -- front-door connections refused
+    /// because the hostname's tunnel was outside its access window.
+    access_window_refused: Counter,
     /// Per-token fixed-window rendezvous rate limit (#86, ADR-0018). `None` = off
     /// (no cap). `Some(limiter)` caps how many rendezvous a single routing token may
     /// drive per window — the second half of the layered rendezvous-flood defense
@@ -755,6 +767,8 @@ impl<H: Clone> EdgeState<H> {
             audit_log: Mutex::new(None),
             host_auth: RwLock::new(None),
             gelb_hosts: RwLock::new(HashSet::new()),
+            access_policies: RwLock::new(HashMap::new()),
+            access_window_refused: Counter::default(),
             rendezvous_limiter: Mutex::new(None),
             join_refusal: std::sync::Arc::new(JoinRefusalPenalty::new()),
             ja4: std::sync::Arc::new(Ja4Observations::new()),
@@ -1128,6 +1142,50 @@ impl<H: Clone> EdgeState<H> {
             Some(key) => self.gelb_hosts.read_safe().contains(&key),
             None => false,
         }
+    }
+
+    /// #779: store (or, with `None`, drop) the access policy for `token`. Called by
+    /// the admin-listener push route on every change the control plane makes and by
+    /// the boot-time rehydration replay; an unrestricted policy (neither expiry nor
+    /// schedule) is stored as an absence so the map only ever holds real restrictions.
+    pub fn set_access_policy(&self, token: RoutingToken, policy: Option<ct_common::access_window::AccessPolicy>) {
+        let mut map = self.access_policies.write_safe();
+        match policy {
+            Some(p) if !p.is_unrestricted() => {
+                map.insert(token, p);
+            }
+            _ => {
+                map.remove(&token);
+            }
+        }
+    }
+
+    /// #779: the access policy currently on file for `token`, if any (a clone -- the
+    /// struct is a few dozen bytes and the lock must not be held across an await).
+    pub fn access_policy(&self, token: &RoutingToken) -> Option<ct_common::access_window::AccessPolicy> {
+        self.access_policies.read_safe().get(token).cloned()
+    }
+
+    /// #779: may a front-door connection for `token` be served at `now_unix`? `true`
+    /// when no policy is on file (unrestricted) -- the pre-#779 behavior for every
+    /// tunnel this feature does not touch.
+    pub fn access_window_open(&self, token: &RoutingToken, now_unix: i64) -> bool {
+        match self.access_policies.read_safe().get(token) {
+            Some(p) => p.is_open(now_unix),
+            None => true,
+        }
+    }
+
+    /// #779: count one front-door refusal outside the access window; returns the
+    /// running total for the caller's log line.
+    pub fn note_access_window_refused(&self) -> u64 {
+        self.access_window_refused.inc();
+        self.access_window_refused.get()
+    }
+
+    /// #779: `ct_edge_access_window_refused_total` for `/metrics`.
+    pub fn access_window_refused_total(&self) -> u64 {
+        self.access_window_refused.get()
     }
 
     /// Note a completed relay for `token`: `client_to_agent`/`agent_to_client`
@@ -1848,6 +1906,9 @@ impl<H: Clone> EdgeState<H> {
         // routing table, not the separate, otherwise-permanent authorization
         // grant.
         self.clear_host_auth_for(token);
+        // #779: a revoked token's access policy must not linger either -- the map is
+        // keyed by token and nothing else would ever sweep it.
+        self.access_policies.write_safe().remove(token);
     }
 
     /// Whether `token` has been revoked (#27 RB3).
@@ -3495,5 +3556,43 @@ mod tests {
         assert_eq!(state.flush_tunnel_history(wall_now_for_test() + 10 * 86_400, 86_400), (0, 0));
         assert_eq!(state.tunnel_bytes(&t), (3, 4), "no durable record -> the in-memory total is kept");
         assert!(state.connection_timing(&t).1.is_some());
+    }
+
+    #[test]
+    fn access_policy_is_evaluated_locally_and_cleared_on_revoke_779() {
+        use ct_common::access_window::AccessPolicy;
+        let state: EdgeState<u32> = EdgeState::new();
+        let t = token(90);
+        // No policy on file: unrestricted, exactly the pre-#779 behavior.
+        assert!(state.access_window_open(&t, 1_000));
+        assert!(state.access_policy(&t).is_none());
+
+        // An expiry: open before it, closed at and after it -- decided from the map alone.
+        state.set_access_policy(t.clone(), Some(AccessPolicy { expires_at: Some(2_000), schedule: None }));
+        assert!(state.access_window_open(&t, 1_999));
+        assert!(!state.access_window_open(&t, 2_000));
+        assert_eq!(state.access_policy(&t).and_then(|p| p.expires_at), Some(2_000));
+
+        // An unrestricted policy is stored as an absence, so the map holds only real limits.
+        state.set_access_policy(t.clone(), Some(AccessPolicy::default()));
+        assert!(state.access_policy(&t).is_none());
+        assert!(state.access_window_open(&t, 5_000));
+
+        // `None` clears an existing one.
+        state.set_access_policy(t.clone(), Some(AccessPolicy { expires_at: Some(10), schedule: None }));
+        assert!(!state.access_window_open(&t, 20));
+        state.set_access_policy(t.clone(), None);
+        assert!(state.access_window_open(&t, 20));
+
+        // Revoke drops the policy with the token's other state.
+        state.set_access_policy(t.clone(), Some(AccessPolicy { expires_at: Some(10), schedule: None }));
+        state.revoke_token(&t);
+        assert!(state.access_policy(&t).is_none(), "a revoked token's policy must not linger");
+
+        // The refusal counter is a plain running total.
+        assert_eq!(state.access_window_refused_total(), 0);
+        assert_eq!(state.note_access_window_refused(), 1);
+        assert_eq!(state.note_access_window_refused(), 2);
+        assert_eq!(state.access_window_refused_total(), 2);
     }
 }

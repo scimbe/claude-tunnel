@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 pub mod a2a;
+/// #779: access windows / auto-expiring exposure -- the pure, wasm32-portable policy type
+/// the portal edits, the control plane stores and pushes, and the edge evaluates locally.
+pub mod access_window;
 pub mod acme_ca;
 pub mod channel;
 /// Native-only (see this module's own doc comment for why): needs `quinn`/`rustls`, which

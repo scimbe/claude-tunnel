@@ -6472,7 +6472,12 @@ pub fn persistent_control_plane_router(
         .merge(pipeline_registry_router(pipeline_registry.clone(), admin_token))
         // edge_mesh Phase 0: heartbeat/lookup/rehydrate — admin-token-gated the same as
         // every other internal machine-writer surface here.
-        .merge(crate::edge_mesh::edge_mesh_router(edge_mesh_store.clone(), admin_token))
+        // #779: with the tunnel store, so rehydrate carries each pair's access window.
+        .merge(crate::edge_mesh::edge_mesh_router_with_policies(
+            edge_mesh_store.clone(),
+            admin_token,
+            Some(tunnels.clone()),
+        ))
         // ACME DNS-01 challenge-publish (ADR-0003 follow-up): an agent proves hostname
         // ownership via its routing token (checked against edge_mesh) instead of ever
         // holding the zone-wide DNS credential itself. Absent when no DNS-01 backend

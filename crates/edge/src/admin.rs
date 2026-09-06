@@ -55,6 +55,11 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // card -- same listener, gate, and `/internal/...` naming as the #763 presence
         // routes above, for the same reason (the CP is its only caller).
         .route("/internal/tunnel/history/:token_hex", get(tunnel_history))
+        // #779: the control plane pushes a tunnel's access window here on every change
+        // (and alongside a fresh hostname authorization); boot-time state comes from the
+        // rehydrate replay instead. Routing token via the `x-ct-routing-token` header,
+        // never the path (#666) -- same posture as the `:host`-only authorize-host route.
+        .route("/internal/tunnel/access-policy", post(set_access_policy))
         .with_state(state)
 }
 
@@ -497,6 +502,51 @@ async fn tunnel_history(
     let uptime = history.uptime_summary(&hex, now).map_err(store_error)?;
     let sessions = history.sessions_for(&hex, limit).map_err(store_error)?;
     Ok(Json(TunnelHistoryResp { open, uptime, sessions }))
+}
+
+/// `POST /internal/tunnel/access-policy` (#779): the control plane's push of one
+/// tunnel's access window. Admin-token-gated like every other route here; the routing
+/// token rides in `x-ct-routing-token` (#666: a bearer credential never goes in a URL
+/// path). Body: the `ct_common::access_window::AccessPolicy` JSON, or `null` to clear.
+/// The edge stores it and evaluates it locally at the front door from then on -- this
+/// route is the only write path besides the boot-time rehydrate replay. `400` on a
+/// missing/malformed token header; the JSON extractor answers a malformed body itself.
+async fn set_access_policy(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Json(policy): Json<Option<ct_common::access_window::AccessPolicy>>,
+) -> StatusCode {
+    if !admin_authed(&state, &headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Some(t) = routing_token_from_header(&headers).as_deref().and_then(parse_token_hex) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if let Some(p) = &policy {
+        if let Err(why) = p.validate() {
+            eprintln!("ct-edge: access-policy push rejected: {why} (#779)");
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+    let restricted = policy.as_ref().is_some_and(|p| !p.is_unrestricted());
+    state.set_access_policy(RoutingToken(t), policy);
+    eprintln!(
+        "ct-edge: access window {} for token {}..{} (#779)",
+        if restricted { "set" } else { "cleared" },
+        hex_prefix(&t),
+        hex_suffix(&t),
+    );
+    StatusCode::OK
+}
+
+/// #779: first / last two bytes of a routing token as hex, for a log line that names
+/// the tunnel without printing the whole bearer credential.
+fn hex_prefix(t: &[u8; 32]) -> String {
+    t[..2].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_suffix(t: &[u8; 32]) -> String {
+    t[30..].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Parse a 64-hex string into 32 bytes.
@@ -1007,5 +1057,80 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn access_policy_push_is_admin_gated_stores_validates_and_clears_779() {
+        use ct_common::access_window::AccessPolicy;
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x79u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let tok_hex = "ab".repeat(32);
+        let token = RoutingToken([0xab; 32]);
+
+        let post = |auth: Option<String>, tok: Option<String>, body: &'static str| {
+            let app = admin_router(state.clone());
+            let mut req = Request::post("/internal/tunnel/access-policy").header("content-type", "application/json");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            if let Some(t) = tok {
+                req = req.header("x-ct-routing-token", t);
+            }
+            app.oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let expiring = r#"{"expires_at":100}"#;
+
+        // Wrong/missing admin auth -> 401, nothing stored.
+        assert_eq!(post(None, Some(tok_hex.clone()), expiring).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(state.access_policy(&token).is_none());
+        // Missing / malformed routing token -> 400.
+        assert_eq!(post(Some(secret_hex.clone()), None, expiring).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post(Some(secret_hex.clone()), Some("zz".repeat(32)), expiring).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        // A policy that fails validation (day 9) -> 400, nothing stored.
+        assert_eq!(
+            post(
+                Some(secret_hex.clone()),
+                Some(tok_hex.clone()),
+                r#"{"schedule":{"tz_offset_minutes":0,"slots":[{"day":9,"start_minute":0,"end_minute":60}]}}"#,
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.access_policy(&token).is_none());
+
+        // A valid push lands in the map and is evaluated locally from then on.
+        let ok = post(Some(secret_hex.clone()), Some(tok_hex.clone()), expiring).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(state.access_policy(&token), Some(AccessPolicy { expires_at: Some(100), schedule: None }));
+        assert!(state.access_window_open(&token, 99));
+        assert!(!state.access_window_open(&token, 100));
+
+        // `null` clears it.
+        let cleared = post(Some(secret_hex.clone()), Some(tok_hex.clone()), "null").await.unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert!(state.access_policy(&token).is_none());
+        assert!(state.access_window_open(&token, 100));
+
+        // Revoke clears a pushed policy too (the same admin listener's revoke route).
+        let again = post(Some(secret_hex.clone()), Some(tok_hex.clone()), expiring).await.unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        let revoke = admin_router(state.clone())
+            .oneshot(
+                Request::post(format!("/admin/revoke/{tok_hex}"))
+                    .header("x-ct-admin-token", secret_hex.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+        assert!(state.access_policy(&token).is_none(), "revoke must drop the policy with the token");
     }
 }
