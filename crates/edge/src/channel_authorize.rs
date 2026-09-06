@@ -389,7 +389,23 @@ impl ChannelAuthorizer {
                 return true;
             }
         }
-        matches!(self.query(channel, holder).await, Outcome::Refused)
+        let refused = matches!(self.query(channel, holder).await, Outcome::Refused);
+        // #696 follow-up (item 3): this authoritative refusal must evict the positive
+        // `cache` entry too, not just record the negative one -- `resolve()`'s own
+        // Refused branch does this (see above), but this call path bypassed it. Without
+        // this, a revoked holder observed here stays in `cache` until its `cache_ttl`
+        // (30s) expires; a `resolve()` call that lands *after* `negative_cache_ttl` (5s)
+        // but hits a transient CP blip (`Outcome::Unresolved`) falls back to that stale
+        // positive entry and re-admits a holder this function just proved is refused.
+        if refused {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(&key);
+            }
+            if let Ok(mut neg) = self.negative_cache.lock() {
+                neg.insert(key, Instant::now());
+            }
+        }
+        refused
     }
 
     pub async fn resolve(&self, channel: &ChannelId, holder: &[u8; 32]) -> Option<MemberResolution> {
@@ -629,6 +645,79 @@ mod tests {
         assert!(
             auth.resolve(&channel, &[0x33u8; 32]).await.is_none(),
             "the evicted key must fail closed on transport error too, not resurrect the pre-revocation cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn definitively_not_a_member_evicts_the_positive_cache_too_696() {
+        // #696 item 3: `membership_revoked` (edge/serve.rs) calls `definitively_not_a_member`
+        // directly, never `resolve`. Before this fix, only `resolve`'s own Refused branch
+        // evicted the positive `cache` entry -- a Refused observed through
+        // `definitively_not_a_member` left the stale pre-revocation entry sitting in
+        // `cache` until its full `cache_ttl` expired. Once the short negative-cache TTL
+        // (which DID get set) expires but the longer `cache_ttl` has not, a `resolve()`
+        // landing on a transient transport failure fell back to that stale entry and
+        // re-admitted a holder this function had already proven refused.
+        let member_still_valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = member_still_valid.clone();
+        async fn revocable_authorize(
+            axum::extract::State(flag): axum::extract::State<Arc<std::sync::atomic::AtomicBool>>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Result<Json<Value>, axum::http::StatusCode> {
+            if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(&hex(&[0x7au8; 32])) {
+                return Err(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            let holder = body.get("holder").and_then(|v| v.as_str()).unwrap_or("");
+            if holder == hex(&[0x44u8; 32]) && flag.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(Json(serde_json::json!({"operator_pubkey": hex(&[0xFFu8; 32])})))
+            } else {
+                Err(axum::http::StatusCode::NOT_FOUND)
+            }
+        }
+        let app = Router::new()
+            .route("/internal/channel/authorize", post(revocable_authorize))
+            .with_state(flag);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let channel = ChannelId([0xC6u8; 32]);
+        // cache_ttl long relative to negative_cache_ttl, matching production's real
+        // 30s/5s ratio -- shrunk so the test doesn't sleep for real seconds.
+        let auth = ChannelAuthorizer::with_ttls(
+            &format!("http://{addr}"),
+            &[0x7au8; 32],
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+
+        assert!(auth.resolve(&channel, &[0x44u8; 32]).await.is_some(), "member resolves once (cached)");
+        member_still_valid.store(false, std::sync::atomic::Ordering::SeqCst); // the CP now genuinely revokes them
+
+        // Observed ONLY through `definitively_not_a_member` -- `resolve` is never called
+        // on this key again before the transport failure below, so any eviction it
+        // performs must have come from this call path.
+        assert!(
+            auth.definitively_not_a_member(&channel, &[0x44u8; 32]).await,
+            "a clean 404 is an authoritative refusal"
+        );
+
+        // Let the short negative-cache entry expire, but stay within cache_ttl.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Now the CP becomes genuinely unreachable (transport failure) -- `resolve`
+        // falls back to the positive `cache` on Unresolved. If `definitively_not_a_member`
+        // had evicted it, this must fail closed (None); if not, it wrongly resurrects
+        // the pre-revocation `Some(operator_pubkey = 0xFF...)`.
+        server.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            auth.resolve(&channel, &[0x44u8; 32]).await.is_none(),
+            "definitively_not_a_member's refusal must evict the positive cache entry too, \
+             not just the negative one -- a transport failure afterward must fail closed"
         );
     }
 
