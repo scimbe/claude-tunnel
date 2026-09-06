@@ -2621,6 +2621,21 @@ impl SqliteTunnelStore {
                  disabled_at  INTEGER NOT NULL
              );",
         )?;
+        // #778: opt-in public uptime badges. One row per tunnel that has a badge
+        // enabled; `public_id` is the unguessable 32-byte hex id the public
+        // `GET /badge/:public_id.svg` route is addressed by (never the tunnel id or
+        // routing token), `subject` the owner at enable time so the public route can
+        // run the owner-scoped `routing_token` lookup server-side. Disabling deletes
+        // the row (the old id 404s from then on -- revocable by design, #778);
+        // `revoke` deletes it alongside the tunnel so no badge outlives its tunnel.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tunnel_badges (
+                 tunnel_id  TEXT PRIMARY KEY,
+                 subject    TEXT NOT NULL,
+                 public_id  TEXT NOT NULL UNIQUE,
+                 created_at INTEGER NOT NULL
+             );",
+        )?;
         // #406: nothing previously enforced one-tunnel-per-hostname -- `idx_subject_tunnels_
         // hostname` above is a plain, non-unique index. Two reachable collisions: a raised
         // per-account tunnel limit lets `auto_hostname(zone, name, subject)` (deterministic
@@ -2860,6 +2875,8 @@ impl SqliteTunnelStore {
                 params![id, subject],
             )?;
             tx.execute("DELETE FROM tunnel_grants WHERE tunnel_id = ?1", params![id])?;
+            // #778: a public badge must not outlive its tunnel.
+            tx.execute("DELETE FROM tunnel_badges WHERE tunnel_id = ?1", params![id])?;
             tx.execute(
                 "INSERT OR REPLACE INTO revoked_tokens (token, revoked_at) VALUES (?1, ?2)",
                 params![tok, now as i64],
@@ -3075,6 +3092,121 @@ impl SqliteTunnelStore {
             .optional()
             .map(Option::flatten)
     }
+
+    // ----- #778: per-tunnel uptime page + opt-in public uptime badge -------------------
+
+    /// One tunnel the caller OWNS (not merely a grantee of), or `None` for an
+    /// unknown/foreign id -- same "existence leaks nothing" posture as
+    /// [`Self::routing_token`], which this generalises: the uptime page (#778) needs the
+    /// name and hostname for its heading as well as the routing token for the edge
+    /// history lookup, in one round trip.
+    pub fn owned_tunnel(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<SubjectTunnel>> {
+        self.read()
+            .query_row(
+                "SELECT id, name, hostname, created_at, routing_token FROM subject_tunnels
+                 WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| {
+                    Ok(SubjectTunnel {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        hostname: r.get(2)?,
+                        created_at: r.get(3)?,
+                        routing_token: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Enable the public uptime badge for a tunnel the caller owns (#778): mints a fresh
+    /// 32-byte random hex `public_id` (same `OsRng` minting as `create`'s routing token)
+    /// and stores it, or -- idempotently -- returns the id already stored, so a double
+    /// submit never rotates a badge URL the owner has already pasted into a README.
+    /// `Ok(None)` for an unknown/foreign tunnel id (nothing is written), same
+    /// "existence leaks nothing" posture as `set_bridge_grant`. Owner check, existing-row
+    /// lookup and insert run in one transaction under the writer lock.
+    pub fn enable_badge(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let owns: bool = tx
+            .query_row(
+                "SELECT 1 FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owns {
+            return Ok(None);
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT public_id FROM tunnel_badges WHERE tunnel_id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(Some(id));
+        }
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let public_id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO tunnel_badges (tunnel_id, subject, public_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![tunnel_id, subject, public_id, created_at],
+        )?;
+        tx.commit()?;
+        Ok(Some(public_id))
+    }
+
+    /// Disable (revoke) the public uptime badge of a tunnel the caller owns (#778):
+    /// deletes the row, so the old `public_id` 404s from the next request on. `Ok(false)`
+    /// when nothing was deleted -- no badge was enabled, or the id is unknown/foreign;
+    /// callers that must tell those two apart check ownership separately
+    /// ([`Self::owns`]), this method itself never confirms a foreign tunnel's existence.
+    pub fn disable_badge(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
+        let n = self.writer.lock_safe().execute(
+            "DELETE FROM tunnel_badges WHERE tunnel_id = ?1 AND subject = ?2",
+            params![tunnel_id, subject],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The current badge `public_id` of a tunnel the caller owns (#778), `None` when no
+    /// badge is enabled or the id is unknown/foreign -- the uptime page's "badge state".
+    pub fn badge_public_id(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        self.read()
+            .query_row(
+                "SELECT public_id FROM tunnel_badges WHERE tunnel_id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Resolve a public badge id to `(subject, tunnel_id)` (#778) -- the ONE unscoped
+    /// read the public `GET /badge/:public_id.svg` route needs, mirroring
+    /// [`Self::routing_token_for_hostname`]'s "not acting for a logged-in customer"
+    /// precedent. The caller then runs the owner-scoped [`Self::routing_token`] with
+    /// the returned pair, so a badge whose tunnel was since revoked (or rehomed)
+    /// resolves to nothing rather than to a stale token.
+    pub fn badge_lookup(&self, public_id: &str) -> rusqlite::Result<Option<(String, String)>> {
+        self.read()
+            .query_row(
+                "SELECT subject, tunnel_id FROM tunnel_badges WHERE public_id = ?1",
+                params![public_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    // ----- end #778 ---------------------------------------------------------------------
 
     /// Every tunnel the caller owns with the REST bridge turned on (`mode != "off"`),
     /// paired with that mode -- the portal discovery page's (`/portal/rest-bridges`)
@@ -8810,6 +8942,55 @@ mod tests {
             "turning the bridge off clears the stored grant -- a stale grant left behind \
              would otherwise silently keep the bridge identity admitted"
         );
+    }
+
+    #[test]
+    fn badge_enable_is_idempotent_owner_scoped_and_revocable_778() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "site", Some("site.example")).unwrap().created().expect("hostname free");
+        let bobs = store.create("bob", "bobs", None).unwrap().created().expect("hostname free");
+
+        assert_eq!(store.badge_public_id("alice", &t.id).unwrap(), None, "nothing enabled yet");
+        assert_eq!(store.enable_badge("bob", &t.id).unwrap(), None, "non-owner cannot enable a foreign badge");
+        assert_eq!(store.enable_badge("alice", "no-such-tunnel").unwrap(), None, "unknown tunnel id");
+        assert_eq!(store.badge_lookup("ab".repeat(32).as_str()).unwrap(), None, "no row was written by the refusals");
+
+        let first = store.enable_badge("alice", &t.id).unwrap().expect("owner enables");
+        assert_eq!(first.len(), 64, "32 random bytes as lowercase hex");
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{first}");
+        assert_ne!(first, t.id, "the public id is neither the tunnel id ...");
+        assert_ne!(first, t.routing_token, "... nor the routing token");
+        let second = store.enable_badge("alice", &t.id).unwrap().expect("owner enables again");
+        assert_eq!(first, second, "idempotent: a second enable keeps the id already pasted into READMEs");
+        assert_eq!(store.badge_public_id("alice", &t.id).unwrap(), Some(first.clone()));
+        assert_eq!(store.badge_public_id("bob", &t.id).unwrap(), None, "owner-scoped read");
+        assert_eq!(
+            store.badge_lookup(&first).unwrap(),
+            Some(("alice".to_string(), t.id.clone())),
+            "the public route resolves the id to (subject, tunnel_id)"
+        );
+        assert_eq!(
+            store.routing_token("alice", &t.id).unwrap().as_deref(),
+            Some(t.routing_token.as_str()),
+            "... and the owner-scoped token lookup with that pair yields the tunnel's token"
+        );
+
+        let other = store.enable_badge("bob", &bobs.id).unwrap().expect("bob enables his own");
+        assert_ne!(other, first, "ids are per tunnel");
+
+        assert!(!store.disable_badge("bob", &t.id).unwrap(), "non-owner cannot disable alice's badge");
+        assert!(store.badge_lookup(&first).unwrap().is_some(), "still resolves after the refused disable");
+        assert!(store.disable_badge("alice", &t.id).unwrap());
+        assert!(!store.disable_badge("alice", &t.id).unwrap(), "already gone: nothing deleted");
+        assert_eq!(store.badge_lookup(&first).unwrap(), None, "the old id resolves to nothing from now on");
+        assert_eq!(store.badge_public_id("alice", &t.id).unwrap(), None);
+        let third = store.enable_badge("alice", &t.id).unwrap().expect("re-enable");
+        assert_ne!(third, first, "re-enabling after a disable mints a NEW id -- the revoked one stays dead");
+
+        // Revoking the tunnel takes its badge with it.
+        assert!(store.revoke("alice", &t.id, 1_700_000_000).unwrap().is_some());
+        assert_eq!(store.badge_lookup(&third).unwrap(), None, "no badge outlives its tunnel");
+        assert_eq!(store.badge_lookup(&other).unwrap().map(|(s, _)| s), Some("bob".to_string()), "bob's is untouched");
     }
 
     #[test]

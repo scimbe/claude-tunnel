@@ -25,6 +25,10 @@ use crate::storage::{
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
+/// #778/#783: per-tunnel uptime page + public badge, account usage page + CSV -- a
+/// child module so it can use this file's private state and helpers; see its own doc.
+mod uptime;
+
 /// #297: map a storage/DB error to a generic 500 instead of leaking `e`'s `Display`
 /// (SQLite internals — constraint/table/column names, schema state) to the caller.
 /// The real error still reaches the operator, just server-side in the log, tagged
@@ -324,7 +328,9 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
         .route("/admin/provision-tunnel", post(admin_provision_tunnel))
         .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
-        .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels));
+        .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
+        // #778/#783: uptime page, badge routes, usage page + CSV (see `uptime.rs`).
+        .merge(uptime::routes());
     if verifier.is_some() {
         router = router
             .route("/me/signup", post(me_signup))
@@ -5761,7 +5767,20 @@ fn tunnel_history_html(history: &EdgeTunnelHistory) -> String {
         human_pct(history.uptime.d7),
         human_pct(history.uptime.d30),
     );
-    let body = if history.sessions.is_empty() {
+    let body = tunnel_history_sessions_html(history);
+    format!(
+        r#"<details class="history"><summary class="row"><span class="k">Connection history</span></summary>
+<p class="help">{uptime}</p>
+{body}
+</details>"#
+    )
+}
+
+/// #776/#778: the sessions table alone (or the "nothing recorded" line when there are
+/// no rows) -- the card's disclosure above and the uptime page (`uptime.rs`) share
+/// this one renderer, so a row is formatted in exactly one place.
+fn tunnel_history_sessions_html(history: &EdgeTunnelHistory) -> String {
+    if history.sessions.is_empty() {
         let copy = if history.open {
             "Connected now; no completed sessions recorded yet."
         } else {
@@ -5791,13 +5810,7 @@ fn tunnel_history_html(history: &EdgeTunnelHistory) -> String {
             r#"<table class="history"><thead><tr><th>Started (UTC)</th><th>Duration</th><th>Transport</th><th>Bytes in / out</th><th>Reason</th></tr></thead>
 <tbody>{rows}</tbody></table>"#
         )
-    };
-    format!(
-        r#"<details class="history"><summary class="row"><span class="k">Connection history</span></summary>
-<p class="help">{uptime}</p>
-{body}
-</details>"#
-    )
+    }
 }
 
 /// Browser-Plane login gate section (#382-follow): a checkbox to require a
@@ -5947,6 +5960,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
                 format!(
                     r#"<div class="actions">
  <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <a class="btn sec" href="/portal/tunnels/{id}/uptime">Uptime &amp; usage</a>
  {share_action}
  <form class="inline fade-out-submit confirm-revoke" method="post" action="/portal/tunnels/{id}/delete">
   <button class="btn danger" type="submit" title="Permanently deletes this tunnel. This cannot be undone via self-service today.">Revoke</button></form>
@@ -6478,7 +6492,7 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><div class="nav-links"><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/agent-bridges">Agent bridges</a></div><div class="nav-account">{signed_in_as}<a class="nav-signout" href="/portal/logout">Sign out</a></div></nav>
+<nav><div class="nav-links"><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/usage">Usage</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/agent-bridges">Agent bridges</a></div><div class="nav-account">{signed_in_as}<a class="nav-signout" href="/portal/logout">Sign out</a></div></nav>
 {body}
 </div>
 <script>
@@ -14811,5 +14825,269 @@ mod tests {
         assert!(html.contains(">Registry manifests</button>"), "{html}");
         assert!(!html.contains("Installed manifests"));
         assert!(html.contains(r#"a URL from the "Registry manifests" list above"#), "the manifest form's help follows");
+    }
+
+    // ----- #778 / #783: uptime page, public badge, usage page + CSV ---------------------
+
+    /// A raw GET (optional session) returning status, headers and body -- the badge and
+    /// CSV routes are asserted on their headers, which [`get`] discards.
+    async fn get_raw(app: &Router, path: &str, subject: Option<&str>) -> (StatusCode, HeaderMap, String) {
+        let mut req = Request::get(path);
+        if let Some(s) = subject {
+            req = req.header("cookie", session_header(s));
+        }
+        let resp = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, headers, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The reference history with timestamps relative to now, so the 30-day aggregation
+    /// actually sees the sessions: an open QUIC session since an hour ago, and a 30 min
+    /// TCP-fallback session that ended 90 min ago -- a 30 min hole between the two.
+    fn recent_history_json() -> serde_json::Value {
+        let now = i64::try_from(unix_now()).unwrap();
+        serde_json::json!({
+            "open": true,
+            "uptime": { "h24": 100.0, "d7": 98.4, "d30": 97.1 },
+            "sessions": [
+                { "transport": "quic", "connected_at": now - 3_600, "disconnected_at": null, "reason": null,
+                  "bytes_in": 1234, "bytes_out": 5678 },
+                { "transport": "tcp-fallback", "connected_at": now - 7_200, "disconnected_at": now - 5_400,
+                  "reason": "registration-closed", "bytes_in": 10, "bytes_out": 20 }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn tunnel_uptime_page_renders_the_edge_numbers_and_is_owner_scoped_778() {
+        let (edge_url, asked) = mock_edge_with_history(Some(recent_history_json())).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let t = tunnels.create("alice", "site", Some("site.example")).unwrap().created().expect("hostname free");
+
+        let (status, html) = get(&app, &format!("/portal/tunnels/{}/uptime", t.id), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Uptime &amp; usage · site"), "{html}");
+        assert!(html.contains("<code>site.example</code>"), "{html}");
+        assert!(html.contains(r#"Uptime 24 h / 7 d / 30 d</span><span class="v">100 % / 98.4 % / 97.1 %</span>"#), "{html}");
+        assert!(html.contains(r#"Longest outage (30 d)</span><span class="v">30 m</span>"#), "{html}");
+        assert!(html.contains(r#"Sessions (30 d)</span><span class="v">2</span>"#), "{html}");
+        assert!(html.contains(r#"Bytes in / out (30 d)</span><span class="v">1.2 KB / 5.6 KB</span>"#), "{html}");
+        // The full sessions table, rendered by the SAME renderer as the card (#776).
+        assert!(html.contains("<td>open</td><td>quic</td><td>1.2 KB / 5.5 KB</td>"), "{html}");
+        assert!(html.contains("<td>30 m</td><td>tcp-fallback</td><td>10 B / 20 B</td><td>registration-closed</td>"), "{html}");
+        assert!(html.contains("Sessions (newest first, up to 200)"), "{html}");
+        // Badge off by default, with the enable form.
+        assert!(html.contains(&format!(r#"action="/portal/tunnels/{}/badge/enable""#, t.id)), "{html}");
+        assert!(!html.contains("Disable badge"), "{html}");
+        assert!(!html.contains(&t.routing_token), "the routing token is never rendered");
+        // Nav carries the new Usage section.
+        assert!(html.contains(r#"<a href="/portal/usage">Usage</a>"#), "{html}");
+
+        let (token_hex, query) = asked.lock().unwrap().clone().expect("the edge was asked");
+        assert_eq!(token_hex, t.routing_token);
+        assert_eq!(query.as_deref(), Some("limit=200"), "the page asks for the edge's full cap");
+
+        // Owner-scoped: a foreign or unknown id is a 404, never a 403.
+        let (status, _) = get(&app, &format!("/portal/tunnels/{}/uptime", t.id), Some("bob")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get(&app, "/portal/tunnels/no-such-tunnel/uptime", Some("alice")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Unauthenticated: bounced to the shell like every portal page.
+        let (status, _) = get(&app, &format!("/portal/tunnels/{}/uptime", t.id), None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn tunnel_uptime_page_says_so_when_the_edge_has_no_history_778() {
+        let (edge_url, _asked) = mock_edge_with_history(None).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let t = tunnels.create("alice", "site", None).unwrap().created().expect("hostname free");
+
+        let (status, html) = get(&app, &format!("/portal/tunnels/{}/uptime", t.id), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("The edge has no connection history for this tunnel yet"), "{html}");
+        assert!(!html.contains("Longest outage"), "no zeros pretending to be data: {html}");
+        assert!(!html.contains("<table"), "{html}");
+        assert!(html.contains("Enable badge"), "the badge section is independent of the edge: {html}");
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_links_each_owned_card_to_its_uptime_page_778() {
+        let (app, tunnels) = test_app_with_tunnels();
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        let t = &tunnels.list_for_subject("alice").unwrap()[0];
+        assert!(
+            html.contains(&format!(r#"<a class="btn sec" href="/portal/tunnels/{}/uptime">Uptime &amp; usage</a>"#, t.id)),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn badge_enable_is_idempotent_and_the_public_svg_reflects_the_7d_uptime_778() {
+        let (edge_url, asked) = mock_edge_with_history(Some(recent_history_json())).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let t = tunnels.create("alice", "site", Some("site.example")).unwrap().created().expect("hostname free");
+        let enable = format!("/portal/tunnels/{}/badge/enable", t.id);
+        let disable = format!("/portal/tunnels/{}/badge/disable", t.id);
+        let uptime = format!("/portal/tunnels/{}/uptime", t.id);
+
+        // Foreign/unknown: 404, and nothing minted.
+        assert_eq!(post_form(&app, &enable, "bob", "").await, StatusCode::NOT_FOUND);
+        assert_eq!(post_form(&app, "/portal/tunnels/no-such-tunnel/badge/enable", "alice", "").await, StatusCode::NOT_FOUND);
+        assert_eq!(tunnels.badge_public_id("alice", &t.id).unwrap(), None);
+
+        // Owner enables: redirected back to the uptime page; a second enable keeps the id.
+        let resp = app
+            .clone()
+            .oneshot(Request::post(enable.as_str()).header("cookie", session_header("alice")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), uptime.as_str());
+        let public_id = tunnels.badge_public_id("alice", &t.id).unwrap().expect("minted");
+        assert_eq!(post_form(&app, &enable, "alice", "").await, StatusCode::SEE_OTHER);
+        assert_eq!(tunnels.badge_public_id("alice", &t.id).unwrap().as_deref(), Some(public_id.as_str()), "idempotent");
+
+        // The uptime page now shows the badge URL, the markdown snippet and Copy buttons.
+        let badge_url = format!("https://portal.example/badge/{public_id}.svg");
+        let (status, html) = get(&app, &uptime, Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(&format!("<code>{badge_url}</code>")), "{html}");
+        assert!(html.contains(&format!("<code>![uptime]({badge_url})</code>")), "{html}");
+        assert!(html.contains(&format!(r#"<img src="{badge_url}""#)), "{html}");
+        assert!(html.contains(&format!("copyText(this,'{badge_url}')")), "{html}");
+        assert!(html.contains(&format!(r#"action="{disable}""#)), "{html}");
+        assert!(html.contains("Disable badge"), "{html}");
+        assert!(!html.contains("Enable badge"), "{html}");
+
+        // The public route: no session needed, SVG, cacheable, the 7 d figure -- and
+        // nothing else about the tunnel.
+        let (status, headers, svg) = get_raw(&app, &format!("/badge/{public_id}.svg"), None).await;
+        assert_eq!(status, StatusCode::OK, "{svg}");
+        assert_eq!(headers.get("content-type").unwrap(), "image/svg+xml");
+        assert_eq!(headers.get("cache-control").unwrap(), "public, max-age=300");
+        assert!(svg.starts_with("<svg "), "{svg}");
+        assert!(svg.contains(">uptime 7d<"), "{svg}");
+        assert!(svg.contains(">98.4 %<"), "{svg}");
+        assert!(svg.contains("#dfb317"), "98.4 is below the 99 green line: yellow. {svg}");
+        assert!(!svg.contains("site.example"), "no hostname in the badge");
+        assert!(!svg.contains(&t.routing_token), "no token in the badge");
+        assert!(!svg.contains(&t.id), "no tunnel id in the badge");
+        assert!(!svg.contains("site"), "no name in the badge");
+        let (token_hex, query) = asked.lock().unwrap().clone().expect("the edge was asked");
+        assert_eq!(token_hex, t.routing_token, "the token was resolved server-side");
+        assert_eq!(query.as_deref(), Some("limit=1"), "the badge asks for the cheapest answer");
+
+        // Malformed or unknown ids: 404 before the store is even asked.
+        let (status, _, _) = get_raw(&app, &format!("/badge/{}.svg", "ab".repeat(32)), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get_raw(&app, &format!("/badge/{public_id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the .svg suffix is part of the address");
+        let (status, _, _) = get_raw(&app, &format!("/badge/{}.svg", public_id.to_ascii_uppercase()), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "exact id only");
+        let (status, _, _) = get_raw(&app, &format!("/badge/{}.svg", t.id), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the tunnel id is not a badge id");
+
+        // Disable: foreign is 404 and leaves the badge alive; the owner's disable kills the URL.
+        assert_eq!(post_form(&app, &disable, "bob", "").await, StatusCode::NOT_FOUND);
+        let (status, _, _) = get_raw(&app, &format!("/badge/{public_id}.svg"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(post_form(&app, &disable, "alice", "").await, StatusCode::SEE_OTHER);
+        let (status, _, _) = get_raw(&app, &format!("/badge/{public_id}.svg"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "revoked: the old URL is dead");
+        assert_eq!(post_form(&app, &disable, "alice", "").await, StatusCode::SEE_OTHER, "disabling twice is a no-op");
+        let (_, html) = get(&app, &uptime, Some("alice")).await;
+        assert!(html.contains("Enable badge"), "{html}");
+        assert!(!html.contains(&public_id), "the dead id is gone from the page");
+    }
+
+    #[tokio::test]
+    async fn public_badge_reads_n_a_when_the_edge_has_no_history_778() {
+        let (edge_url, _asked) = mock_edge_with_history(None).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let t = tunnels.create("alice", "site", None).unwrap().created().expect("hostname free");
+        let public_id = tunnels.enable_badge("alice", &t.id).unwrap().expect("minted");
+
+        let (status, headers, svg) = get_raw(&app, &format!("/badge/{public_id}.svg"), None).await;
+        assert_eq!(status, StatusCode::OK, "fail-open: the badge renders, it just says n/a");
+        assert_eq!(headers.get("content-type").unwrap(), "image/svg+xml");
+        assert!(svg.contains(">n/a<"), "{svg}");
+        assert!(svg.contains("#9f9f9f"), "grey, not any of the traffic-light colours: {svg}");
+        assert!(!svg.contains("%</text>"), "no percentage value is rendered (the gradient's y2=\"100%\" is not a value): {svg}");
+    }
+
+    #[tokio::test]
+    async fn badge_dies_with_its_tunnel_778() {
+        let (edge_url, _asked) = mock_edge_with_history(Some(recent_history_json())).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let t = tunnels.create("alice", "site", None).unwrap().created().expect("hostname free");
+        let public_id = tunnels.enable_badge("alice", &t.id).unwrap().expect("minted");
+        let (status, _, _) = get_raw(&app, &format!("/badge/{public_id}.svg"), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(post_form(&app, &format!("/portal/tunnels/{}/delete", t.id), "alice", "").await, StatusCode::SEE_OTHER);
+        let (status, _, _) = get_raw(&app, &format!("/badge/{public_id}.svg"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a revoked tunnel's badge 404s");
+    }
+
+    #[tokio::test]
+    async fn usage_page_lists_owned_tunnels_with_totals_and_exports_csv_783() {
+        let (edge_url, _asked) = mock_edge_with_history(Some(recent_history_json())).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let mine = tunnels.create("alice", "site", Some("site.example")).unwrap().created().expect("hostname free");
+        let mesh = tunnels.create("alice", "mesh-only", None).unwrap().created().expect("hostname free");
+        let bobs = tunnels.create("bob", "bobs-site", Some("bob.example")).unwrap().created().expect("hostname free");
+        // Shared WITH alice, but bob's: usage is the owner's, so it must not list here.
+        tunnels.grant("bob", &bobs.id, "alice").unwrap();
+
+        let (status, html) = get(&app, "/portal/usage", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(&format!(r#"<a href="/portal/tunnels/{}/uptime">site</a> · <code>site.example</code>"#, mine.id)), "{html}");
+        assert!(html.contains(&format!(r#"<a href="/portal/tunnels/{}/uptime">mesh-only</a></td>"#, mesh.id)), "{html}");
+        // The mock answers the same history for every token: two identical rows.
+        assert_eq!(html.matches("<td>97.1 %</td><td>2</td><td>1.2 KB</td><td>5.6 KB</td>").count(), 2, "{html}");
+        assert!(html.contains("<strong>Total</strong> (2 tunnels)</td><td>&ndash;</td><td>4</td><td>2.4 KB</td><td>11.1 KB</td>"), "{html}");
+        assert!(!html.contains("bobs-site"), "a tunnel shared with me is not my usage: {html}");
+        assert!(!html.contains("bob.example"), "{html}");
+        assert!(!html.contains(&mine.routing_token), "never a token");
+        assert!(html.contains(r#"href="/portal/usage.csv""#), "{html}");
+        assert!(html.contains(r#"<a href="/portal/usage">Usage</a>"#), "in the nav: {html}");
+
+        let (status, headers, csv) = get_raw(&app, "/portal/usage.csv", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "text/csv; charset=utf-8");
+        assert!(headers.get("content-disposition").unwrap().to_str().unwrap().contains("cads-tunnel-usage.csv"));
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "tunnel,hostname,uptime_30d_pct,sessions_30d,bytes_in_30d,bytes_out_30d");
+        assert_eq!(lines.len(), 3, "header + one row per owned tunnel, no totals row: {csv}");
+        assert!(lines.contains(&r#""site","site.example",97.1,2,1244,5698"#), "{csv}");
+        assert!(lines.contains(&r#""mesh-only","",97.1,2,1244,5698"#), "{csv}");
+        assert!(!csv.contains("bobs-site"), "{csv}");
+        assert!(!csv.contains(&mine.routing_token) && !csv.contains(&mine.id), "no tokens, no ids: {csv}");
+
+        // Unauthenticated: both bounce to the shell.
+        let (status, _) = get(&app, "/portal/usage", None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, _, _) = get_raw(&app, "/portal/usage.csv", None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn usage_page_is_fail_open_per_tunnel_when_the_edge_has_no_history_783() {
+        let (edge_url, _asked) = mock_edge_with_history(None).await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+        let t = tunnels.create("alice", "site", Some("site.example")).unwrap().created().expect("hostname free");
+
+        let (status, html) = get(&app, "/portal/usage", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(&format!(r#"<a href="/portal/tunnels/{}/uptime">site</a>"#, t.id)), "still listed: {html}");
+        assert!(html.contains("<td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td>"), "{html}");
+        assert!(html.contains("<strong>Total</strong> (1 tunnels)</td><td>&ndash;</td><td>0</td><td>0 B</td><td>0 B</td>"), "{html}");
+
+        let (_, _, csv) = get_raw(&app, "/portal/usage.csv", Some("alice")).await;
+        assert!(csv.lines().any(|l| l == r#""site","site.example",,,,"#), "empty number fields: {csv}");
     }
 }
