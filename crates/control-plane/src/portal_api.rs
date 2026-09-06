@@ -3854,7 +3854,7 @@ const BRIDGE_CALL_TOOLS: &[(&str, &str)] = &[
     ("bridge/config", "Config"),
     ("bridge/channel-members", "Channel members"),
     ("bridge/allowlist-list", "Allow-list"),
-    ("bridge/manifest-list", "Installed manifests"),
+    ("bridge/manifest-list", "Registry manifests"),
 ];
 
 fn rest_bridges_html(
@@ -3952,7 +3952,7 @@ on this tunnel's agent being dialable at all.</p>
 <h2 class="muted">Install a manifest</h2>
 <form method="post" action="/portal/tunnels/{id}/agent-bridge/manifest/install">
  <fieldset{disabled}>
- <label>Manifest location <span class="opt">(a URL or id from "Installed manifests" above)</span>
+ <label>Manifest location <span class="opt">(a URL from the "Registry manifests" list above, or a path on the agent's host)</span>
   <input type="text" name="manifest_location" required placeholder="https://registry.example/manifests/...">
  </label>
  <label>Project name <span class="opt">(a new, unused name to isolate this install as)</span>
@@ -4739,14 +4739,382 @@ async fn install_bridge_manifest(
     .await
 }
 
-/// Render one bridge-tool call's outcome as a small standalone portal page --
-/// plain JSON (success) or the [`ct_common::channel_dial::DialError`]'s own
-/// `Display` text (failure). #763: the two failures that mean "nobody served the
-/// channel" -- `NoPeer` (admitted, park window ran out partnerless) and `TimedOut`
-/// (a bounded phase, in practice the same park, exceeded its deadline) -- additionally
-/// get one paragraph naming the missing sidecar and the command that starts it
-/// (`noise_hex` is this deployment's bridge Noise pubkey, its `CT_CHANNEL_BRIDGE_PEER`);
-/// every other error stays the dialer's text alone, uninterpreted.
+// ---- #763 structured bridge-result rendering ------------------------------------------
+//
+// Every value below comes from the owner's agent over the channel and is untrusted: it is
+// passed through `escape` before it reaches the page, including the values that end up
+// inside a `copyText(...)` onclick. The customer `page()` stylesheet has no table rules
+// (`table.data` lives in the admin shell only), so the tables carry inline styles that
+// borrow the page's own tokens.
+
+const BRIDGE_TABLE_STYLE: &str = "width:100%;border-collapse:collapse;font-size:.89rem";
+const BRIDGE_TH_STYLE: &str = "text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--border);\
+color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em";
+const BRIDGE_TD_STYLE: &str = "padding:.5rem .6rem;border-bottom:1px solid #21262d;vertical-align:top";
+
+/// One table from already-rendered (escaped) header and cell HTML.
+fn bridge_table_html(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let head = headers
+        .iter()
+        .map(|h| format!(r#"<th style="{BRIDGE_TH_STYLE}">{h}</th>"#))
+        .collect::<String>();
+    let body = rows
+        .iter()
+        .map(|cells| {
+            let tds = cells.iter().map(|c| format!(r#"<td style="{BRIDGE_TD_STYLE}">{c}</td>"#)).collect::<String>();
+            format!("<tr>{tds}</tr>")
+        })
+        .collect::<String>();
+    format!(
+        r#"<div style="overflow-x:auto"><table style="{BRIDGE_TABLE_STYLE}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"#
+    )
+}
+
+/// A JSON value as one table cell: strings as `<code>`, everything else as compact JSON.
+fn bridge_json_cell_html(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("<code>{}</code>", escape(s)),
+        other => escape(&other.to_string()),
+    }
+}
+
+/// A JSON value as plain text: booleans as on/off, strings bare, everything else compact JSON.
+fn bridge_json_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Bool(true) => "on".to_string(),
+        serde_json::Value::Bool(false) => "off".to_string(),
+        serde_json::Value::String(s) => escape(s),
+        other => escape(&other.to_string()),
+    }
+}
+
+/// The first 16 characters of a long hex string plus a Copy button carrying the whole
+/// value. The value is JS-string-escaped BEFORE the HTML escape so a quote in it can
+/// neither leave the attribute nor the JS literal.
+fn bridge_short_hex_html(full: &str) -> String {
+    let short: String = full.chars().take(16).collect();
+    let ellipsis = if full.chars().count() > 16 { "…" } else { "" };
+    let js = full.replace('\\', "\\\\").replace('\'', "\\'");
+    format!(
+        r#"<code>{short}{ellipsis}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{js}')">Copy</button>"#,
+        short = escape(&short),
+        js = escape(&js),
+    )
+}
+
+/// The pretty-printed reply behind a "Raw JSON" disclosure -- always present, so nothing the
+/// structured view leaves out is lost.
+fn bridge_raw_json_html(v: &serde_json::Value) -> String {
+    format!(
+        "<details><summary>Raw JSON</summary><pre><code>{}</code></pre></details>",
+        escape(&serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+    )
+}
+
+/// The per-tool structured view of one successful bridge call, always followed by the raw
+/// JSON. Unknown tools and replies of an unexpected shape get the raw block alone.
+fn bridge_result_body_html(id: &str, tool: &str, v: &serde_json::Value) -> String {
+    let structured = match tool {
+        "bridge/status" => bridge_status_html(v),
+        "bridge/config" => bridge_config_html(v),
+        "bridge/channel-members" => bridge_members_html(v),
+        "bridge/allowlist-list" => bridge_allowlist_html(v),
+        "bridge/manifest-list" => bridge_manifest_list_html(id, v),
+        "bridge/manifest-install" => bridge_install_report_html(v),
+        _ => None,
+    };
+    format!("{}{}", structured.unwrap_or_default(), bridge_raw_json_html(v))
+}
+
+/// `bridge/status`: every top-level field as a key/value row.
+fn bridge_status_html(v: &serde_json::Value) -> Option<String> {
+    let obj = v.as_object()?;
+    let rows = obj
+        .iter()
+        .map(|(k, val)| {
+            format!(
+                r#"<div class="row"><span class="k">{}</span><span class="v">{}</span></div>"#,
+                escape(k),
+                bridge_json_cell_html(val)
+            )
+        })
+        .collect::<String>();
+    Some(format!("<div>{rows}</div>"))
+}
+
+/// `bridge/config`: which of the sidecar's optional features are on, and for each that is
+/// off, the exact sidecar setting that turns it on. Every env var here is set on the
+/// agent's `channel --serve` sidecar, never in this portal. Keys not listed render with an
+/// empty hint; keys not sent (older agents send fewer) are simply absent.
+fn bridge_config_hint_html(key: &str, value: &serde_json::Value) -> &'static str {
+    let off = matches!(value, serde_json::Value::Bool(false)) || value.as_str() == Some("none");
+    let on = matches!(value, serde_json::Value::Bool(true));
+    match key {
+        "manifest_registry_configured" if off => {
+            "Set <code>CT_MANIFEST_REGISTRY_URL</code> (the <code>https://</code> base URL of the manifest registry) \
+             on the sidecar -- needed for the manifest list."
+        }
+        "cp_url_configured" if off => {
+            "Set <code>CT_AGENT_CP_URL</code> (this plane's API base URL) on the sidecar -- needed for channel \
+             members and the allow-list."
+        }
+        "channel_id_configured" if off => {
+            "Set <code>CT_CHANNEL_ID</code> (or <code>CT_GRANT_CHANNEL</code>) on the sidecar."
+        }
+        "oidc_credential" if off => {
+            "Run <code>ct-agent login</code> where the sidecar runs (or mount the token file and set \
+             <code>CT_AGENT_LOGIN_TOKEN_FILE</code>, or set <code>CT_OIDC_TOKEN</code>) -- needed for channel \
+             members and the allow-list."
+        }
+        "manifest_trust_allowlist_configured" if off => {
+            "Set <code>CT_MANIFEST_TRUST_ALLOWLIST</code> or <code>CT_MANIFEST_TRUST_ALLOWLIST_FILE</code> \
+             (the publisher pubkeys the agent trusts) on the sidecar -- needed for installs."
+        }
+        "manifest_work_dir_configured" if off => {
+            "Set <code>CT_MANIFEST_WORK_DIR</code> on the sidecar -- needed for installs."
+        }
+        "docker_available" if off => {
+            "The sidecar has no <code>docker</code> CLI, so compose manifests cannot be installed from it \
+             (binary manifests can)."
+        }
+        "manifest_install_disabled" if on => {
+            "The agent's owner opted out of remote installs via \
+             <code>CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL</code>; installs from here are refused."
+        }
+        _ => "",
+    }
+}
+
+/// `bridge/config`: a Feature / State / How to enable table.
+fn bridge_config_html(v: &serde_json::Value) -> Option<String> {
+    let obj = v.as_object()?;
+    let rows = obj
+        .iter()
+        .map(|(k, val)| {
+            vec![
+                format!("<code>{}</code>", escape(k)),
+                bridge_json_text(val),
+                bridge_config_hint_html(k, val).to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    Some(bridge_table_html(&["Feature", "State", "How to enable"], &rows))
+}
+
+/// A list of objects as a table whose columns are the union of their keys in first-seen
+/// order. `None` when any element is not an object.
+fn bridge_objects_table_html(items: &[serde_json::Value]) -> Option<String> {
+    let mut columns: Vec<&str> = Vec::new();
+    for item in items {
+        for k in item.as_object()?.keys() {
+            if !columns.contains(&k.as_str()) {
+                columns.push(k);
+            }
+        }
+    }
+    let rows = items
+        .iter()
+        .map(|item| {
+            columns
+                .iter()
+                .map(|c| item.get(*c).map(bridge_json_cell_html).unwrap_or_default())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let headers = columns.iter().map(|c| escape(c)).collect::<Vec<_>>();
+    Some(bridge_table_html(&headers.iter().map(String::as_str).collect::<Vec<_>>(), &rows))
+}
+
+/// `bridge/channel-members`: a bare array of members, or `{"members": [...]}`.
+fn bridge_members_html(v: &serde_json::Value) -> Option<String> {
+    let items = v.as_array().or_else(|| v.get("members")?.as_array())?;
+    if items.is_empty() {
+        return Some(r#"<p class="help">No members.</p>"#.to_string());
+    }
+    bridge_objects_table_html(items)
+}
+
+/// `bridge/allowlist-list`: `{"emails": [...]}` as a list.
+fn bridge_allowlist_html(v: &serde_json::Value) -> Option<String> {
+    let emails = v.get("emails")?.as_array()?;
+    if emails.is_empty() {
+        return Some(r#"<p class="help">No e-mails allow-listed.</p>"#.to_string());
+    }
+    let items = emails.iter().map(|e| format!("<li>{}</li>", bridge_json_cell_html(e))).collect::<String>();
+    Some(format!("<ul>{items}</ul>"))
+}
+
+/// Where an install of one listed manifest should fetch it from: the entry's own
+/// `manifest_url`, else `{registry_url}/manifests/{manifest_id}` when the registry is known,
+/// else the bare id (the agent resolves it against its own registry).
+fn bridge_manifest_location(entry: &serde_json::Value, registry_url: Option<&str>) -> String {
+    if let Some(url) = entry.get("manifest_url").and_then(serde_json::Value::as_str) {
+        return url.to_string();
+    }
+    let id = entry.get("manifest_id").and_then(serde_json::Value::as_str).unwrap_or_default();
+    match registry_url {
+        Some(base) if !id.is_empty() => format!("{}/manifests/{id}", base.trim_end_matches('/')),
+        _ => id.to_string(),
+    }
+}
+
+/// The inline install form for one listed manifest (empty when there is nothing to locate).
+fn bridge_manifest_install_form_html(id: &str, location: &str) -> String {
+    if location.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<form class="inline" method="post" action="/portal/tunnels/{id}/agent-bridge/manifest/install">
+ <input type="hidden" name="manifest_location" value="{location}">
+ <input type="text" name="project_name" required placeholder="new-project-name" size="18">
+ <button type="submit" class="btn sec">Install</button>
+</form>"#,
+        location = escape(location),
+    )
+}
+
+/// `bridge/manifest-list`: a bare array, or `{"registry_url": ..., "manifests": [...]}`, as a
+/// table with one install form per entry.
+fn bridge_manifest_list_html(id: &str, v: &serde_json::Value) -> Option<String> {
+    let items = v.as_array().or_else(|| v.get("manifests")?.as_array())?;
+    let registry_url = v.get("registry_url").and_then(serde_json::Value::as_str);
+    if items.is_empty() {
+        return Some(r#"<p class="help">The registry has no manifests yet.</p>"#.to_string());
+    }
+    let id = escape(id);
+    let text = |entry: &serde_json::Value, key: &str| entry.get(key).map(bridge_json_cell_html).unwrap_or_default();
+    let short_hex = |entry: &serde_json::Value, key: &str| {
+        entry.get(key).and_then(serde_json::Value::as_str).map(bridge_short_hex_html).unwrap_or_default()
+    };
+    let mut rows = Vec::with_capacity(items.len());
+    for entry in items {
+        entry.as_object()?;
+        rows.push(vec![
+            text(entry, "name"),
+            text(entry, "version"),
+            text(entry, "installer_kind"),
+            text(entry, "guardrail_verdict"),
+            short_hex(entry, "publisher_pubkey"),
+            short_hex(entry, "manifest_id"),
+            text(entry, "published_at"),
+            bridge_manifest_install_form_html(&id, &bridge_manifest_location(entry, registry_url)),
+        ]);
+    }
+    let headers = ["Name", "Version", "Kind", "Verdict", "Publisher", "Manifest id", "Published", "Install"];
+    Some(format!(
+        r#"{table}
+<p class="help">Installs run on the agent's host under its own trust allow-list; the project name must be new
+and unused there.</p>"#,
+        table = bridge_table_html(&headers, &rows),
+    ))
+}
+
+/// One "exit N, M ms" cell from an install step's `{exit_code, duration_ms}` object.
+fn bridge_step_text(v: Option<&serde_json::Value>) -> String {
+    let Some(step) = v else { return String::new() };
+    match (step.get("exit_code"), step.get("duration_ms")) {
+        (Some(code), Some(ms)) => format!("exit {}, {} ms", escape(&code.to_string()), escape(&ms.to_string())),
+        _ => bridge_json_text(step),
+    }
+}
+
+/// `bridge/manifest-install`: the agent's InstallReport, tagged by `status`.
+fn bridge_install_report_html(v: &serde_json::Value) -> Option<String> {
+    let field = |key: &str| v.get(key).map(bridge_json_cell_html).unwrap_or_default();
+    let rows = |extra: Vec<(&'static str, String)>| {
+        let mut all = vec![
+            ("Manifest id", field("manifest_id")),
+            ("Publisher", field("publisher_pubkey")),
+            ("Project name", field("project_name")),
+        ];
+        all.extend(extra);
+        let cells = all
+            .into_iter()
+            .filter(|(_, val)| !val.is_empty())
+            .map(|(k, val)| vec![k.to_string(), val])
+            .collect::<Vec<_>>();
+        bridge_table_html(&["Field", "Value"], &cells)
+    };
+    match v.get("status").and_then(serde_json::Value::as_str)? {
+        "ok" => {
+            let table = rows(vec![
+                ("Compose up", bridge_step_text(v.get("compose_up"))),
+                ("Verify", bridge_step_text(v.get("verify"))),
+                ("Sandbox", field("sandbox")),
+            ]);
+            let stdout = v
+                .get("captured_stdout")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| format!("<h2 class=\"muted\">Captured output</h2><pre><code>{}</code></pre>", escape(s)))
+                .unwrap_or_default();
+            Some(format!(r#"<p class="help"><strong>Installed.</strong></p>{table}{stdout}"#))
+        }
+        "failed" => {
+            let step = v.get("step").map(bridge_json_text).unwrap_or_default();
+            let detail = v.get("detail").map(bridge_json_text).unwrap_or_default();
+            let table = rows(vec![("Sandbox", field("sandbox"))]);
+            Some(format!(
+                r#"<p class="help"><strong>Install failed at step {step}.</strong></p><p class="help">{detail}</p>{table}"#
+            ))
+        }
+        "rejected" => {
+            let reason = v.get("reason").map(bridge_json_text).unwrap_or_default();
+            let table = rows(Vec::new());
+            Some(format!(r#"<p class="help"><strong>Install rejected: {reason}</strong></p>{table}"#))
+        }
+        _ => None,
+    }
+}
+
+/// The one hint that goes with a tool refusal, chosen by the agent's message text (first
+/// match wins): each names exactly the setting to fix on the agent's `channel --serve`
+/// sidecar. An unrecognised message gets no hint rather than a wrong one.
+fn bridge_tool_error_hint_html(message: &str, noise_hex: &str) -> String {
+    let hint = if message.contains("CT_MANIFEST_REGISTRY_URL") {
+        "No manifest registry is configured on the sidecar. Set <code>CT_MANIFEST_REGISTRY_URL</code> to the \
+         registry's <code>https://</code> base URL there and restart it."
+            .to_string()
+    } else if message.contains("CT_OIDC_TOKEN") || message.contains("ct-agent login") {
+        "The sidecar has no plane login. Run <code>ct-agent login</code> on its host, or mount the token file \
+         and set <code>CT_AGENT_LOGIN_TOKEN_FILE</code>, or set <code>CT_OIDC_TOKEN</code>."
+            .to_string()
+    } else if message.contains("CT_AGENT_CP_URL") {
+        "Set <code>CT_AGENT_CP_URL</code> on the sidecar to this plane's API base URL.".to_string()
+    } else if message.contains("not this agent's configured bridge peer") {
+        format!(
+            "The sidecar's <code>CT_CHANNEL_BRIDGE_PEER</code> does not equal this deployment's bridge Noise \
+             pubkey <code>{}</code>. Restart it with that value.",
+            escape(noise_hex)
+        )
+    } else if message.contains("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL") {
+        "The agent's owner opted out of remote installs (<code>CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL</code> \
+         is set on the sidecar)."
+            .to_string()
+    } else if message.contains("CT_MANIFEST_TRUST_ALLOWLIST") {
+        "Set the trust allow-list on the sidecar: <code>CT_MANIFEST_TRUST_ALLOWLIST</code> or \
+         <code>CT_MANIFEST_TRUST_ALLOWLIST_FILE</code> (the publisher pubkeys it may install from)."
+            .to_string()
+    } else if message.contains("CT_MANIFEST_WORK_DIR") {
+        "Set the work directory on the sidecar: <code>CT_MANIFEST_WORK_DIR</code>.".to_string()
+    } else if message.contains("unknown tool") {
+        "This agent's version does not offer this tool; upgrade <code>ct-agent</code> on the sidecar.".to_string()
+    } else {
+        return String::new();
+    };
+    format!(r#"<p class="help">{hint}</p>"#)
+}
+
+/// Render one bridge-tool call's outcome as a small standalone portal page. A success
+/// gets the per-tool structured view of [`bridge_result_body_html`] (raw JSON always
+/// kept behind a disclosure); a failure the [`ct_common::channel_dial::DialError`]'s
+/// own `Display` text. #763: the two failures that mean "nobody served the channel" --
+/// `NoPeer` (admitted, park window ran out partnerless) and `TimedOut` (a bounded phase,
+/// in practice the same park, exceeded its deadline) -- additionally get one paragraph
+/// naming the missing sidecar and the command that starts it (`noise_hex` is this
+/// deployment's bridge Noise pubkey, its `CT_CHANNEL_BRIDGE_PEER`); a `ToolError` (the
+/// agent answered, and refused) shows the agent's own message plus the one sidecar
+/// setting it points at ([`bridge_tool_error_hint_html`]); every other error stays the
+/// dialer's text alone, uninterpreted.
 fn bridge_call_result_html(
     id: &str,
     tool: &str,
@@ -4756,11 +5124,14 @@ fn bridge_call_result_html(
 ) -> String {
     use ct_common::channel_dial::DialError;
     let (heading, body) = match result {
-        Ok(v) => (
-            "Result",
+        Ok(v) => ("Result", bridge_result_body_html(id, tool, v)),
+        Err(DialError::ToolError { message, .. }) => (
+            "The agent refused the call",
             format!(
-                "<pre><code>{}</code></pre>",
-                escape(&serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                r#"<p class="help">{message}</p>
+{hint}"#,
+                message = escape(message),
+                hint = bridge_tool_error_hint_html(message, noise_hex),
             ),
         ),
         Err(e @ (DialError::NoPeer | DialError::TimedOut)) => (
@@ -13842,5 +14213,216 @@ mod tests {
         assert!(html.contains("not-member"));
         assert!(!html.contains("No sidecar answered"));
         assert!(!html.contains("ct-agent channel --serve"));
+    }
+
+    fn tool_error(message: &str) -> ct_common::channel_dial::DialError {
+        ct_common::channel_dial::DialError::ToolError { code: -32000, message: message.to_string() }
+    }
+
+    #[test]
+    fn bridge_call_result_html_explains_a_tool_refusal_with_the_sidecar_setting_it_names_763() {
+        // The agent answered (dial, admissions and Noise all worked) and refused: the page
+        // says so, shows the agent's own text, and names the ONE sidecar setting to fix --
+        // never "malformed reply", which sent the owner hunting for a wire bug.
+        let noise = "ab".repeat(32);
+        let registry = tool_error("bridge/manifest-list: this agent has no CT_MANIFEST_REGISTRY_URL configured");
+        let html = bridge_call_result_html("t-1", "bridge/manifest-list", Err(&registry), &noise, None);
+        assert!(html.contains("The agent refused the call"), "{html}");
+        assert!(html.contains("this agent has no CT_MANIFEST_REGISTRY_URL configured"), "the agent's text stays");
+        assert!(html.contains("Set <code>CT_MANIFEST_REGISTRY_URL</code>"), "and the registry hint: {html}");
+        assert!(!html.contains("malformed"), "{html}");
+
+        let oidc = tool_error("bridge/channel-members: no plane credential; set CT_OIDC_TOKEN or run ct-agent login");
+        let html = bridge_call_result_html("t-1", "bridge/channel-members", Err(&oidc), &noise, None);
+        assert!(html.contains("The sidecar has no plane login"), "{html}");
+        assert!(html.contains("<code>ct-agent login</code>"));
+        assert!(html.contains("CT_AGENT_LOGIN_TOKEN_FILE"));
+        assert!(!html.contains("malformed"));
+
+        let peer = tool_error("bridge/status: caller is not this agent's configured bridge peer");
+        let html = bridge_call_result_html("t-1", "bridge/status", Err(&peer), &noise, None);
+        assert!(html.contains("CT_CHANNEL_BRIDGE_PEER"), "{html}");
+        assert!(html.contains(&format!("<code>{noise}</code>")), "shows this deployment's Noise pubkey");
+        assert!(!html.contains("malformed"));
+
+        let unknown = tool_error("unknown tool `bridge/config`");
+        let html = bridge_call_result_html("t-1", "bridge/config", Err(&unknown), &noise, None);
+        assert!(html.contains("does not offer this tool"), "{html}");
+        assert!(html.contains("upgrade <code>ct-agent</code>"));
+
+        let other = tool_error("bridge/allowlist-add: e-mail already listed");
+        let html = bridge_call_result_html("t-1", "bridge/allowlist-add", Err(&other), &noise, None);
+        assert!(html.contains("e-mail already listed"));
+        for invented in ["Set <code>", "ct-agent login", "does not offer this tool", "opted out"] {
+            assert!(!html.contains(invented), "no hint is invented for an unrecognised message: {html}");
+        }
+        assert!(!html.contains("No sidecar answered"), "a refusal is not a missing sidecar");
+    }
+
+    #[test]
+    fn bridge_result_body_html_renders_config_hints_only_for_missing_settings_763() {
+        let missing = serde_json::json!({
+            "role": "serve",
+            "direct_upgrade": true,
+            "manifest_registry_configured": false,
+            "oidc_credential": "none",
+            "manifest_install_disabled": false,
+        });
+        let html = bridge_result_body_html("t-1", "bridge/config", &missing);
+        assert!(html.contains("<th style=\""), "a table, not a JSON dump: {html}");
+        assert!(html.contains("How to enable"));
+        assert!(html.contains("<code>manifest_registry_configured</code>"));
+        assert!(html.contains("Set <code>CT_MANIFEST_REGISTRY_URL</code>"), "{html}");
+        assert!(html.contains("Run <code>ct-agent login</code>"), "{html}");
+        assert!(html.contains("<code>role</code>") && html.contains("serve"), "unknown keys still render");
+        assert!(html.contains(">on<") && html.contains(">off<"), "booleans read on/off: {html}");
+        assert!(!html.contains("CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL"), "installs are not disabled here");
+
+        let configured = serde_json::json!({
+            "manifest_registry_configured": true,
+            "oidc_credential": "stored",
+            "manifest_install_disabled": true,
+        });
+        let html = bridge_result_body_html("t-1", "bridge/config", &configured);
+        assert!(!html.contains("CT_MANIFEST_REGISTRY_URL"), "no hint for a configured registry: {html}");
+        assert!(!html.contains("ct-agent login"), "no hint for a stored credential: {html}");
+        assert!(html.contains("stored"));
+        assert!(html.contains("opted out of remote installs"), "the opt-out IS worth a line: {html}");
+    }
+
+    #[test]
+    fn bridge_result_body_html_renders_the_manifest_list_with_one_install_form_per_entry_763() {
+        let entry = serde_json::json!({
+            "manifest_id": "0123456789abcdef0123456789abcdef",
+            "name": "hello-tool",
+            "version": "1.2.3",
+            "publisher_pubkey": "fedcba9876543210fedcba9876543210",
+            "guardrail_verdict": "pass",
+            "installer_kind": "compose",
+            "published_at": "2026-09-01T00:00:00Z",
+        });
+        // Bare array, no registry known: the location is the bare manifest id.
+        let html = bridge_result_body_html("t-1", "bridge/manifest-list", &serde_json::json!([entry]));
+        assert!(html.contains("<code>hello-tool</code>"), "{html}");
+        assert!(html.contains("<code>1.2.3</code>"));
+        assert!(html.contains("<code>compose</code>") && html.contains("<code>pass</code>"));
+        assert!(html.contains("<code>0123456789abcdef…</code>"), "the id is shortened to 16 hex: {html}");
+        assert!(html.contains("copyText(this,'0123456789abcdef0123456789abcdef')"), "with the full id behind Copy");
+        assert!(html.contains(r#"action="/portal/tunnels/t-1/agent-bridge/manifest/install""#));
+        assert!(html.contains(r#"name="manifest_location" value="0123456789abcdef0123456789abcdef""#), "{html}");
+        assert!(html.contains(r#"name="project_name" required"#));
+        assert!(html.contains("under its own trust allow-list"));
+
+        // Registry shape: the location is derived from the registry base URL.
+        let listed = serde_json::json!({ "registry_url": "https://reg.example", "manifests": [entry] });
+        let html = bridge_result_body_html("t-1", "bridge/manifest-list", &listed);
+        assert!(
+            html.contains(r#"value="https://reg.example/manifests/0123456789abcdef0123456789abcdef""#),
+            "{html}"
+        );
+
+        // An explicit manifest_url wins over the derived one.
+        let mut with_url = entry.clone();
+        with_url["manifest_url"] = serde_json::json!("https://cdn.example/m/hello.json");
+        let listed = serde_json::json!({ "registry_url": "https://reg.example", "manifests": [with_url] });
+        let html = bridge_result_body_html("t-1", "bridge/manifest-list", &listed);
+        assert!(html.contains(r#"value="https://cdn.example/m/hello.json""#), "{html}");
+        assert!(!html.contains("reg.example/manifests/"));
+
+        let html = bridge_result_body_html("t-1", "bridge/manifest-list", &serde_json::json!([]));
+        assert!(html.contains("The registry has no manifests yet."));
+    }
+
+    #[test]
+    fn bridge_result_body_html_renders_each_install_report_outcome_763() {
+        let ok = serde_json::json!({
+            "status": "ok",
+            "manifest_id": "m-1",
+            "publisher_pubkey": "pk-1",
+            "project_name": "demo",
+            "compose_up": { "exit_code": 0, "duration_ms": 1200 },
+            "verify": { "exit_code": 0, "duration_ms": 30 },
+            "captured_stdout": "pulled <image>",
+        });
+        let html = bridge_result_body_html("t-1", "bridge/manifest-install", &ok);
+        assert!(html.contains("<strong>Installed.</strong>"), "{html}");
+        assert!(html.contains("exit 0, 1200 ms"), "{html}");
+        assert!(html.contains("pulled &lt;image&gt;"), "captured output is escaped: {html}");
+
+        let failed = serde_json::json!({
+            "status": "failed",
+            "manifest_id": "m-1",
+            "publisher_pubkey": "pk-1",
+            "project_name": "demo",
+            "step": "verify",
+            "detail": "health check never went green",
+        });
+        let html = bridge_result_body_html("t-1", "bridge/manifest-install", &failed);
+        assert!(html.contains("Install failed at step verify."), "{html}");
+        assert!(html.contains("health check never went green"));
+
+        let rejected = serde_json::json!({ "status": "rejected", "reason": "publisher not in trust allow-list" });
+        let html = bridge_result_body_html("t-1", "bridge/manifest-install", &rejected);
+        assert!(html.contains("Install rejected: publisher not in trust allow-list"), "{html}");
+    }
+
+    #[test]
+    fn bridge_result_body_html_renders_members_and_allowlist_and_keeps_the_raw_json_763() {
+        let members = serde_json::json!({ "members": [
+            { "holder": "aa", "role": "owner" },
+            { "holder": "bb", "parked_now": true }
+        ] });
+        let html = bridge_result_body_html("t-1", "bridge/channel-members", &members);
+        assert!(html.contains("<th style=\""), "{html}");
+        for col in ["holder", "role", "parked_now"] {
+            assert!(html.contains(&format!(">{col}</th>")), "column {col} from the union of keys: {html}");
+        }
+        assert!(html.contains("<code>owner</code>") && html.contains(">true<"), "{html}");
+        let html = bridge_result_body_html("t-1", "bridge/channel-members", &serde_json::json!([]));
+        assert!(html.contains("No members."));
+
+        let two = serde_json::json!({ "emails": ["a@x", "b@y"] });
+        let html = bridge_result_body_html("t-1", "bridge/allowlist-list", &two);
+        assert!(html.contains("<li><code>a@x</code></li>") && html.contains("<li><code>b@y</code></li>"), "{html}");
+        let html = bridge_result_body_html("t-1", "bridge/allowlist-list", &serde_json::json!({ "emails": [] }));
+        assert!(html.contains("No e-mails allow-listed."));
+
+        let status = serde_json::json!({ "version": "0.7.26", "bridge_gated": true });
+        let html = bridge_result_body_html("t-1", "bridge/status", &status);
+        assert!(html.contains(r#"<span class="k">version</span><span class="v"><code>0.7.26</code></span>"#), "{html}");
+
+        // Every success page keeps the raw reply -- also for a tool this page has no view
+        // for, and for a known tool whose reply has an unexpected shape.
+        let noise = "ab".repeat(32);
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("bridge/status", status),
+            ("bridge/config", serde_json::json!({ "role": "serve" })),
+            ("bridge/channel-members", members),
+            ("bridge/allowlist-list", serde_json::json!({ "emails": [] })),
+            ("bridge/manifest-list", serde_json::json!([])),
+            ("bridge/manifest-install", serde_json::json!({ "status": "rejected", "reason": "no" })),
+            ("bridge/manifest-list", serde_json::json!("not a list")),
+            ("bridge/something-new", serde_json::json!({ "x": "<y>" })),
+        ];
+        for (tool, value) in &cases {
+            let html = bridge_call_result_html("t-1", tool, Ok(value), &noise, None);
+            assert!(html.contains("<summary>Raw JSON</summary>"), "{tool}: {html}");
+            assert!(html.contains("<h1>Result: <code>"), "{tool}");
+        }
+        let html = bridge_call_result_html("t-1", "bridge/something-new", Ok(&cases[7].1), &noise, None);
+        assert!(html.contains("&quot;x&quot;: &quot;&lt;y&gt;&quot;"), "raw JSON is escaped: {html}");
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_labels_the_registry_manifest_list_763() {
+        // The fifth one-click button lists the REGISTRY's manifests, not what is installed.
+        let (edge_url, _asked) = mock_edge_with_presence(None).await;
+        let (app, _id) = bridge_page_fixture(&edge_url, [0x66u8; 32]);
+
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(">Registry manifests</button>"), "{html}");
+        assert!(!html.contains("Installed manifests"));
+        assert!(html.contains(r#"a URL from the "Registry manifests" list above"#), "the manifest form's help follows");
     }
 }
