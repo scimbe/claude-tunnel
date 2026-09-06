@@ -2120,6 +2120,142 @@ pub fn new_shared_channel_pairer() -> SharedChannelPairer {
     std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new()))
 }
 
+/// #763: read-only channel **presence** -- the last time each `(channel, holder)` was
+/// admitted (parked or paired) on ANY channel transport: the `:4435` rendezvous and
+/// `:4436` relay QUIC brokers ([`run_channel_broker_loop`]), the `:443` front door and
+/// the browser WebSocket listener (both through [`offer_admitted_stream_member`]).
+/// `admin.rs` serves it as `GET /internal/channel/presence/...` so the portal's
+/// Agent-bridges card can say "Sidecar: serving / not connected" BEFORE the owner
+/// clicks a call button. Without it, three of the four bridge cards in the 2026-09-06
+/// inventory offered Status/Config/... buttons whose only possible outcome was the
+/// dialer's rendezvous park running out (`ADMISSION_EXCHANGE_TIMEOUT`, 45 s) on a
+/// blocking form POST, followed by a raw `DialError`. A serving `ct-agent channel
+/// --serve` sidecar re-parks every park TTL (`serve::CHANNEL_PARK_TTL_SECS`, 30 s), so
+/// "admitted within [`PRESENCE_SERVING_WINDOW_SECS`]" is a faithful "somebody is
+/// serving this channel right now" without touching any pairer's waiting set.
+///
+/// Process-wide (one static above every transport's own pairer) for the same reason
+/// as [`LIVE_SPLICES`]: the QUIC relay and rendezvous loops each own a pairer and the
+/// front door / WS share a third, so a per-pairer view would have to be stitched
+/// together by whoever asks -- this map IS the stitch. Pure and clock-injected (`now`
+/// is a parameter everywhere) so it is unit-testable without sockets; the static
+/// wrappers below are the only place the wall clock is sampled.
+#[derive(Debug, Default)]
+pub struct ChannelPresence {
+    seen: std::collections::HashMap<(ChannelId, [u8; 32]), UnixSeconds>,
+}
+
+/// #763: an entry unseen this long is forgotten -- a sidecar that stopped serving five
+/// minutes ago is not "recently seen" for any purpose the card has, and the map must
+/// not keep every holder that ever joined.
+pub const PRESENCE_MAX_AGE_SECS: u64 = 300;
+/// #763: hard cap on tracked `(channel, holder)` pairs; past it the OLDEST entry goes.
+/// The pairer bounds parks PER holder (`PARKS_PER_MEMBER`); this bounds ACROSS holders,
+/// so a flood of one-shot joins from many keys cannot grow the map without bound.
+pub const PRESENCE_MAX_ENTRIES: usize = 4096;
+/// #763: "parked now or within the last 60 s" -- two park TTLs, so one missed re-park
+/// (a reap racing the sidecar's re-park) does not flap the card between renders.
+pub const PRESENCE_SERVING_WINDOW_SECS: u64 = 60;
+
+impl ChannelPresence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `holder` was just admitted on `channel` at `now`. Ages out stale
+    /// entries and enforces the cap on every write -- O(n) at n <= 4096, and admissions
+    /// happen once per park TTL per member, never per byte, so this is cheap where it runs.
+    pub fn note(&mut self, channel: ChannelId, holder: [u8; 32], now: UnixSeconds) {
+        self.seen.retain(|_, at| now.saturating_sub(*at) <= PRESENCE_MAX_AGE_SECS);
+        self.seen.insert((channel, holder), now);
+        while self.seen.len() > PRESENCE_MAX_ENTRIES {
+            let Some(oldest) = self.seen.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k) else {
+                break;
+            };
+            self.seen.remove(&oldest);
+        }
+    }
+
+    /// Seconds since `holder` was last admitted on `channel`, if within
+    /// [`PRESENCE_MAX_AGE_SECS`]. `None` = never seen, or aged out.
+    pub fn last_seen_secs_ago(&self, channel: &ChannelId, holder: &[u8; 32], now: UnixSeconds) -> Option<u64> {
+        let at = *self.seen.get(&(*channel, *holder))?;
+        let ago = now.saturating_sub(at);
+        (ago <= PRESENCE_MAX_AGE_SECS).then_some(ago)
+    }
+
+    /// Every holder admitted on `channel` within [`PRESENCE_MAX_AGE_SECS`], most recent
+    /// first, each with its seconds-ago. This answers the portal's real question -- "is
+    /// ANY member other than my own bridge holder serving?" -- because the serving
+    /// sidecar's holder is not derivable from the grant the portal stores (that grant
+    /// binds the portal's OWN holder, see `SignedChannelGrant::grant.holder`).
+    pub fn holders_of(&self, channel: &ChannelId, now: UnixSeconds) -> Vec<([u8; 32], u64)> {
+        let mut out: Vec<([u8; 32], u64)> = self
+            .seen
+            .iter()
+            .filter(|((c, _), _)| c == channel)
+            .filter_map(|((_, h), at)| {
+                let ago = now.saturating_sub(*at);
+                (ago <= PRESENCE_MAX_AGE_SECS).then_some((*h, ago))
+            })
+            .collect();
+        out.sort_by_key(|(_, ago)| *ago);
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
+/// #763: whether a last-seen age still counts as "serving now" (see
+/// [`PRESENCE_SERVING_WINDOW_SECS`]). One definition, used by the admin endpoint's
+/// `parked_now` field, so the wire meaning cannot drift from the map's.
+pub fn presence_is_serving(last_seen_secs_ago: u64) -> bool {
+    last_seen_secs_ago <= PRESENCE_SERVING_WINDOW_SECS
+}
+
+/// #763: the process-wide presence map (see [`ChannelPresence`]). `OnceLock` rather than
+/// a `const`-constructed `Mutex<Option<..>>` like [`LIVE_SPLICES`] only because
+/// `HashMap::new` is not `const`; same lifetime and same poison-recovering access.
+static CHANNEL_PRESENCE: std::sync::OnceLock<std::sync::Mutex<ChannelPresence>> = std::sync::OnceLock::new();
+
+fn channel_presence() -> &'static std::sync::Mutex<ChannelPresence> {
+    CHANNEL_PRESENCE.get_or_init(|| std::sync::Mutex::new(ChannelPresence::new()))
+}
+
+/// #763: the wall clock as `UnixSeconds` -- the presence map's own `now` source, kept
+/// next to it so `admin.rs`'s read side and the two admission-side writes here sample
+/// the same clock (`serve::unix_now` is private to that module).
+pub(crate) fn presence_unix_now() -> UnixSeconds {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// #763: admission-side write -- called from every live `offer` site with the SAME `now`
+/// the member's park deadline is computed from. `#497`: poison-resilient like every
+/// other production lock in this module.
+pub fn note_channel_presence(channel: ChannelId, holder: [u8; 32], now: UnixSeconds) {
+    channel_presence().lock_safe().note(channel, holder, now);
+}
+
+/// #763: read side of [`note_channel_presence`] for one `(channel, holder)`.
+pub fn channel_presence_last_seen(channel: &ChannelId, holder: &[u8; 32], now: UnixSeconds) -> Option<u64> {
+    channel_presence().lock_safe().last_seen_secs_ago(channel, holder, now)
+}
+
+/// #763: read side of [`note_channel_presence`] for a whole channel
+/// ([`ChannelPresence::holders_of`]).
+pub fn channel_presence_holders(channel: &ChannelId, now: UnixSeconds) -> Vec<([u8; 32], u64)> {
+    channel_presence().lock_safe().holders_of(channel, now)
+}
+
 /// The wire token an expiring park sends before closing (ct-agent#21): a reaped member's
 /// client used to read a SILENT close, indistinguishable from a refusal -- it then advanced
 /// its dial ladder and backed off, burning 40s windows on what was a perfectly healthy rung
@@ -2758,6 +2894,10 @@ where
 {
     let channel = member.req.grant.grant.channel;
     let holder = member.req.grant.grant.holder;
+    // #763: presence is recorded at OFFER time, so it covers both outcomes -- a member
+    // that parks and one that pairs immediately were equally "here" -- and every stream
+    // transport (`:443`, WS, boxed) funnels through this one site.
+    note_channel_presence(channel, holder, presence_unix_now());
     // #497: lock_safe -- a panic in some other critical section must not permanently wedge
     // every later offer (the 2026-08-13 broker-outage class).
     let outcome = pairer
@@ -3278,6 +3418,10 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             let now = now_fn();
             let channel = member.req.grant.grant.channel;
             let holder = member.req.grant.grant.holder;
+            // #763: the QUIC brokers' (`:4435`/`:4436`) presence write -- same admission
+            // instant the park deadline is computed from, before the offer decides
+            // Parked vs Paired (both mean "this holder is here").
+            note_channel_presence(channel, holder, now);
 
             // #603: durable evidentiary record of this admitted member's source IP,
             // independent of whether it ends up Parked or Paired below -- admission
@@ -9013,5 +9157,79 @@ mod tests {
             let off = unified_pairer_startup_line_for(None, true);
             assert!(off.contains("QUIC-native") && off.contains("default"), "{off}");
         }
+    }
+
+    // ---- #763: channel presence ------------------------------------------------------
+
+    #[test]
+    fn presence_note_then_lookup_reports_age_and_ages_out_past_max_age_763() {
+        let mut p = ChannelPresence::new();
+        let ch = ChannelId([0x63u8; 32]);
+        let h = [0xA1u8; 32];
+        assert_eq!(p.last_seen_secs_ago(&ch, &h, 1_000), None, "never seen -> None");
+        p.note(ch, h, 1_000);
+        assert_eq!(p.last_seen_secs_ago(&ch, &h, 1_012), Some(12));
+        assert_eq!(p.last_seen_secs_ago(&ch, &[0xA2u8; 32], 1_012), None, "a different holder is not seen");
+        assert_eq!(
+            p.last_seen_secs_ago(&ChannelId([0x64u8; 32]), &h, 1_012),
+            None,
+            "nor is the same holder on a different channel"
+        );
+        // Exactly at the max age: still reported; one second past it: gone (read side) ...
+        assert_eq!(p.last_seen_secs_ago(&ch, &h, 1_000 + PRESENCE_MAX_AGE_SECS), Some(PRESENCE_MAX_AGE_SECS));
+        assert_eq!(p.last_seen_secs_ago(&ch, &h, 1_001 + PRESENCE_MAX_AGE_SECS), None);
+        // ... and the write side sweeps it too, so the map never accumulates stale rows.
+        p.note(ChannelId([0x65u8; 32]), h, 1_001 + PRESENCE_MAX_AGE_SECS);
+        assert_eq!(p.len(), 1, "the aged-out entry was swept by the next write");
+        // A clock that went backwards never underflows (saturating arithmetic).
+        assert_eq!(p.last_seen_secs_ago(&ChannelId([0x65u8; 32]), &h, 0), Some(0));
+    }
+
+    #[test]
+    fn presence_holders_of_lists_one_channels_members_most_recent_first_763() {
+        let mut p = ChannelPresence::new();
+        let ch = ChannelId([0x66u8; 32]);
+        p.note(ch, [1u8; 32], 100);
+        p.note(ch, [2u8; 32], 130);
+        p.note(ChannelId([0x67u8; 32]), [3u8; 32], 130);
+        assert_eq!(p.holders_of(&ch, 140), vec![([2u8; 32], 10), ([1u8; 32], 40)]);
+        assert!(p.holders_of(&ChannelId([0x68u8; 32]), 140).is_empty(), "unknown channel -> nobody");
+        // The wire meaning of `parked_now`: inside the two-park-TTL window, not past it.
+        assert!(presence_is_serving(PRESENCE_SERVING_WINDOW_SECS));
+        assert!(!presence_is_serving(PRESENCE_SERVING_WINDOW_SECS + 1));
+    }
+
+    #[test]
+    fn presence_map_is_bounded_evicting_the_oldest_entry_past_the_cap_763() {
+        fn holder(i: usize) -> [u8; 32] {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            h
+        }
+        let mut p = ChannelPresence::new();
+        let ch = ChannelId([0x69u8; 32]);
+        // One strictly-oldest entry, then PRESENCE_MAX_ENTRIES fresher ones -- all inside
+        // the max age, so ageing alone cannot be what shrinks the map here.
+        p.note(ch, holder(0), 10_000);
+        for i in 1..=PRESENCE_MAX_ENTRIES {
+            p.note(ch, holder(i), 10_100);
+        }
+        assert_eq!(p.len(), PRESENCE_MAX_ENTRIES, "never more than the cap");
+        assert_eq!(p.last_seen_secs_ago(&ch, &holder(0), 10_100), None, "the oldest entry was the one evicted");
+        assert_eq!(p.last_seen_secs_ago(&ch, &holder(PRESENCE_MAX_ENTRIES), 10_100), Some(0), "the newest survived");
+    }
+
+    #[test]
+    fn process_wide_presence_records_a_note_and_reads_it_back_763() {
+        // The static wrappers the two admission sites and `admin.rs` actually call. The
+        // map is process-wide, so this test owns a channel id no other test in this
+        // binary uses.
+        let ch = ChannelId([0x6Au8; 32]);
+        let h = [0x6Bu8; 32];
+        let now = presence_unix_now();
+        assert_eq!(channel_presence_last_seen(&ch, &h, now), None);
+        note_channel_presence(ch, h, now);
+        assert_eq!(channel_presence_last_seen(&ch, &h, now), Some(0));
+        assert_eq!(channel_presence_holders(&ch, now), vec![(h, 0)]);
     }
 }

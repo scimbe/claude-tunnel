@@ -3606,6 +3606,96 @@ async fn edge_tunnel_status(st: &ApiState, routing_token_hex: &str) -> Option<Ed
     resp.json::<EdgeTunnelStatus>().await.ok()
 }
 
+/// #763: the edge's answer to "is anybody serving this bridge's channel?", rendered on
+/// each Agent-bridges card as "Sidecar: serving (seen N s ago)" / "Sidecar: not
+/// connected". `None` (see [`edge_bridge_presence`]) means the edge could not be asked,
+/// which renders exactly as before this field existed -- fail open, never "not
+/// connected" on a transient edge hiccup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BridgePresence {
+    /// Some member OTHER than this deployment's own bridge holder was parked on the
+    /// channel within the edge's serving window (`parked_now` on the wire).
+    serving: bool,
+    /// The freshest such member's age in seconds, when any was seen at all.
+    last_seen_secs_ago: Option<u64>,
+}
+
+/// One row of the edge's `GET /internal/channel/presence/:channel_hex` (#763,
+/// `crates/edge/src/admin.rs`).
+#[derive(Deserialize)]
+struct EdgePresenceHolder {
+    holder: String,
+    parked_now: bool,
+    last_seen_secs_ago: u64,
+}
+
+#[derive(Deserialize)]
+struct EdgePresenceList {
+    holders: Vec<EdgePresenceHolder>,
+}
+
+/// #763: the presence client's own, tighter timeout. The card's whole point is to
+/// spare the owner a 45 s dead dial, so its lookup must never itself become a
+/// noticeable wait: 2 s, then fail open (the edge answers this from memory, so a real
+/// answer takes milliseconds).
+fn edge_presence_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| edge_admin_http_client_with(std::time::Duration::from_secs(2))).clone()
+}
+
+/// #763: ask the edge who is parked on the channel of the stored bridge `grant_hex`,
+/// excluding this deployment's own bridge holder. The grant stored per tunnel binds the
+/// PORTAL's holder (it is the grant the owner minted FOR this deployment), so the
+/// serving sidecar's own holder is not derivable from it -- hence the list form and
+/// the "anyone else" rule, rather than a `(channel, holder)` point lookup.
+///
+/// Best-effort like [`edge_tunnel_status`]: `None` when `edge_admin`/`bridge` isn't
+/// configured, the grant doesn't decode, or the edge doesn't answer (including an
+/// older edge without this route -- a 404 fails open too), bounded by
+/// [`edge_presence_http_client`]'s timeout.
+async fn edge_bridge_presence(st: &ApiState, grant_hex: &str) -> Option<BridgePresence> {
+    let edge = st.edge_admin.as_ref()?;
+    let own_holder_hex = hex_encode(&st.bridge.as_ref()?.holder.verifying_key().to_bytes());
+    let grant = ct_common::channel::SignedChannelGrant::decode(&hex_decode(grant_hex.trim())?).ok()?;
+    let channel_hex = hex_encode(&grant.grant.channel.0);
+    let endpoint = format!("{}/internal/channel/presence/{channel_hex}", edge.url.trim_end_matches('/'));
+    let resp = edge_presence_http_client()
+        .get(&endpoint)
+        .header("x-ct-admin-token", edge.token.as_ref())
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let list = resp.json::<EdgePresenceList>().await.ok()?;
+    let others: Vec<&EdgePresenceHolder> =
+        list.holders.iter().filter(|h| !h.holder.eq_ignore_ascii_case(&own_holder_hex)).collect();
+    Some(BridgePresence {
+        serving: others.iter().any(|h| h.parked_now),
+        last_seen_secs_ago: others.iter().map(|h| h.last_seen_secs_ago).min(),
+    })
+}
+
+/// #763: this deployment's bridge Noise pubkey, hex -- the value a tunnel owner's
+/// sidecar must carry as `CT_CHANNEL_BRIDGE_PEER`. One derivation for the page header,
+/// the not-connected card and the failed-call page, so they can never disagree.
+fn bridge_noise_hex(bridge: &BridgeDialer) -> String {
+    hex_encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bridge.noise_private)).as_bytes())
+}
+
+/// #763: the exact command that starts the missing sidecar, as a copyable block. Shown
+/// wherever the portal has just learned nobody serves the channel (the card, and the
+/// result page of a `NoPeer`/`TimedOut` call).
+fn bridge_serve_command_html(noise_hex: &str) -> String {
+    format!(
+        r#"<pre><code>CT_CHANNEL_BRIDGE_PEER={noise_hex} ct-agent channel --serve</code></pre>
+<p class="help">Run this on the host of this tunnel's agent (with that agent's usual channel
+environment -- its own channel id and <code>CT_CHANNEL_GRANT</code>). The sidecar re-parks on the
+edge every 30 s; this page picks it up on the next reload.</p>"#
+    )
+}
+
 async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
     let Some(claims) = session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
@@ -3710,7 +3800,7 @@ async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Re
     };
     let statuses: Vec<_> =
         futures::future::join_all(bridges.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
-    let mut rows: Vec<(SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>)> = Vec::new();
+    let mut listed: Vec<(SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>)> = Vec::new();
     for ((t, mode), status) in bridges.into_iter().zip(statuses) {
         if mode == "ephemeral" && !status.as_ref().map(|s| s.connected).unwrap_or(false) {
             continue;
@@ -3721,20 +3811,37 @@ async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Re
         // page's row count is bounded by an account's tunnel quota, never large
         // enough for N+1 to matter the way it would on a shared listing.
         let grant = st.tunnels.bridge_grant(&subject, &t.id).unwrap_or(None);
-        rows.push((t, mode, status, grant));
+        listed.push((t, mode, status, grant));
     }
+    // #763: one bounded presence lookup per row WITH a grant (nothing to look up
+    // otherwise), concurrently like the status scrape above -- so the card can say
+    // whether a sidecar serves the channel before the owner clicks into a 45 s dead dial.
+    let presences: Vec<Option<BridgePresence>> = futures::future::join_all(listed.iter().map(|(_, _, _, grant)| async {
+        match grant {
+            Some(g) => edge_bridge_presence(&st, g).await,
+            None => None,
+        }
+    }))
+    .await;
+    let rows: Vec<BridgeRow> = listed
+        .into_iter()
+        .zip(presences)
+        .map(|((t, mode, status, grant), presence)| (t, mode, status, grant, presence))
+        .collect();
     let holder_hex = st.bridge.as_ref().map(|b| hex_encode(&b.holder.verifying_key().to_bytes()));
     // #43-follow: a tunnel owner needs BOTH this deployment's holder pubkey (to mint the
     // channel grant) AND its Noise pubkey (for their own CT_CHANNEL_BRIDGE_PEER, so their
     // `channel --serve` process registers the bridge/* tools at all) -- shown here for the
     // first time; previously only the holder half was published, silently leaving every
     // bridge/* call unreachable regardless of a valid grant (found live-testing this page).
-    let noise_hex = st
-        .bridge
-        .as_ref()
-        .map(|b| hex_encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(b.noise_private)).as_bytes()));
+    let noise_hex = st.bridge.as_ref().map(bridge_noise_hex);
     Html(rest_bridges_html(&rows, holder_hex.as_deref(), noise_hex.as_deref(), claims.email.as_deref())).into_response()
 }
+
+/// One Agent-bridges card's inputs: the tunnel, its bridge mode, the edge's live tunnel
+/// status, the stored bridge grant (hex), and -- #763 -- the channel's sidecar presence
+/// (`None` = the edge could not be asked; renders as before #763).
+type BridgeRow = (SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>, Option<BridgePresence>);
 
 /// Agent-bridges-v2's read-only bridge tools this page offers a one-click "refresh"
 /// button for -- no arguments, just a labeled call. The three tools that take real
@@ -3751,7 +3858,7 @@ const BRIDGE_CALL_TOOLS: &[(&str, &str)] = &[
 ];
 
 fn rest_bridges_html(
-    rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>)],
+    rows: &[BridgeRow],
     holder_hex: Option<&str>,
     noise_hex: Option<&str>,
     email: Option<&str>,
@@ -3779,7 +3886,7 @@ unavailable here until an operator sets them.</p>"#
             .to_string()
     } else {
         rows.iter()
-            .map(|(t, mode, status, grant)| {
+            .map(|(t, mode, status, grant, presence)| {
                 let connected = status.as_ref().map(|s| s.connected).unwrap_or(false);
                 let dot_class = if connected { "live" } else { "off" };
                 let status_label = if connected { "Online" } else { "Offline" };
@@ -3792,6 +3899,30 @@ unavailable here until an operator sets them.</p>"#
                     String::new()
                 } else if let Some(grant_hex) = grant {
                     let short = if grant_hex.len() > 16 { &grant_hex[..16] } else { grant_hex.as_str() };
+                    // #763: a grant on file is necessary but not sufficient -- only a
+                    // `channel --serve` sidecar on the owner's side actually answers.
+                    // When the edge says nobody is parked, the call buttons and the
+                    // manifest form are DISABLED (every click would otherwise be a
+                    // 45 s rendezvous park running out on a blocking form POST) and
+                    // the exact command to start the sidecar is shown instead. `None`
+                    // (edge not asked / not answering) keeps today's rendering.
+                    let sidecar_absent = matches!(presence, Some(p) if !p.serving);
+                    let disabled = if sidecar_absent { " disabled" } else { "" };
+                    let sidecar_block = match presence {
+                        Some(BridgePresence { serving: true, last_seen_secs_ago }) => format!(
+                            r#"<p class="help"><span class="status-dot live"></span>Sidecar: serving{seen}.</p>"#,
+                            seen = last_seen_secs_ago.map(|s| format!(" (seen {s} s ago)")).unwrap_or_default()
+                        ),
+                        Some(BridgePresence { serving: false, last_seen_secs_ago }) => format!(
+                            r#"<p class="help"><span class="status-dot off"></span>Sidecar: not connected{seen} --
+no <code>ct-agent channel --serve</code> process is parked on this bridge's channel, so every call
+below would only wait out the broker's park window and fail. Start it on the agent's host:</p>
+{command}"#,
+                            seen = last_seen_secs_ago.map(|s| format!(" (last seen {s} s ago)")).unwrap_or_default(),
+                            command = bridge_serve_command_html(noise_hex.unwrap_or("&lt;this deployment's bridge Noise pubkey&gt;")),
+                        ),
+                        None => String::new(),
+                    };
                     let refresh_buttons = BRIDGE_CALL_TOOLS
                         .iter()
                         .map(|(name, label)| {
@@ -3799,14 +3930,20 @@ unavailable here until an operator sets them.</p>"#
                                 r#"<form class="inline" method="post" action="/portal/tunnels/{id}/agent-bridge/call">
  <input type="hidden" name="tool" value="{name}">
  <input type="hidden" name="arguments" value="{{}}">
- <button type="submit" class="btn sec">{label}</button>
+ <button type="submit" class="btn sec"{disabled}>{label}</button>
 </form>"#
                             )
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
+                    let call_anyway = if sidecar_absent {
+                        "Advanced: call anyway (waits out the 45 s park window if nobody answers)"
+                    } else {
+                        "Advanced: call any tool directly"
+                    };
                     format!(
                         r#"<p class="help">Bridge grant stored (<code>{short}…</code>).</p>
+{sidecar_block}
 <h2 class="muted">Check status</h2>
 <div class="actions">{refresh_buttons}</div>
 <p class="help">Managing the allow-list itself? Use the <a href="/portal/channels">Channels</a>
@@ -3814,6 +3951,7 @@ tab's own allow-list form directly -- it's the same underlying list, reached wit
 on this tunnel's agent being dialable at all.</p>
 <h2 class="muted">Install a manifest</h2>
 <form method="post" action="/portal/tunnels/{id}/agent-bridge/manifest/install">
+ <fieldset{disabled}>
  <label>Manifest location <span class="opt">(a URL or id from "Installed manifests" above)</span>
   <input type="text" name="manifest_location" required placeholder="https://registry.example/manifests/...">
  </label>
@@ -3821,10 +3959,11 @@ on this tunnel's agent being dialable at all.</p>
   <input type="text" name="project_name" required placeholder="my-agent-tool">
  </label>
  <button type="submit">Install</button>
+ </fieldset>
 </form>
 <p class="help">Refused entirely if the agent itself has set
 <code>CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL</code>, regardless of this form.</p>
-<details><summary>Advanced: call any tool directly</summary>
+<details><summary>{call_anyway}</summary>
 <form method="post" action="/portal/tunnels/{id}/agent-bridge/call">
  <label>Tool <span class="opt">(e.g. bridge/status)</span>
   <input type="text" name="tool" required>
@@ -4551,6 +4690,7 @@ async fn dial_bridge_tool(
         Err(e) => return internal_error("dial_bridge_tool/grant_decode", e).into_response(),
     };
     let claims_email = claims.email;
+    let noise_hex = bridge_noise_hex(&bridge);
     match ct_common::channel_dial::dial_and_call(
         bridge.broker_addr,
         bridge.relay_addr,
@@ -4562,8 +4702,8 @@ async fn dial_bridge_tool(
     )
     .await
     {
-        Ok(result) => Html(bridge_call_result_html(&id, &tool, Ok(&result), claims_email.as_deref())).into_response(),
-        Err(e) => Html(bridge_call_result_html(&id, &tool, Err(&e.to_string()), claims_email.as_deref())).into_response(),
+        Ok(result) => Html(bridge_call_result_html(&id, &tool, Ok(&result), &noise_hex, claims_email.as_deref())).into_response(),
+        Err(e) => Html(bridge_call_result_html(&id, &tool, Err(&e), &noise_hex, claims_email.as_deref())).into_response(),
     }
 }
 
@@ -4601,8 +4741,20 @@ async fn install_bridge_manifest(
 
 /// Render one bridge-tool call's outcome as a small standalone portal page --
 /// plain JSON (success) or the [`ct_common::channel_dial::DialError`]'s own
-/// `Display` text (failure), no further interpretation of either.
-fn bridge_call_result_html(id: &str, tool: &str, result: Result<&serde_json::Value, &str>, email: Option<&str>) -> String {
+/// `Display` text (failure). #763: the two failures that mean "nobody served the
+/// channel" -- `NoPeer` (admitted, park window ran out partnerless) and `TimedOut`
+/// (a bounded phase, in practice the same park, exceeded its deadline) -- additionally
+/// get one paragraph naming the missing sidecar and the command that starts it
+/// (`noise_hex` is this deployment's bridge Noise pubkey, its `CT_CHANNEL_BRIDGE_PEER`);
+/// every other error stays the dialer's text alone, uninterpreted.
+fn bridge_call_result_html(
+    id: &str,
+    tool: &str,
+    result: Result<&serde_json::Value, &ct_common::channel_dial::DialError>,
+    noise_hex: &str,
+    email: Option<&str>,
+) -> String {
+    use ct_common::channel_dial::DialError;
     let (heading, body) = match result {
         Ok(v) => (
             "Result",
@@ -4611,7 +4763,20 @@ fn bridge_call_result_html(id: &str, tool: &str, result: Result<&serde_json::Val
                 escape(&serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
             ),
         ),
-        Err(e) => ("Call failed", format!("<p class=\"help\">{}</p>", escape(e))),
+        Err(e @ (DialError::NoPeer | DialError::TimedOut)) => (
+            "Call failed",
+            format!(
+                r#"<p class="help">{err}</p>
+<p class="help"><strong>No sidecar answered.</strong> This deployment was admitted to the
+bridge's channel, but no <code>ct-agent channel --serve</code> process for this tunnel's agent
+was parked on the other side within the broker's park window, so the call had nobody to reach.
+The bridge grant is fine; what is missing is the serving sidecar on the agent's host:</p>
+{command}"#,
+                err = escape(&e.to_string()),
+                command = bridge_serve_command_html(noise_hex),
+            ),
+        ),
+        Err(e) => ("Call failed", format!("<p class=\"help\">{}</p>", escape(&e.to_string()))),
     };
     page(
         "Agent bridges",
@@ -12656,6 +12821,16 @@ mod tests {
     /// return before `ct_common::channel_dial::dial_and_call` ever touches a
     /// socket.
     fn test_app_with_bridge() -> (Router, Arc<SqliteTunnelStore>, ed25519_dalek::SigningKey, Arc<crate::storage::SqliteChannelStore>) {
+        test_app_with_bridge_and_edge(None)
+    }
+
+    /// #763: [`test_app_with_bridge`] plus an optional edge admin base URL (a mock
+    /// axum server in the tests below), so the Agent-bridges page's presence lookup
+    /// (`edge_bridge_presence`) actually runs instead of short-circuiting on
+    /// `edge_admin: None`.
+    fn test_app_with_bridge_and_edge(
+        edge_url: Option<String>,
+    ) -> (Router, Arc<SqliteTunnelStore>, ed25519_dalek::SigningKey, Arc<crate::storage::SqliteChannelStore>) {
         let holder = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
         let noise_private = [0x22u8; 32];
         let broker_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -12669,7 +12844,7 @@ mod tests {
             Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
             Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
             "https://portal.example",
-            None,
+            edge_url.map(|u| (u, "edge-secret".to_string())),
             None,
             None,
             None, // oidc_issuer (test)
@@ -13065,5 +13240,145 @@ mod tests {
         assert!(html.contains(&holder_hex), "the holder pubkey must still be published");
         assert!(html.contains(&expected_noise_hex), "the Noise pubkey must also be published");
         assert!(html.contains("CT_CHANNEL_BRIDGE_PEER"), "the page must name the env var the owner needs to set");
+    }
+
+    /// #763 harness: a mock edge serving `/admin/tunnel-status/:token` (always
+    /// connected) and -- when `presence` is `Some` -- `/internal/channel/presence/
+    /// :channel_hex` answering that fixed body for any channel while recording the
+    /// channel hex it was asked about. `None` mounts NO presence route (an older edge:
+    /// 404), the fail-open case. Returns the base URL and the recorded channel.
+    async fn mock_edge_with_presence(presence: Option<serde_json::Value>) -> (String, Arc<std::sync::Mutex<Option<String>>>) {
+        let asked: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let mut mock = Router::new().route(
+            "/admin/tunnel-status/:token",
+            axum::routing::get(|axum::extract::Path(_token): axum::extract::Path<String>| async {
+                Json(serde_json::json!({ "connected": true, "registrations": 1, "bytes_received": 0, "bytes_sent": 0 }))
+            }),
+        );
+        if let Some(body) = presence {
+            let asked = asked.clone();
+            mock = mock.route(
+                "/internal/channel/presence/:channel_hex",
+                axum::routing::get(move |axum::extract::Path(channel_hex): axum::extract::Path<String>| {
+                    let asked = asked.clone();
+                    let body = body.clone();
+                    async move {
+                        *asked.lock().unwrap() = Some(channel_hex);
+                        Json(body)
+                    }
+                }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// #763: one permanent bridge for alice with a stored grant on `channel`, on an app
+    /// whose edge admin URL is `edge_url`. Returns the app and the tunnel id.
+    fn bridge_page_fixture(edge_url: &str, channel: [u8; 32]) -> (Router, String) {
+        let (app, tunnels, holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url.to_string()));
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("hostname free");
+        tunnels.set_rest_bridge_mode("alice", &t.id, "permanent").unwrap();
+        let (_, grant_hex) = bridge_grant_hex(channel, holder.verifying_key().to_bytes());
+        assert!(tunnels.set_bridge_grant("alice", &t.id, &grant_hex).unwrap());
+        (app, t.id)
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_marks_a_served_bridge_and_keeps_its_calls_enabled_763() {
+        // The edge reports the owner's serving sidecar (a holder OTHER than this
+        // deployment's own bridge holder) parked 12 s ago, alongside our own park: the
+        // card says "serving", nothing is disabled, and the edge was asked about the
+        // channel FROM THE STORED GRANT, not some other id.
+        let own_holder_hex = hex_encode(&ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]).verifying_key().to_bytes());
+        let (edge_url, asked) = mock_edge_with_presence(Some(serde_json::json!({
+            "holders": [
+                { "holder": own_holder_hex, "parked_now": true, "last_seen_secs_ago": 3 },
+                { "holder": "ab".repeat(32), "parked_now": true, "last_seen_secs_ago": 12 }
+            ]
+        })))
+        .await;
+        let (app, _id) = bridge_page_fixture(&edge_url, [0x63u8; 32]);
+
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Sidecar: serving (seen 12 s ago)"), "the OTHER member's age, not our own 3 s: {html}");
+        assert!(!html.contains(" disabled"), "a served bridge keeps every call button and the manifest form live");
+        assert!(html.contains("Advanced: call any tool directly"), "the plain advanced form, not the call-anyway wording");
+        assert_eq!(asked.lock().unwrap().as_deref(), Some("63".repeat(32).as_str()), "asked about the grant's channel");
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_disables_calls_and_shows_the_serve_command_when_nobody_serves_763() {
+        // The 2026-09-06 inventory's three-of-four case: a grant is stored, our own
+        // bridge holder is the ONLY member the edge has seen on the channel (it is
+        // excluded -- it is us), so nobody serves. Every call button and the manifest
+        // form must be disabled, the exact `channel --serve` command with THIS
+        // deployment's Noise pubkey shown instead, and the advanced call kept behind a
+        // "call anyway" block -- instead of five buttons that each cost a 45 s dead dial.
+        let own_holder_hex = hex_encode(&ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]).verifying_key().to_bytes());
+        let (edge_url, _asked) = mock_edge_with_presence(Some(serde_json::json!({
+            "holders": [{ "holder": own_holder_hex, "parked_now": true, "last_seen_secs_ago": 1 }]
+        })))
+        .await;
+        let (app, id) = bridge_page_fixture(&edge_url, [0x64u8; 32]);
+        let expected_noise_hex =
+            hex_encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x22u8; 32])).as_bytes());
+
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Sidecar: not connected"), "{html}");
+        assert_eq!(
+            html.matches(r#"<button type="submit" class="btn sec" disabled>"#).count(),
+            BRIDGE_CALL_TOOLS.len(),
+            "every one-click call button is disabled"
+        );
+        assert!(html.contains("<fieldset disabled>"), "the manifest-install form is disabled");
+        assert!(
+            html.contains(&format!("CT_CHANNEL_BRIDGE_PEER={expected_noise_hex} ct-agent channel --serve")),
+            "the exact command to start the sidecar is shown"
+        );
+        assert!(html.contains("Advanced: call anyway"), "the escape hatch stays, clearly labeled");
+        assert!(
+            html.contains(&format!(r#"action="/portal/tunnels/{id}/agent-bridge/call""#)),
+            "and it still posts to the real call route"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_fails_open_to_todays_rendering_when_the_edge_has_no_presence_route_763() {
+        // An edge without `/internal/channel/presence` (older build, or a transient
+        // failure) must not turn every card into "not connected": no sidecar line at
+        // all, nothing disabled -- exactly the pre-#763 page.
+        let (edge_url, _asked) = mock_edge_with_presence(None).await;
+        let (app, _id) = bridge_page_fixture(&edge_url, [0x65u8; 32]);
+
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Bridge grant stored"), "the grant-and-call card still renders");
+        assert!(!html.contains("Sidecar:"), "no presence claim either way when the edge could not be asked: {html}");
+        assert!(!html.contains(" disabled"), "nothing is disabled on the fail-open path");
+        assert!(html.contains("Advanced: call any tool directly"));
+    }
+
+    #[test]
+    fn bridge_call_result_html_explains_the_missing_sidecar_for_no_peer_and_timed_out_763() {
+        use ct_common::channel_dial::DialError;
+        let noise = "ab".repeat(32);
+        for e in [DialError::NoPeer, DialError::TimedOut] {
+            let html = bridge_call_result_html("t-1", "bridge/status", Err(&e), &noise, None);
+            assert!(html.contains(&escape(&e.to_string())), "the dialer's own text stays: {html}");
+            assert!(html.contains("No sidecar answered"), "{e}: names the missing sidecar");
+            assert!(html.contains(&format!("CT_CHANNEL_BRIDGE_PEER={noise} ct-agent channel --serve")), "{e}: and how to start it");
+        }
+        // Every other failure is the dialer's text alone -- a refusal is NOT a missing
+        // sidecar, and saying so would send the owner to the wrong fix.
+        let refused = DialError::Refused { category: Some("not-member".to_string()) };
+        let html = bridge_call_result_html("t-1", "bridge/status", Err(&refused), &noise, None);
+        assert!(html.contains("not-member"));
+        assert!(!html.contains("No sidecar answered"));
+        assert!(!html.contains("ct-agent channel --serve"));
     }
 }
