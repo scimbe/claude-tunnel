@@ -3606,6 +3606,79 @@ async fn edge_tunnel_status(st: &ApiState, routing_token_hex: &str) -> Option<Ed
     resp.json::<EdgeTunnelStatus>().await.ok()
 }
 
+/// #776: how many sessions the tunnels page asks the edge for per tunnel -- a card is a
+/// glance, not an audit log, and the page already makes one edge call per tunnel for
+/// the status badge; this bounds the second one's payload.
+const TUNNEL_HISTORY_SESSIONS: usize = 10;
+
+/// #776: a tunnel's connection history as the edge's `GET /internal/tunnel/history/
+/// :token_hex?limit=N` (`crates/edge/src/admin.rs`) reports it -- uptime percentages
+/// over three windows plus the newest-first session rows. `open` is the edge's own
+/// "a session is currently open" flag; the per-row `disconnected_at: None` is what the
+/// table itself renders as "open", the flag only steers the empty-table wording.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+struct EdgeTunnelHistory {
+    #[serde(default)]
+    open: bool,
+    #[serde(default)]
+    uptime: EdgeUptime,
+    #[serde(default)]
+    sessions: Vec<EdgeSessionRow>,
+}
+
+/// #776: uptime percentages (0..=100) over the edge's 24 h / 7 d / 30 d windows.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+struct EdgeUptime {
+    #[serde(default)]
+    h24: f64,
+    #[serde(default)]
+    d7: f64,
+    #[serde(default)]
+    d30: f64,
+}
+
+/// #776: one session row of [`EdgeTunnelHistory`]. Timestamps are unix seconds;
+/// `disconnected_at`/`reason` are `None` for the session still running.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+struct EdgeSessionRow {
+    #[serde(default)]
+    transport: String,
+    #[serde(default)]
+    connected_at: i64,
+    #[serde(default)]
+    disconnected_at: Option<i64>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    bytes_in: u64,
+    #[serde(default)]
+    bytes_out: u64,
+}
+
+/// #776: `routing_token_hex`'s connection history (newest `limit` sessions), queried
+/// from the edge. Same fail-open contract as [`edge_tunnel_status`]: `None` when
+/// `edge_admin` isn't configured, the call fails or times out, or the edge answers
+/// non-2xx -- including the 404 an edge with history disabled (or an older edge
+/// without the route) returns -- so the card simply has no history block rather than
+/// a misleading empty one. Bounded by [`edge_presence_http_client`]'s 2 s timeout, not
+/// the general admin client's: the page renders one such call per tunnel and must not
+/// let a slow edge turn into a slow page.
+async fn edge_tunnel_history(st: &ApiState, routing_token_hex: &str, limit: usize) -> Option<EdgeTunnelHistory> {
+    let edge = st.edge_admin.as_ref()?;
+    let endpoint = format!("{}/internal/tunnel/history/{routing_token_hex}", edge.url.trim_end_matches('/'));
+    let resp = edge_presence_http_client()
+        .get(&endpoint)
+        .query(&[("limit", limit)])
+        .header("x-ct-admin-token", edge.token.as_ref())
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<EdgeTunnelHistory>().await.ok()
+}
+
 /// #763: the edge's answer to "is anybody serving this bridge's channel?", rendered on
 /// each Agent-bridges card as "Sidecar: serving (seen N s ago)" / "Sidecar: not
 /// connected". `None` (see [`edge_bridge_presence`]) means the edge could not be asked,
@@ -3745,10 +3818,18 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             let allow_and_pending = st.tunnels.allowlist_and_pending_batch(&subject, &tunnel_ids).unwrap_or_default();
             let topology_links = st.tunnels.topology_link_batch(&subject, &tunnel_ids).unwrap_or_default();
             let rest_bridge_modes = st.tunnels.rest_bridge_mode_batch(&subject, &tunnel_ids).unwrap_or_default();
-            let statuses: Vec<_> =
-                futures::future::join_all(tunnels.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
+            // #776: the connection history rides in the SAME concurrent join as the
+            // status scrape -- two bounded edge calls per tunnel, all in flight at
+            // once, never a second sequential round.
+            let edge_lookups: Vec<_> = futures::future::join_all(tunnels.iter().map(|(t, _)| {
+                futures::future::join(
+                    edge_tunnel_status(&st, &t.routing_token),
+                    edge_tunnel_history(&st, &t.routing_token, TUNNEL_HISTORY_SESSIONS),
+                )
+            }))
+            .await;
             let mut rows = Vec::with_capacity(tunnels.len());
-            for ((t, owned), status) in tunnels.into_iter().zip(statuses) {
+            for ((t, owned), (status, history)) in tunnels.into_iter().zip(edge_lookups) {
                 let admission = t.hostname.as_deref().and_then(|h| admissions.get(h).cloned());
                 // #382-follow (Browser-Plane login gate): owner-scoped, so a shared
                 // (not-owned) row simply gets the off/empty defaults -- matching the
@@ -3771,6 +3852,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     pending_requests,
                     topology_link,
                     rest_bridge_mode,
+                    history,
                 ));
             }
             Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan)).into_response()
@@ -5617,6 +5699,107 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+/// #776: unix seconds as `YYYY-MM-DD HH:MM` in UTC, for the connection-history table.
+/// Server-side on purpose: the portal's [`page`] shell has no `[data-ts]` script the
+/// admin console's shell has, and a history is read across time zones anyway (the
+/// header says UTC). Proleptic-Gregorian civil-from-days (Howard Hinnant's algorithm),
+/// so no chrono dependency for a display concern; negative inputs clamp to the epoch.
+fn utc_ymd_hm(secs: i64) -> String {
+    let secs = secs.max(0);
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hour, minute) = (rem / 3_600, (rem % 3_600) / 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+/// #776: a session length in the coarse units a card reader wants -- `3 h 12 m`,
+/// `12 m`, `2 d 5 h`; anything under a minute reads `&lt; 1 m` rather than `0 m`.
+fn human_duration(secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MINUTE {
+        "&lt; 1 m".to_string()
+    } else if secs < HOUR {
+        format!("{} m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{} h {} m", secs / HOUR, (secs % HOUR) / MINUTE)
+    } else {
+        format!("{} d {} h", secs / DAY, (secs % DAY) / HOUR)
+    }
+}
+
+/// #776: an uptime percentage as the card shows it -- `100 %` when whole, `98.4 %`
+/// otherwise; clamped to 0..=100 (the edge already promises that range, this just
+/// keeps a bad payload from rendering `-3 %` or `NaN %`).
+fn human_pct(pct: f64) -> String {
+    let pct = if pct.is_finite() { pct.clamp(0.0, 100.0) } else { 0.0 };
+    if (pct - pct.round()).abs() < 0.05 {
+        format!("{:.0} %", pct.round())
+    } else {
+        format!("{pct:.1} %")
+    }
+}
+
+/// #776: the per-card "Connection history" block -- the edge's uptime line plus a
+/// small newest-first table of the last sessions. Only called when the edge
+/// answered ([`edge_tunnel_history`] returned `Some`); every value passes through
+/// [`escape`], the transport/reason strings are edge-supplied text.
+fn tunnel_history_html(history: &EdgeTunnelHistory) -> String {
+    let uptime = format!(
+        "Uptime 24 h / 7 d / 30 d: {} / {} / {}",
+        human_pct(history.uptime.h24),
+        human_pct(history.uptime.d7),
+        human_pct(history.uptime.d30),
+    );
+    let body = if history.sessions.is_empty() {
+        let copy = if history.open {
+            "Connected now; no completed sessions recorded yet."
+        } else {
+            "No sessions recorded yet."
+        };
+        format!(r#"<p class="help">{copy}</p>"#)
+    } else {
+        let rows = history
+            .sessions
+            .iter()
+            .map(|s| {
+                let duration = match s.disconnected_at {
+                    Some(end) => human_duration(u64::try_from(end.saturating_sub(s.connected_at)).unwrap_or(0)),
+                    None => "open".to_string(),
+                };
+                format!(
+                    "<tr><td>{started}</td><td>{duration}</td><td>{transport}</td><td>{bytes_in} / {bytes_out}</td><td>{reason}</td></tr>",
+                    started = utc_ymd_hm(s.connected_at),
+                    transport = escape(&s.transport),
+                    bytes_in = human_bytes(s.bytes_in),
+                    bytes_out = human_bytes(s.bytes_out),
+                    reason = s.reason.as_deref().map(escape).unwrap_or_else(|| "&ndash;".to_string()),
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<table class="history"><thead><tr><th>Started (UTC)</th><th>Duration</th><th>Transport</th><th>Bytes in / out</th><th>Reason</th></tr></thead>
+<tbody>{rows}</tbody></table>"#
+        )
+    };
+    format!(
+        r#"<details class="history"><summary class="row"><span class="k">Connection history</span></summary>
+<p class="help">{uptime}</p>
+{body}
+</details>"#
+    )
+}
+
 /// Browser-Plane login gate section (#382-follow): a checkbox to require a
 /// Keycloak login (checked against this tunnel's own email allow-list) before
 /// its public content is served, and -- while enabled -- the allow-list itself
@@ -5719,6 +5902,7 @@ type TunnelRow = (
     Vec<(String, String, i64)>,
     Option<String>, // the topology id this tunnel is linked to, if any
     String,         // rest_bridge_mode: "off" | "ephemeral" | "permanent"
+    Option<EdgeTunnelHistory>, // #776: edge connection history; None = edge not asked/answered
 );
 
 fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is_business_plan: bool) -> String {
@@ -5730,7 +5914,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
     let owned_count = tunnels.iter().filter(|(_, owned, ..)| *owned).count() as u32;
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link, rest_bridge_mode)| {
+        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link, rest_bridge_mode, history)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -5799,6 +5983,10 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
                 ),
                 _ => String::new(),
             };
+            // #776: the edge's connection history, same absent-renders-nothing rule as
+            // the status badge and byte counters above (no edge_admin, edge down, or
+            // history disabled on the edge -> no block at all, never an empty table).
+            let history_section = history.as_ref().map(tunnel_history_html).unwrap_or_default();
             // Browser-Plane login gate (#382-follow): owner-only, and only shown for
             // a tunnel that actually has public content to protect (a hostname).
             let login_gate = if *owned && t.hostname.is_some() {
@@ -5885,7 +6073,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}
+{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}
 </details></div>"#,
                 name = escape(&t.name),
             )
@@ -6255,6 +6443,11 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  .tier{{font-size:.85rem;margin:.2rem 0 .1rem}} .tier-rot{{color:#f85149}} .tier-gelb{{color:#f0c674}} .tier-gruen{{color:#3fb950}}
  .tier-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:.45rem;vertical-align:middle}}
  .tier-dot.pulse{{animation:pulse 1.6s ease-in-out infinite}}
+ /* #776: per-card session-history disclosure and its sessions table (the phrase itself stays out of CSS so page tests can assert its absence). */
+ details.history>summary{{cursor:pointer}}
+ table.history{{width:100%;border-collapse:collapse;font-size:.82rem;margin:.2rem 0 .6rem}}
+ table.history th{{text-align:left;color:#8b949e;font-weight:500;padding:.25rem .5rem .25rem 0;border-bottom:1px solid #30363d}}
+ table.history td{{padding:.25rem .5rem .25rem 0;border-bottom:1px solid #21262d;white-space:nowrap}}
  .warn code{{background:#2a1500;border-color:#7d4e00}} h2.muted{{color:#6e7681}}
  .btn.disabled,button:disabled,input:disabled{{opacity:.45;cursor:not-allowed;pointer-events:none}}
  .code-block{{margin:.6rem 0 1rem;border:1px solid #30363d;border-radius:8px;overflow:hidden;background:#0d1117}}
@@ -8666,6 +8859,40 @@ mod tests {
         assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(human_bytes(u64::MAX), "16777216.0 TB", "never panics/overflows at the top of the range");
+    }
+
+    #[test]
+    fn utc_ymd_hm_renders_unix_seconds_as_utc_civil_time_776() {
+        // Reference values cross-checked against `date -u -d @N '+%Y-%m-%d %H:%M'`.
+        assert_eq!(utc_ymd_hm(0), "1970-01-01 00:00");
+        assert_eq!(utc_ymd_hm(1_757_100_000), "2025-09-05 19:20");
+        assert_eq!(utc_ymd_hm(1_757_000_000), "2025-09-04 15:33");
+        assert_eq!(utc_ymd_hm(951_782_400), "2000-02-29 00:00", "leap day in a 400-year leap year");
+        assert_eq!(utc_ymd_hm(4_102_444_800), "2100-01-01 00:00", "past a non-leap century");
+        assert_eq!(utc_ymd_hm(-5), "1970-01-01 00:00", "negative input clamps to the epoch, never panics");
+    }
+
+    #[test]
+    fn human_duration_uses_the_coarse_units_a_card_reader_wants_776() {
+        assert_eq!(human_duration(0), "&lt; 1 m");
+        assert_eq!(human_duration(59), "&lt; 1 m");
+        assert_eq!(human_duration(60), "1 m");
+        assert_eq!(human_duration(12 * 60 + 30), "12 m");
+        assert_eq!(human_duration(3_600), "1 h 0 m");
+        assert_eq!(human_duration(3 * 3_600 + 12 * 60), "3 h 12 m");
+        assert_eq!(human_duration(2 * 86_400 + 5 * 3_600 + 59 * 60), "2 d 5 h");
+    }
+
+    #[test]
+    fn human_pct_drops_the_decimal_only_for_whole_percentages_776() {
+        assert_eq!(human_pct(100.0), "100 %");
+        assert_eq!(human_pct(98.4), "98.4 %");
+        assert_eq!(human_pct(97.1), "97.1 %");
+        assert_eq!(human_pct(0.0), "0 %");
+        assert_eq!(human_pct(99.96), "100 %", "rounds rather than printing 100.0");
+        assert_eq!(human_pct(-3.0), "0 %", "clamped from below");
+        assert_eq!(human_pct(140.0), "100 %", "clamped from above");
+        assert_eq!(human_pct(f64::NAN), "0 %", "never renders NaN");
     }
 
     // Screenshot bug report: the "Require login" checkbox rendered on its own
@@ -14194,6 +14421,166 @@ mod tests {
         assert!(!html.contains("Sidecar:"), "no presence claim either way when the edge could not be asked: {html}");
         assert!(!html.contains(" disabled"), "nothing is disabled on the fail-open path");
         assert!(html.contains("Advanced: call any tool directly"));
+    }
+
+    /// #776: what [`mock_edge_with_history`]'s history route recorded -- the
+    /// `(token_hex, raw query)` it was last asked with, `None` until asked.
+    type HistoryAsked = Arc<std::sync::Mutex<Option<(String, Option<String>)>>>;
+
+    /// #776 harness, mirroring [`mock_edge_with_presence`]: a mock edge serving
+    /// `/admin/tunnel-status/:token` (always connected) and -- when `history` is
+    /// `Some` -- `/internal/tunnel/history/:token_hex` answering that fixed body for
+    /// any token while recording the `(token_hex, limit query)` it was asked with and
+    /// asserting the admin-token header. `None` mounts NO history route (history
+    /// disabled on the edge, or an older edge: 404), the fail-open case.
+    async fn mock_edge_with_history(history: Option<serde_json::Value>) -> (String, HistoryAsked) {
+        let asked: HistoryAsked = Arc::new(std::sync::Mutex::new(None));
+        let mut mock = Router::new().route(
+            "/admin/tunnel-status/:token",
+            axum::routing::get(|axum::extract::Path(_token): axum::extract::Path<String>| async {
+                Json(serde_json::json!({ "connected": true, "registrations": 1, "bytes_received": 0, "bytes_sent": 0 }))
+            }),
+        );
+        if let Some(body) = history {
+            let asked = asked.clone();
+            mock = mock.route(
+                "/internal/tunnel/history/:token_hex",
+                axum::routing::get(
+                    move |headers: HeaderMap,
+                          axum::extract::Path(token_hex): axum::extract::Path<String>,
+                          axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                        let asked = asked.clone();
+                        let body = body.clone();
+                        async move {
+                            assert_eq!(
+                                headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()),
+                                Some("edge-secret"),
+                                "the history call authenticates like every other edge-admin call"
+                            );
+                            *asked.lock().unwrap() = Some((token_hex, query));
+                            Json(body)
+                        }
+                    },
+                ),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        (format!("http://{addr}"), asked)
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_shows_the_edge_connection_history_776() {
+        // The edge answers with the issue's reference payload: the card gets a
+        // "Connection history" block with the three uptime windows and one table row
+        // per session (newest first) -- the running one reading "open", the closed one
+        // with its transport, duration, bytes and close reason -- and the edge was asked
+        // about THIS tunnel's routing token with the page's session limit.
+        let (edge_url, asked) = mock_edge_with_history(Some(serde_json::json!({
+            "open": true,
+            "uptime": { "h24": 100.0, "d7": 98.4, "d30": 97.1 },
+            "sessions": [
+                { "transport": "quic", "connected_at": 1_757_100_000, "disconnected_at": null, "reason": null,
+                  "bytes_in": 1234, "bytes_out": 5678 },
+                { "transport": "tcp-fallback", "connected_at": 1_757_000_000, "disconnected_at": 1_757_003_600,
+                  "reason": "registration-closed", "bytes_in": 10, "bytes_out": 20 }
+            ]
+        })))
+        .await;
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Connection history"), "{html}");
+        assert!(html.contains("Uptime 24 h / 7 d / 30 d: 100 % / 98.4 % / 97.1 %"), "{html}");
+        assert!(html.contains("<td>2025-09-05 19:20</td><td>open</td><td>quic</td><td>1.2 KB / 5.5 KB</td>"), "{html}");
+        assert!(
+            html.contains(
+                "<td>2025-09-04 15:33</td><td>1 h 0 m</td><td>tcp-fallback</td><td>10 B / 20 B</td><td>registration-closed</td>"
+            ),
+            "{html}"
+        );
+        let quic_at = html.find("<td>quic</td>").unwrap();
+        let tcp_at = html.find("<td>tcp-fallback</td>").unwrap();
+        assert!(quic_at < tcp_at, "newest session first, in the edge's own order");
+        assert!(html.contains("Connected"), "the existing status badge is untouched");
+
+        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
+        let (token_hex, query) = asked.lock().unwrap().clone().expect("the edge was asked");
+        assert_eq!(token_hex, tunnel.routing_token, "asked about this tunnel's routing token");
+        assert_eq!(query.as_deref(), Some("limit=10"), "bounded to the page's session limit");
+        assert!(!html.contains(&tunnel.routing_token), "the raw routing token itself is never rendered");
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_escapes_edge_supplied_history_strings_776() {
+        // Transport and reason are edge-supplied text: they must go through `escape`
+        // like every other rendered value, never land in the page raw.
+        let (edge_url, _asked) = mock_edge_with_history(Some(serde_json::json!({
+            "open": false,
+            "uptime": { "h24": 50.0, "d7": 50.0, "d30": 50.0 },
+            "sessions": [
+                { "transport": "<b>x</b>", "connected_at": 1_757_000_000, "disconnected_at": 1_757_000_030,
+                  "reason": "a&b", "bytes_in": 0, "bytes_out": 0 }
+            ]
+        })))
+        .await;
+        let (app, _tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("<td>&lt;b&gt;x&lt;/b&gt;</td>"), "{html}");
+        assert!(!html.contains("<b>x</b>"), "{html}");
+        assert!(html.contains("<td>a&amp;b</td>"), "{html}");
+        assert!(html.contains("<td>&lt; 1 m</td>"), "a 30 s session reads as under a minute: {html}");
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_omits_the_connection_history_when_the_edge_has_no_history_route_776() {
+        // History disabled on the edge (or an older edge): the route 404s, the card has
+        // no history block at all -- never an empty table -- and everything else on
+        // the page (including the status badge from the route that DID answer) still
+        // renders.
+        let (edge_url, _asked) = mock_edge_with_history(None).await;
+        let (app, _tunnels, _holder, _channels) = test_app_with_bridge_and_edge(Some(edge_url));
+
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("Connection history"), "{html}");
+        assert!(!html.contains("Uptime 24 h"), "{html}");
+        assert!(html.contains("Connected"), "the status badge from the answering route is still there");
+        assert!(html.contains("Your tunnels"), "the page itself renders");
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_omits_the_connection_history_without_edge_admin_776() {
+        // No edge_admin configured: nothing to ask, so no history block, same fail-open
+        // posture as the status badge (`tunnels_page_renders_fine_when_edge_admin_is_unconfigured_248`).
+        let (app, _tunnels, _holder, _channels) = test_app_with_bridge_and_edge(None);
+
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("Connection history"), "{html}");
+        assert!(html.contains("Your tunnels"), "the page itself renders");
+    }
+
+    #[test]
+    fn tunnel_history_html_explains_an_empty_history_instead_of_rendering_an_empty_table_776() {
+        let open = EdgeTunnelHistory {
+            open: true,
+            uptime: EdgeUptime { h24: 100.0, d7: 100.0, d30: 100.0 },
+            sessions: vec![],
+        };
+        let html = tunnel_history_html(&open);
+        assert!(html.contains("Connected now; no completed sessions recorded yet."), "{html}");
+        assert!(!html.contains("<table"), "{html}");
+        assert!(html.contains("Uptime 24 h / 7 d / 30 d: 100 % / 100 % / 100 %"), "{html}");
+
+        let closed = EdgeTunnelHistory { open: false, ..Default::default() };
+        let html = tunnel_history_html(&closed);
+        assert!(html.contains("No sessions recorded yet."), "{html}");
+        assert!(html.contains("Uptime 24 h / 7 d / 30 d: 0 % / 0 % / 0 %"), "{html}");
     }
 
     #[test]

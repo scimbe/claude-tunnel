@@ -3607,6 +3607,50 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
             }
         }
     }
+    // #776: durable per-tunnel session history, ON by default (unlike the audit log: this
+    // is owner-facing product data, not an evidentiary record) at `tunnel-history.sqlite`
+    // beside the persisted CA key -- the one volume a redeploy already has to keep.
+    // `CT_EDGE_TUNNEL_HISTORY=off` disables it; `CT_EDGE_TUNNEL_HISTORY_PATH` relocates it;
+    // an unopenable path degrades to an in-memory store with a loud warning rather than
+    // refusing tunnel service (same advisory-disable posture as the audit log above).
+    match crate::tunnel_history::resolve_history_path(
+        std::env::var("CT_EDGE_TUNNEL_HISTORY").ok().as_deref(),
+        std::env::var("CT_EDGE_TUNNEL_HISTORY_PATH").ok().as_deref(),
+        &ca_key_path,
+    ) {
+        None => eprintln!("ct-edge: tunnel session history DISABLED (CT_EDGE_TUNNEL_HISTORY=off, #776)"),
+        Some(path) => {
+            if let Some((history, durable)) = crate::tunnel_history::open_with_fallback(&path) {
+                let history = std::sync::Arc::new(history);
+                // Rows left open by the previous process (redeploy, crash) would otherwise
+                // be adopted by the token's next registration and count the gap as uptime.
+                match history.close_stale_open_sessions(crate::tunnel_history::now_secs(), "edge-restart") {
+                    Ok(n) if n > 0 => eprintln!("ct-edge: tunnel history: closed {n} session(s) left open by the previous process (#776)"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("ct-edge: tunnel history: boot-time repair failed: {e} (#776)"),
+                }
+                state.set_tunnel_history(history.clone());
+                let idle_evict_secs = crate::tunnel_history::idle_evict_secs_from(
+                    std::env::var("CT_EDGE_TUNNEL_IDLE_EVICT_SECS").ok().as_deref(),
+                );
+                let retention_secs = crate::tunnel_history::retention_secs_from(
+                    std::env::var("CT_EDGE_TUNNEL_HISTORY_RETENTION_SECS").ok().as_deref(),
+                );
+                eprintln!(
+                    "ct-edge: tunnel session history enabled at {} (idle eviction {idle_evict_secs}s, \
+                     retention {retention_secs}s, #776)",
+                    if durable { path.as_str() } else { "<in-memory fallback>" }
+                );
+                tokio::spawn(crate::tunnel_history::run_tunnel_history_flush_loop(
+                    state.clone(),
+                    history,
+                    idle_evict_secs,
+                    retention_secs,
+                    shutdown.clone(),
+                ));
+            }
+        }
+    }
     // #23 BP4b / #84: require hostname-ownership authorization for 'H'/'B' binds —
     // fail-closed by default when a public front door is exposed (CT_FRONT_DOOR), so an
     // anonymous bind can't squat an unbound name on :443.

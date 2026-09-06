@@ -295,6 +295,18 @@ its own. `cross_family` is ordinary dual-stack.\n\
         tracked = penalty.tracked_ips(),
         tracked_max = penalty.max_tracked_ips(),
     ));
+    // #776: the in-memory per-token timing/byte maps used to grow forever; the tunnel-
+    // history flush loop now evicts idle tokens. This gauge is what proves the bound is
+    // actually being applied (a monotonically rising value with a stable fleet means the
+    // eviction is not running -- e.g. the history store is disabled).
+    out.push_str(&format!(
+        "# HELP ct_edge_tunnel_history_tracked_tokens Distinct routing tokens currently held \
+         in the in-memory tunnel timing/byte maps; bounded by the tunnel-history idle \
+         eviction (#776, CT_EDGE_TUNNEL_IDLE_EVICT_SECS) when the history store is on.\n\
+         # TYPE ct_edge_tunnel_history_tracked_tokens gauge\n\
+         ct_edge_tunnel_history_tracked_tokens {tracked}\n",
+        tracked = state.tunnel_history_tracked_tokens(),
+    ));
     // JA4 TLS-ClientHello fingerprinting: informational only -- see `crate::ja4`'s
     // module doc for what this is and is deliberately NOT (no reputation lookup, no
     // admission/blocking decision anywhere reads these numbers). `total`/`evictions`
