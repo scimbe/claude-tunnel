@@ -4395,6 +4395,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         crate::channel_broker::ChannelPairer::new(),
                                     ));
                                 _relay_pairer_keepalive = Some(relay_pairer.clone());
+                                // #591: CT_EDGE_UNIFIED_PAIRER=1 parks :4436 members in the
+                                // SHARED :443/WS pairer (constructed by the front-door channel
+                                // broker above; `None` when that is not configured, in which
+                                // case the relay stays QUIC-native and the line says why).
+                                // Default off -- see `run_channel_broker_loop`'s `unified` doc.
+                                let relay_unified = if crate::channel_broker::unified_pairer_enabled() {
+                                    shared_channel_pairer.clone()
+                                } else {
+                                    None
+                                };
+                                eprintln!(
+                                    "{}",
+                                    crate::channel_broker::unified_pairer_startup_line_for(
+                                        std::env::var("CT_EDGE_UNIFIED_PAIRER").ok().as_deref(),
+                                        shared_channel_pairer.is_some(),
+                                    )
+                                );
                                 eprintln!("ct-edge: Agent-Fabric channel RELAY on {relay_addr} (#105/#72 AF4-relay, #109 concurrent)");
                                 tokio::spawn(async move {
                                     // #109-concurrent-b: drive the relay with a channel-keyed
@@ -4425,6 +4442,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         relay_cap,
                                         shutdown_relay,
                                         relay_pairer,
+                                        relay_unified,
                                         relay_penalty,
                                         relay_heartbeat,
                                         relay_audit_log,
@@ -4490,6 +4508,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 rendezvous_cap,
                                 shutdown_rendezvous,
                                 rendezvous_pairer,
+                                None, // #591: the unified pairer is a RELAY-only slice
                                 rendezvous_penalty,
                                 rendezvous_heartbeat,
                                 rendezvous_audit_log,
