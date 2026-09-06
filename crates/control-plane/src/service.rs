@@ -4427,6 +4427,10 @@ static PAYMENT_WEBHOOK_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// for each field.
 static PADDLE_WEBHOOK_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AI_BACKEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// #697: edge-facing channel-authorize refusals of a topology-only holder that has no
+/// registered, attested Noise key for the derived channel (reason `topology-unkeyed`).
+static CHANNEL_AUTHORIZE_REFUSED_TOPOLOGY_UNKEYED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Requests per IP per minute the unauthenticated-write limiter is armed at, or `0`
 /// when it is not armed at all (#572).
 ///
@@ -4478,6 +4482,32 @@ pub(crate) fn note_ai_backend_failure(why: &str) -> u64 {
     let n = AI_BACKEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     eprintln!("ct-control-plane: AI backend request FAILED ({why}) -- {n} so far.");
     n
+}
+
+/// #697: count -- and say so in the log -- a `POST /internal/channel/authorize` the
+/// topology path authorized but that carried NO registered, attested Noise key for the
+/// derived channel. The decision (issue #697, option B, 2026-09-06) is to refuse such a
+/// holder at admission exactly like a non-member, because admitting it never produced a
+/// session anyway: the broker paired it, counted a success, and both agents then aborted on
+/// "relayed no peer Noise key" and re-parked in a loop. A refusal here is fail-closed at the
+/// earliest point; this line + counter are what make it observable instead of silent.
+///
+/// Logged on EVERY occurrence, like the webhook refusals: the fix is a one-time
+/// registration step (`POST /me/channels/:channel/members` with the holder's attested key),
+/// and the operator can only take it if the log names the channel and holder.
+fn note_channel_authorize_refused_topology_unkeyed(channel_hex: &str, holder_hex: &str) -> u64 {
+    let n = CHANNEL_AUTHORIZE_REFUSED_TOPOLOGY_UNKEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!(
+        "ct-cp: channel-authorize NO [topology-unkeyed] channel={channel_hex} holder={holder_hex} \
+         -- {n} so far. The topology edge authorizes this holder but no attested Noise key is \
+         registered for the derived channel; register it via POST /me/channels/:channel/members (#697)."
+    );
+    n
+}
+
+/// #697: the counter behind [`note_channel_authorize_refused_topology_unkeyed`], for `/status`.
+fn channel_authorize_refused_topology_unkeyed() -> u64 {
+    CHANNEL_AUTHORIZE_REFUSED_TOPOLOGY_UNKEYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// #561: the three counters above, for `/status`.
@@ -4563,6 +4593,13 @@ pub struct StatusResp {
     /// paid-tier-aware watcher should alert on ("AI backend down"), which
     /// otherwise only ever reached the one caller who happened to hit it.
     pub ai_backend_failures: u64,
+    /// #697: edge-facing channel-authorize requests refused with reason
+    /// `topology-unkeyed` since start -- a topology edge authorized the holder, but no
+    /// attested Noise key is registered for the derived channel, so the plane refuses
+    /// at admission (option B) instead of admitting a holder no session can be built
+    /// with. Non-zero means a drawn edge is live whose endpoint never completed the
+    /// key-registration step; the CP log line of the same name says which one.
+    pub channel_authorize_refused_topology_unkeyed: u64,
     /// Whether any account is on a paid plan right now -- the qualifier that
     /// turns "control plane down" from a general incident into one that also
     /// owes someone an SLA/refund conversation. `false` on a deployment with
@@ -4652,6 +4689,7 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         unauth_write_limit_per_min: unauth_write_limit_per_min(),
         paddle_webhook_rejected,
         ai_backend_failures,
+        channel_authorize_refused_topology_unkeyed: channel_authorize_refused_topology_unkeyed(),
         has_paid_accounts,
     }
 }
@@ -4675,6 +4713,7 @@ fn refresh_refusal_counters(resp: &mut StatusResp) {
     let (paddle_webhook_rejected, ai_backend_failures) = paid_tier_alert_counters();
     resp.paddle_webhook_rejected = paddle_webhook_rejected;
     resp.ai_backend_failures = ai_backend_failures;
+    resp.channel_authorize_refused_topology_unkeyed = channel_authorize_refused_topology_unkeyed();
 }
 
 async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
@@ -6622,7 +6661,9 @@ fn ct_token_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// only when the admin token is configured.
 ///
 /// * `POST /internal/channel/authorize` `{channel, holder}` + header `x-ct-admin-token`
-///   → `200 {operator_pubkey}` iff member; `401` bad/missing token; `404` non-member.
+///   → `200 {operator_pubkey}` iff member; `401` bad/missing token; `404` non-member --
+///   and (#697) `404` for a topology-only holder with no registered Noise key, which the
+///   edge maps to the same definitive `not-member` refusal.
 fn internal_channel_authorize_router(
     channels: Arc<SqliteChannelStore>,
     topologies: Arc<SqliteTopologyStore>,
@@ -6659,6 +6700,26 @@ struct AuthorizeResp {
     noise_attestation: Option<String>,
 }
 
+/// What the store lookup behind [`channel_authorize`] resolved to (#697): the three
+/// outcomes are distinct on purpose, so the handler can log and count the unkeyed
+/// topology refusal without the edge ever seeing anything but a plain `404`.
+enum AuthorizeLookup {
+    /// A current channel member (any key state -- a legacy member enrolled before
+    /// AF4-keydist legitimately has no key), or a topology-authorized holder whose
+    /// attested Noise key IS registered for the derived channel.
+    Authorized {
+        operator: [u8; 32],
+        noise: Option<[u8; 32]>,
+        attestation: Option<[u8; 64]>,
+    },
+    /// Neither a member nor named by any bound topology edge.
+    NotMember,
+    /// #697 option B: a bound topology edge authorizes the holder, but no attested Noise
+    /// key is registered for the derived channel -- refused at admission, since no
+    /// session (direct or relay) can be built without the peer key anyway.
+    TopologyUnkeyed,
+}
+
 async fn channel_authorize(
     State(state): State<AdminChannelState>,
     headers: HeaderMap,
@@ -6691,34 +6752,54 @@ async fn channel_authorize(
     let topologies = state.topologies.clone();
     let lookup = tokio::task::spawn_blocking(move || {
         let cid = ChannelId(channel);
-        let op = channels.authorize_holder(&cid, &holder)?;
-        let op = match op {
-            Some(op) => Some(op),
-            // #235/#107-enforce (ii-b): a declared topology edge is an ADDITIVE second path
-            // to authorization, consulted only when the channel-membership registry has no
-            // match -- a bound topology never removes an existing channel's authorization,
-            // it only ever ADDS one for a channel its own drawn edges name.
-            None => topologies.topology_authorizes(&cid, &holder)?,
-        };
-        let Some(op) = op else { return Ok(None) };
-        // Also hand back the member's attested Noise key (if registered) so the
-        // broker can deliver it to the paired peer (#72 AF4 / #100). A topology-only
-        // authorization (no channel-store registration at all) simply has neither --
-        // AuthorizeResp already treats both as optional.
+        // The member's attested Noise key (if registered), handed back so the broker can
+        // deliver it to the paired peer (#72 AF4 / #100).
         let noise = channels.member_noise_key(&cid, &holder).ok().flatten();
         let attestation = channels.member_noise_attestation(&cid, &holder).ok().flatten();
-        Ok::<_, rusqlite::Error>(Some((op, noise, attestation)))
+        if let Some(operator) = channels.authorize_holder(&cid, &holder)? {
+            // A registered member is admitted in ANY key state: "no Noise key" is a real
+            // legacy-member registration state (enrolled before AF4-keydist) that the
+            // member-ack wire grammar (ADR-0020) expressly allows.
+            return Ok(AuthorizeLookup::Authorized { operator, noise, attestation });
+        }
+        // #235/#107-enforce (ii-b): a declared topology edge is an ADDITIVE second path
+        // to authorization, consulted only when the channel-membership registry has no
+        // match -- a bound topology never removes an existing channel's authorization,
+        // it only ever ADDS one for a channel its own drawn edges name.
+        let Some(operator) = topologies.topology_authorizes(&cid, &holder)? else {
+            return Ok(AuthorizeLookup::NotMember);
+        };
+        // #697 (option B, decided 2026-09-06): a topology-authorized holder is admitted
+        // only with a registered, attested Noise key for the derived channel. Admitting it
+        // without one never yielded a session -- the broker paired it and counted a
+        // success, then both agents aborted on "relayed no peer Noise key" and re-parked
+        // in a loop, burning the honest peer's park/pair slot every cycle. Refusing here
+        // is fail-closed at the earliest point (ADR-0020 §3 "clean deny, no partial
+        // access") and loses no working session. The attestation travels with the key
+        // (`add_member` stores both or neither), so the key alone is the gate.
+        if noise.is_none() {
+            return Ok(AuthorizeLookup::TopologyUnkeyed);
+        }
+        Ok::<_, rusqlite::Error>(AuthorizeLookup::Authorized { operator, noise, attestation })
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match lookup {
-        Some((op, noise, attestation)) => Ok(Json(AuthorizeResp {
-            operator_pubkey: hex_encode(&op),
+        AuthorizeLookup::Authorized { operator, noise, attestation } => Ok(Json(AuthorizeResp {
+            operator_pubkey: hex_encode(&operator),
             noise_pubkey: noise.map(|n| hex_encode(&n)),
             noise_attestation: attestation.map(|a| hex_encode(&a)),
         })),
-        None => Err(StatusCode::NOT_FOUND),
+        AuthorizeLookup::NotMember => Err(StatusCode::NOT_FOUND),
+        AuthorizeLookup::TopologyUnkeyed => {
+            // Same status as a non-member on purpose: the edge maps `404` to its definitive
+            // `Refused` / `not-member` outcome (channel_authorize.rs), so the agent applies
+            // the exponential refusal backoff instead of the flat transient retry loop.
+            // The cause is named here, in the CP log + `/status` counter, not on the wire.
+            note_channel_authorize_refused_topology_unkeyed(&hex_encode(&channel), &hex_encode(&holder));
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -11709,10 +11790,11 @@ mod tests {
         // #235/#107-enforce (ii-b): a declared topology edge is a SECOND, ADDITIVE path to
         // channel authorization -- neither replaces nor restricts the existing
         // channel-membership path. Exercises both halves: a topology-only holder (never
-        // registered in the channel store at all) gets authorized purely from a declared
-        // edge, and a genuinely unrelated channel/holder pair with NO topology involvement
-        // is completely unaffected by topologies existing elsewhere in the same store.
-        use axum::body::{to_bytes, Body};
+        // registered in the channel store at all) is reached purely through a declared
+        // edge (and, since #697, refused there for lacking a registered Noise key), and a
+        // genuinely unrelated channel/holder pair with NO topology involvement is
+        // completely unaffected by topologies existing elsewhere in the same store.
+        use axum::body::Body;
         use axum::http::Request;
         use ed25519_dalek::{Signer, SigningKey};
         use tower::ServiceExt;
@@ -11746,19 +11828,227 @@ mod tests {
             app.clone().oneshot(req.body(Body::from(body)).unwrap())
         };
 
-        // The topology-declared edge authorizes holder_a on the derived channel -- purely
-        // from the drawn edge, with no channel-store registration whatsoever.
+        // The topology-declared edge DOES authorize holder_a on the derived channel -- purely
+        // from the drawn edge, with no channel-store registration whatsoever -- but #697
+        // (option B) refuses an authorized holder that has no registered Noise key, so the
+        // edge sees a plain 404. That the topology path was consulted (and not just the
+        // membership one) is visible in the `topology-unkeyed` counter moving: a holder no
+        // edge names (below) is a 404 that does NOT move it.
+        let _serialized = UNKEYED_COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = channel_authorize_refused_topology_unkeyed();
         let r = post(&topo_channel, holder_a).await.unwrap();
-        assert_eq!(r.status(), StatusCode::OK, "topology edge authorizes a never-registered holder");
-        let bytes = to_bytes(r.into_body(), 1 << 16).await.unwrap();
-        let resp: AuthorizeResp = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(resp.operator_pubkey, hex_encode(&op_pub));
-        assert_eq!(resp.noise_pubkey, None, "no channel-store registration -> no noise key to hand back");
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_FOUND,
+            "a topology-authorized holder with no registered Noise key is refused (#697)"
+        );
+        assert_eq!(
+            channel_authorize_refused_topology_unkeyed(),
+            before + 1,
+            "the refusal is the topology-unkeyed kind -- proof the edge path was consulted"
+        );
 
         // A genuinely unrelated (channel, holder) pair -- no edge names it -- is still a
-        // clean 404, unaffected by the topology store having OTHER real topologies in it.
+        // clean 404, unaffected by the topology store having OTHER real topologies in it,
+        // and NOT counted as a topology-unkeyed refusal.
         let unrelated: ct_common::channel::ChannelId = ct_common::channel::ChannelId([0x99u8; 32]);
         assert_eq!(post(&unrelated, [0x44u8; 32]).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            channel_authorize_refused_topology_unkeyed(),
+            before + 1,
+            "a plain non-member 404 is not a topology-unkeyed refusal"
+        );
+    }
+
+    /// #697: serializes the tests that count `topology-unkeyed` refusals, since the
+    /// counter is process-wide and the tests in this binary run in parallel.
+    static UNKEYED_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn internal_channel_authorize_refuses_an_unkeyed_topology_only_holder_697() {
+        // #697 option B: a holder a bound topology edge authorizes, with NO registered,
+        // attested Noise key for the derived channel, is refused at admission with the same
+        // 404 a non-member gets (the edge maps it to its definitive `not-member` refusal),
+        // and the refusal is counted under `topology-unkeyed` so it is observable in
+        // `/status`. Before this, the CP admitted it with `noise_pubkey: None`, the broker
+        // paired it and counted a success, and both agents aborted and re-parked forever.
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+
+        let op_key = SigningKey::from_bytes(&[0x12u8; 32]);
+        let op_pub = op_key.verifying_key().to_bytes();
+        let holder_a = SigningKey::from_bytes(&[0x23u8; 32]).verifying_key().to_bytes();
+        let holder_b = SigningKey::from_bytes(&[0x34u8; 32]).verifying_key().to_bytes();
+        let tid = "t697";
+        assert!(topologies.create_topology("owner697", tid, "net697").unwrap());
+        topologies.assign("owner697", &hex_encode(&holder_a), tid).unwrap();
+        topologies.assign("owner697", &hex_encode(&holder_b), tid).unwrap();
+        assert!(topologies.add_edge("owner697", tid, &hex_encode(&holder_a), &hex_encode(&holder_b)).unwrap());
+        let proof = op_key.sign(&ct_common::channel::topology_operator_binding_bytes(tid, &op_pub)).to_bytes();
+        assert!(topologies.set_operator("owner697", tid, &op_pub, &proof).unwrap());
+        let topo_channel = ct_common::channel::channel_id_for_link(&op_pub, &holder_a, &holder_b);
+        // Sanity: the topology path genuinely authorizes this holder -- the refusal below
+        // is the #697 key gate, not a missing edge.
+        assert_eq!(topologies.topology_authorizes(&topo_channel, &holder_a).unwrap(), Some(op_pub));
+        assert_eq!(channels.member_noise_key(&topo_channel, &holder_a).unwrap(), None, "no key registered");
+
+        let app = internal_channel_authorize_router(channels, topologies, admin);
+        let admin_hex = hex_encode(&admin);
+        let post = |holder: [u8; 32]| {
+            let req = Request::post("/internal/channel/authorize")
+                .header("content-type", "application/json")
+                .header("x-ct-admin-token", admin_hex.clone());
+            let body = format!(r#"{{"channel":"{}","holder":"{}"}}"#, hex_encode(&topo_channel.0), hex_encode(&holder));
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        let _serialized = UNKEYED_COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = channel_authorize_refused_topology_unkeyed();
+        assert_eq!(
+            post(holder_a).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "unkeyed topology-only holder -> 404, exactly like a non-member (#697)"
+        );
+        assert_eq!(
+            post(holder_b).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "the other endpoint of the same edge is just as unkeyed -> 404"
+        );
+        assert_eq!(
+            channel_authorize_refused_topology_unkeyed(),
+            before + 2,
+            "each unkeyed refusal is counted under topology-unkeyed"
+        );
+        // ... and `/status` carries the live value on the cache-serving path too.
+        let mut resp = StatusResp::default();
+        refresh_refusal_counters(&mut resp);
+        assert_eq!(resp.channel_authorize_refused_topology_unkeyed, before + 2, "/status exposes the counter");
+    }
+
+    #[tokio::test]
+    async fn internal_channel_authorize_admits_a_topology_holder_once_its_noise_key_is_registered_697() {
+        // #697: the same holder, after the registration step the decision asks topology
+        // authoring to gain -- `POST /me/channels` (the derived channel, under the topology's
+        // operator key) + `POST /me/channels/:channel/members` with the holder's attested
+        // Noise key -- is admitted with a 200 that carries the key and its attestation.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+
+        let op_key = SigningKey::from_bytes(&[0x13u8; 32]);
+        let op_pub = op_key.verifying_key().to_bytes();
+        let holder_a_sk = SigningKey::from_bytes(&[0x24u8; 32]);
+        let holder_a = holder_a_sk.verifying_key().to_bytes();
+        let holder_b = SigningKey::from_bytes(&[0x35u8; 32]).verifying_key().to_bytes();
+        let tid = "t697b";
+        assert!(topologies.create_topology("owner697", tid, "net697").unwrap());
+        topologies.assign("owner697", &hex_encode(&holder_a), tid).unwrap();
+        topologies.assign("owner697", &hex_encode(&holder_b), tid).unwrap();
+        assert!(topologies.add_edge("owner697", tid, &hex_encode(&holder_a), &hex_encode(&holder_b)).unwrap());
+        let proof = op_key.sign(&ct_common::channel::topology_operator_binding_bytes(tid, &op_pub)).to_bytes();
+        assert!(topologies.set_operator("owner697", tid, &op_pub, &proof).unwrap());
+        let topo_channel = ct_common::channel::channel_id_for_link(&op_pub, &holder_a, &holder_b);
+        let ch_hex = hex_encode(&topo_channel.0);
+
+        // The edge-facing gate and the owner-facing registry share one channel store.
+        let gate = internal_channel_authorize_router(channels.clone(), topologies, admin);
+        let admin_hex = hex_encode(&admin);
+        let authorize = |holder: [u8; 32]| {
+            let req = Request::post("/internal/channel/authorize")
+                .header("content-type", "application/json")
+                .header("x-ct-admin-token", admin_hex.clone());
+            let body = format!(r#"{{"channel":"{ch_hex}","holder":"{}"}}"#, hex_encode(&holder));
+            gate.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let registry = authed_channel_router(
+            channels.clone(),
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
+        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "owner697", "iss": issuer, "exp": now + 3600 });
+        let owner_jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let register = |path: String, body: String| {
+            let req = Request::post(&path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner_jwt}"));
+            registry.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        // Fail-first half: unkeyed today -> refused.
+        {
+            let _serialized = UNKEYED_COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(authorize(holder_a).await.unwrap().status(), StatusCode::NOT_FOUND, "unkeyed -> 404 (#697)");
+        }
+
+        // The registration step: the derived channel under the topology's operator key,
+        // then the holder's attested Noise key as a member of it (#101 attestation).
+        let op_hex = hex_encode(&op_pub);
+        assert_eq!(
+            register("/me/channels".into(), format!(r#"{{"channel":"{ch_hex}","operator_pubkey":"{op_hex}"}}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "the derived channel is registered under the topology's operator key"
+        );
+        let nk = [0xd7u8; 32];
+        let att = holder_a_sk
+            .sign(&ct_common::channel::member_noise_attest_bytes(&topo_channel, &holder_a, &nk))
+            .to_bytes();
+        assert_eq!(
+            register(
+                format!("/me/channels/{ch_hex}/members"),
+                format!(
+                    r#"{{"holder":"{}","noise_pubkey":"{}","noise_attestation":"{}"}}"#,
+                    hex_encode(&holder_a),
+                    hex_encode(&nk),
+                    hex_encode(&att)
+                )
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK,
+            "the holder's attested Noise key is registered for the derived channel"
+        );
+
+        // Now the same holder is admitted, and the key travels to the broker.
+        let r = authorize(holder_a).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "keyed -> 200 (#697)");
+        let bytes = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let resp: AuthorizeResp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.operator_pubkey, op_hex);
+        assert_eq!(resp.noise_pubkey.as_deref(), Some(hex_encode(&nk).as_str()), "the registered key is served");
+        assert_eq!(
+            resp.noise_attestation.as_deref(),
+            Some(hex_encode(&att).as_str()),
+            "with its holder attestation, so the peer can verify before pinning (#101)"
+        );
+        // The other endpoint never registered -> still refused (counted, hence under the lock).
+        {
+            let _serialized = UNKEYED_COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(authorize(holder_b).await.unwrap().status(), StatusCode::NOT_FOUND, "still unkeyed -> 404");
+        }
     }
 
     #[tokio::test]

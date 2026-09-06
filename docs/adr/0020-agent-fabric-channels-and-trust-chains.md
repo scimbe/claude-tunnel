@@ -138,7 +138,17 @@ OK <endpoint-or-mode> [<peer_noise_hex64> <peer_holder_hex64> <peer_attest_hex12
 
 - The `<peer_noise> <peer_holder> <peer_attest>` triple is **optional and all-or-nothing** —
   present only when the registry holds the peer's attested Noise key (#101); absent otherwise
-  (then "no peer Noise key" is a real registration state, not a parse failure).
+  (then "no peer Noise key" is a real registration state, not a parse failure). **Absent means
+  exactly one thing (#697, decided 2026-09-06): the peer is a *registered channel member*
+  enrolled before AF4-keydist/#101, i.e. a legacy-member state.** It is never a
+  topology-only outcome: a holder that a bound topology edge authorizes but that has no
+  attested Noise key registered for the derived channel is **refused at admission** by the
+  control plane (`404` → the edge's definitive `not-member` refusal, CP log
+  `channel-authorize NO [topology-unkeyed] …`, `/status` counter
+  `channel_authorize_refused_topology_unkeyed`) — so the broker never pairs a peer no session
+  could be built with, and §3's "clean deny, no partial access" holds. Topology authoring must
+  therefore register the holder's attested key (`POST /me/channels/:channel/members`) before
+  a drawn edge becomes live.
 - `r=` (own edge-observed reflexive, #121) and `sp=` (same-public-IP fact, #276) are **tagged,
   order-independent, and appended** — the line is deliberately **additively extensible**. A
   conformant parser reads positional fields up to the optional triple, then reads any trailing
