@@ -4,8 +4,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::noise::client_noise_exchange;
-use ct_common::noise::{client_handshake_for, frame, noise_pump, read_frame, read_frame_into};
+use crate::noise::{client_noise_exchange, client_noise_exchange_with_payload};
+use ct_common::noise::{
+    client_handshake_for, direct_handshake_payload, frame, noise_pump, read_frame, read_frame_into,
+};
 use ct_common::pow::{assemble_request, solve, Challenge};
 use ct_common::sync::MutexExt as _;
 use ct_common::{Capability, RoutingToken};
@@ -569,14 +571,28 @@ pub async fn client_direct_connect(
 /// Tunnel `payload` to the Origin over a **direct** connection to the Agent
 /// (M11.3c): no Edge rendezvous or PoW — the Noise handshake authenticates the
 /// path (Client pins the Origin Identity). Returns the decrypted response.
+///
+/// ct-agent#45 slice 2: because no Edge ever sees this path, the Client
+/// presents the tunnel's `token` to the Agent inside Noise message 1 -- the
+/// encoding is [`ct_common::noise::direct_handshake_payload`] (`0x01 ‖
+/// token(32)`, the wire contract lives on that doc comment) -- so a token
+/// revoked at the control plane (#554) can cut a direct client off too. The
+/// agent-side check landed in scimbe/ct-agent#159 (a pre-#45 agent ignores the
+/// payload; a #159 agent refuses a mismatch before message 2); the revocation
+/// poll is slice 3. The relayed entry points keep their empty message-1
+/// payload: there the Edge already checked the token at the rendezvous.
 pub async fn client_tunnel_direct(
     conn: &Connection,
+    token: &RoutingToken,
     cap: &Capability,
     client_private: &[u8; 32],
     payload: &[u8],
 ) -> Result<Vec<u8>, BoxError> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    let response = client_noise_exchange(&mut send, &mut recv, client_private, cap, payload).await?;
+    let hs_payload = direct_handshake_payload(token);
+    let response =
+        client_noise_exchange_with_payload(&mut send, &mut recv, client_private, cap, &hs_payload, payload)
+            .await?;
     send.finish()?;
     Ok(response)
 }
@@ -668,7 +684,7 @@ pub async fn client_tunnel_p2p_or_relay(
 
     let direct_fut = std::pin::pin!(async {
         let conn = client_direct_connect(candidate, cert, timeout).await?;
-        let resp = client_tunnel_direct(&conn, cap, client_private, payload).await;
+        let resp = client_tunnel_direct(&conn, token, cap, client_private, payload).await;
         conn.close(0u32.into(), b"done");
         resp
     });
@@ -786,7 +802,7 @@ pub async fn udp_selftest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ct_common::noise::generate_static_keypair;
+    use ct_common::noise::{generate_static_keypair, origin_handshake};
     use ct_common::OriginIdentity;
     use ct_edge::transport::build_server_endpoint_with_cert;
     use std::time::Instant;
@@ -1329,5 +1345,125 @@ mod tests {
             "the working rung is cached for the network"
         );
         edge.abort();
+    }
+
+    /// ct-agent#45 slice 2: over a real QUIC loopback, the direct path
+    /// (`client_direct_connect` + `client_tunnel_direct`) puts exactly
+    /// `0x01 ‖ token(32)` into Noise message 1 -- the loopback "agent" runs the
+    /// Origin responder, reads the message-1 payload the way ct-agent#159's
+    /// `serve_direct` does, and echoes the request so the client-side exchange
+    /// completes too.
+    #[tokio::test]
+    async fn client_tunnel_direct_presents_the_routing_token_in_noise_message_1_45() {
+        let token = RoutingToken([0xC3u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "127.0.0.1:4433".into(),
+        };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("agent direct listener");
+        let addr = server.local_addr().expect("addr");
+        let origin_priv = origin_kp.private;
+        let agent = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut hs = origin_handshake(&origin_priv).unwrap();
+            let mut buf = vec![0u8; 65535];
+            let mut tmp = vec![0u8; 65535];
+
+            let m1 = read_frame(&mut recv).await.unwrap();
+            let n = hs.read_message(&m1, &mut tmp).unwrap();
+            let hs_payload = tmp[..n].to_vec();
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            send.write_all(&frame(&buf[..n])).await.unwrap();
+
+            let mut transport = hs.into_transport_mode().unwrap();
+            let ct = read_frame(&mut recv).await.unwrap();
+            let n = transport.read_message(&ct, &mut tmp).unwrap();
+            let request = tmp[..n].to_vec();
+            let n = transport.write_message(&request, &mut buf).unwrap();
+            send.write_all(&frame(&buf[..n])).await.unwrap();
+            let _ = send.finish();
+            // Hand the connection back rather than dropping it here: quinn does
+            // not guarantee delivery of unacknowledged stream data across an
+            // abrupt close, so the agent side stays open until the client has
+            // read its response.
+            (hs_payload, conn)
+        });
+
+        let conn = client_direct_connect(addr, cert, Duration::from_secs(5)).await.expect("direct connect");
+        let resp = client_tunnel_direct(&conn, &token, &cap, &client_kp.private, b"direct-hello")
+            .await
+            .expect("direct tunnel");
+        assert_eq!(resp, b"direct-hello", "the direct exchange still round-trips");
+
+        let (seen, _agent_conn) = agent.await.unwrap();
+        assert_eq!(seen.len(), 33, "tag byte + 32-byte token, got {seen:02x?}");
+        assert_eq!(seen[0], 0x01, "v1 tag");
+        assert_eq!(&seen[1..], &token.0[..], "raw RoutingToken.0 after the tag");
+        assert_eq!(seen, direct_handshake_payload(&token).to_vec(), "byte-exact ct-common encoding");
+        conn.close(0u32.into(), b"done");
+    }
+
+    /// ct-agent#45 slice 2: the relayed path is UNCHANGED -- after the 'C'
+    /// rendezvous and the PoW request (difficulty 0 so the fake edge needs no
+    /// solve), `client_tunnel_noise_tcp` still sends an EMPTY Noise message-1
+    /// payload. Only the direct path presents the token; on the relay the Edge
+    /// already checked it in the `solution(8) | token(32)` request.
+    #[tokio::test]
+    async fn relayed_client_tunnel_noise_tcp_keeps_the_message_1_payload_empty_45() {
+        let token = RoutingToken([0xC3u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "127.0.0.1:4433".into(),
+        };
+
+        let (client_io, edge_io) = tokio::io::duplex(8192);
+        let origin_priv = origin_kp.private;
+        let expected_token = token.clone();
+        let edge_and_agent = tokio::spawn(async move {
+            let (mut r, mut w) = split(edge_io);
+            // Edge half: 'C', challenge (difficulty 0), 40-byte gated request.
+            let mut c = [0u8; 1];
+            r.read_exact(&mut c).await.unwrap();
+            assert_eq!(&c, b"C", "rendezvous role byte");
+            let mut chal = [0x22u8; 17];
+            chal[16] = 0;
+            w.write_all(&chal).await.unwrap();
+            let mut req = [0u8; 40];
+            r.read_exact(&mut req).await.unwrap();
+            assert_eq!(&req[8..], &expected_token.0[..], "the token rides in the rendezvous request");
+
+            // Agent half: Origin responder, capture the message-1 payload, echo.
+            let mut hs = origin_handshake(&origin_priv).unwrap();
+            let mut buf = vec![0u8; 65535];
+            let mut tmp = vec![0u8; 65535];
+            let m1 = read_frame(&mut r).await.unwrap();
+            let n = hs.read_message(&m1, &mut tmp).unwrap();
+            let hs_payload = tmp[..n].to_vec();
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            w.write_all(&frame(&buf[..n])).await.unwrap();
+            let mut transport = hs.into_transport_mode().unwrap();
+            let ct = read_frame(&mut r).await.unwrap();
+            let n = transport.read_message(&ct, &mut tmp).unwrap();
+            let request = tmp[..n].to_vec();
+            let n = transport.write_message(&request, &mut buf).unwrap();
+            w.write_all(&frame(&buf[..n])).await.unwrap();
+            hs_payload
+        });
+
+        let resp = client_tunnel_noise_tcp(client_io, &token, &cap, &client_kp.private, b"relay-hello")
+            .await
+            .expect("relayed tunnel");
+        assert_eq!(resp, b"relay-hello", "the relayed exchange round-trips");
+
+        let seen = edge_and_agent.await.unwrap();
+        assert!(seen.is_empty(), "relayed path: message-1 payload must stay empty, got {seen:02x?}");
     }
 }

@@ -4,7 +4,7 @@
 //! X25519 keypair; its public half is the Origin Identity a Client pins. The
 //! handshake (P3.2) and QUIC wiring (P3.3) follow.
 
-use crate::OriginIdentity;
+use crate::{OriginIdentity, RoutingToken};
 use std::io;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -130,6 +130,50 @@ pub fn client_handshake_for(
     cap: &crate::Capability,
 ) -> Result<snow::HandshakeState, snow::Error> {
     client_handshake(client_private, &cap.origin.0)
+}
+
+// ---------------------------------------------------------------------------
+// ct-agent#45: the RoutingToken in the direct-connect handshake payload
+// ---------------------------------------------------------------------------
+
+/// Version tag of the direct-connect handshake payload: "a RoutingToken
+/// follows" (ct-agent#45). See [`direct_handshake_payload`] for the encoding.
+pub const DIRECT_HS_PAYLOAD_TOKEN_V1: u8 = 0x01;
+
+/// Exact length of a v1 direct-connect handshake payload: the tag byte plus
+/// the raw 32-byte token.
+pub const DIRECT_HS_PAYLOAD_TOKEN_V1_LEN: usize = 1 + 32;
+
+/// Encode `token` as the **Noise_IK message-1 payload** a Client sends on the
+/// **direct-connect** path (ct-agent#45 slice 2). This is the one place the
+/// encoding is defined on the CADS-Tunnel side; the agent half that parses and
+/// judges it is ct-agent's `serve::DirectHandshakePayload` (scimbe/ct-agent#159).
+///
+/// Why: the relayed path is gated at the Edge (RoutingToken + PoW) before a
+/// stream ever reaches the Agent, but the direct path never touches the Edge,
+/// so a token revoked at the control plane (#554) could not cut a direct
+/// client off. Carrying the token inside message 1 -- which Noise_IK encrypts
+/// to the pinned Origin Identity, so a passive observer never sees it and only
+/// the real Origin key can read it -- lets the Agent apply the same gate.
+///
+/// | message-1 payload        | meaning on the agent                                 |
+/// |--------------------------|------------------------------------------------------|
+/// | (empty)                  | pre-#45 client, no token (accepted in rollout mode)  |
+/// | `0x01 ‖ token(32)`       | v1: the Client's `RoutingToken.0`, raw               |
+/// | `0x01 ‖ <not 32 bytes>`  | malformed -> refused                                 |
+/// | first byte != `0x01`     | unknown tag -> treated as "no token"                 |
+///
+/// The token's wire form is the same raw 32 bytes the relay path already puts
+/// on the wire in the `solution(8) | token(32)` rendezvous request -- no new
+/// serialization. Only the first byte is versioned: a future encoding picks a
+/// new tag rather than changing what `0x01` means. The relayed entry points
+/// keep sending an **empty** message-1 payload (the Edge has already checked
+/// the token there), so the Agent can tell the two apart.
+pub fn direct_handshake_payload(token: &RoutingToken) -> [u8; DIRECT_HS_PAYLOAD_TOKEN_V1_LEN] {
+    let mut out = [0u8; DIRECT_HS_PAYLOAD_TOKEN_V1_LEN];
+    out[0] = DIRECT_HS_PAYLOAD_TOKEN_V1;
+    out[1..].copy_from_slice(&token.0);
+    out
 }
 
 /// Length-prefix a message for streaming over a byte transport (2-byte
@@ -1272,5 +1316,58 @@ mod tests {
             ini.is_handshake_finished() && resp.is_handshake_finished(),
             "handshake pinned from the imported Capability completes with the matching Origin"
         );
+    }
+
+    /// ct-agent#45 slice 2: the direct-connect payload is exactly `0x01 ‖ token(32)`,
+    /// it rides inside Noise_IK message 1, and the Origin responder (`origin_handshake`,
+    /// the same helper ct-agent's serve path builds on) reads it back byte-exact --
+    /// while the rotation-aware `origin_handshake_any` still selects the pinned
+    /// identity for a message that carries a payload. Contrast: the relayed form
+    /// (empty payload) reads back as zero bytes, so the agent can tell them apart.
+    #[test]
+    fn direct_handshake_payload_rides_in_message_1_and_the_origin_reads_it_45() {
+        use crate::{Capability, OriginIdentity, RoutingToken};
+
+        let origin = generate_static_keypair();
+        let client = generate_static_keypair();
+        let token = RoutingToken([0xA5u8; 32]);
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let payload = direct_handshake_payload(&token);
+        assert_eq!(payload.len(), DIRECT_HS_PAYLOAD_TOKEN_V1_LEN, "tag byte + raw 32-byte token");
+        assert_eq!(payload[0], DIRECT_HS_PAYLOAD_TOKEN_V1, "v1 tag first");
+        assert_eq!(&payload[1..], &token.0[..], "raw RoutingToken.0 after the tag");
+
+        let mut ini = client_handshake_for(&client.private, &cap).unwrap();
+        let mut msg1 = [0u8; 1024];
+        let n = ini.write_message(&payload, &mut msg1).unwrap();
+
+        let mut resp = origin_handshake(&origin.private).unwrap();
+        let mut got = [0u8; 1024];
+        let m = resp.read_message(&msg1[..n], &mut got).unwrap();
+        assert_eq!(&got[..m], &payload[..], "the responder reads exactly 0x01 ‖ token out of message 1");
+
+        // A wrong key still cannot read it, and the rotation selector (#12) still
+        // finds the pinned identity when message 1 carries a payload.
+        let other = generate_static_keypair();
+        assert!(
+            origin_handshake(&other.private).unwrap().read_message(&msg1[..n], &mut got).is_err(),
+            "only the pinned Origin key decrypts the token-bearing message 1"
+        );
+        assert!(
+            origin_handshake_any(&[other.private, origin.private], &msg1[..n]).is_some(),
+            "origin_handshake_any selects the pinned identity for a token-bearing message 1"
+        );
+
+        // Relayed form: empty payload -> the responder reads zero bytes.
+        let mut ini_relay = client_handshake_for(&client.private, &cap).unwrap();
+        let n = ini_relay.write_message(&[], &mut msg1).unwrap();
+        let mut resp_relay = origin_handshake(&origin.private).unwrap();
+        let m = resp_relay.read_message(&msg1[..n], &mut got).unwrap();
+        assert_eq!(m, 0, "the relayed (pre-#45) form carries no message-1 payload");
     }
 }
