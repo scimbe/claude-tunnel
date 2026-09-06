@@ -30,6 +30,9 @@ use ct_dns::provider::DesecClient;
 mod uptime;
 /// #781: the fleet view (`GET /portal/fleet`) -- see `portal_api/fleet.rs`.
 mod fleet;
+/// #779: access windows / auto-expiring exposure -- the "Access window" card block,
+/// its two owner-scoped routes, and the best-effort push to the edge.
+mod access;
 
 /// #297: map a storage/DB error to a generic 500 instead of leaking `e`'s `Display`
 /// (SQLite internals — constraint/table/column names, schema state) to the caller.
@@ -338,7 +341,8 @@ pub fn portal_api_router_with_verifier(
         .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
         // #778/#783: uptime page, badge routes, usage page + CSV (see `uptime.rs`).
         .merge(uptime::routes())
-        .merge(fleet::routes());
+        .merge(fleet::routes())
+        .merge(access::routes());
     if verifier.is_some() {
         router = router
             .route("/me/signup", post(me_signup))
@@ -3870,6 +3874,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             let rest_bridge_modes = st.tunnels.rest_bridge_mode_batch(&subject, &tunnel_ids).unwrap_or_default();
             // #777: the per-tunnel dead-man alert blocks, pre-rendered by `crate::alerts`.
             let alert_blocks = crate::alerts::card_blocks(&st.tunnels, &subject, &tunnel_ids);
+            // #779: owner-scoped like the other batched lookups; a missing entry is unrestricted.
+            let access_policies = st.tunnels.access_policy_batch(&subject, &tunnel_ids).unwrap_or_default();
             // #776: the connection history rides in the SAME concurrent join as the
             // status scrape -- two bounded edge calls per tunnel, all in flight at
             // once, never a second sequential round.
@@ -3893,6 +3899,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                 let topology_link = topology_links.get(&t.id).cloned();
                 let rest_bridge_mode =
                     rest_bridge_modes.get(&t.id).cloned().unwrap_or_else(|| "off".to_string());
+                // #779: looked up before `t` moves into the row below.
+                let access_policy = access_policies.get(&t.id).cloned();
                 rows.push((
                     t,
                     owned,
@@ -3905,6 +3913,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     topology_link,
                     rest_bridge_mode,
                     history,
+                    access_policy,
                 ));
             }
             Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan, &alert_blocks))
@@ -4260,6 +4269,9 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
                 // edge_mesh Phase 0: record that this deployment's local edge now owns
                 // this (token, hostname) pair -- best-effort, never blocks the caller.
                 st.edge_mesh.record(&tunnel.routing_token, Some(host));
+                // #779: a fresh authorization re-sends the tunnel's access window too, so
+                // the edge never serves an authorized hostname without its policy.
+                access::push_current_access_policy(st, &tunnel.routing_token).await;
                 // #233 follow-up: promote Rot -> Gelb right now instead of waiting up
                 // to a full admission-loop tick (found live testing a fresh tunnel --
                 // nothing previously did this synchronously despite doc comments
@@ -5971,6 +5983,7 @@ type TunnelRow = (
     Option<String>, // the topology id this tunnel is linked to, if any
     String,         // rest_bridge_mode: "off" | "ephemeral" | "permanent"
     Option<EdgeTunnelHistory>, // #776: edge connection history; None = edge not asked/answered
+    Option<ct_common::access_window::AccessPolicy>, // #779: the owner's access window; None = unrestricted
 );
 
 fn tunnels_html(
@@ -5989,7 +6002,7 @@ fn tunnels_html(
     let owned_count = tunnels.iter().filter(|(_, owned, ..)| *owned).count() as u32;
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link, rest_bridge_mode, history)| {
+        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link, rest_bridge_mode, history, access_policy)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -6131,6 +6144,13 @@ fn tunnels_html(
             };
             // #777: dead-man alert block -- owner-only, like the login gate above.
             let alert_section = if *owned { alert_blocks.get(&t.id).cloned().unwrap_or_default() } else { String::new() };
+            // #779: access window -- owner-only, and only for a tunnel with public
+            // content to gate (a hostname), same rule as the login gate above.
+            let access_section = if *owned && t.hostname.is_some() {
+                access::card_block_now(&id, access_policy.as_ref())
+            } else {
+                String::new()
+            };
             // data-search: lowercased name+hostname, read by the search box's JS
             // filter below -- client-side (an account's own tunnel count is small,
             // no round trip needed) and independent of what's actually displayed
@@ -6151,7 +6171,7 @@ fn tunnels_html(
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}{alert_section}
+{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}{alert_section}{access_section}
 </details></div>"#,
                 name = escape(&t.name),
             )

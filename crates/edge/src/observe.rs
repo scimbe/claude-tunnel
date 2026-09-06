@@ -135,6 +135,17 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         tcp_reaped = state.tcp_reaped_total(),
         tcp_deliveries = state.tcp_deliveries_total(),
     );
+    // #779: front-door connections refused because the hostname's tunnel was outside
+    // its access window (both the SNI-passthrough and the Gelb leg). Separate from
+    // ct_edge_front_door_client_aborts_total on purpose: this is the edge's own decision,
+    // not a client going away, and an alert on it means "a closed hostname is being hit".
+    out.push_str(&format!(
+        "# HELP ct_edge_access_window_refused_total :443 front-door connections refused because \
+         the hostname's tunnel was outside its owner-set access window (#779).\n\
+         # TYPE ct_edge_access_window_refused_total counter\n\
+         ct_edge_access_window_refused_total {refused}\n",
+        refused = state.access_window_refused_total(),
+    ));
     // #497 slice 2: broker-loop liveness. Raw unix seconds (0 = loop never started); a
     // scraper alerts on staleness -- with the loops' own 10s idle tick, a value older than
     // ~30s means the accept loop is wedged, not idle (the 2026-08-13 outage class, invisible

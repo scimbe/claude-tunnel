@@ -334,6 +334,18 @@ where
     let token = state
         .route_host(&sni)
         .ok_or_else(|| format!("no tunnel registered for host '{sni}'"))?;
+    // #779: access window, evaluated locally from the pushed policy. On this
+    // passthrough leg the edge never terminates TLS, so there is no page to show --
+    // the connection is closed right after the ClientHello, the same refusal shape a
+    // hostname with no tunnel gets, and the typed error condenses under the throttle.
+    {
+        let now = unix_now() as i64;
+        if !state.access_window_open(&token, now) {
+            state.note_access_window_refused();
+            let next_change = state.access_policy(&token).and_then(|p| p.next_change(now));
+            return Err(Box::new(AccessWindowRefused { host: sni, next_change }));
+        }
+    }
     // #41 FB2: a TCP-fallback agent (UDP/QUIC blocked) is parked with no QUIC
     // connection — hand it the browser stream (buffered ClientHello + the rest)
     // directly, rather than opening a QUIC stream it doesn't have.
@@ -435,6 +447,19 @@ where
     let tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, wildcard_acceptor.accept(inbound))
         .await
         .map_err(|_| -> BoxError { "gelb-terminate: TLS handshake not completed within the timeout (#422)".into() })??;
+    // #779: access window, evaluated locally from the pushed policy. This leg
+    // terminates TLS, so the browser can be told WHY with a real `503` page and a
+    // `Retry-After` instead of a bare reset; the typed error then condenses under the
+    // front-door throttle like every other refusal.
+    {
+        let now = unix_now() as i64;
+        if !state.access_window_open(&token, now) {
+            state.note_access_window_refused();
+            let next_change = state.access_policy(&token).and_then(|p| p.next_change(now));
+            refuse_outside_access_window(tls, host, next_change, now).await;
+            return Err(Box::new(AccessWindowRefused { host: host.to_string(), next_change }));
+        }
+    }
     // #233 follow-up (found live, #229): a TCP-fallback agent (UDP/QUIC
     // blocked) is parked with no QUIC connection to open a stream on at all
     // -- `open_agent_stream` below would always fail "no agent tunnel for
@@ -1238,6 +1263,20 @@ pub enum ClientAbortClass {
     /// synthetic error in this codebase raises `NotConnected` for a real edge-side
     /// fault, so unlike `IdleTimeout` this needs no `raw_os_error()` narrowing — #631.
     NotConnected,
+    /// #779: not a client abort at all but a deliberate refusal -- the hostname's tunnel
+    /// is outside its access window. Rides the same throttle so a bot hammering a closed
+    /// hostname cannot flood the log (one full line per window, the rest aggregated);
+    /// counted in `ct_edge_access_window_refused_total`, NOT in the client-abort metric.
+    AccessWindowClosed,
+}
+
+impl ClientAbortClass {
+    /// #779: whether a benign class is a CLIENT abort for `ct_edge_front_door_client_aborts_total`.
+    /// An access-window refusal is the edge's own decision and has its own counter
+    /// (`ct_edge_access_window_refused_total`), so it must not inflate this one.
+    pub fn counts_as_client_abort(self) -> bool {
+        self != ClientAbortClass::AccessWindowClosed
+    }
 }
 
 impl ClientAbortClass {
@@ -1250,8 +1289,113 @@ impl ClientAbortClass {
             Self::TlsCloseNotifyMissing => "tls-close-notify-missing",
                 Self::IdleTimeout => "idle-timeout",
             Self::NotConnected => "not-connected",
+            Self::AccessWindowClosed => "access-window-closed",
         }
     }
+}
+
+/// #779: the typed error both `:443` front-door legs return when a hostname's tunnel is
+/// outside its access window. Typed (not a string) so [`classify_client_abort`] can
+/// recognize it by downcast and the throttle can condense it, the same way the io
+/// classes are matched on `ErrorKind` rather than message text.
+#[derive(Debug)]
+pub struct AccessWindowRefused {
+    /// The hostname that was asked for (already normalized by `route_host`).
+    pub host: String,
+    /// When the window next changes, if known (`AccessPolicy::next_change`).
+    pub next_change: Option<i64>,
+}
+
+impl std::fmt::Display for AccessWindowRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.next_change {
+            Some(at) => write!(
+                f,
+                "host {} is outside its access window (next change at {} UTC) -- refused (#779)",
+                self.host,
+                ct_common::access_window::format_utc_ymd_hm(at)
+            ),
+            None => write!(
+                f,
+                "host {} is outside its access window (no reopening scheduled) -- refused (#779)",
+                self.host
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AccessWindowRefused {}
+
+/// #779: cap on how much of the browser's request head the Gelb refusal drains before
+/// answering -- enough for any real request line + headers, small enough that a client
+/// streaming garbage cannot hold the slot (see [`refuse_outside_access_window`]).
+const ACCESS_WINDOW_REFUSAL_DRAIN_LIMIT: usize = 16 * 1024;
+/// #779: how long that drain may take before the 503 is written regardless.
+const ACCESS_WINDOW_REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// #779: `Retry-After` when the policy has no scheduled reopening (an expired
+/// exposure waits for an explicit re-arm, which this edge cannot predict).
+const ACCESS_WINDOW_REFUSAL_DEFAULT_RETRY_SECS: i64 = 3_600;
+
+/// #779: the small HTML page the Gelb (edge-terminated HTTP) leg answers with when the
+/// hostname's tunnel is outside its access window. `host` is a `route_host`-normalized
+/// DNS name (so it cannot carry markup), escaped anyway on principle.
+fn access_window_refusal_page(host: &str, next_change: Option<i64>) -> String {
+    let host = host.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let next = match next_change {
+        Some(at) => format!("The next change is at {} UTC.", ct_common::access_window::format_utc_ymd_hm(at)),
+        None => "No reopening is currently scheduled.".to_string(),
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>Outside access window</title>\
+         <style>body{{font:16px system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#222}}\
+         h1{{font-size:1.4rem}}code{{background:#eee;padding:.1em .3em;border-radius:3px}}</style></head>\
+         <body><h1>This service is outside its access window</h1>\
+         <p>The owner of <code>{host}</code> limits when it can be reached. {next}</p></body></html>\n"
+    )
+}
+
+/// #779: answer a browser on the Gelb (edge-terminated) leg with `503` + `Retry-After`
+/// and the refusal page, then close. The request head is drained first (bounded by
+/// [`ACCESS_WINDOW_REFUSAL_DRAIN_LIMIT`] / [`ACCESS_WINDOW_REFUSAL_DRAIN_TIMEOUT`]):
+/// closing a socket with unread bytes in its receive buffer makes the kernel answer
+/// with an RST, and a browser that sees the RST discards the response it was just
+/// sent -- the page would never render. Every I/O error here is swallowed: the
+/// refusal already happened, the response is best-effort courtesy.
+pub(crate) async fn refuse_outside_access_window<S>(mut stream: S, host: &str, next_change: Option<i64>, now: i64)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let drain = async {
+        let mut buf = [0u8; 1024];
+        let mut seen = Vec::with_capacity(1024);
+        loop {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"\r\n\r\n") || seen.len() >= ACCESS_WINDOW_REFUSAL_DRAIN_LIMIT {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(ACCESS_WINDOW_REFUSAL_DRAIN_TIMEOUT, drain).await;
+    let retry_after = next_change.map(|at| (at - now).max(1)).unwrap_or(ACCESS_WINDOW_REFUSAL_DEFAULT_RETRY_SECS);
+    let body = access_window_refusal_page(host, next_change);
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Retry-After: {retry_after}\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         \r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 /// #533: rustls' message for "the peer just dropped the TCP connection instead of
@@ -1316,7 +1460,18 @@ pub fn classify_client_abort(e: &BoxError) -> Option<ClientAbortClass> {
     let mut cur = Some(root);
     for _ in 0..CLIENT_ABORT_SOURCE_CHAIN_DEPTH {
         let err = cur?;
+        // #779: a deliberate access-window refusal is typed, so it condenses under the
+        // same throttle without any message matching.
+        if err.downcast_ref::<AccessWindowRefused>().is_some() {
+            return Some(ClientAbortClass::AccessWindowClosed);
+        }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            // #779: `io::Error::other(inner)` does not expose `inner` through `source()`
+            // (it forwards to `inner.source()`), so the wrapped refusal is only reachable
+            // through the payload accessor.
+            if io.get_ref().is_some_and(|inner| inner.downcast_ref::<AccessWindowRefused>().is_some()) {
+                return Some(ClientAbortClass::AccessWindowClosed);
+            }
             if let Some(class) = classify_io_client_abort(io) {
                 return Some(class);
             }
@@ -1402,7 +1557,12 @@ fn log_front_door_error_on(
         eprintln!("ct-edge: {leg} connection error: {e}");
         return FrontDoorErrorLog::Loud;
     };
-    FRONT_DOOR_CLIENT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // #779: an access-window refusal is the edge's own decision, not a client abort --
+    // it has its own counter (`ct_edge_access_window_refused_total`, bumped where the
+    // refusal is decided) and must not inflate this one.
+    if class.counts_as_client_abort() {
+        FRONT_DOOR_CLIENT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let (summary, decision) = {
         let mut t = log.lock_safe(); // #497-style poison resilience; no await under the lock
         (t.window_summary(now), t.note(now, class))
@@ -1426,10 +1586,17 @@ fn log_front_door_error_on(
             // Same leading text as before #533 (operators grep it; it is the line the
             // issue was filed about) plus the classification, so it is obvious that
             // further aborts of this class are being aggregated rather than lost.
-            eprintln!(
-                "ct-edge: {leg} connection error: {e} (benign client abort, class={}; further ones this window are aggregated — #533)",
-                class.label()
-            );
+            if class == ClientAbortClass::AccessWindowClosed {
+                eprintln!(
+                    "ct-edge: {leg} refused: {e} (class={}; further refusals this window are aggregated — #779)",
+                    class.label()
+                );
+            } else {
+                eprintln!(
+                    "ct-edge: {leg} connection error: {e} (benign client abort, class={}; further ones this window are aggregated — #533)",
+                    class.label()
+                );
+            }
             FrontDoorErrorLog::BenignFirst(class)
         }
         crate::log_throttle::LogDecision::Suppress => {
@@ -3774,6 +3941,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         state.authorize_host(&host, RoutingToken(pair.token));
                         authorized += 1;
                     }
+                    // #779: replay the tunnel's access window too, so a restart cannot
+                    // silently re-open an expired or scheduled exposure until the next push.
+                    if pair.policy.is_some() {
+                        state.set_access_policy(RoutingToken(pair.token), pair.policy);
+                    }
                 }
                 match &unavailable {
                     None => eprintln!(
@@ -3801,6 +3973,9 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         if let Some(host) = pair.hostname {
                                             rstate.authorize_host(&host, RoutingToken(pair.token));
                                             n += 1;
+                                        }
+                                        if pair.policy.is_some() {
+                                            rstate.set_access_policy(RoutingToken(pair.token), pair.policy); // #779
                                         }
                                     }
                                     // The recovery is logged too: an operator who saw the
@@ -8751,6 +8926,205 @@ mod tests {
             "must fail at the TLS-accept bound (~{FRONT_DOOR_TLS_ACCEPT_TIMEOUT:?}), not hang: {:?}",
             start.elapsed()
         );
+    }
+
+    /// #779: a self-signed "wildcard" acceptor for `app.example.test` plus the matching
+    /// browser-side connector, shared by the access-window tests below.
+    fn wildcard_pair_for_test() -> (tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        crate::transport::install_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["app.example.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let ccfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        (tokio_rustls::TlsAcceptor::from(Arc::new(scfg)), tokio_rustls::TlsConnector::from(Arc::new(ccfg)))
+    }
+
+    #[tokio::test]
+    async fn serve_gelb_terminated_answers_503_with_retry_after_outside_the_access_window_779() {
+        // #779: on the edge-terminated (Gelb) leg a closed access window is answered
+        // with a real HTTP 503 page and `Retry-After`, the refusal is counted on
+        // /metrics, and the handler's error is the typed, throttle-condensable class.
+        use ct_common::access_window::AccessPolicy;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (wildcard_tls, connector) = wildcard_pair_for_test();
+
+        let token = RoutingToken([0x79; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let _ = state.register_host("app.example.test", token.clone());
+        state.set_cert_tier("app.example.test", true);
+        // Expired an epoch ago: closed, and with no reopening scheduled.
+        state.set_access_policy(token.clone(), Some(AccessPolicy { expires_at: Some(1), schedule: None }));
+        let before = state.access_window_refused_total();
+
+        let (browser_side, edge_inbound) = tokio::io::duplex(64 * 1024);
+        let state_g = state.clone();
+        let gelb_task = tokio::spawn(async move {
+            serve_gelb_terminated(edge_inbound, "app.example.test", &state_g, &wildcard_tls).await
+        });
+
+        let sni = rustls::pki_types::ServerName::try_from("app.example.test").unwrap();
+        let mut tls = connector.connect(sni, browser_side).await.expect("TLS still terminates -- the page needs it");
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: app.example.test\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tls.read_to_end(&mut resp).await; // the edge closes after the page; EOF/close_notify either way
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 503 "), "a 503, not a reset: {text}");
+        assert!(text.contains("\r\nRetry-After: 3600\r\n"), "no reopening scheduled -> the default Retry-After: {text}");
+        assert!(text.contains("Connection: close"), "{text}");
+        assert!(text.contains("This service is outside its access window"), "{text}");
+        assert!(text.contains("No reopening is currently scheduled."), "{text}");
+        assert!(text.contains("app.example.test"), "names the host: {text}");
+
+        let err = tokio::time::timeout(Duration::from_secs(5), gelb_task).await.unwrap().unwrap().unwrap_err();
+        assert_eq!(classify_client_abort(&err), Some(ClientAbortClass::AccessWindowClosed), "{err}");
+        assert!(err.to_string().contains("outside its access window"), "{err}");
+        assert_eq!(state.access_window_refused_total(), before + 1, "counted once");
+        let metrics = crate::observe::render_edge_metrics(&*state, None);
+        assert!(metrics.contains("ct_edge_access_window_refused_total 1\n"), "{metrics}");
+    }
+
+    #[tokio::test]
+    async fn serve_gelb_terminated_serves_normally_inside_the_access_window_779() {
+        // #779: the same leg with a policy that is OPEN right now (far-future expiry)
+        // behaves exactly as with no policy -- here through the parked TCP-fallback
+        // agent path, the shape the #229 test above already pins.
+        use ct_common::access_window::AccessPolicy;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (wildcard_tls, connector) = wildcard_pair_for_test();
+
+        let token = RoutingToken([0x7a; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let _ = state.register_host("app.example.test", token.clone());
+        state.set_cert_tier("app.example.test", true);
+        state.set_access_policy(token.clone(), Some(AccessPolicy { expires_at: Some(i64::MAX / 2), schedule: None }));
+        let parked_rx = state.park_tcp_agent(token.clone());
+
+        let (browser_side, edge_inbound) = tokio::io::duplex(64 * 1024);
+        let state_g = state.clone();
+        let gelb_task = tokio::spawn(async move {
+            serve_gelb_terminated(edge_inbound, "app.example.test", &state_g, &wildcard_tls).await
+        });
+        let agent_task = tokio::spawn(async move {
+            let mut stream = parked_rx.await.expect("agent receives the delivered stream");
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(buf[..n].starts_with(b"GET "));
+            stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nopen").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let sni = rustls::pki_types::ServerName::try_from("app.example.test").unwrap();
+        let mut tls = connector.connect(sni, browser_side).await.unwrap();
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: app.example.test\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("200 OK") && text.contains("open"), "served normally inside the window: {text}");
+        assert_eq!(state.access_window_refused_total(), 0, "nothing refused");
+
+        agent_task.await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), gelb_task).await;
+    }
+
+    #[tokio::test]
+    async fn sni_passthrough_closes_after_the_client_hello_outside_the_access_window_779() {
+        // #779: the passthrough (Grün) leg never terminates TLS, so a closed window is
+        // a close right after the ClientHello -- nothing is delivered to the agent, the
+        // refusal is counted, and the error is the typed class the throttle condenses.
+        use ct_common::access_window::AccessPolicy;
+        use tokio::io::AsyncWriteExt;
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x7b; 32]);
+        let _ = state.register_host("closed.test", token.clone());
+        state.set_access_policy(token.clone(), Some(AccessPolicy { expires_at: Some(1), schedule: None }));
+        let live_rx = state.park_tcp_agent(token.clone());
+
+        let (mut browser, edge_end) = tokio::io::duplex(8192);
+        browser.write_all(&crate::sni::synth_client_hello(Some("closed.test"), &[])).await.unwrap();
+        let st = state.clone();
+        let serve = tokio::spawn(async move { serve_sni_passthrough(edge_end, &st).await });
+        let err = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("must not hang")
+            .unwrap()
+            .expect_err("refused");
+        assert_eq!(classify_client_abort(&err), Some(ClientAbortClass::AccessWindowClosed), "{err}");
+        assert!(err.to_string().contains("closed.test"), "names the host: {err}");
+        assert_eq!(state.access_window_refused_total(), 1);
+        assert!(state.has_tcp_agent(&token), "the parked agent was never handed the stream");
+        drop(live_rx);
+    }
+
+    #[test]
+    fn access_window_refusals_condense_under_the_throttle_but_are_not_client_aborts_779() {
+        // #779: a bot hammering a closed hostname gets one full line per window and is
+        // aggregated after that -- and never inflates the client-abort metric, which
+        // measures something else (clients going away).
+        let log = front_door_abort_log(FRONT_DOOR_ABORT_LOG_WINDOW_SECS, FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES);
+        let before = front_door_client_aborts_total();
+        let refused: BoxError =
+            Box::new(AccessWindowRefused { host: "closed.test".into(), next_change: Some(1_788_739_200) });
+        assert!(refused.to_string().contains("2026-09-07 00:00 UTC"), "{refused}");
+        assert_eq!(
+            log_front_door_error(&log, 1_000, &refused),
+            FrontDoorErrorLog::BenignFirst(ClientAbortClass::AccessWindowClosed)
+        );
+        for i in 1..50u64 {
+            assert_eq!(
+                log_front_door_error(&log, 1_000 + i, &refused),
+                FrontDoorErrorLog::BenignSuppressed(ClientAbortClass::AccessWindowClosed),
+                "repeat {i} is condensed"
+            );
+        }
+        // The counter itself is process-wide and bumped by parallel #533 tests, so the
+        // decision is asserted through its pure form rather than a before/after read.
+        assert!(!ClientAbortClass::AccessWindowClosed.counts_as_client_abort(), "refusals are not client aborts");
+        assert!(ClientAbortClass::ConnectionReset.counts_as_client_abort(), "a real client abort still counts");
+        let _ = before;
+        // A refusal wrapped one level down is still recognized (source-chain walk).
+        let wrapped: BoxError =
+            Box::new(std::io::Error::other(AccessWindowRefused { host: "x.test".into(), next_change: None }));
+        assert_eq!(classify_client_abort(&wrapped), Some(ClientAbortClass::AccessWindowClosed));
+        // The page itself: names the next change when known.
+        let page = access_window_refusal_page("a.test", Some(1_788_739_200));
+        assert!(page.contains("The next change is at 2026-09-07 00:00 UTC."), "{page}");
+        assert!(page.contains("<code>a.test</code>"));
+        let page = access_window_refusal_page("<b>", None);
+        assert!(page.contains("&lt;b&gt;") && !page.contains("<b>"), "escaped on principle: {page}");
+    }
+
+    #[tokio::test]
+    async fn refuse_outside_access_window_drains_the_request_head_and_sets_retry_after_779() {
+        // #779: the refusal reads the request head before answering (a close with
+        // unread bytes makes the kernel RST and the browser discard the page) and
+        // `Retry-After` is the seconds until the next change, floored at 1.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut browser, edge_end) = tokio::io::duplex(8192);
+        browser.write_all(b"GET /x HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        refuse_outside_access_window(edge_end, "a.test", Some(1_000 + 90), 1_000).await;
+        let mut resp = Vec::new();
+        browser.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 503 "), "{text}");
+        assert!(text.contains("\r\nRetry-After: 90\r\n"), "{text}");
+        let (head, body) = text.split_once("\r\n\r\n").expect("a blank line ends the head");
+        let len: usize = head.lines().find_map(|l| l.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+        assert_eq!(len, body.len(), "Content-Length matches the page");
+
+        // A next change in the past (a race with the boundary) still floors at 1.
+        let (mut browser, edge_end) = tokio::io::duplex(8192);
+        browser.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        refuse_outside_access_window(edge_end, "a.test", Some(5), 1_000).await;
+        let mut resp = Vec::new();
+        browser.read_to_end(&mut resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp).contains("Retry-After: 1\r\n"));
     }
 
     #[tokio::test]

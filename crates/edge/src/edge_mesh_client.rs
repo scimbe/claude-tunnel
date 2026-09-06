@@ -99,6 +99,11 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 struct RehydratePair {
     token: String,
     hostname: Option<String>,
+    /// #779: the tunnel's access window, if the owner set one. `default` so a control
+    /// plane that predates the field (no `policy` key at all) still parses -- absent
+    /// means unrestricted, exactly the pre-#779 behavior.
+    #[serde(default)]
+    policy: Option<ct_common::access_window::AccessPolicy>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +118,9 @@ struct HeartbeatReq<'a> {
 pub struct RehydratedPair {
     pub token: [u8; 32],
     pub hostname: Option<String>,
+    /// #779: the access window to replay into `EdgeState::set_access_policy`; `None`
+    /// (the common case, and everything an older control plane ever sends) = unrestricted.
+    pub policy: Option<ct_common::access_window::AccessPolicy>,
 }
 
 /// Fetch every (token, hostname) pair the control plane has recorded as owned
@@ -159,7 +167,9 @@ pub async fn rehydrate(cp_url: &str, admin_token: &[u8; 32], edge_id: &str) -> R
     Rehydration::Answered(
         pairs
             .into_iter()
-            .filter_map(|p| hex_decode_32(&p.token).map(|token| RehydratedPair { token, hostname: p.hostname }))
+            .filter_map(|p| {
+                hex_decode_32(&p.token).map(|token| RehydratedPair { token, hostname: p.hostname, policy: p.policy })
+            })
             .collect(),
     )
 }
@@ -311,6 +321,45 @@ mod tests {
         assert_eq!(got.len(), 2, "the malformed-token row is skipped, not fatal to the others");
         assert_eq!(got[0].hostname.as_deref(), Some("a.example.com"));
         assert_eq!(got[1].hostname, None, "a Mesh-Plane-only token (no hostname) round-trips as None");
+        assert!(got.iter().all(|p| p.policy.is_none()), "#779: no `policy` key at all parses as unrestricted");
+    }
+
+    #[tokio::test]
+    async fn rehydrate_carries_the_access_policy_when_the_registry_sends_one_779() {
+        // #779: a pair may carry the tunnel's access window; the edge replays it into
+        // its local map at boot so a restart does not silently re-open an expired or
+        // scheduled exposure until the next push.
+        let secret = [0x79u8; 32];
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_mock_cp(
+            secret,
+            r#"[{"token":"aa11223344556677889900112233445566778899001122334455667788990011","hostname":"a.example.com",
+                 "policy":{"expires_at":1789084800,"schedule":{"tz_offset_minutes":120,"slots":[{"day":0,"start_minute":540,"end_minute":1020}]}}},
+                {"token":"bb11223344556677889900112233445566778899001122334455667788990011","hostname":"b.example.com","policy":null}]"#,
+            hits,
+        )
+        .await;
+
+        let got = rehydrate(&base, &secret, "primary").await.pairs();
+        assert_eq!(got.len(), 2);
+        let policy = got[0].policy.as_ref().expect("the first pair carries a policy");
+        assert_eq!(policy.expires_at, Some(1_789_084_800));
+        let schedule = policy.schedule.as_ref().expect("with a schedule");
+        assert_eq!(schedule.tz_offset_minutes, 120);
+        assert_eq!(schedule.slots.len(), 1);
+        let slot = &schedule.slots[0];
+        assert_eq!((slot.day, slot.start_minute, slot.end_minute), (0, 540, 1020));
+        assert!(got[1].policy.is_none(), "an explicit null is unrestricted too");
+        // What the boot replay does with it, end to end against the state:
+        let state: crate::state::EdgeState<u32> = crate::state::EdgeState::new();
+        for pair in got {
+            state.set_access_policy(ct_common::RoutingToken(pair.token), pair.policy);
+        }
+        let a = ct_common::RoutingToken(
+            hex_decode_32("aa11223344556677889900112233445566778899001122334455667788990011").unwrap(),
+        );
+        assert!(state.access_policy(&a).is_some(), "rehydrate populates the edge's policy map");
+        assert!(!state.access_window_open(&a, 1_789_084_800), "and it is evaluated locally from then on");
     }
 
     #[tokio::test]

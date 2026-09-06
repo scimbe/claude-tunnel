@@ -2692,6 +2692,17 @@ impl SqliteTunnelStore {
                  hostname     TEXT PRIMARY KEY,
                  disabled_by  TEXT NOT NULL,
                  disabled_at  INTEGER NOT NULL
+             );
+             -- #779: access windows / auto-expiring exposure. One optional row per tunnel;
+             -- `policy_json` is a `ct_common::access_window::AccessPolicy`. `subject` is
+             -- denormalized so every owner-scoped read/write is one predicate, and the
+             -- edge-facing lookups join through subject_tunnels on the routing token, so
+             -- a row whose tunnel was revoked is inert (never joined) rather than harmful.
+             CREATE TABLE IF NOT EXISTS tunnel_access_policies (
+                 tunnel_id   TEXT PRIMARY KEY,
+                 subject     TEXT NOT NULL,
+                 policy_json TEXT NOT NULL,
+                 updated_at  INTEGER NOT NULL
              );",
         )?;
         // #778: opt-in public uptime badges. One row per tunnel that has a badge
@@ -3056,6 +3067,165 @@ impl SqliteTunnelStore {
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    /// #779: set (upsert) the access window of a tunnel the caller owns. `Ok(false)`
+    /// if the id is unknown or owned by someone else -- "existence leaks nothing",
+    /// the same posture as every other owner-scoped tunnel action here. The policy is
+    /// stored as its JSON wire form (the exact bytes the edge is pushed), and callers
+    /// validate it (`AccessPolicy::validate`) before it gets here.
+    pub fn set_access_policy(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+        policy: &ct_common::access_window::AccessPolicy,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let json = serde_json::to_string(policy).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+        })?;
+        let conn = self.writer.lock_safe();
+        if Self::owner_of(&conn, tunnel_id)?.as_deref() != Some(subject) {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO tunnel_access_policies (tunnel_id, subject, policy_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(tunnel_id) DO UPDATE SET
+                 subject = excluded.subject, policy_json = excluded.policy_json, updated_at = excluded.updated_at",
+            params![tunnel_id, subject, json, now],
+        )?;
+        Ok(true)
+    }
+
+    /// #779: remove the access window of a tunnel the caller owns (back to
+    /// unrestricted). `Ok(true)` whenever the caller owns the tunnel, whether or not a
+    /// policy row existed -- "clear" is idempotent; `Ok(false)` for an unknown or
+    /// foreign id, same as [`Self::set_access_policy`].
+    pub fn clear_access_policy(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.writer.lock_safe();
+        if Self::owner_of(&conn, tunnel_id)?.as_deref() != Some(subject) {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM tunnel_access_policies WHERE tunnel_id = ?1 AND subject = ?2",
+            params![tunnel_id, subject],
+        )?;
+        Ok(true)
+    }
+
+    /// #779: the access window of a tunnel the caller owns, `None` when unrestricted,
+    /// unknown, or someone else's. A row whose JSON no longer parses is logged and
+    /// read as `None` (unrestricted) rather than failing the caller's page.
+    pub fn access_policy(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+    ) -> rusqlite::Result<Option<ct_common::access_window::AccessPolicy>> {
+        let json: Option<String> = self
+            .read()
+            .query_row(
+                "SELECT policy_json FROM tunnel_access_policies WHERE tunnel_id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(json.as_deref().and_then(|j| Self::parse_access_policy(tunnel_id, j)))
+    }
+
+    /// #779: batched form of [`Self::access_policy`] for the tunnels-page render loop
+    /// (same shape as [`Self::require_login_batch`]). Keyed by tunnel id; no entry =
+    /// unrestricted.
+    pub fn access_policy_batch(
+        &self,
+        subject: &str,
+        tunnel_ids: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, ct_common::access_window::AccessPolicy>> {
+        if tunnel_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read();
+        let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT tunnel_id, policy_json FROM tunnel_access_policies
+             WHERE subject = ?1 AND tunnel_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, json) = row?;
+            if let Some(p) = Self::parse_access_policy(&id, &json) {
+                out.insert(id, p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// #779: the access window behind a routing token, for the edge-facing push
+    /// (`portal_api::authorize_hostname` re-sends it with a fresh authorization).
+    /// Joined through `subject_tunnels`, so a revoked tunnel's leftover row is never
+    /// found. Not owner-scoped: the routing token is itself the credential here.
+    pub fn access_policy_for_token(
+        &self,
+        routing_token: &str,
+    ) -> rusqlite::Result<Option<ct_common::access_window::AccessPolicy>> {
+        let row: Option<(String, String)> = self
+            .read()
+            .query_row(
+                "SELECT t.id, p.policy_json FROM tunnel_access_policies p
+                 JOIN subject_tunnels t ON t.id = p.tunnel_id
+                 WHERE t.routing_token = ?1",
+                params![routing_token],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(id, json)| Self::parse_access_policy(&id, &json)))
+    }
+
+    /// #779: every (routing token, policy) pair, for the edge rehydrate response
+    /// (`edge_mesh::rehydrate` attaches each edge-owned pair's policy). One query
+    /// regardless of tunnel count; the table only ever holds tunnels with a real
+    /// restriction, so it stays small.
+    pub fn access_policies_by_token(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, ct_common::access_window::AccessPolicy>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT t.routing_token, t.id, p.policy_json FROM tunnel_access_policies p
+             JOIN subject_tunnels t ON t.id = p.tunnel_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (token, id, json) = row?;
+            if let Some(p) = Self::parse_access_policy(&id, &json) {
+                out.insert(token, p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// #779: parse a stored `policy_json`; a row that no longer parses (a future
+    /// schema change, a hand-edited DB) is logged and treated as unrestricted rather
+    /// than failing every caller -- the same fail-open-with-a-loud-line posture the
+    /// portal already takes for a best-effort edge lookup.
+    fn parse_access_policy(tunnel_id: &str, json: &str) -> Option<ct_common::access_window::AccessPolicy> {
+        match serde_json::from_str::<ct_common::access_window::AccessPolicy>(json) {
+            Ok(p) if !p.is_unrestricted() => Some(p),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!(
+                    "ct-cp: tunnel_access_policies row for {tunnel_id} does not parse ({e}) -- read as unrestricted (#779)"
+                );
+                None
+            }
+        }
     }
 
     /// Enable/disable the Browser-Plane login gate for a tunnel the caller owns
@@ -9390,6 +9560,61 @@ mod tests {
             .find(|(row, _)| row.id == t.id)
             .expect("tunnel still present");
         assert_eq!(row.name, "padded-name", "rejected renames leave the prior name intact");
+    }
+
+    #[test]
+    fn access_policy_round_trips_owner_scoped_and_resolves_by_token_779() {
+        use ct_common::access_window::{AccessPolicy, Slot, WeeklySchedule};
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "shop", Some("shop.example.com")).unwrap().created().expect("hostname is free");
+        let bobs = store.create("bob", "bobs", Some("bobs.example.com")).unwrap().created().expect("hostname is free");
+        let policy = AccessPolicy {
+            expires_at: Some(1_789_084_800),
+            schedule: Some(WeeklySchedule {
+                tz_offset_minutes: 120,
+                slots: vec![Slot { day: 0, start_minute: 540, end_minute: 1020 }],
+            }),
+        };
+
+        // Nothing set: unrestricted everywhere.
+        assert_eq!(store.access_policy("alice", &t.id).unwrap(), None);
+        assert_eq!(store.access_policy_for_token(&t.routing_token).unwrap(), None);
+        assert!(store.access_policies_by_token().unwrap().is_empty());
+
+        // Owner-scoped writes: a stranger and an unknown id both come back `false`.
+        assert!(!store.set_access_policy("bob", &t.id, &policy, 1_000).unwrap(), "non-owner cannot set");
+        assert!(!store.set_access_policy("alice", "no-such-id", &policy, 1_000).unwrap(), "unknown id");
+        assert_eq!(store.access_policy("alice", &t.id).unwrap(), None, "the refused writes left nothing");
+
+        assert!(store.set_access_policy("alice", &t.id, &policy, 1_000).unwrap());
+        assert_eq!(store.access_policy("alice", &t.id).unwrap(), Some(policy.clone()), "round-trips");
+        assert_eq!(store.access_policy("bob", &t.id).unwrap(), None, "a non-owner reads nothing");
+        assert_eq!(store.access_policy_for_token(&t.routing_token).unwrap(), Some(policy.clone()), "resolves by token");
+        assert_eq!(store.access_policy_for_token(&bobs.routing_token).unwrap(), None);
+        let batch = store.access_policy_batch("alice", &[t.id.as_str(), bobs.id.as_str()]).unwrap();
+        assert_eq!(batch.len(), 1, "only alice's own tunnel, even though bob's id was asked for");
+        assert_eq!(batch.get(&t.id), Some(&policy));
+        let by_token = store.access_policies_by_token().unwrap();
+        assert_eq!(by_token.get(&t.routing_token), Some(&policy));
+
+        // Upsert replaces in place.
+        let expiry_only = AccessPolicy { expires_at: Some(42), schedule: None };
+        assert!(store.set_access_policy("alice", &t.id, &expiry_only, 2_000).unwrap());
+        assert_eq!(store.access_policy("alice", &t.id).unwrap(), Some(expiry_only));
+
+        // Clear: owner-scoped and idempotent.
+        assert!(!store.clear_access_policy("bob", &t.id).unwrap(), "non-owner cannot clear");
+        assert_eq!(store.access_policy("alice", &t.id).unwrap().map(|p| p.expires_at), Some(Some(42)), "still there");
+        assert!(store.clear_access_policy("alice", &t.id).unwrap());
+        assert_eq!(store.access_policy("alice", &t.id).unwrap(), None);
+        assert!(store.clear_access_policy("alice", &t.id).unwrap(), "clearing an already-clear tunnel is fine");
+        assert_eq!(store.access_policy_for_token(&t.routing_token).unwrap(), None);
+
+        // A revoked tunnel's leftover row is inert: never joined by token.
+        assert!(store.set_access_policy("alice", &t.id, &policy, 3_000).unwrap());
+        assert!(store.revoke("alice", &t.id, 3_001).unwrap().is_some());
+        assert_eq!(store.access_policy_for_token(&t.routing_token).unwrap(), None);
+        assert!(store.access_policies_by_token().unwrap().is_empty());
     }
 
     #[test]
