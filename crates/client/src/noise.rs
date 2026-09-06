@@ -28,6 +28,11 @@ async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, BoxEr
 /// Run the Client (initiator) `Noise_IK` handshake against the Origin responder,
 /// pinning the Origin Identity in `cap`, then send `payload` encrypted and
 /// return the decrypted response.
+///
+/// Message 1 carries an **empty** handshake payload: the relayed form, where
+/// the Edge has already checked the RoutingToken at the PoW-gated rendezvous.
+/// The direct-connect path uses [`client_noise_exchange_with_payload`] instead
+/// (ct-agent#45 slice 2).
 pub async fn client_noise_exchange<S, R>(
     send: &mut S,
     recv: &mut R,
@@ -39,12 +44,37 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    client_noise_exchange_with_payload(send, recv, client_private, cap, &[], payload).await
+}
+
+/// [`client_noise_exchange`] with `handshake_payload` carried inside Noise_IK
+/// **message 1** -- encrypted to the pinned Origin Identity, so only the real
+/// Origin key can read it and the Edge (or any observer) never sees it.
+///
+/// ct-agent#45 slice 2: the direct-connect path presents the tunnel's
+/// RoutingToken this way, encoded by
+/// [`ct_common::noise::direct_handshake_payload`] (`0x01 ‖ token(32)`; that
+/// doc comment is the wire contract). An empty `handshake_payload` is
+/// byte-for-byte the pre-#45 wire form, which is what [`client_noise_exchange`]
+/// passes for every relayed entry point.
+pub async fn client_noise_exchange_with_payload<S, R>(
+    send: &mut S,
+    recv: &mut R,
+    client_private: &[u8; 32],
+    cap: &Capability,
+    handshake_payload: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, BoxError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let mut hs = client_handshake_for(client_private, cap)?;
     let mut buf = vec![0u8; 65535];
     let mut tmp = vec![0u8; 65535];
 
-    // -> handshake message 1 (e, es, s, ss)
-    let n = hs.write_message(&[], &mut buf)?;
+    // -> handshake message 1 (e, es, s, ss) + the caller's handshake payload
+    let n = hs.write_message(handshake_payload, &mut buf)?;
     send.write_all(&frame(&buf[..n])).await?;
     send.flush().await?;
 
@@ -68,8 +98,102 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ct_common::noise::{generate_static_keypair, origin_handshake};
+    use ct_common::noise::{direct_handshake_payload, generate_static_keypair, origin_handshake};
     use ct_common::{OriginIdentity, RoutingToken};
+
+    /// Origin responder over the server half of a duplex: terminate Noise_IK,
+    /// echo one encrypted frame back, and return the **message-1 payload** it
+    /// read -- what an agent applying ct-agent#45's token check would see.
+    fn spawn_echo_responder(
+        server_io: tokio::io::DuplexStream,
+        origin_priv: [u8; 32],
+    ) -> tokio::task::JoinHandle<Vec<u8>> {
+        tokio::spawn(async move {
+            let (mut s_read, mut s_write) = tokio::io::split(server_io);
+            let mut hs = origin_handshake(&origin_priv).unwrap();
+            let mut buf = vec![0u8; 65535];
+            let mut tmp = vec![0u8; 65535];
+
+            let m1 = read_frame(&mut s_read).await.unwrap();
+            let n = hs.read_message(&m1, &mut tmp).unwrap();
+            let hs_payload = tmp[..n].to_vec();
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            s_write.write_all(&frame(&buf[..n])).await.unwrap();
+
+            let mut transport = hs.into_transport_mode().unwrap();
+            let ct = read_frame(&mut s_read).await.unwrap();
+            let n = transport.read_message(&ct, &mut tmp).unwrap();
+            let plaintext = tmp[..n].to_vec();
+            let n = transport.write_message(&plaintext, &mut buf).unwrap();
+            s_write.write_all(&frame(&buf[..n])).await.unwrap();
+            hs_payload
+        })
+    }
+
+    /// ct-agent#45 slice 2: whatever the initiator hands
+    /// `client_noise_exchange_with_payload` as `handshake_payload` is exactly
+    /// what the Origin responder reads out of message 1 -- here the direct-connect
+    /// form `0x01 ‖ token(32)` -- and the exchange still completes end to end.
+    #[tokio::test]
+    async fn handshake_payload_lands_in_message_1_for_the_responder_45() {
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let token = RoutingToken([0x5Au8; 32]);
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (mut c_read, mut c_write) = tokio::io::split(client_io);
+        let responder = spawn_echo_responder(server_io, origin_kp.private);
+
+        let hs_payload = direct_handshake_payload(&token);
+        let resp = client_noise_exchange_with_payload(
+            &mut c_write,
+            &mut c_read,
+            &client_kp.private,
+            &cap,
+            &hs_payload,
+            b"direct-payload",
+        )
+        .await
+        .expect("noise exchange with a message-1 payload");
+        assert_eq!(resp, b"direct-payload", "the exchange still completes with a payload in message 1");
+
+        let seen = responder.await.unwrap();
+        assert_eq!(seen, hs_payload.to_vec(), "the responder read the handshake payload byte-exact");
+        assert_eq!(seen[0], 0x01, "v1 tag");
+        assert_eq!(&seen[1..], &token.0[..], "raw RoutingToken.0 after the tag");
+    }
+
+    /// ct-agent#45 slice 2: the plain `client_noise_exchange` -- every relayed
+    /// entry point (`client_tunnel_noise`, `client_tunnel_noise_tcp`) goes
+    /// through it -- keeps sending an EMPTY message-1 payload. The relayed wire
+    /// form is unchanged; only the direct path presents the token.
+    #[tokio::test]
+    async fn client_noise_exchange_keeps_the_message_1_payload_empty_45() {
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+        let cap = Capability {
+            token: RoutingToken([0x5Au8; 32]),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: "edge:443".into(),
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (mut c_read, mut c_write) = tokio::io::split(client_io);
+        let responder = spawn_echo_responder(server_io, origin_kp.private);
+
+        let resp = client_noise_exchange(&mut c_write, &mut c_read, &client_kp.private, &cap, b"relayed")
+            .await
+            .expect("noise exchange");
+        assert_eq!(resp, b"relayed");
+
+        let seen = responder.await.unwrap();
+        assert!(seen.is_empty(), "relayed form: no message-1 payload, got {seen:02x?}");
+    }
 
     #[tokio::test]
     async fn client_completes_noise_roundtrip_with_responder() {
