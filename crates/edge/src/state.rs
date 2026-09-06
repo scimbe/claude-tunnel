@@ -510,18 +510,18 @@ pub struct EdgeState<H> {
     /// is bounded only by process lifetime (one 32-byte entry per ever-revoked
     /// token).
     ///
-    /// A restart IS a full reclamation of this set (and, today, the ONLY one) --
-    /// but that is a pre-existing, separate gap from what #280 covers, not a
-    /// mitigation of it: `POST /admin/revoke/:token` (`admin.rs`) is a one-time
-    /// push at the moment of revocation, and nothing replays the CP's
-    /// currently-revoked tokens to the Edge at boot (checked: no such call
-    /// anywhere in this crate). So a restarted Edge starts with an *empty*
-    /// revoked set, and a still-reconnecting Agent for an already-revoked
-    /// tunnel would successfully re-register until the customer revokes again
-    /// -- which they have no reason to, believing it's already done. Filed
-    /// separately (deserves its own fix: a boot-time sync endpoint or
-    /// replay-on-connect from the CP), since building that is a real feature
-    /// addition, not the same bounded scope as this unbounded-growth finding.
+    /// A restart IS a full reclamation of this set -- and since #327 that is
+    /// safe, because the set is re-seeded at boot: `POST /admin/revoke/:token`
+    /// (`admin.rs`) is the one-time push at the moment of revocation, and
+    /// `serve::run_edge` replays the control plane's durable record of every
+    /// currently-revoked token (`edge_mesh_client::fetch_revoked_tokens` against
+    /// the CP's `/internal/revoked-tokens`, fed into
+    /// [`seed_revoked_tokens`](Self::seed_revoked_tokens)) BEFORE any public
+    /// listener opens (#503 made that replay awaited inline, closing the boot
+    /// window in which an already-revoked, still-reconnecting Agent could
+    /// re-register). So a restarted Edge starts with the CP's revoked set, not
+    /// an empty one. (An earlier version of this comment predated #327 and
+    /// claimed no such boot-time seed existed.)
     /// #362: `RwLock` -- read on every `is_revoked()` check (the rendezvous
     /// hot path), written only at revoke/boot-seed time.
     revoked: RwLock<HashSet<RoutingToken>>,
@@ -708,6 +708,20 @@ pub struct EdgeState<H> {
     /// "last-seen" is that a currently-offline tunnel still reports when it
     /// was last seen, which `connected_since` alone cannot answer once cleared.
     last_seen: Mutex<HashMap<RoutingToken, u64>>,
+    /// #776: durable per-tunnel session history (`tunnel_history.rs`). `None` =
+    /// disabled (`CT_EDGE_TUNNEL_HISTORY=off`, or the store failed to open even in
+    /// memory) -- every history call below is then a no-op, exactly like `audit_log`.
+    /// Set once at boot via [`set_tunnel_history`](Self::set_tunnel_history).
+    /// `RwLock`: read on every register/teardown and by the flush loop, written once.
+    tunnel_history: RwLock<Option<std::sync::Arc<crate::tunnel_history::SqliteTunnelHistory>>>,
+    /// #776: per token, the `tunnel_bytes` value already written into the session
+    /// history -- the flush loop and the close paths write only `tunnel_bytes -
+    /// flushed_bytes` (the delta since the last flush) into the open session row,
+    /// so `tunnel_bytes` itself stays the cumulative in-memory counter the
+    /// tunnel-status route reports and the relay hot path never touches SQLite.
+    /// Evicted together with the three maps above by
+    /// [`flush_tunnel_history`](Self::flush_tunnel_history).
+    flushed_bytes: Mutex<HashMap<RoutingToken, (u64, u64)>>,
     /// #282 follow-up: `agents`/`candidates`/`direct`/`hosts` are four
     /// independent mutexes with no shared critical section of their own, which
     /// left a narrow but real TOCTOU window between [`remove_registration`]'s
@@ -763,6 +777,8 @@ impl<H: Clone> EdgeState<H> {
             tunnel_bytes: Mutex::new(HashMap::new()),
             connected_since: Mutex::new(HashMap::new()),
             last_seen: Mutex::new(HashMap::new()),
+            tunnel_history: RwLock::new(None),
+            flushed_bytes: Mutex::new(HashMap::new()),
             registration_lock: Mutex::new(()),
             active_tunnels_gauge: AtomicU64::new(0),
             total_registrations_gauge: AtomicU64::new(0),
@@ -1231,7 +1247,7 @@ impl<H: Clone> EdgeState<H> {
         self.tcp_agents.lock_safe().entry(token.clone()).or_default().push_back(tx);
         // ADR-0025 Decision 6: a fallback-only tunnel (never QUIC-registered) must
         // still show up as connected/uptime-tracked -- see `note_connected`'s doc.
-        self.note_connected(&token, Self::wall_now());
+        self.note_connected(&token, Self::wall_now(), crate::tunnel_history::TRANSPORT_TCP_FALLBACK);
         // Instrumented so a fallback-only Agent is visible at all (see `tcp_parks`).
         self.tcp_parks.inc();
         self.tcp_parked_gauge.fetch_add(1, Ordering::Relaxed);
@@ -1443,7 +1459,7 @@ impl<H: Clone> EdgeState<H> {
             }
             entry.push((id, handle));
         }
-        self.note_connected(&token, now);
+        self.note_connected(&token, now, crate::tunnel_history::TRANSPORT_QUIC);
         self.total_registrations_gauge.fetch_add(1, Ordering::Relaxed);
         self.registrations.inc();
         id
@@ -1460,9 +1476,160 @@ impl<H: Clone> EdgeState<H> {
     /// `registrations > 0 || fallback_parked > 0` #544 contract), and
     /// [`note_relay`] separately keeps `last_seen` moving for an
     /// already-registered tunnel between registration events.
-    fn note_connected(&self, token: &RoutingToken, now: u64) {
+    ///
+    /// #776: this is also the ONLY place a durable session row is opened --
+    /// `transport` (`"quic"` / `"tcp-fallback"`) is what the row records. The
+    /// store's own one-open-row-per-token rule mirrors the `or_insert` above: a
+    /// redundant registration or a transport switch mid-streak updates the open
+    /// row's transport instead of starting a second session.
+    fn note_connected(&self, token: &RoutingToken, now: u64, transport: &'static str) {
         self.connected_since.lock_safe().entry(token.clone()).or_insert(now);
         self.last_seen.lock_safe().insert(token.clone(), now);
+        if let Some(history) = self.tunnel_history() {
+            let hex = crate::tunnel_history::routing_token_hex(token);
+            if let Err(e) = history.open_session(&hex, transport, now as i64) {
+                eprintln!("ct-edge: tunnel history: failed to open a session row: {e} (#776)");
+            }
+        }
+    }
+
+    /// #776: install the session history store (once, at boot). Every open/close/
+    /// flush call is a no-op until this runs.
+    pub fn set_tunnel_history(&self, history: std::sync::Arc<crate::tunnel_history::SqliteTunnelHistory>) {
+        *self.tunnel_history.write_safe() = Some(history);
+    }
+
+    /// #776: the configured session history, if any.
+    pub fn tunnel_history(&self) -> Option<std::sync::Arc<crate::tunnel_history::SqliteTunnelHistory>> {
+        self.tunnel_history.read_safe().clone()
+    }
+
+    /// #776: distinct routing tokens currently held in the in-memory timing/byte
+    /// maps (`last_seen` is their superset: `note_connected` and `note_relay` both
+    /// write it) -- the `ct_edge_tunnel_history_tracked_tokens` gauge, so an operator
+    /// can see the eviction actually bounding the maps.
+    pub fn tunnel_history_tracked_tokens(&self) -> usize {
+        self.last_seen.lock_safe().len()
+    }
+
+    /// #776: write `token`'s byte delta since the last flush into its open session
+    /// row and record the new high-water mark. A delta with no open row (bytes
+    /// relayed between sessions) is dropped, not carried into the next session --
+    /// it belongs to no streak. On a store error nothing is marked flushed, so the
+    /// delta is retried next round. Returns whether a row was written.
+    fn flush_token_bytes(
+        &self,
+        history: &crate::tunnel_history::SqliteTunnelHistory,
+        token: &RoutingToken,
+        now: u64,
+    ) -> bool {
+        let Some((cur_in, cur_out)) = self.tunnel_bytes.lock_safe().get(token).copied() else {
+            return false;
+        };
+        let (flushed_in, flushed_out) = self.flushed_bytes.lock_safe().get(token).copied().unwrap_or((0, 0));
+        let (delta_in, delta_out) = (cur_in.saturating_sub(flushed_in), cur_out.saturating_sub(flushed_out));
+        if delta_in == 0 && delta_out == 0 {
+            return false;
+        }
+        let hex = crate::tunnel_history::routing_token_hex(token);
+        match history.add_session_bytes(&hex, delta_in, delta_out, now as i64) {
+            Ok(written) => {
+                self.flushed_bytes.lock_safe().insert(token.clone(), (cur_in, cur_out));
+                written
+            }
+            Err(e) => {
+                eprintln!("ct-edge: tunnel history: byte flush failed: {e} (#776)");
+                false
+            }
+        }
+    }
+
+    /// #776: final byte flush, then close `token`'s open session row with `reason`
+    /// (`"registration-closed"` / `"removed"` / `"revoked"`). Called from the two
+    /// teardown paths that clear `connected_since` -- and only those, so the row's
+    /// lifetime is exactly the in-memory streak's.
+    fn close_tunnel_session(&self, token: &RoutingToken, reason: &str) {
+        let Some(history) = self.tunnel_history() else { return };
+        let now = Self::wall_now();
+        self.flush_token_bytes(&history, token, now);
+        let hex = crate::tunnel_history::routing_token_hex(token);
+        if let Err(e) = history.close_session(&hex, now as i64, reason) {
+            eprintln!("ct-edge: tunnel history: failed to close a session row: {e} (#776)");
+        }
+    }
+
+    /// #776: one round of the flush loop (`tunnel_history::run_tunnel_history_flush_loop`),
+    /// with `now` injected so the eviction age is testable. Returns
+    /// `(tokens whose byte delta was written, tokens evicted)`.
+    ///
+    /// 1. For every token in `tunnel_bytes`, write the delta since the last flush into
+    ///    its open session row (see [`flush_token_bytes`](Self::flush_token_bytes)).
+    /// 2. Evict from `tunnel_bytes`/`last_seen`/`connected_since`/`flushed_bytes` every
+    ///    token with NO live registration on either transport whose last activity is
+    ///    at least `idle_evict_secs` old. Until #776 these maps never evicted (see
+    ///    `tunnel_bytes`'s own doc for the original cumulative-forever intent) -- the
+    ///    durable row now carries that history, so the in-memory entry can go. A token
+    ///    with a live registration is never evicted, however stale its timestamps look.
+    ///    If an evicted token still has an open session row (a fallback-only tunnel
+    ///    whose parks were all reaped -- nothing clears `connected_since` on that path,
+    ///    a pre-existing gap), the row is closed at its `last_seen` with reason
+    ///    `"idle-evicted"`, so it cannot count as uptime forever.
+    ///
+    /// No-op (besides returning zeros) when no history store is configured: without a
+    /// durable record, evicting would lose the byte totals the tunnel-status route
+    /// reports, so the maps keep today's cumulative-forever behavior.
+    ///
+    /// The eviction pass holds `registration_lock` (the flush pass does not): without
+    /// it, a `register_locked` landing between the "no live registration" check and
+    /// the map removal would have its fresh `connected_since` wiped and its just-opened
+    /// row closed as idle. Lock order matches the teardown paths (registration lock,
+    /// then the store's own mutex), so no cycle. `park_tcp_agent` does not take that
+    /// lock, so the same window remains for a fallback park racing the once-a-minute
+    /// pass: the park's `note_connected` reopens the row on its next call either way,
+    /// and the streak start moves by at most one park cycle -- accepted rather than
+    /// serializing every park against the flush loop.
+    pub fn flush_tunnel_history(&self, now: u64, idle_evict_secs: u64) -> (usize, usize) {
+        let Some(history) = self.tunnel_history() else {
+            return (0, 0);
+        };
+        let tokens_with_bytes: Vec<RoutingToken> = self.tunnel_bytes.lock_safe().keys().cloned().collect();
+        let mut flushed = 0usize;
+        for token in &tokens_with_bytes {
+            if self.flush_token_bytes(&history, token, now) {
+                flushed += 1;
+            }
+        }
+
+        let _guard = self.registration_lock.lock_safe();
+        let mut candidates: HashSet<RoutingToken> = self.last_seen.lock_safe().keys().cloned().collect();
+        candidates.extend(tokens_with_bytes);
+        candidates.extend(self.connected_since.lock_safe().keys().cloned());
+        candidates.extend(self.flushed_bytes.lock_safe().keys().cloned());
+        let mut evicted = 0usize;
+        for token in candidates {
+            let seen = self.last_seen.lock_safe().get(&token).copied();
+            let idle = seen.is_none_or(|s| now.saturating_sub(s) >= idle_evict_secs);
+            if !idle || self.registration_count(&token) > 0 || self.has_tcp_agent(&token) {
+                continue;
+            }
+            let hex = crate::tunnel_history::routing_token_hex(&token);
+            match history.open_session_exists(&hex) {
+                Ok(true) => {
+                    let closed_at = seen.unwrap_or(now) as i64;
+                    if let Err(e) = history.close_session(&hex, closed_at, "idle-evicted") {
+                        eprintln!("ct-edge: tunnel history: failed to close an idle session row: {e} (#776)");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("ct-edge: tunnel history: open-row lookup failed during eviction: {e} (#776)"),
+            }
+            self.tunnel_bytes.lock_safe().remove(&token);
+            self.last_seen.lock_safe().remove(&token);
+            self.connected_since.lock_safe().remove(&token);
+            self.flushed_bytes.lock_safe().remove(&token);
+            evicted += 1;
+        }
+        (flushed, evicted)
     }
 
     /// Current wall-clock time in Unix seconds, `0` on a clock error (matches
@@ -1612,6 +1779,7 @@ impl<H: Clone> EdgeState<H> {
             // so `connected_since` (which "uptime" is computed from) must not be
             // cleared out from under a tunnel that is still actually serving.
             self.connected_since.lock_safe().remove(token);
+            self.close_tunnel_session(token, "registration-closed");
         }
     }
 
@@ -1621,13 +1789,14 @@ impl<H: Clone> EdgeState<H> {
     /// [`remove_registration`](Self::remove_registration).
     pub fn remove(&self, token: &RoutingToken) {
         let _guard = self.registration_lock.lock_safe();
-        self.remove_locked(token);
+        self.remove_locked(token, "removed");
     }
 
     /// Shared by [`remove`](Self::remove) and [`revoke_token`](Self::revoke_token)
     /// -- assumes `registration_lock` is already held by the caller (it is NOT
-    /// reentrant, so this must never call back into `remove`).
-    fn remove_locked(&self, token: &RoutingToken) {
+    /// reentrant, so this must never call back into `remove`). `reason` is what
+    /// the token's session-history row records (#776): `"removed"` / `"revoked"`.
+    fn remove_locked(&self, token: &RoutingToken, reason: &str) {
         // #359: unlike remove_registration's single-id retain, this always
         // drops the token's *entire* entry -- gauges move by however many
         // registrations it actually held, not by a flat 1, and only if it
@@ -1649,6 +1818,7 @@ impl<H: Clone> EdgeState<H> {
         // function this needs no #661 has_tcp_agent guard -- it is unconditionally
         // a full disconnect.
         self.connected_since.lock_safe().remove(token);
+        self.close_tunnel_session(token, reason);
     }
 
     /// Revoke `token` (#27 RB3): tear down its live registrations and any hostname
@@ -1666,7 +1836,7 @@ impl<H: Clone> EdgeState<H> {
         // registration-side half of this fix.
         let _guard = self.registration_lock.lock_safe();
         self.revoked.write_safe().insert(token.clone());
-        self.remove_locked(token); // also clears the token's hostname routes (#23 BP4a)
+        self.remove_locked(token, "revoked"); // also clears the token's hostname routes (#23 BP4a)
         // #554: wake every live relay so it can re-check its own token and cut itself.
         // Dropping the registration above only stops NEW connections; an already-spliced
         // `copy_bidirectional` consults nothing and would keep carrying traffic for a
@@ -3129,5 +3299,201 @@ mod tests {
              as `true`, the eviction policy changed and the #551 metric's documented meaning \
              must change with it"
         );
+    }
+
+    // ---- #776: durable session history wired into the registration lifecycle ----
+
+    fn history_store() -> std::sync::Arc<crate::tunnel_history::SqliteTunnelHistory> {
+        std::sync::Arc::new(crate::tunnel_history::SqliteTunnelHistory::open_in_memory().unwrap())
+    }
+
+    fn hex_of(t: &RoutingToken) -> String {
+        crate::tunnel_history::routing_token_hex(t)
+    }
+
+    #[test]
+    fn note_connected_opens_one_session_row_per_streak_with_the_transport_776() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let history = history_store();
+        state.set_tunnel_history(history.clone());
+        let t = token(70);
+        assert!(!history.open_session_exists(&hex_of(&t)).unwrap(), "never registered -> no row");
+
+        let id_a = state.register(t.clone(), 1);
+        assert!(history.open_session_exists(&hex_of(&t)).unwrap(), "first registration opens a session");
+        let rows = history.sessions_for(&hex_of(&t), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, crate::tunnel_history::TRANSPORT_QUIC);
+        assert_eq!(rows[0].disconnected_at, None);
+
+        // A redundant registration (#8) and a fallback park mid-streak do NOT open a
+        // second row -- the open one is reused (transport follows the latest).
+        let id_b = state.register(t.clone(), 2);
+        let _rx = state.park_tcp_agent(t.clone());
+        let rows = history.sessions_for(&hex_of(&t), 10).unwrap();
+        assert_eq!(rows.len(), 1, "one open session per token at a time");
+        assert_eq!(rows[0].transport, crate::tunnel_history::TRANSPORT_TCP_FALLBACK);
+
+        // A token that only ever relays (never registers) gets no row -- mirrors
+        // `note_relay` never fabricating a connected_since.
+        let never = token(71);
+        state.note_relay(&never, 1, 1, RelayKind::DataPlane);
+        assert!(!history.open_session_exists(&hex_of(&never)).unwrap());
+
+        // Unused ids, kept so the registrations stay live for the assertions above.
+        let _ = (id_a, id_b);
+    }
+
+    #[test]
+    fn teardown_paths_close_the_session_with_their_reason_776() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let history = history_store();
+        state.set_tunnel_history(history.clone());
+
+        // remove_registration: the LAST registration going (no fallback park) closes
+        // the row; an earlier one of two does not.
+        let a = token(72);
+        let id_a = state.register(a.clone(), 1);
+        let id_b = state.register(a.clone(), 2);
+        state.remove_registration(&a, id_a);
+        assert!(history.open_session_exists(&hex_of(&a)).unwrap(), "one of two evicted -> still open");
+        state.remove_registration(&a, id_b);
+        let row = &history.sessions_for(&hex_of(&a), 1).unwrap()[0];
+        assert!(row.disconnected_at.is_some());
+        assert_eq!(row.reason.as_deref(), Some("registration-closed"));
+
+        // #661: a QUIC teardown with a live fallback park is NOT a close.
+        let b = token(73);
+        let id = state.register(b.clone(), 1);
+        let _rx = state.park_tcp_agent(b.clone());
+        state.remove_registration(&b, id);
+        assert!(history.open_session_exists(&hex_of(&b)).unwrap(), "fallback still live -> session stays open");
+
+        // remove(): full teardown -> "removed".
+        state.remove(&b);
+        let row = &history.sessions_for(&hex_of(&b), 1).unwrap()[0];
+        assert_eq!(row.reason.as_deref(), Some("removed"));
+
+        // revoke_token(): -> "revoked".
+        let c = token(74);
+        state.register(c.clone(), 1);
+        state.revoke_token(&c);
+        let row = &history.sessions_for(&hex_of(&c), 1).unwrap()[0];
+        assert_eq!(row.reason.as_deref(), Some("revoked"));
+        assert!(!history.open_session_exists(&hex_of(&c)).unwrap());
+
+        // A reconnect after a close starts a NEW session (a fresh streak, not a resume).
+        state.remove(&a);
+        state.register(a.clone(), 3);
+        assert_eq!(history.sessions_for(&hex_of(&a), 10).unwrap().len(), 2);
+        assert!(history.open_session_exists(&hex_of(&a)).unwrap());
+    }
+
+    #[test]
+    fn flush_writes_only_the_delta_since_the_last_flush_and_close_flushes_finally_776() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let history = history_store();
+        state.set_tunnel_history(history.clone());
+        let t = token(75);
+        state.register(t.clone(), 1);
+        let now = wall_now_for_test();
+
+        state.note_relay(&t, 100, 40, RelayKind::DataPlane);
+        assert_eq!(state.flush_tunnel_history(now, 86_400), (1, 0), "one token flushed, nothing evicted");
+        let row = &history.sessions_for(&hex_of(&t), 1).unwrap()[0];
+        assert_eq!((row.bytes_in, row.bytes_out), (100, 40));
+
+        // A second flush with no new bytes writes nothing (no double counting).
+        assert_eq!(state.flush_tunnel_history(now, 86_400), (0, 0));
+        let row = &history.sessions_for(&hex_of(&t), 1).unwrap()[0];
+        assert_eq!((row.bytes_in, row.bytes_out), (100, 40));
+
+        // More relay, then a close: the close path's own final flush carries the
+        // unflushed remainder into the row before it is sealed.
+        state.note_relay(&t, 25, 5, RelayKind::TcpFallback);
+        state.remove(&t);
+        let row = &history.sessions_for(&hex_of(&t), 1).unwrap()[0];
+        assert_eq!((row.bytes_in, row.bytes_out), (125, 45));
+        assert_eq!(row.reason.as_deref(), Some("removed"));
+        // The in-memory cumulative counter is untouched by flushing.
+        assert_eq!(state.tunnel_bytes(&t), (125, 45));
+
+        // Bytes relayed while NO session is open belong to no row: they are marked
+        // flushed (dropped), not carried into the next session.
+        state.note_relay(&t, 7, 3, RelayKind::Browser);
+        assert_eq!(state.flush_tunnel_history(now, 86_400).0, 0, "no open row -> nothing written");
+        state.register(t.clone(), 2);
+        state.note_relay(&t, 1, 1, RelayKind::Browser);
+        state.flush_tunnel_history(now, 86_400);
+        let rows = history.sessions_for(&hex_of(&t), 10).unwrap();
+        assert_eq!((rows[0].bytes_in, rows[0].bytes_out), (1, 1), "the new session sees only its own bytes");
+    }
+
+    #[test]
+    fn flush_evicts_idle_tokens_from_every_map_but_never_a_live_one_776() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let history = history_store();
+        state.set_tunnel_history(history.clone());
+        let idle = 86_400u64;
+        let now = wall_now_for_test();
+
+        // `gone`: registered, relayed, torn down -> no live registration.
+        let gone = token(76);
+        state.register(gone.clone(), 1);
+        state.note_relay(&gone, 10, 10, RelayKind::DataPlane);
+        state.remove(&gone);
+        // `live`: still registered over QUIC. `parked`: live over the TCP fallback only.
+        let live = token(77);
+        state.register(live.clone(), 2);
+        let parked = token(78);
+        let _rx = state.park_tcp_agent(parked.clone());
+        // `relay_only`: never registered, only relayed -> in tunnel_bytes/last_seen.
+        let relay_only = token(79);
+        state.note_relay(&relay_only, 5, 5, RelayKind::Browser);
+        assert_eq!(state.tunnel_history_tracked_tokens(), 4);
+
+        // Not idle yet (last_seen is "now") -> nothing evicted.
+        assert_eq!(state.flush_tunnel_history(now, idle).1, 0);
+        assert_eq!(state.tunnel_history_tracked_tokens(), 4);
+        assert_eq!(state.tunnel_bytes(&gone), (10, 10));
+
+        // Far enough in the future that every timestamp is stale: only the tokens with
+        // no live registration on either transport go.
+        let later = now + 2 * idle;
+        assert_eq!(state.flush_tunnel_history(later, idle).1, 2, "gone + relay_only");
+        assert_eq!(state.tunnel_history_tracked_tokens(), 2);
+        assert_eq!(state.connection_timing(&gone), (None, None), "evicted from last_seen too");
+        assert_eq!(state.tunnel_bytes(&gone), (0, 0), "and from tunnel_bytes");
+        assert_eq!(state.tunnel_bytes(&relay_only), (0, 0));
+        assert!(state.connection_timing(&live).0.is_some(), "a live QUIC registration is never evicted");
+        assert!(state.connection_timing(&parked).0.is_some(), "a live fallback park is never evicted");
+        // The durable row survives eviction -- that is the point.
+        assert_eq!(history.sessions_for(&hex_of(&gone), 10).unwrap().len(), 1);
+
+        // The pre-existing gap: a fallback-only tunnel whose parks all died (reaped)
+        // never clears connected_since. Once it is evicted as idle, its still-open row
+        // is closed at its last_seen so it cannot count as uptime forever.
+        drop(_rx);
+        assert_eq!(state.reap_dead_tcp_parks(), 1);
+        assert!(history.open_session_exists(&hex_of(&parked)).unwrap(), "nothing closed it yet");
+        assert_eq!(state.flush_tunnel_history(later, idle).1, 1);
+        let row = &history.sessions_for(&hex_of(&parked), 1).unwrap()[0];
+        assert_eq!(row.reason.as_deref(), Some("idle-evicted"));
+        assert!(row.disconnected_at.unwrap() <= later as i64 - idle as i64, "closed at last_seen, not at eviction time");
+    }
+
+    #[test]
+    fn without_a_history_store_nothing_is_evicted_and_teardown_is_unchanged_776() {
+        // The default-off shape (`CT_EDGE_TUNNEL_HISTORY=off`): no store -> the maps keep
+        // today's cumulative-forever behavior, and register/remove stay pure in-memory.
+        let state: EdgeState<u32> = EdgeState::new();
+        assert!(state.tunnel_history().is_none());
+        let t = token(80);
+        state.register(t.clone(), 1);
+        state.note_relay(&t, 3, 4, RelayKind::DataPlane);
+        state.remove(&t);
+        assert_eq!(state.flush_tunnel_history(wall_now_for_test() + 10 * 86_400, 86_400), (0, 0));
+        assert_eq!(state.tunnel_bytes(&t), (3, 4), "no durable record -> the in-memory total is kept");
+        assert!(state.connection_timing(&t).1.is_some());
     }
 }

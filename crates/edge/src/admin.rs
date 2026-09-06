@@ -51,6 +51,10 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // "who ELSE was here?" instead (see `channel_broker::ChannelPresence::holders_of`).
         .route("/internal/channel/presence/:channel_hex", get(channel_presence_list))
         .route("/internal/channel/presence/:channel_hex/:holder_hex", get(channel_presence_one))
+        // #776: read-only per-tunnel session history for the portal's "Connection history"
+        // card -- same listener, gate, and `/internal/...` naming as the #763 presence
+        // routes above, for the same reason (the CP is its only caller).
+        .route("/internal/tunnel/history/:token_hex", get(tunnel_history))
         .with_state(state)
 }
 
@@ -431,6 +435,70 @@ struct ChannelPresenceListResp {
     holders: Vec<ChannelPresenceHolder>,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct TunnelHistoryQuery {
+    /// How many sessions to return, newest first. Absent -> [`HISTORY_DEFAULT_LIMIT`];
+    /// clamped to `1..=`[`HISTORY_MAX_LIMIT`].
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+const HISTORY_DEFAULT_LIMIT: usize = 20;
+const HISTORY_MAX_LIMIT: usize = 200;
+
+/// #776: the body of [`tunnel_history`].
+#[derive(Serialize, serde::Deserialize, Debug)]
+struct TunnelHistoryResp {
+    /// Whether the token has an open session row right now (a live streak).
+    open: bool,
+    /// Uptime over the trailing 24 h / 7 d / 30 d, `0.0..=100.0` each.
+    uptime: crate::tunnel_history::UptimeSummary,
+    /// The most recent sessions, newest first (the open one, if any, leads).
+    sessions: Vec<crate::tunnel_history::SessionRow>,
+}
+
+/// `GET /internal/tunnel/history/:token_hex?limit=N` (#776): the token's recent session
+/// rows and its uptime over the trailing 24 h / 7 d / 30 d, from the durable
+/// `tunnel_sessions` store (`tunnel_history.rs`). Read-only and admin-token-gated like
+/// every other route here; `404` when the history store is disabled
+/// (`CT_EDGE_TUNNEL_HISTORY=off`, or it failed to open even in memory) so the CP can
+/// fail open exactly as it does for presence (#763). What is disclosed is METADATA ONLY
+/// for a token the caller already names: per session the transport, start/end Unix
+/// seconds, the disconnect reason, and byte volume in each direction -- never a
+/// hostname, source IP, request path, or payload (ADR-0016 posture). Response:
+/// `{"open":bool,"uptime":{"h24":f,"d7":f,"d30":f},"sessions":[{"transport":"quic",
+/// "connected_at":n,"disconnected_at":n|null,"reason":"..."|null,"bytes_in":n,
+/// "bytes_out":n},...]}`. `limit` defaults to 20, capped at 200.
+async fn tunnel_history(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Path(token_hex): Path<String>,
+    Query(q): Query<TunnelHistoryQuery>,
+) -> Result<Json<TunnelHistoryResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(t) = parse_token_hex(&token_hex) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(history) = state.tunnel_history() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let limit = q.limit.filter(|&l| l > 0).unwrap_or(HISTORY_DEFAULT_LIMIT).min(HISTORY_MAX_LIMIT);
+    // Re-derive the lowercase hex from the parsed bytes: the store is keyed by the exact
+    // string `EdgeState` writes, and the caller's segment may be upper-case.
+    let hex = crate::tunnel_history::routing_token_hex(&RoutingToken(t));
+    let now = crate::tunnel_history::now_secs();
+    let store_error = |e: rusqlite::Error| {
+        eprintln!("ct-edge: tunnel history read failed: {e} (#776)");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let open = history.open_session_exists(&hex).map_err(store_error)?;
+    let uptime = history.uptime_summary(&hex, now).map_err(store_error)?;
+    let sessions = history.sessions_for(&hex, limit).map_err(store_error)?;
+    Ok(Json(TunnelHistoryResp { open, uptime, sessions }))
+}
+
 /// Parse a 64-hex string into 32 bytes.
 ///
 /// Chunks the raw BYTES rather than string-slicing (`&s[i*2..i*2+2]`): `s.len()` is a
@@ -803,6 +871,103 @@ mod tests {
         );
         assert_eq!(
             get(Some(secret_hex), format!("/internal/channel/presence/{channel_hex}/not-hex")).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_history_is_admin_gated_and_reports_sessions_and_uptime_776() {
+        // #776: the read the portal's "Connection history" card renders from. Must
+        // require the admin token (401), 400 malformed hex, 404 while the store is
+        // disabled (so the CP fails open like presence), and -- with one closed and one
+        // open session -- return the documented JSON shape, newest first, with the
+        // uptime computed from the rows. The store's own math is proven in
+        // tunnel_history.rs and the lifecycle wiring in state.rs; this covers the HTTP
+        // layer.
+        use crate::tunnel_history::{SqliteTunnelHistory, TRANSPORT_QUIC};
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x78u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let tok_hex = "7a".repeat(32);
+        let tok = RoutingToken([0x7a; 32]);
+
+        let get = |auth: Option<String>, path: String| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get(path);
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+        let path = format!("/internal/tunnel/history/{tok_hex}");
+
+        // No admin token -> 401 (before any "is the store even on" answer leaks).
+        assert_eq!(get(None, path.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // Store not configured -> 404, the CP's fail-open signal.
+        assert_eq!(get(Some(secret_hex.clone()), path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        let history = Arc::new(SqliteTunnelHistory::open_in_memory().unwrap());
+        state.set_tunnel_history(history.clone());
+        let now = crate::tunnel_history::now_secs();
+        // One CLOSED 12 h session inside the last 24 h, written directly to the store...
+        let hex = crate::tunnel_history::routing_token_hex(&tok);
+        history.open_session(&hex, TRANSPORT_QUIC, now - 18 * 3600).unwrap();
+        history.add_session_bytes(&hex, 500, 200, now - 12 * 3600).unwrap();
+        history.close_session(&hex, now - 6 * 3600, "removed").unwrap();
+        // ...and one OPEN session via the real registration path (a fallback park needs
+        // no quinn handle, unlike `register`).
+        let _park = state.park_tcp_agent(tok.clone());
+
+        let resp = get(Some(secret_hex.clone()), format!("{path}?limit=10")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelHistoryResp = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.open, "the park opened a live session");
+        assert_eq!(parsed.sessions.len(), 2);
+        assert_eq!(parsed.sessions[0].transport, "tcp-fallback", "newest (open) first");
+        assert_eq!(parsed.sessions[0].disconnected_at, None);
+        assert_eq!(parsed.sessions[0].reason, None);
+        assert_eq!(parsed.sessions[1].transport, "quic");
+        assert_eq!(parsed.sessions[1].disconnected_at, Some(now - 6 * 3600));
+        assert_eq!(parsed.sessions[1].reason.as_deref(), Some("removed"));
+        assert_eq!((parsed.sessions[1].bytes_in, parsed.sessions[1].bytes_out), (500, 200));
+        // 12 h closed + a just-opened live session (a few seconds at most) over 24 h.
+        assert!(parsed.uptime.h24 >= 50.0 && parsed.uptime.h24 < 50.1, "{:?}", parsed.uptime);
+        assert!(parsed.uptime.d7 > 0.0 && parsed.uptime.d30 > 0.0);
+
+        // The raw JSON carries exactly the documented keys.
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut keys: Vec<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["open", "sessions", "uptime"]);
+        let mut ukeys: Vec<&str> = raw["uptime"].as_object().unwrap().keys().map(String::as_str).collect();
+        ukeys.sort_unstable();
+        assert_eq!(ukeys, ["d30", "d7", "h24"]);
+        let mut skeys: Vec<&str> = raw["sessions"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        skeys.sort_unstable();
+        assert_eq!(skeys, ["bytes_in", "bytes_out", "connected_at", "disconnected_at", "reason", "transport"]);
+
+        // `limit` is honoured (and an upper-case token segment resolves the same rows).
+        let resp = get(Some(secret_hex.clone()), format!("/internal/tunnel/history/{}?limit=1", tok_hex.to_uppercase()))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelHistoryResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.sessions.len(), 1);
+
+        // An unknown token is an empty, zero-uptime answer, not an error.
+        let resp = get(Some(secret_hex.clone()), format!("/internal/tunnel/history/{}", "7b".repeat(32))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelHistoryResp = serde_json::from_slice(&body).unwrap();
+        assert!(!parsed.open && parsed.sessions.is_empty());
+        assert_eq!((parsed.uptime.h24, parsed.uptime.d7, parsed.uptime.d30), (0.0, 0.0, 0.0));
+
+        // Malformed hex -> 400, not a panic.
+        assert_eq!(
+            get(Some(secret_hex), "/internal/tunnel/history/not-hex".to_string()).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
     }
