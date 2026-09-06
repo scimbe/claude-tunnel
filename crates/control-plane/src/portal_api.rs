@@ -6208,6 +6208,8 @@ pub fn channel_claim_router(
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
         .route("/portal/channels/:channel/grant", get(fetch_deposited_grant))
         .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
+        .route("/portal/claim", get(claim_invite_page))
+        .route("/portal/claim/confirm", post(claim_invite_confirm))
         .route("/portal/static/ct_agent_wasm.js", get(serve_ct_agent_wasm_js))
         .route("/portal/static/ct_agent_wasm_bg.wasm", get(serve_ct_agent_wasm_bg))
         .with_state(ClaimState {
@@ -6627,10 +6629,37 @@ to compose it together -- they wire in their own agents, never yours.</p>
 /// -- now discoverable purely from being logged in. Self-scoped by construction:
 /// the query is keyed on the session's own email, never a caller-supplied one, so
 /// there is no way to view another subject's invitations from this route.
-async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Response {
+/// `GET /portal/channels?claimed=<channel hex>`: `claimed` is set by the #514
+/// claim-invite confirm redirect and only ever produces a notice when it decodes
+/// as a real channel id (never reflected otherwise).
+#[derive(Deserialize, Default)]
+struct ChannelsQuery {
+    claimed: Option<String>,
+}
+
+/// The success banner [`claim_invite_confirm`] redirects into: names the channel
+/// (short id) and links to its claim page, where the onboarding block -- and the
+/// grant, once the owner deposits it -- lives.
+fn claimed_notice_html(claimed: Option<&str>) -> String {
+    match claimed.and_then(crate::service::hex_decode_32) {
+        Some(channel) => {
+            let channel_hex = hex(&channel);
+            format!(
+                r#"<div class="warn" style="border-color:#238636;background:#0d2818;color:#3fb950">Claimed -- you're now a
+ member of channel <code>{short}…</code>. <a href="/portal/channels/{channel_hex}/claim">Open its page</a> for your
+ onboarding block (and your grant, once the owner has deposited it).</div>"#,
+                short = &channel_hex[..16],
+            )
+        }
+        None => String::new(),
+    }
+}
+
+async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap, Query(q): Query<ChannelsQuery>) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
+    let notice = claimed_notice_html(q.claimed.as_deref());
     // Owned channels don't need a verified e-mail (ownership is keyed on the OIDC
     // subject, not e-mail) -- fetch these regardless of whether the invited-channels
     // half below can render.
@@ -6655,6 +6684,7 @@ async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Resp
     let Some(email) = claims.email else {
         let body = format!(
             r#"<h1>Your channels</h1>
+{notice}
 {owned_section}
 <h2>Channels you're invited to</h2>
 <p class="help">Your session has no verified e-mail, so channel invitations (which are matched by
@@ -6667,7 +6697,7 @@ e-mail) can't be shown here. Log in again with an identity provider that verifie
         Ok(v) => v,
         Err(e) => return internal_error("channels_page/channels_for_email", e).into_response(),
     };
-    Html(channels_html(&owned, &entries, Some(&email), max_channels)).into_response()
+    Html(channels_html(&owned, &entries, Some(&email), max_channels, &notice)).into_response()
 }
 
 /// The "channels you own" half of `channels_page`: a create-channel entry point plus a
@@ -6721,6 +6751,7 @@ fn channels_html(
     entries: &[(ct_common::channel::ChannelId, Option<u64>)],
     email: Option<&str>,
     max_channels: u32,
+    notice: &str,
 ) -> String {
     let rows = if entries.is_empty() {
         r#"<p class="help">No channel invitations yet. A channel owner adds your e-mail to their
@@ -6751,6 +6782,7 @@ portal), and it appears here automatically -- nothing to request.</p>"#
     let owned_section = owned_channels_html(owned, max_channels);
     let body = format!(
         r#"<h1>Your channels</h1>
+{notice}
 {owned_section}
 <h2>Channels you're invited to</h2>
 <p class="help">Channels your e-mail has been invited to (matched against your verified
@@ -7564,6 +7596,220 @@ async fn claim_page_submit(
             .into_response()
         }
         Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)), claims.email.as_deref(), None, None, None, "")).into_response(),
+    }
+}
+
+/// #514 claim-invite (decision of 2026-09-06 on the issue, sort#20's open question):
+/// the shape of a token as [`crate::storage::SqliteChannelStore::mint_claim_invite`]
+/// issues it -- 32 random bytes, base64url, no padding. Anything else never reaches
+/// the store, a `Location` header or the page: it is answered as "unknown".
+fn claim_invite_token_is_well_formed(token: &str) -> bool {
+    token.len() == 43 && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Where an unauthenticated visitor to an invite URL is sent (the #521 pattern
+/// [`claim_login_target`] set for the per-channel claim page): the login round-trip
+/// brings them back to this exact invite, `?next=` percent-encoded because the
+/// target itself carries a query string. Only a well-formed token rides along.
+fn claim_invite_login_target(token: Option<&str>) -> String {
+    match token {
+        Some(t) if claim_invite_token_is_well_formed(t) => {
+            format!("/portal?next={}", crate::portal::urlencode(&format!("/portal/claim?invite={t}")))
+        }
+        _ => "/portal".to_string(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ClaimInviteQuery {
+    invite: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClaimInviteConfirmForm {
+    invite: String,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A refusal page for the invite flow -- `410` for a used/expired invitation, `404`
+/// for one that never existed, or whatever the claim itself answered. Never a claim.
+fn claim_invite_problem(status: StatusCode, detail: &str, email: Option<&str>) -> Response {
+    let body = format!(
+        r#"<h1>Join a channel</h1>
+<div class="warn">{}</div>
+<p class="help">Nothing was claimed. If you were sent this link by a demo's waiting room, ask for a fresh
+one -- each invitation works exactly once and only for a few minutes.</p>
+<a class="btn sec" href="/portal/channels">Your channels</a>"#,
+        escape(detail)
+    );
+    (status, Html(page("join channel", &body, email))).into_response()
+}
+
+/// Resolve a submitted token to a live invitation, or the page that says why not.
+fn resolve_claim_invite(
+    st: &ClaimState,
+    token: &str,
+    now: u64,
+    email: Option<&str>,
+) -> Result<crate::storage::ClaimInvite, Response> {
+    use crate::storage::ClaimInviteLookup;
+    if !claim_invite_token_is_well_formed(token) {
+        return Err(claim_invite_problem(StatusCode::NOT_FOUND, "Unknown invitation.", email));
+    }
+    match st.channels.claim_invite(token, now) {
+        Ok(ClaimInviteLookup::Valid(invite)) => Ok(invite),
+        Ok(ClaimInviteLookup::Consumed) => Err(claim_invite_problem(
+            StatusCode::GONE,
+            "This invitation has already been used.",
+            email,
+        )),
+        Ok(ClaimInviteLookup::Expired) => Err(claim_invite_problem(
+            StatusCode::GONE,
+            "This invitation has expired.",
+            email,
+        )),
+        Ok(ClaimInviteLookup::Unknown) => Err(claim_invite_problem(StatusCode::NOT_FOUND, "Unknown invitation.", email)),
+        Err(e) => Err(internal_error("claim_invite/lookup", e).into_response()),
+    }
+}
+
+/// `GET /portal/claim?invite=<token>` (#514 claim-invite): session-gated like every
+/// `/portal` route -- logged out, the visitor is sent through login and back to
+/// this URL. Logged in, it shows what the invitation is for (channel, label, the
+/// holder it is bound to, when it expires) and a single confirm button. Nothing is
+/// claimed on `GET`; a used/expired/unknown token renders a refusal page instead.
+async fn claim_invite_page(State(st): State<ClaimState>, headers: HeaderMap, Query(q): Query<ClaimInviteQuery>) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&claim_invite_login_target(q.invite.as_deref())).into_response();
+    };
+    let email = claims.email.as_deref();
+    let token = q.invite.as_deref().unwrap_or("");
+    let now = unix_now();
+    let invite = match resolve_claim_invite(&st, token, now, email) {
+        Ok(i) => i,
+        Err(resp) => return resp,
+    };
+    // The claim this confirms needs a verified e-mail (same bar as the per-channel
+    // claim page) -- say so here, while the invitation is still unused, rather than
+    // burning it on a confirm that can only fail.
+    let Some(email) = email else {
+        return claim_invite_problem(
+            StatusCode::FORBIDDEN,
+            "Your session has no verified e-mail -- log in again with an identity provider that verifies e-mail, then re-open this link.",
+            None,
+        );
+    };
+    Html(claim_invite_html(&invite, token, now, email)).into_response()
+}
+
+fn claim_invite_html(invite: &crate::storage::ClaimInvite, token: &str, now: u64, email: &str) -> String {
+    let channel_hex = hex(&invite.channel.0);
+    let holder_hex = hex(&invite.holder);
+    let minutes_left = invite.expires_at.saturating_sub(now).div_ceil(60);
+    let label = match invite.label.as_deref() {
+        Some(l) => format!("<b>{}</b>", escape(l)),
+        None => r#"<span class="help">(none)</span>"#.to_string(),
+    };
+    let body = format!(
+        r#"<h1>Join a channel</h1>
+<p class="k">A channel owner invited the identity below to join. Confirming adds it as a member under
+<b>your</b> account (<code>{email}</code>) -- the invitation is then used up.</p>
+<div class="row"><span class="v">Channel</span><span><code>{short_channel}…</code></span></div>
+<div class="row"><span class="v">Label</span><span>{label}</span></div>
+<div class="row"><span class="v">Holder</span><span><code>{short_holder}…</code></span></div>
+<div class="row"><span class="v">Expires</span><span>in about {minutes_left} min</span></div>
+<form method="post" action="/portal/claim/confirm" id="claim-invite-form">
+ <input type="hidden" name="invite" value="{token}">
+ <button type="submit" id="claim-invite-submit">Join channel</button>
+</form>
+<details>
+ <summary>How does this work?</summary>
+ <p class="help">The holder and Noise keys named here were generated where you started (for a demo, its
+ join page) and only their PUBLIC halves travel with this invitation -- nothing on this page needs, or
+ ever sees, your private keys. Confirming records the membership under your own sign-in, so you can
+ re-fetch your grant, and the owner can revoke it, from your <a href="/portal/channels">channels</a>.</p>
+</details>
+<a class="btn sec" href="/portal/channels">Cancel</a>"#,
+        email = escape(email),
+        short_channel = &channel_hex[..16],
+        short_holder = &holder_hex[..16],
+        token = escape(token),
+    );
+    page("join channel", &body, Some(email))
+}
+
+/// `POST /portal/claim/confirm` (form: `invite`) (#514 claim-invite): burn the
+/// invitation exactly once, then run EXACTLY the self-service claim
+/// `POST /portal/channels/:channel/claim` runs -- [`do_claim`], unchanged -- under
+/// the CURRENT session's subject, for the channel/holder/keys the invitation is
+/// bound to. The invitation is the owner's authorization: it allow-lists the
+/// confirming session's verified e-mail under the minting owner (the same write the
+/// owner's `POST /me/channels/:channel/allowlist` performs, so the membership shows
+/// up on the owner console and on the invitee's channels page like any other), and
+/// the ordinary allow-list-gated claim then lands with no second gate to configure.
+/// Consumption is the guarded single-row `UPDATE` in
+/// [`crate::storage::SqliteChannelStore::consume_claim_invite`], so two racing
+/// confirms of one link yield one claim and one `410`. On success: redirect to the
+/// channels page with a notice. Used/expired → `410`, unknown → `404`, never a claim.
+async fn claim_invite_confirm(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Form(form): Form<ClaimInviteConfirmForm>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        // A session that expired between the page and the click: back through login,
+        // returning to the invite PAGE (the token is still unused at this point).
+        return Redirect::to(&claim_invite_login_target(Some(form.invite.as_str()))).into_response();
+    };
+    let now = unix_now();
+    let invite = match resolve_claim_invite(&st, &form.invite, now, claims.email.as_deref()) {
+        Ok(i) => i,
+        Err(resp) => return resp,
+    };
+    // Checked BEFORE consuming (see `claim_invite_page`): `do_claim` would refuse
+    // this anyway, but only after the single-use token had been spent.
+    let Some(email) = claims.email.as_deref() else {
+        return claim_invite_problem(
+            StatusCode::FORBIDDEN,
+            "Your session has no verified e-mail -- log in again with an identity provider that verifies e-mail, then re-open this link.",
+            None,
+        );
+    };
+    match st.channels.consume_claim_invite(&form.invite, now) {
+        Ok(true) => {}
+        Ok(false) => {
+            return claim_invite_problem(StatusCode::GONE, "This invitation has already been used.", Some(email));
+        }
+        Err(e) => return internal_error("claim_invite_confirm/consume", e).into_response(),
+    }
+    match st.channels.allowlist_add(&invite.channel, &invite.minted_by, email, now) {
+        Ok(true) => {}
+        // The minting owner no longer owns this channel (deleted, or re-registered by
+        // someone else since): the invitation can't authorize anything any more.
+        Ok(false) => {
+            return claim_invite_problem(
+                StatusCode::NOT_FOUND,
+                "The channel this invitation was for no longer exists under the owner who issued it.",
+                Some(email),
+            );
+        }
+        Err(e) => return internal_error("claim_invite_confirm/allowlist_add", e).into_response(),
+    }
+    let channel_hex = hex(&invite.channel.0);
+    let req = ClaimReq {
+        holder: hex(&invite.holder),
+        noise_pubkey: hex(&invite.noise_pubkey),
+        noise_attestation: hex(&invite.noise_attestation),
+    };
+    match do_claim(&st, &headers, &channel_hex, &req).await {
+        Ok(()) => Redirect::to(&format!("/portal/channels?claimed={channel_hex}")).into_response(),
+        Err((status, msg)) => claim_invite_problem(status, &format!("Could not claim: {msg}"), Some(email)),
     }
 }
 
@@ -11550,6 +11796,222 @@ mod tests {
             !html.contains("PASTE_YOUR_CT_CHANNEL_GRANT_HERE") || html.contains("Your identities on this channel"),
             "the existing-identity block renders"
         );
+    }
+
+    /// #514 claim-invite: the shared fixture -- a channel owned by `alice-owner`, a
+    /// holder identity with a real attestation, and the claim router. `nat` is NEVER
+    /// allow-listed here: the invitation itself is the authorization under test.
+    fn claim_invite_fixture() -> (
+        Arc<crate::storage::SqliteChannelStore>,
+        Router,
+        ct_common::channel::ChannelId,
+        [u8; 32],
+        [u8; 32],
+        [u8; 64],
+    ) {
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x7au8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        let app = channel_claim_router(
+            KEY,
+            channels.clone(),
+            None,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            "https://portal.example",
+            "/nonexistent/ct-edge-ca.der",
+        );
+        let holder_sk = SigningKey::from_bytes(&[0xc9u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let noise = [0xdau8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder, &noise)).to_bytes();
+        (channels, app, ch, holder, noise, attest)
+    }
+
+    async fn get_invite_page(app: &Router, token: &str, cookie: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::get(format!("/portal/claim?invite={token}"));
+        if let Some(c) = cookie {
+            req = req.header("cookie", c);
+        }
+        let resp = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn post_invite_confirm(app: &Router, token: &str, cookie: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::post("/portal/claim/confirm")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("invite={token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// #514 claim-invite: an invite URL is a deep link like the per-channel claim page
+    /// (#521) -- logged out, the visitor goes through login and comes BACK to this exact
+    /// invitation, query string and all; only a well-formed token ever reaches the
+    /// `Location` header.
+    #[tokio::test]
+    async fn claim_invite_page_bounces_a_logged_out_visitor_back_to_the_invite_514() {
+        let (_channels, app, ..) = claim_invite_fixture();
+        let token = "A".repeat(43);
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/portal/claim?invite={token}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            loc,
+            format!("/portal?next=%2Fportal%2Fclaim%3Finvite%3D{token}"),
+            "the login round-trip returns to the invitation itself"
+        );
+        // (that the portal accepts this target after the round-trip is asserted next to
+        // `sanitized_next` itself, in portal.rs)
+
+        for bad in ["%3Cscript%3E", "ab%0D%0ASet-Cookie%3A%20x%3D1", ""] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(format!("/portal/claim?invite={bad}")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                resp.headers().get("location").unwrap().to_str().unwrap(),
+                "/portal",
+                "{bad:?} must not reach a Location header"
+            );
+        }
+        assert_eq!(claim_invite_login_target(None), "/portal");
+        assert_eq!(claim_invite_login_target(Some("A".repeat(44).as_str())), "/portal", "wrong length");
+    }
+
+    /// #514 claim-invite: the whole path the decision describes -- owner mints, the
+    /// participant (never allow-listed by hand) opens the link in their OWN session,
+    /// sees channel + label, confirms, and the ordinary claim lands under THEIR subject.
+    /// The link is then used up: a replay (same or another session) is a 410.
+    #[tokio::test]
+    async fn claim_invite_round_trip_claims_under_the_confirming_sessions_subject_514() {
+        use crate::portal::sign_session_with_email_for_test;
+        let (channels, app, ch, holder, noise, attest) = claim_invite_fixture();
+        let ch_hex = hex(&ch.0);
+        let now = unix_now();
+        let (token, _expires_at) = channels
+            .mint_claim_invite(&ch, "alice-owner", &holder, &noise, &attest, Some("sorter-7"), now)
+            .unwrap()
+            .expect("the owner mints");
+        let nat = format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "subj-nat", "nat@example.com"));
+
+        // The page: what the invitation is for, and a confirm form -- no claim yet.
+        let (status, html) = get_invite_page(&app, &token, Some(nat.as_str())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("sorter-7"), "label shown");
+        assert!(html.contains(&format!("<code>{}…</code>", &ch_hex[..16])), "short channel id shown");
+        assert!(html.contains(&format!(r#"name="invite" value="{token}""#)), "the form carries the token");
+        assert!(html.contains(r#"action="/portal/claim/confirm""#));
+        assert!(!channels.is_member(&ch, &holder).unwrap(), "GET never claims");
+
+        // Confirm: membership under nat's subject, e-mail allow-listed under the owner,
+        // redirect to the channels page with the notice.
+        let resp = post_invite_confirm(&app, &token, &nat).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get("location").unwrap().to_str().unwrap(),
+            format!("/portal/channels?claimed={ch_hex}")
+        );
+        assert!(channels.is_member(&ch, &holder).unwrap(), "the claim landed");
+        let rows = channels.deposited_grants_for_subject(&ch, "subj-nat").unwrap();
+        assert_eq!(rows.len(), 1, "recorded under the CONFIRMING session's subject");
+        assert_eq!(rows[0].0, holder);
+        assert!(rows[0].1.is_none(), "no grant deposited yet -- waiting state, as after any claim");
+        assert!(
+            channels.allowlist_contains(&ch, "nat@example.com").unwrap(),
+            "the invitation allow-listed the confirming e-mail (visible on the owner console)"
+        );
+        let (status, _) = get(&app, &format!("/portal/channels?claimed={ch_hex}"), None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "logged out, the channels page still bounces");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/portal/channels?claimed={ch_hex}"))
+                    .header("cookie", nat.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("Claimed -- you're now a"), "success notice on the channels page");
+        assert!(html.contains(&format!("/portal/channels/{ch_hex}/claim")), "links to the onboarding page");
+        assert!(html.contains("Claimed</span>"), "and the invitation row shows as claimed");
+
+        // Replays: 410 for the same session, 410 for another session, no second claim.
+        let resp = post_invite_confirm(&app, &token, &nat).await;
+        assert_eq!(resp.status(), StatusCode::GONE, "second confirm");
+        let (status, html) = get_invite_page(&app, &token, Some(nat.as_str())).await;
+        assert_eq!(status, StatusCode::GONE, "the page itself after use");
+        assert!(html.contains("already been used"));
+        let mallory = format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "subj-mallory", "mallory@example.com"));
+        assert_eq!(post_invite_confirm(&app, &token, &mallory).await.status(), StatusCode::GONE);
+        assert!(channels.deposited_grants_for_subject(&ch, "subj-mallory").unwrap().is_empty());
+        assert!(!channels.allowlist_contains(&ch, "mallory@example.com").unwrap(), "a burnt link authorizes nobody");
+    }
+
+    /// #514 claim-invite: an expired invitation is a 410, an unknown one a 404, and a
+    /// session with no verified e-mail is refused BEFORE the single-use token is spent
+    /// -- in every case, nothing is claimed.
+    #[tokio::test]
+    async fn claim_invite_expired_is_410_unknown_is_404_and_never_a_claim_514() {
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::ClaimInviteLookup;
+        let (channels, app, ch, holder, noise, attest) = claim_invite_fixture();
+        let nat = format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "subj-nat", "nat@example.com"));
+
+        // Minted at unix 1_000 -> expired 15 minutes later, long before "now".
+        let (stale, _) = channels
+            .mint_claim_invite(&ch, "alice-owner", &holder, &noise, &attest, None, 1_000)
+            .unwrap()
+            .unwrap();
+        let (status, html) = get_invite_page(&app, &stale, Some(nat.as_str())).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(html.contains("expired"));
+        assert_eq!(post_invite_confirm(&app, &stale, &nat).await.status(), StatusCode::GONE);
+        assert!(!channels.is_member(&ch, &holder).unwrap());
+
+        // Well-formed but never minted, and outright malformed: 404 either way.
+        for unknown in ["B".repeat(43), "not-a-token".to_string()] {
+            let (status, _) = get_invite_page(&app, &unknown, Some(nat.as_str())).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+            assert_eq!(post_invite_confirm(&app, &unknown, &nat).await.status(), StatusCode::NOT_FOUND, "{unknown}");
+        }
+        assert!(!channels.is_member(&ch, &holder).unwrap());
+
+        // A valid invitation opened by a session WITHOUT a verified e-mail: refused, and
+        // the invitation stays usable for a session that has one.
+        let now = unix_now();
+        let (fresh, _) = channels
+            .mint_claim_invite(&ch, "alice-owner", &holder, &noise, &attest, Some("sorter-8"), now)
+            .unwrap()
+            .unwrap();
+        let no_email = session_header("subj-anon");
+        let (status, _) = get_invite_page(&app, &fresh, Some(no_email.as_str())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(post_invite_confirm(&app, &fresh, &no_email).await.status(), StatusCode::FORBIDDEN);
+        assert!(
+            matches!(channels.claim_invite(&fresh, now).unwrap(), ClaimInviteLookup::Valid(_)),
+            "not burnt by the refused attempt"
+        );
+        assert!(!channels.is_member(&ch, &holder).unwrap());
+        assert_eq!(post_invite_confirm(&app, &fresh, &nat).await.status(), StatusCode::SEE_OTHER);
+        assert!(channels.is_member(&ch, &holder).unwrap(), "the verified session still gets to use it");
     }
 
     #[tokio::test]

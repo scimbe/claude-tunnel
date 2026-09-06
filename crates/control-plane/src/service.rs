@@ -962,6 +962,10 @@ pub struct AuthedTunnelState {
 ///   self-service claiming (#248-follow, owner-scoped)
 /// * `GET /me/channels/:channel/allowlist` → list allow-listed emails (owner-scoped)
 /// * `POST /me/channels/:channel/allowlist/:email/remove` → de-list an email (owner-scoped)
+/// * `POST /me/channels/:channel/claim-invites` `{holder, noise_pubkey, noise_attestation,
+///   label?}` → mint a single-use, 15-minute claim invitation for that identity; the
+///   response carries a portal URL the participant confirms in THEIR OWN session
+///   (#514 claim-invite decision, 2026-09-06; owner-scoped, `404` otherwise)
 /// * `POST /me/rooms` `{operator_pubkey, holders}` → register every pairwise channel
 ///   a full-mesh room of `holders` needs in one call (multicast/room fan-out
 ///   follow-up, owner-scoped, idempotent/additive for the same operator; `409` if an
@@ -989,6 +993,10 @@ pub fn authed_channel_router(
         .route(
             "/me/channels/:channel/grants/:holder",
             post(channel_deposit_grant),
+        )
+        .route(
+            "/me/channels/:channel/claim-invites",
+            post(channel_mint_claim_invite),
         )
         .route(
             "/me/channels/:channel/allowlist",
@@ -3562,6 +3570,130 @@ async fn channel_deposit_grant(
 #[derive(Deserialize)]
 struct GrantDepositReq {
     grant: String,
+}
+
+/// `POST /me/channels/:channel/claim-invites` (#514, claim-invite decision of
+/// 2026-09-06 -- sort#20's open question): the claim stays bound to the portal
+/// session of the HUMAN who joins; a bridge never claims on someone's behalf. So
+/// that a demo's waiting-room approval still hands the participant something
+/// concrete (one link instead of "copy these five values"), the channel OWNER --
+/// same auth model as the grant deposit above: service-account bearer or portal
+/// session, owner-scoped -- mints a short-lived, single-use invitation bound to
+/// the identity the participant already produced client-side (`holder`,
+/// `noise_pubkey`, `noise_attestation` -- exactly the three values
+/// `POST /portal/channels/:channel/claim` takes; the attestation is verified here
+/// so a bad invitation fails at mint time, not in front of the participant).
+///
+/// Response: `{"invite": <token>, "url": "<portal base>/portal/claim?invite=<token>",
+/// "expires_at": <unix>}`. Opening the URL (logged in, or via the login round-trip)
+/// shows channel/label and a confirm button; confirming runs the ordinary
+/// self-service claim under the confirming session's subject and burns the
+/// invitation. Expiry is [`crate::storage::CLAIM_INVITE_TTL_SECS`] (15 minutes).
+/// The bridge learns about completion the way it already does (the roster) --
+/// no callback. Not-the-owner and unknown-channel are both `404`, so a caller
+/// can't probe which channel ids exist.
+async fn channel_mint_claim_invite(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<ClaimInviteReq>,
+) -> Result<Json<ClaimInviteResp>, (StatusCode, String)> {
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    // Owner scope FIRST, before any body validation: the 404 below must not leak
+    // whether a channel exists, and a validation error (e.g. "attestation does not
+    // verify" -- which is channel-bound, so it fires for every channel but the one
+    // the holder signed for) would otherwise tell a non-owner exactly that. The
+    // store re-checks ownership under its writer lock when it inserts; this early
+    // read only fixes the ORDER of the answers.
+    match state
+        .channels
+        .channel_owner(&ChannelId(channel))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Some(o) if o == owner => {}
+        _ => return Err((StatusCode::NOT_FOUND, "no such channel".to_string())),
+    }
+    let holder = hex_decode_32(&req.holder)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let noise_pubkey = hex_decode_32(&req.noise_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
+    let noise_attestation = hex_decode_64(&req.noise_attestation)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_attestation".to_string()))?;
+    // Same bar as the claim this invitation will later run (#101 SEC101b): refuse a
+    // forged/mis-signed key NOW, while the bridge is on the line to fix it.
+    if !ct_common::channel::verify_member_noise_attestation(
+        &ChannelId(channel),
+        &holder,
+        &noise_pubkey,
+        &noise_attestation,
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "noise_attestation does not verify against the holder key".to_string(),
+        ));
+    }
+    let label = req.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+    if let Some(l) = label {
+        if l.chars().count() > CLAIM_INVITE_LABEL_MAX_CHARS || l.chars().any(char::is_control) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("label must be at most {CLAIM_INVITE_LABEL_MAX_CHARS} printable characters"),
+            ));
+        }
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match state
+        .channels
+        .mint_claim_invite(&ChannelId(channel), &owner, &holder, &noise_pubkey, &noise_attestation, label, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Some((invite, expires_at)) => Ok(Json(ClaimInviteResp {
+            url: format!("{}/portal/claim?invite={invite}", portal_base_url()),
+            invite,
+            expires_at,
+        })),
+        None => Err((StatusCode::NOT_FOUND, "no such channel".to_string())),
+    }
+}
+
+/// Longest `label` a claim invitation accepts -- it is display-only (the confirm
+/// page shows it next to the channel id), so a short human-readable name is all
+/// it needs to hold.
+const CLAIM_INVITE_LABEL_MAX_CHARS: usize = 64;
+
+/// The public portal origin the claim-invite URL is built on -- the same
+/// `CT_PORTAL_BASE_URL` value (and `https://localhost` fallback) the portal,
+/// installer and claim routers are constructed with at startup, read here
+/// per-request rather than threaded through [`AuthedChannelState`]'s eight
+/// constructor call sites. A trailing slash is dropped so the join never yields
+/// `//portal`.
+pub(crate) fn portal_base_url() -> String {
+    let base = std::env::var("CT_PORTAL_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://localhost".to_string());
+    base.trim().trim_end_matches('/').to_string()
+}
+
+#[derive(Deserialize)]
+struct ClaimInviteReq {
+    holder: String,
+    noise_pubkey: String,
+    noise_attestation: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClaimInviteResp {
+    invite: String,
+    url: String,
+    expires_at: u64,
 }
 
 async fn channel_remove_member(
@@ -11018,6 +11150,119 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["emails"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn claim_invite_mint_requires_auth_and_owner_scope_514() {
+        // #514 claim-invite decision (2026-09-06): the mint endpoint shares the grant
+        // deposit's auth model (bearer/service-account or portal session, owner-scoped),
+        // answers 404 for not-yours-or-unknown, refuses a mis-signed attestation up front,
+        // and hands back a single-use token + portal URL that the store can resolve.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ct_common::channel::member_noise_attest_bytes;
+        use ed25519_dalek::{Signer, SigningKey};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_channel_router(
+            channels.clone(),
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
+        );
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let ch = ChannelId([0x5au8; 32]);
+        let ch_hex = hex(&ch.0);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice").unwrap());
+
+        let holder_sk = SigningKey::from_bytes(&[0xc7u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let noise = [0xd8u8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder, &noise)).to_bytes();
+        let body = serde_json::json!({
+            "holder": hex(&holder),
+            "noise_pubkey": hex(&noise),
+            "noise_attestation": hex(&attest),
+            "label": "  sorter-7  ",
+        })
+        .to_string();
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let path = format!("/me/channels/{ch_hex}/claim-invites");
+
+        // No credential at all: refused before anything is looked at.
+        assert_eq!(post(path.clone(), None, body.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // Not the owner: 404, indistinguishable from an unknown channel (no probing).
+        assert_eq!(post(path.clone(), Some(mallory), body.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        // The attestation in `body` is bound to `ch`, so it would NOT verify for this
+        // channel -- the 404 proves owner scope is decided before body validation
+        // (a 400 here would tell a non-owner the channel exists).
+        let unknown = format!("/me/channels/{}/claim-invites", "6b".repeat(32));
+        assert_eq!(post(unknown, Some(alice.clone()), body.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        // A mis-signed attestation is refused at mint time, not in front of the participant.
+        let bad = serde_json::json!({
+            "holder": hex(&holder),
+            "noise_pubkey": hex(&[0x11u8; 32]),
+            "noise_attestation": hex(&attest),
+        })
+        .to_string();
+        assert_eq!(post(path.clone(), Some(alice.clone()), bad).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+        // Owner mints: token + portal URL + expiry, and the store resolves the token.
+        let resp = post(path, Some(alice), body).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let invite = parsed["invite"].as_str().expect("invite token");
+        assert_eq!(invite.len(), 43, "32 random bytes, base64url without padding");
+        assert!(
+            invite.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "URL-safe token: {invite}"
+        );
+        assert_eq!(
+            parsed["url"].as_str().unwrap(),
+            format!("{}/portal/claim?invite={invite}", portal_base_url()),
+            "the URL the bridge hands to the participant"
+        );
+        let expires_at = parsed["expires_at"].as_u64().unwrap();
+        assert!(
+            expires_at >= now + crate::storage::CLAIM_INVITE_TTL_SECS
+                && expires_at <= now + crate::storage::CLAIM_INVITE_TTL_SECS + 5,
+            "15-minute expiry: {expires_at} vs now {now}"
+        );
+        match channels.claim_invite(invite, now).unwrap() {
+            crate::storage::ClaimInviteLookup::Valid(inv) => {
+                assert_eq!(inv.channel, ch);
+                assert_eq!(inv.holder, holder);
+                assert_eq!(inv.noise_pubkey, noise);
+                assert_eq!(inv.noise_attestation, attest);
+                assert_eq!(inv.label.as_deref(), Some("sorter-7"), "label is trimmed");
+                assert_eq!(inv.minted_by, "alice", "the minting owner is recorded");
+                assert_eq!(inv.expires_at, expires_at);
+            }
+            other => panic!("expected a valid invitation, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -4337,6 +4337,46 @@ pub enum GrantDepositOutcome {
     NotAMember,
 }
 
+/// #514 claim-invite: how long a freshly minted invitation stays redeemable
+/// (the "Vorschlag 15 min" from the 2026-09-06 decision on the issue).
+pub const CLAIM_INVITE_TTL_SECS: u64 = 15 * 60;
+
+/// #514 claim-invite: one minted invitation, as the portal confirm page needs it --
+/// exactly the three public values `POST /portal/channels/:channel/claim` takes
+/// (holder, Noise key, holder-signed attestation), plus what the page shows (label,
+/// expiry) and who minted it (the channel owner's subject, recorded as the
+/// allow-list `added_by` when the invitee confirms).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimInvite {
+    pub channel: ChannelId,
+    pub holder: [u8; 32],
+    pub noise_pubkey: [u8; 32],
+    pub noise_attestation: [u8; 64],
+    pub label: Option<String>,
+    pub minted_by: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// #514 claim-invite: what a token lookup found. The three refusals map to
+/// different pages (404 vs. 410), so a bare `Option` won't do -- and "consumed" is
+/// checked before "expired" so a replay of a used invitation is always reported as
+/// used, never as merely stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimInviteLookup {
+    Valid(ClaimInvite),
+    Consumed,
+    Expired,
+    Unknown,
+}
+
+/// Hex SHA-256 of an invite token -- the only form the store ever keeps.
+fn claim_invite_token_hash(token: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Why a self-service claim did or did not land (#577).
 ///
 /// Was a bare `bool` whose `false` the route reported as "this email is not allow-listed".
@@ -4473,6 +4513,30 @@ impl SqliteChannelStore {
              );
              CREATE INDEX IF NOT EXISTS idx_channel_member_subjects_subject
                  ON channel_member_subjects (subject);",
+        )?;
+        // #514 (claim-invite decision, 2026-09-06): a channel OWNER's automation (a
+        // demo bridge, over its service-account token) mints a short-lived, single-use
+        // invitation bound to one (channel, holder, Noise key, label); the participant
+        // opens the portal URL it yields and confirms the claim in THEIR OWN portal
+        // session. The claim itself never runs under a bridge identity -- consent stays
+        // with the human. Only the SHA-256 of the token is stored (a leaked DB row is not
+        // an open invitation); `consumed_at` makes it single-use; expired rows are inert
+        // and simply stay (no sweeper -- the expires_at index keeps the lookups cheap).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_claim_invites (
+                 token_hash        TEXT PRIMARY KEY,
+                 channel           BLOB NOT NULL,
+                 holder            BLOB NOT NULL,
+                 noise_pubkey      BLOB NOT NULL,
+                 noise_attestation BLOB NOT NULL,
+                 label             TEXT,
+                 minted_by         TEXT NOT NULL,
+                 created_at        INTEGER NOT NULL,
+                 expires_at        INTEGER NOT NULL,
+                 consumed_at       INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_channel_claim_invites_expires
+                 ON channel_claim_invites (expires_at);",
         )?;
         Ok(Self {
             writer: Mutex::new(conn),
@@ -5170,6 +5234,132 @@ impl SqliteChannelStore {
             )?;
         }
         Ok(ClaimOutcome::Claimed)
+    }
+
+    /// #514 claim-invite: mint a single-use invitation for `holder` to join `channel`,
+    /// redeemable for [`CLAIM_INVITE_TTL_SECS`] from `now`. Owner-scoped exactly like
+    /// [`deposit_grant`](Self::deposit_grant): `None` (no write) unless `owner` owns
+    /// `channel` -- the route reports that as a 404 so a stranger can't tell an unknown
+    /// channel from someone else's. Returns the raw base64url token (32 random bytes)
+    /// and its expiry; only the token's SHA-256 is stored. The attestation is NOT
+    /// re-verified here (the route does that up front, same as the claim itself).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_claim_invite(
+        &self,
+        channel: &ChannelId,
+        owner: &str,
+        holder: &[u8; 32],
+        noise_pubkey: &[u8; 32],
+        noise_attestation: &[u8; 64],
+        label: Option<&str>,
+        now: u64,
+    ) -> rusqlite::Result<Option<(String, u64)>> {
+        use base64::Engine;
+        let conn = self.writer.lock_safe();
+        let owns: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owns {
+            return Ok(None);
+        }
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let expires_at = now.saturating_add(CLAIM_INVITE_TTL_SECS);
+        conn.execute(
+            "INSERT INTO channel_claim_invites \
+             (token_hash, channel, holder, noise_pubkey, noise_attestation, label, minted_by, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                claim_invite_token_hash(&token),
+                &channel.0[..],
+                &holder[..],
+                &noise_pubkey[..],
+                &noise_attestation[..],
+                label,
+                owner,
+                now as i64,
+                expires_at as i64
+            ],
+        )?;
+        Ok(Some((token, expires_at)))
+    }
+
+    /// #514 claim-invite: resolve `token` as of `now`, without consuming it (what the
+    /// confirm PAGE renders from). Deliberately **not** owner-scoped: the reader is
+    /// the invitee. See [`ClaimInviteLookup`] for the refusal order.
+    pub fn claim_invite(&self, token: &str, now: u64) -> rusqlite::Result<ClaimInviteLookup> {
+        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<String>, String, i64, i64, Option<i64>)> = self
+            .read()
+            .query_row(
+                "SELECT channel, holder, noise_pubkey, noise_attestation, label, minted_by, \
+                        created_at, expires_at, consumed_at \
+                 FROM channel_claim_invites WHERE token_hash = ?1",
+                params![claim_invite_token_hash(token)],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((channel, holder, noise_pubkey, noise_attestation, label, minted_by, created_at, expires_at, consumed_at)) =
+            row
+        else {
+            return Ok(ClaimInviteLookup::Unknown);
+        };
+        if consumed_at.is_some() {
+            return Ok(ClaimInviteLookup::Consumed);
+        }
+        if now >= expires_at as u64 {
+            return Ok(ClaimInviteLookup::Expired);
+        }
+        let (Ok(channel), Ok(holder), Ok(noise_pubkey), Ok(noise_attestation)) = (
+            <[u8; 32]>::try_from(channel),
+            <[u8; 32]>::try_from(holder),
+            <[u8; 32]>::try_from(noise_pubkey),
+            <[u8; 64]>::try_from(noise_attestation),
+        ) else {
+            // Only reachable through a hand-edited row; treat it as no invitation
+            // rather than handing a malformed identity to the claim path.
+            return Ok(ClaimInviteLookup::Unknown);
+        };
+        Ok(ClaimInviteLookup::Valid(ClaimInvite {
+            channel: ChannelId(channel),
+            holder,
+            noise_pubkey,
+            noise_attestation,
+            label,
+            minted_by,
+            created_at: created_at as u64,
+            expires_at: expires_at as u64,
+        }))
+    }
+
+    /// #514 claim-invite: burn `token` exactly once. A single guarded `UPDATE` (still
+    /// unconsumed AND unexpired as of `now`) makes two racing confirms of the same link
+    /// resolve to exactly one `true`; the loser sees `false` and the route answers 410.
+    /// Same single-use posture as [`consume_invitation`](Self::consume_invitation).
+    pub fn consume_claim_invite(&self, token: &str, now: u64) -> rusqlite::Result<bool> {
+        let changed = self.writer.lock_safe().execute(
+            "UPDATE channel_claim_invites SET consumed_at = ?2 \
+             WHERE token_hash = ?1 AND consumed_at IS NULL AND expires_at > ?2",
+            params![claim_invite_token_hash(token), now as i64],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Self-service discoverability (2026-08-01): every channel `email`

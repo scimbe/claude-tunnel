@@ -1746,6 +1746,9 @@ mod tests {
     #[test]
     fn sanitized_next_accepts_only_portal_internal_paths() {
         assert_eq!(sanitized_next(Some("/portal/channels/ab12/claim")).as_deref(), Some("/portal/channels/ab12/claim"));
+        // #514 claim-invite: the invite deep link carries a query string and must survive.
+        let invite = format!("/portal/claim?invite={}", "A".repeat(43));
+        assert_eq!(sanitized_next(Some(&invite)).as_deref(), Some(invite.as_str()));
         assert_eq!(sanitized_next(Some(" /portal/tunnels ")).as_deref(), Some("/portal/tunnels"));
         assert_eq!(sanitized_next(Some("https://evil.example/portal")), None, "absolute URL");
         assert_eq!(sanitized_next(Some("//evil.example/portal")), None, "protocol-relative");
