@@ -33,6 +33,8 @@ mod fleet;
 /// #779: access windows / auto-expiring exposure -- the "Access window" card block,
 /// its two owner-scoped routes, and the best-effort push to the edge.
 mod access;
+/// #780: time-boxed share links for login-gated hostnames -- see `portal_api/share.rs`.
+mod share;
 
 /// #297: map a storage/DB error to a generic 500 instead of leaking `e`'s `Display`
 /// (SQLite internals — constraint/table/column names, schema state) to the caller.
@@ -342,7 +344,8 @@ pub fn portal_api_router_with_verifier(
         // #778/#783: uptime page, badge routes, usage page + CSV (see `uptime.rs`).
         .merge(uptime::routes())
         .merge(fleet::routes())
-        .merge(access::routes());
+        .merge(access::routes())
+        .merge(share::routes());
     if verifier.is_some() {
         router = router
             .route("/me/signup", post(me_signup))
@@ -3876,6 +3879,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             let alert_blocks = crate::alerts::card_blocks(&st.tunnels, &subject, &tunnel_ids);
             // #779: owner-scoped like the other batched lookups; a missing entry is unrestricted.
             let access_policies = st.tunnels.access_policy_batch(&subject, &tunnel_ids).unwrap_or_default();
+            // #780: the per-tunnel share-link blocks, pre-rendered by `share`.
+            let share_blocks = share::card_blocks(&st.tunnels, &subject, &tunnel_ids, &require_logins);
             // #776: the connection history rides in the SAME concurrent join as the
             // status scrape -- two bounded edge calls per tunnel, all in flight at
             // once, never a second sequential round.
@@ -3916,8 +3921,15 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     access_policy,
                 ));
             }
-            Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan, &alert_blocks))
-                .into_response()
+            Html(tunnels_html(
+                &rows,
+                max_tunnels,
+                claims.email.as_deref(),
+                is_business_plan,
+                &alert_blocks,
+                &share_blocks,
+            ))
+            .into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
@@ -5993,6 +6005,8 @@ fn tunnels_html(
     is_business_plan: bool,
     // #777: pre-rendered dead-man alert block per tunnel id (`crate::alerts::card_blocks`).
     alert_blocks: &HashMap<String, String>,
+    // #780: pre-rendered share-link block per tunnel id (`share::card_blocks`).
+    share_blocks: &HashMap<String, String>,
 ) -> String {
     // #439 follow-up: owned_count is derived from the SAME rows the page just
     // fetched live from the store (list_authorized_for_subject), not a cached
@@ -6080,6 +6094,13 @@ fn tunnels_html(
             // a tunnel that actually has public content to protect (a hostname).
             let login_gate = if *owned && t.hostname.is_some() {
                 login_gate_html(&id, *require_login, *allow_any_login, login_allowlist, pending_requests)
+            } else {
+                String::new()
+            };
+            // #780: share links -- same owner-with-hostname condition as the login gate
+            // they depend on, rendered directly after it.
+            let share_section = if *owned && t.hostname.is_some() {
+                share_blocks.get(&t.id).cloned().unwrap_or_default()
             } else {
                 String::new()
             };
@@ -6171,7 +6192,7 @@ fn tunnels_html(
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}{alert_section}{access_section}
+{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{share_section}{topology_section}{rename_section}{rest_bridge_section}{alert_section}{access_section}
 </details></div>"#,
                 name = escape(&t.name),
             )

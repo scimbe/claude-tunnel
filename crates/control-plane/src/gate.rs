@@ -26,6 +26,20 @@
 //! `CT_GATE_COOKIE_DOMAIN`, so it's shared across every `*.<zone>` subdomain)
 //! and redirects back to the original URL, or shows a clear "not on the access
 //! list" page.
+//!
+//! Share links (#780): the tunnel owner can mint a time-boxed, optionally
+//! single-use link from the portal (`portal_api/share.rs`). `GET /gate/share?
+//! host=<gated hostname>&token=<token>` redeems it (`SqliteTunnelStore::
+//! redeem_share_link`) and mints the SAME `ct_gate_session` cookie the OIDC
+//! callback mints -- bound to that one hostname, with the synthetic subject
+//! `share:<link id>` in the identity slot and the LINK's expiry as the session's
+//! expiry (signed payload and cookie `Max-Age` alike, so a copied cookie dies
+//! with the link). No account is involved. `gate_check` honors such a session
+//! only for its own hostname, and additionally re-checks that the link is still
+//! unrevoked and unexpired, so a revoke in the portal ends live sessions at once.
+//! This covers every hostname the login gate covers (Gelb); a Grün/passthrough
+//! hostname is never seen by this gate at all -- the agent-side counterpart is
+//! ct-agent#185.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -57,6 +71,12 @@ const GATE_STATE_COOKIE: &str = "__Host-ct_gate_state";
 const GATE_TARGET_COOKIE: &str = "ct_gate_target";
 const GATE_SESSION_COOKIE: &str = "ct_gate_session";
 const GATE_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
+/// #780: the identity slot of a gate session minted from a share link holds
+/// `share:<link id>` instead of an email. Keycloak never issues an email
+/// containing a colon-prefixed scheme, so the prefix alone tells the two apart;
+/// `gate_check` reports it verbatim in `X-Gate-Email` (an origin can tell a
+/// share visitor from a signed-in account by the missing `@`).
+const GATE_SHARE_SUBJECT_PREFIX: &str = "share:";
 
 /// Exchanges an authorization `code` (against the gate's own `redirect_uri`)
 /// for the authenticated identity. Injectable so `gate_callback` is
@@ -103,18 +123,24 @@ struct GateState {
     /// `allow_any_login` path is deliberately unaffected — it never consults the
     /// email at all, so it carries no ownership claim to weaken.
     require_verified_email: bool,
+    /// #780: where `share_link_redeemed` rows go. `None` on a router built without
+    /// an audit log (every existing test); the redemption itself never depends on it.
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 }
 
 /// Build the Browser-Plane login-gate router: `GET /gate/check` (Caddy
 /// `forward_auth` target), `GET /gate/start` (begins the Keycloak login),
-/// `GET /gate/callback` (the OIDC redirect target). Mounted unconditionally;
-/// each handler answers `503` until both `oidc` and `CT_GATE_COOKIE_DOMAIN`
-/// are configured, matching this project's opt-in-until-configured convention.
+/// `GET /gate/callback` (the OIDC redirect target), `GET /gate/share` (#780,
+/// redeems a share link). Mounted unconditionally; each handler answers `503`
+/// until both `oidc` and `CT_GATE_COOKIE_DOMAIN` are configured, matching this
+/// project's opt-in-until-configured convention. `audit` receives
+/// `share_link_redeemed` rows (#780); `None` just skips them.
 pub fn gate_router(
     tunnels: Arc<SqliteTunnelStore>,
     oidc: Option<PortalOidc>,
     session_key: &[u8],
     verifier: OidcVerifierHandle,
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 ) -> Router {
     let cookie_domain = std::env::var("CT_GATE_COOKIE_DOMAIN")
         .ok()
@@ -123,7 +149,7 @@ pub fn gate_router(
         .map(Arc::from);
     let exchange = default_gate_exchanger();
     let require_verified_email = crate::portal::is_truthy_env("CT_GATE_REQUIRE_VERIFIED_EMAIL");
-    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, require_verified_email)
+    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, require_verified_email, audit)
 }
 
 /// Test-only 6-arg builder: keeps the pre-`CT_GATE_REQUIRE_VERIFIED_EMAIL` behavior
@@ -139,7 +165,7 @@ fn gate_router_with(
     cookie_domain: Option<Arc<str>>,
     verifier: OidcVerifierHandle,
 ) -> Router {
-    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, false)
+    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, false, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,6 +177,7 @@ fn gate_router_full(
     cookie_domain: Option<Arc<str>>,
     verifier: OidcVerifierHandle,
     require_verified_email: bool,
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 ) -> Router {
     let state = GateState {
         tunnels,
@@ -160,11 +187,13 @@ fn gate_router_full(
         cookie_domain,
         verifier,
         require_verified_email,
+        audit,
     };
     Router::new()
         .route("/gate/check", get(gate_check))
         .route("/gate/start", get(gate_start))
         .route("/gate/callback", get(gate_callback))
+        .route("/gate/share", get(gate_share))
         .route("/gate/logout", get(gate_logout))
         .route("/gate/request-access", get(gate_request_access_form).post(gate_request_access_submit))
         .with_state(state)
@@ -337,7 +366,17 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
     if let Some(claims) =
         cookie_value(&headers, GATE_SESSION_COOKIE).and_then(|t| verify_gate_session(&st.session_key, &t, now))
     {
-        if claims.host == host {
+        // #780: a session minted from a share link is honored exactly like a login
+        // session for ITS host (the host binding above is what keeps it from
+        // satisfying any other host's gate -- the allow-list is never consulted for
+        // it), PLUS the link itself must still be unrevoked and unexpired: the
+        // cookie is stateless, so this one primary-key lookup is what makes a
+        // portal-side Revoke take effect on sessions already handed out.
+        let share_link_still_active = || match claims.email.strip_prefix(GATE_SHARE_SUBJECT_PREFIX) {
+            Some(link_id) => matches!(st.tunnels.share_link_active(link_id, &host, now), Ok(true)),
+            None => true,
+        };
+        if claims.host == host && share_link_still_active() {
             if let Ok(v) = HeaderValue::from_str(&claims.email) {
                 return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
             }
@@ -512,6 +551,106 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
             resp
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ShareQuery {
+    host: String,
+    token: Option<String>,
+    #[serde(rename = "return")]
+    return_path: Option<String>,
+}
+
+/// Longest share-link token this route bothers hashing: the real ones are 43
+/// characters (32 bytes, unpadded base64url); anything far longer is junk.
+const MAX_SHARE_TOKEN_LEN: usize = 128;
+
+/// `GET /gate/share?host=X&token=T[&return=/path]` (#780): redeem a share link
+/// for gated hostname `host`. On success mints the same host-bound
+/// `ct_gate_session` cookie [`gate_callback`] mints -- identity slot
+/// `share:<link id>`, expiry = the LINK's expiry (signed payload and `Max-Age`
+/// both) -- and redirects to `https://<host><return>`; `return` must be an
+/// absolute path and defaults to `/`. `host` is validated the same way
+/// [`gate_start`] validates its own (404 unless the login gate is on for it),
+/// so this route can't be turned into an open redirect either: the only
+/// redirect target is a hostname that is both gated and named by a row whose
+/// token hash the visitor just proved knowledge of. An expired, used-up,
+/// revoked, or unknown token gets [`share_denied_html`] with a `403` and no
+/// cookie.
+async fn gate_share(State(st): State<GateState>, Query(q): Query<ShareQuery>) -> Response {
+    let host = q.host.to_ascii_lowercase();
+    let Some(domain) = &st.cookie_domain else {
+        return gate_unconfigured();
+    };
+    match st.tunnels.require_login_for_hostname(&host) {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "this hostname does not require login").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    let token = q.token.unwrap_or_default();
+    if token.is_empty() || token.len() > MAX_SHARE_TOKEN_LEN {
+        return (StatusCode::FORBIDDEN, Html(share_denied_html(&host))).into_response();
+    }
+    let now = now_secs();
+    match st.tunnels.redeem_share_link(&host, &token, now) {
+        Ok(Some(link)) => {
+            let subject = format!("{GATE_SHARE_SUBJECT_PREFIX}{}", link.link_id);
+            if let Some(log) = &st.audit {
+                // Best-effort by that store's own contract; detail names the link, never
+                // the token.
+                let _ = log.record(
+                    &subject,
+                    "share_link_redeemed",
+                    Some(&link.tunnel_id),
+                    Some(&format!("link={} host={host} single_use={}", link.link_id, link.single_use)),
+                );
+            }
+            let exp = link.expires_at.max(now + 1);
+            let session = sign_gate_session(&st.session_key, &host, &subject, exp);
+            let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
+            let mut resp = Redirect::to(&format!("https://{host}{return_path}")).into_response();
+            set_cookie(&mut resp, &gate_session_cookie_with_max_age(&session, domain, exp - now));
+            resp
+        }
+        Ok(None) => (StatusCode::FORBIDDEN, Html(share_denied_html(&host))).into_response(),
+        Err(e) => {
+            eprintln!("ct-cp: gate share-link redeem failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "share link lookup failed").into_response()
+        }
+    }
+}
+
+/// The share-link denial page (#780): the specific line is what a recipient
+/// needs ("ask for a new link"), and the normal sign-in is offered as the
+/// alternative for someone who does have an account on the access list.
+fn share_denied_html(host: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Share link not valid</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:center;justify-content:center}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
+ p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ a{{color:var(--accent)}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
+</style></head><body>
+<div class="card">
+ <h1>This share link is no longer valid</h1>
+ <p>This share link has expired or was already used. Ask whoever shared
+    <code>{host}</code> with you for a new one.</p>
+ <p>Have an account on its access list?
+    <a href="/gate/start?host={host_q}&amp;return=%2F">Sign in instead</a>.</p>
+</div>
+</body></html>"#,
+        host = crate::portal::escape(host),
+        host_q = urlencode(host),
+    )
 }
 
 /// The CSRF-state cookie is a single slot per browser/host: a second
@@ -825,8 +964,16 @@ fn cleared_gate_target_cookie() -> String {
 /// must be readable by `GET /gate/check` when a visitor hits ANY gated
 /// `*.<zone>` subdomain, not just the host that minted it.
 fn gate_session_cookie(token: &str, domain: &str) -> String {
+    gate_session_cookie_with_max_age(token, domain, GATE_SESSION_TTL_SECS)
+}
+
+/// [`gate_session_cookie`] with an explicit `Max-Age` (#780): a share-link
+/// session's cookie lives exactly as long as the link's remaining TTL, matching
+/// the `exp` inside its signed payload. Every other attribute is identical, so
+/// [`cleared_gate_session_cookie`] clears this one too.
+fn gate_session_cookie_with_max_age(token: &str, domain: &str, max_age_secs: u64) -> String {
     format!(
-        "{GATE_SESSION_COOKIE}={token}; Domain={domain}; Path=/; Max-Age={GATE_SESSION_TTL_SECS}; \
+        "{GATE_SESSION_COOKIE}={token}; Domain={domain}; Path=/; Max-Age={max_age_secs}; \
          HttpOnly; Secure; SameSite=Lax"
     )
 }
@@ -1429,6 +1576,7 @@ mod tests {
                 Some(Arc::from(".bunsenbrenner.org")),
                 OidcVerifierHandle::empty(),
                 require_verified,
+                None,
             );
             app.oneshot(
                 Request::get("/gate/callback?code=abc&state=xyz")
@@ -1995,4 +2143,211 @@ mod tests {
         // Dismissing again (nothing left to dismiss) is an honest no-op, not an error.
         assert!(!tunnels.dismiss_access_request("alice", &t.id, "carol@example.com").unwrap());
     }
+
+    // ===== #780 share links (begin) =====
+
+    const DEMO: &str = "demo.bunsenbrenner.org";
+    const OTHER: &str = "other.bunsenbrenner.org";
+
+    /// Two gated tunnels (alice's `demo`, bob's `other`) behind a configured gate.
+    fn share_app() -> (Router, Arc<SqliteTunnelStore>, String) {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some(DEMO)).unwrap().created().expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        let o = tunnels.create("bob", "other", Some(OTHER)).unwrap().created().expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("bob", &o.id, true).unwrap());
+        let app = gate_router_with(
+            tunnels.clone(),
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
+        (app, tunnels, t.id)
+    }
+
+    fn mint(tunnels: &SqliteTunnelStore, tunnel_id: &str, ttl: u64, single_use: bool, now: u64) -> (String, String) {
+        match tunnels.mint_share_link("alice", tunnel_id, Some("test"), ttl, single_use, now).unwrap() {
+            crate::storage::ShareLinkMint::Minted { link_id, token, .. } => (link_id, token),
+            other => panic!("expected a minted link, got {other:?}"),
+        }
+    }
+
+    async fn redeem(app: &Router, host: &str, token: &str, extra: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::get(format!("/gate/share?host={host}&token={token}{extra}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The `ct_gate_session=<token>` pair from a redeem response, plus the full header.
+    fn session_cookie(resp: &Response) -> (String, String) {
+        let raw = resp
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with(&format!("{GATE_SESSION_COOKIE}=")))
+            .expect("sets the gate session cookie");
+        (raw.split(';').next().unwrap().to_string(), raw)
+    }
+
+    async fn check(app: &Router, host: &str, cookie: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", host)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gate_share_valid_token_mints_a_host_bound_session_that_passes_only_its_own_hosts_check_780() {
+        let (app, tunnels, tid) = share_app();
+        let now = now_secs();
+        let (link_id, token) = mint(&tunnels, &tid, 3600, false, now);
+
+        let resp = redeem(&app, DEMO, &token, "&return=%2Froom%2F1").await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), &format!("https://{DEMO}/room/1"));
+        let (cookie, raw) = session_cookie(&resp);
+        assert!(raw.contains("Domain=.bunsenbrenner.org"), "same zone-wide cookie the OIDC callback mints: {raw}");
+        assert!(raw.contains("HttpOnly") && raw.contains("Secure"), "{raw}");
+        let max_age: u64 = raw
+            .split(';')
+            .map(str::trim)
+            .find_map(|a| a.strip_prefix("Max-Age="))
+            .expect("Max-Age present")
+            .parse()
+            .unwrap();
+        assert!((3590..=3600).contains(&max_age), "Max-Age is the link's remaining TTL, not the 8 h login default: {max_age}");
+        // The signed payload carries the link's expiry and the synthetic subject.
+        let claims = verify_gate_session(TEST_KEY, cookie.strip_prefix("ct_gate_session=").unwrap(), now).unwrap();
+        assert_eq!(claims.host, DEMO);
+        assert_eq!(claims.email, format!("share:{link_id}"));
+        assert!(
+            verify_gate_session(TEST_KEY, cookie.strip_prefix("ct_gate_session=").unwrap(), now + 3601).is_none(),
+            "a copied cookie dies with the link"
+        );
+
+        // Passes the gate for its own host, reporting the synthetic subject ...
+        let ok = check(&app, DEMO, &cookie).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get(GATE_EMAIL_HEADER).unwrap(), &format!("share:{link_id}"));
+        // ... and is refused for another gated host, even one whose allow-list is empty
+        // (no cross-host replay -- the allow-list is never consulted for a share session).
+        let other = check(&app, OTHER, &cookie).await;
+        assert_eq!(other.status(), StatusCode::FOUND, "redirected to the real login flow");
+        assert!(other.headers().get("location").unwrap().to_str().unwrap().contains("/gate/start?"));
+
+        // A reusable link redeems again.
+        assert_eq!(redeem(&app, DEMO, &token, "").await.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn gate_share_return_path_defaults_to_root_and_never_leaves_the_gated_host_780() {
+        let (app, tunnels, tid) = share_app();
+        let (_, token) = mint(&tunnels, &tid, 3600, false, now_secs());
+        let resp = redeem(&app, DEMO, &token, "").await;
+        assert_eq!(resp.headers().get("location").unwrap(), &format!("https://{DEMO}/"));
+        let resp = redeem(&app, DEMO, &token, "&return=https%3A%2F%2Fevil.example%2F").await;
+        assert_eq!(resp.headers().get("location").unwrap(), &format!("https://{DEMO}/"), "a non-path return is ignored");
+    }
+
+    #[tokio::test]
+    async fn gate_share_denies_an_expired_token_with_the_specific_line_and_no_cookie_780() {
+        let (app, tunnels, tid) = share_app();
+        let now = now_secs();
+        // Minted two hours ago with a one-hour TTL: already expired.
+        let (_, token) = mint(&tunnels, &tid, 3600, false, now - 7200);
+        let resp = redeem(&app, DEMO, &token, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get_all(SET_COOKIE).iter().next().is_none(), "no session on a denial");
+        let html = body_text(resp).await;
+        assert!(html.contains("This share link has expired or was already used"), "got: {html}");
+        assert!(html.contains("/gate/start?host=demo.bunsenbrenner.org"), "offers the normal sign-in");
+
+        // Unknown token and a missing token: same page.
+        let resp = redeem(&app, DEMO, "not-a-real-token", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/gate/share?host={DEMO}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn gate_share_single_use_token_redeems_once_but_its_session_keeps_passing_780() {
+        let (app, tunnels, tid) = share_app();
+        let (_, token) = mint(&tunnels, &tid, 3600, true, now_secs());
+
+        let first = redeem(&app, DEMO, &token, "").await;
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        let (cookie, _) = session_cookie(&first);
+
+        let second = redeem(&app, DEMO, &token, "").await;
+        assert_eq!(second.status(), StatusCode::FORBIDDEN, "a single-use token is spent");
+        assert!(body_text(second).await.contains("This share link has expired or was already used"));
+
+        assert_eq!(check(&app, DEMO, &cookie).await.status(), StatusCode::OK, "the one session lives on until the link expires");
+    }
+
+    #[tokio::test]
+    async fn gate_share_revoked_link_is_denied_and_its_live_sessions_stop_passing_780() {
+        let (app, tunnels, tid) = share_app();
+        let now = now_secs();
+        let (link_id, token) = mint(&tunnels, &tid, 3600, false, now);
+
+        let resp = redeem(&app, DEMO, &token, "").await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let (cookie, _) = session_cookie(&resp);
+        assert_eq!(check(&app, DEMO, &cookie).await.status(), StatusCode::OK);
+
+        assert!(tunnels.revoke_share_link("alice", &tid, &link_id, now).unwrap());
+        assert_eq!(redeem(&app, DEMO, &token, "").await.status(), StatusCode::FORBIDDEN, "revoked token");
+        assert_eq!(
+            check(&app, DEMO, &cookie).await.status(),
+            StatusCode::FOUND,
+            "the stateless cookie is still validly signed, but the gate re-checks the link"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_share_refuses_a_token_for_another_host_and_an_ungated_or_unconfigured_gate_780() {
+        let (app, tunnels, tid) = share_app();
+        let (_, token) = mint(&tunnels, &tid, 3600, false, now_secs());
+        // The token was minted for DEMO; presenting it for OTHER (gated, bob's) fails.
+        assert_eq!(redeem(&app, OTHER, &token, "").await.status(), StatusCode::FORBIDDEN);
+        // An ungated hostname 404s before any token work, like /gate/start.
+        tunnels.create("carol", "open", Some("open.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
+        assert_eq!(redeem(&app, "open.bunsenbrenner.org", &token, "").await.status(), StatusCode::NOT_FOUND);
+        // No cookie domain configured: 503, same as every other gate route.
+        let unconfigured = gate_router_with(
+            tunnels.clone(),
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            None,
+            OidcVerifierHandle::empty(),
+        );
+        assert_eq!(redeem(&unconfigured, DEMO, &token, "").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ===== #780 share links (end) =====
 }

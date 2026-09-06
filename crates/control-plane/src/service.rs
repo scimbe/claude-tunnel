@@ -6524,7 +6524,15 @@ pub fn persistent_control_plane_router(
                 .as_ref()
                 .map(|c| c.account_console_url_with_referrer(&portal_base_url, "/portal/account"));
             crate::portal::portal_router(oidc_cfg.clone(), session_key)
-                .merge(crate::gate::gate_router(tunnels.clone(), oidc_cfg, session_key, oidc.clone()))
+                .merge(crate::gate::gate_router(
+                    tunnels.clone(),
+                    oidc_cfg,
+                    session_key,
+                    oidc.clone(),
+                    // #780: `share_link_redeemed` rows land in the same audit log
+                    // the portal's own share-link mint/revoke rows use.
+                    Some(admin_audit.clone()),
+                ))
                 .merge(
                 // `_with_verifier`: real production wiring, so `POST /me/signup`
                 // (`ct-agent signup`'s anti-abuse-capped CLI entry point) is actually

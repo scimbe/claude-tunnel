@@ -2816,6 +2816,32 @@ impl SqliteTunnelStore {
                  probed_at      INTEGER NOT NULL
              );",
         )?;
+        // ===== #780 share links (begin) =====
+        // Time-boxed share links for a login-gated hostname: one row per minted link.
+        // Only the SHA-256 of the token is stored (`token_hash`, like
+        // `channel_claim_invites`); `hostname` is the tunnel's hostname at mint time and
+        // is re-checked against the tunnel's CURRENT hostname on every redeem, so a link
+        // never admits anyone to a hostname the tunnel no longer has. `subject` is the
+        // owner at mint time (owner-scoped list/revoke without a join). Deleted with the
+        // tunnel (`revoke`); rows expired or revoked for more than
+        // `SHARE_LINK_PRUNE_AFTER_SECS` are dropped opportunistically by `mint_share_link`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS share_links (
+                 id         TEXT PRIMARY KEY,
+                 tunnel_id  TEXT NOT NULL,
+                 subject    TEXT NOT NULL,
+                 hostname   TEXT NOT NULL,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 label      TEXT,
+                 expires_at INTEGER NOT NULL,
+                 single_use INTEGER NOT NULL,
+                 used_at    INTEGER,
+                 created_at INTEGER NOT NULL,
+                 revoked_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_share_links_tunnel ON share_links (tunnel_id);",
+        )?;
+        // ===== #780 share links (end) =====
         Ok(Self {
             writer: Mutex::new(conn),
             readers: None,
@@ -3013,6 +3039,8 @@ impl SqliteTunnelStore {
             // #778: a public badge must not outlive its tunnel.
             tx.execute("DELETE FROM tunnel_badges WHERE tunnel_id = ?1", params![id])?;
             tx.execute("DELETE FROM bridge_probe_cache WHERE tunnel_id = ?1", params![id])?;
+            // #780: no share link outlives its tunnel.
+            tx.execute("DELETE FROM share_links WHERE tunnel_id = ?1", params![id])?;
             tx.execute(
                 "INSERT OR REPLACE INTO revoked_tokens (token, revoked_at) VALUES (?1, ?2)",
                 params![tok, now as i64],
@@ -3580,6 +3608,201 @@ impl SqliteTunnelStore {
     }
 
     // ----- end #778 ---------------------------------------------------------------------
+
+    // ===== #780 share links (begin) =====
+
+    /// Mint a share link for a tunnel the caller owns (#780). Returns the plaintext
+    /// token exactly once -- only its SHA-256 is stored -- together with the new row's
+    /// id. [`ShareLinkMint::NotEligible`] for an unknown or foreign tunnel, or one
+    /// without a hostname (there is nothing to share); [`ShareLinkMint::TooMany`] once
+    /// the tunnel already has [`MAX_ACTIVE_SHARE_LINKS_PER_TUNNEL`] active links
+    /// (unexpired, unrevoked, and -- for single-use -- unused), counted under the same
+    /// writer lock as the insert so two concurrent mints cannot both squeeze under the
+    /// cap. Whether the login gate is currently ON is deliberately NOT checked here:
+    /// the portal refuses to mint while it is off (a link only works while the gate is
+    /// on), the gate re-checks at redeem time.
+    ///
+    /// Opportunistically prunes long-dead rows first ([`Self::prune_share_links`]).
+    pub fn mint_share_link(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+        label: Option<&str>,
+        ttl_secs: u64,
+        single_use: bool,
+        now: u64,
+    ) -> rusqlite::Result<ShareLinkMint> {
+        use base64::Engine;
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM share_links WHERE expires_at < ?1 OR revoked_at < ?1",
+            params![now.saturating_sub(SHARE_LINK_PRUNE_AFTER_SECS) as i64],
+        )?;
+        let hostname: Option<String> = tx
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(hostname) = hostname else {
+            return Ok(ShareLinkMint::NotEligible);
+        };
+        let active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM share_links
+             WHERE tunnel_id = ?1 AND revoked_at IS NULL AND expires_at > ?2
+               AND (single_use = 0 OR used_at IS NULL)",
+            params![tunnel_id, now as i64],
+            |r| r.get(0),
+        )?;
+        if active >= MAX_ACTIVE_SHARE_LINKS_PER_TUNNEL {
+            return Ok(ShareLinkMint::TooMany);
+        }
+        let mut idb = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut idb);
+        let link_id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
+        let mut tokb = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut tokb);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tokb);
+        let expires_at = now.saturating_add(ttl_secs.max(1));
+        tx.execute(
+            "INSERT INTO share_links
+             (id, tunnel_id, subject, hostname, token_hash, label, expires_at, single_use, used_at, created_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL)",
+            params![
+                link_id,
+                tunnel_id,
+                subject,
+                hostname,
+                share_link_token_hash(&token),
+                label.map(str::trim).filter(|l| !l.is_empty()),
+                expires_at as i64,
+                single_use as i64,
+                now as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ShareLinkMint::Minted { link_id, token, hostname })
+    }
+
+    /// Every share link of a tunnel the caller owns (#780), newest first, revoked and
+    /// expired ones included until pruned (the card shows their state). Never the
+    /// token -- the store only has its hash anyway. Empty for a foreign/unknown tunnel.
+    pub fn share_links_for(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Vec<ShareLinkRow>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT id, tunnel_id, hostname, label, expires_at, single_use, used_at, created_at, revoked_at
+             FROM share_links WHERE tunnel_id = ?1 AND subject = ?2 ORDER BY created_at DESC, id",
+        )?;
+        let rows = stmt.query_map(params![tunnel_id, subject], |r| {
+            Ok(ShareLinkRow {
+                id: r.get(0)?,
+                tunnel_id: r.get(1)?,
+                hostname: r.get(2)?,
+                label: r.get(3)?,
+                expires_at: r.get(4)?,
+                single_use: r.get::<_, i64>(5)? != 0,
+                used_at: r.get(6)?,
+                created_at: r.get(7)?,
+                revoked_at: r.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Revoke one share link of the caller's (#780): stamps `revoked_at`, after which
+    /// `redeem_share_link` refuses the token AND `share_link_active` refuses every gate
+    /// session already minted from it. `false` if the link id is unknown, belongs to
+    /// another tunnel or owner, or is already revoked.
+    pub fn revoke_share_link(&self, subject: &str, tunnel_id: &str, link_id: &str, now: u64) -> rusqlite::Result<bool> {
+        let n = self.writer.lock_safe().execute(
+            "UPDATE share_links SET revoked_at = ?1
+             WHERE id = ?2 AND subject = ?3 AND tunnel_id = ?4 AND revoked_at IS NULL",
+            params![now as i64, link_id, subject, tunnel_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Redeem a share-link token presented to the gate for `hostname` (#780). Valid iff
+    /// the token's hash matches a row, that row was minted for `hostname`, the tunnel
+    /// still exists under the same owner and STILL has that hostname (a rehomed hostname
+    /// never inherits an old link), the link is neither revoked nor expired, and -- for
+    /// single-use -- was never used. A single-use success stamps `used_at` in the same
+    /// transaction, so a second presentation of the same token fails. Not owner-scoped:
+    /// the caller is the anonymous visitor. `hostname` is matched case-insensitively
+    /// (#393).
+    pub fn redeem_share_link(&self, hostname: &str, token: &str, now: u64) -> rusqlite::Result<Option<RedeemedLink>> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let row: Option<(String, String, i64, Option<i64>, i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT s.id, s.tunnel_id, s.single_use, s.used_at, s.expires_at, s.revoked_at
+                 FROM share_links s
+                 JOIN subject_tunnels t ON t.id = s.tunnel_id AND t.subject = s.subject
+                 WHERE s.token_hash = ?1 AND s.hostname = ?2 COLLATE NOCASE
+                   AND t.hostname = s.hostname COLLATE NOCASE",
+                params![share_link_token_hash(token), hostname],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?;
+        let Some((link_id, tunnel_id, single_use, used_at, expires_at, revoked_at)) = row else {
+            return Ok(None);
+        };
+        let single_use = single_use != 0;
+        if revoked_at.is_some() || expires_at <= now as i64 || (single_use && used_at.is_some()) {
+            return Ok(None);
+        }
+        if single_use {
+            let n = tx.execute(
+                "UPDATE share_links SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+                params![now as i64, link_id],
+            )?;
+            if n != 1 {
+                return Ok(None);
+            }
+        }
+        tx.commit()?;
+        Ok(Some(RedeemedLink {
+            link_id,
+            tunnel_id,
+            single_use,
+            expires_at: expires_at as u64,
+        }))
+    }
+
+    /// Whether a gate session minted from share link `link_id` for `hostname` is still
+    /// honored (#780): the link exists for that hostname (tunnel still owns it), is not
+    /// revoked, and has not expired. `used_at` is deliberately NOT consulted -- a
+    /// single-use link's one session lives on until the link's expiry; only a revoke
+    /// cuts it short. One primary-key lookup per gate check of a share session.
+    pub fn share_link_active(&self, link_id: &str, hostname: &str, now: u64) -> rusqlite::Result<bool> {
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT 1 FROM share_links s
+                 JOIN subject_tunnels t ON t.id = s.tunnel_id AND t.subject = s.subject
+                 WHERE s.id = ?1 AND s.hostname = ?2 COLLATE NOCASE AND t.hostname = s.hostname COLLATE NOCASE
+                   AND s.revoked_at IS NULL AND s.expires_at > ?3",
+                params![link_id, hostname, now as i64],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Drop share links that expired, or were revoked, more than
+    /// [`SHARE_LINK_PRUNE_AFTER_SECS`] ago (#780); returns how many. Also run
+    /// opportunistically by [`Self::mint_share_link`].
+    pub fn prune_share_links(&self, now: u64) -> rusqlite::Result<usize> {
+        self.writer.lock_safe().execute(
+            "DELETE FROM share_links WHERE expires_at < ?1 OR revoked_at < ?1",
+            params![now.saturating_sub(SHARE_LINK_PRUNE_AFTER_SECS) as i64],
+        )
+    }
+
+    // ===== #780 share links (end) =====
 
     /// Every tunnel the caller owns with the REST bridge turned on (`mode != "off"`),
     /// paired with that mode -- the portal discovery page's (`/portal/rest-bridges`)
@@ -5198,6 +5421,75 @@ fn claim_invite_token_hash(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+// ===== #780 share links (begin) =====
+
+/// Hex SHA-256 of a share-link token (#780) -- the only form `share_links` keeps, same
+/// construction as [`claim_invite_token_hash`].
+fn share_link_token_hash(token: &str) -> String {
+    claim_invite_token_hash(token)
+}
+
+/// Active (unexpired, unrevoked, not-yet-used-if-single-use) share links a tunnel may
+/// hold at once (#780) -- a per-tunnel bound, not a rate limit; enforced by
+/// [`SqliteTunnelStore::mint_share_link`].
+pub const MAX_ACTIVE_SHARE_LINKS_PER_TUNNEL: i64 = 50;
+
+/// How long an expired or revoked share link stays listed (so the owner can still see
+/// "expired"/"revoked" on the card) before [`SqliteTunnelStore::prune_share_links`]
+/// drops it: 7 days.
+pub const SHARE_LINK_PRUNE_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// One owner-facing `share_links` row (#780). Never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareLinkRow {
+    pub id: String,
+    pub tunnel_id: String,
+    /// The tunnel's hostname at mint time; a link is only ever honored while the
+    /// tunnel still has exactly this hostname.
+    pub hostname: String,
+    pub label: Option<String>,
+    pub expires_at: i64,
+    pub single_use: bool,
+    /// Unix seconds of the first (and, for single-use, only) redemption.
+    pub used_at: Option<i64>,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+impl ShareLinkRow {
+    /// Whether a token for this row would still be accepted by
+    /// [`SqliteTunnelStore::redeem_share_link`] as of `now`.
+    pub fn is_active(&self, now: i64) -> bool {
+        self.revoked_at.is_none() && self.expires_at > now && !(self.single_use && self.used_at.is_some())
+    }
+}
+
+/// How [`SqliteTunnelStore::mint_share_link`] resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareLinkMint {
+    /// The new row's id, the plaintext token -- the ONLY time the token exists
+    /// outside the caller's response -- and the hostname the link is for (what the
+    /// share URL names).
+    Minted { link_id: String, token: String, hostname: String },
+    /// Unknown or foreign tunnel, or a tunnel without a hostname.
+    NotEligible,
+    /// The tunnel already has [`MAX_ACTIVE_SHARE_LINKS_PER_TUNNEL`] active links.
+    TooMany,
+}
+
+/// A successfully redeemed share link (#780): what the gate needs to mint the
+/// visitor's session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemedLink {
+    pub link_id: String,
+    pub tunnel_id: String,
+    pub single_use: bool,
+    /// Unix seconds; the gate session minted from this link expires no later than this.
+    pub expires_at: u64,
+}
+
+// ===== #780 share links (end) =====
 
 /// Why a self-service claim did or did not land (#577).
 ///
@@ -9737,6 +10029,167 @@ mod tests {
         assert_eq!(store.badge_lookup(&third).unwrap(), None, "no badge outlives its tunnel");
         assert_eq!(store.badge_lookup(&other).unwrap().map(|(s, _)| s), Some("bob".to_string()), "bob's is untouched");
     }
+
+    // ===== #780 share links (begin) =====
+
+    fn minted(m: ShareLinkMint) -> (String, String) {
+        match m {
+            ShareLinkMint::Minted { link_id, token, .. } => (link_id, token),
+            other => panic!("expected a minted link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn share_link_mint_is_owner_scoped_needs_a_hostname_and_stores_only_the_hash_780() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "demo", Some("demo.example")).unwrap().created().expect("hostname free");
+        let bare = store.create("alice", "mesh-only", None).unwrap().created().expect("hostname free");
+        let now = 1_700_000_000u64;
+
+        assert_eq!(
+            store.mint_share_link("bob", &t.id, None, 3600, false, now).unwrap(),
+            ShareLinkMint::NotEligible,
+            "non-owner cannot mint for alice's tunnel"
+        );
+        assert_eq!(
+            store.mint_share_link("alice", "no-such-tunnel", None, 3600, false, now).unwrap(),
+            ShareLinkMint::NotEligible
+        );
+        assert_eq!(
+            store.mint_share_link("alice", &bare.id, None, 3600, false, now).unwrap(),
+            ShareLinkMint::NotEligible,
+            "a tunnel without a hostname has nothing to share"
+        );
+        assert!(store.share_links_for("alice", &t.id).unwrap().is_empty(), "refusals wrote nothing");
+
+        let (link_id, token) = match store.mint_share_link("alice", &t.id, Some(" reviewers "), 3600, false, now).unwrap() {
+            ShareLinkMint::Minted { link_id, token, hostname } => {
+                assert_eq!(hostname, "demo.example", "the mint names the hostname the link is for");
+                (link_id, token)
+            }
+            other => panic!("expected a minted link, got {other:?}"),
+        };
+        assert_eq!(link_id.len(), 32, "16 random bytes as hex");
+        assert_eq!(token.len(), 43, "32 random bytes as unpadded base64url");
+        assert!(token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "{token}");
+
+        let rows = store.share_links_for("alice", &t.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, link_id);
+        assert_eq!(row.hostname, "demo.example");
+        assert_eq!(row.label.as_deref(), Some("reviewers"), "label is trimmed");
+        assert_eq!(row.expires_at, (now + 3600) as i64);
+        assert!(!row.single_use);
+        assert_eq!(row.used_at, None);
+        assert_eq!(row.revoked_at, None);
+        assert!(row.is_active(now as i64));
+        assert!(store.share_links_for("bob", &t.id).unwrap().is_empty(), "owner-scoped listing");
+
+        // The plaintext token is nowhere in the database.
+        let stored: String = store
+            .writer
+            .lock_safe()
+            .query_row("SELECT token_hash FROM share_links WHERE id = ?1", params![link_id], |r| r.get(0))
+            .unwrap();
+        assert_ne!(stored, token);
+        assert_eq!(stored, share_link_token_hash(&token));
+    }
+
+    #[test]
+    fn share_link_redeem_checks_hash_hostname_expiry_revocation_and_single_use_780() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "demo", Some("demo.example")).unwrap().created().expect("hostname free");
+        let _other = store.create("bob", "other", Some("other.example")).unwrap().created().expect("hostname free");
+        let now = 1_700_000_000u64;
+
+        // Reusable link: redeems as often as wanted until it expires.
+        let (multi_id, multi) = minted(store.mint_share_link("alice", &t.id, None, 3600, false, now).unwrap());
+        let first = store.redeem_share_link("demo.example", &multi, now + 1).unwrap().expect("valid");
+        assert_eq!(first.link_id, multi_id);
+        assert_eq!(first.tunnel_id, t.id);
+        assert!(!first.single_use);
+        assert_eq!(first.expires_at, now + 3600);
+        assert!(store.redeem_share_link("demo.example", &multi, now + 2).unwrap().is_some(), "reusable");
+        assert!(store.redeem_share_link("DEMO.example", &multi, now + 2).unwrap().is_some(), "#393: hostname is case-insensitive");
+        assert_eq!(
+            store.share_links_for("alice", &t.id).unwrap()[0].used_at,
+            None,
+            "a reusable link never records used_at"
+        );
+
+        assert!(store.redeem_share_link("other.example", &multi, now + 1).unwrap().is_none(), "hostname mismatch");
+        assert!(store.redeem_share_link("demo.example", "not-a-token", now + 1).unwrap().is_none(), "unknown token");
+        assert!(store.redeem_share_link("demo.example", &multi, now + 3600).unwrap().is_none(), "expired at exactly expires_at");
+        assert!(store.redeem_share_link("demo.example", &multi, now + 3599).unwrap().is_some(), "still valid one second before");
+
+        // Single-use: exactly one redemption.
+        let (once_id, once) = minted(store.mint_share_link("alice", &t.id, Some("once"), 3600, true, now).unwrap());
+        let redeemed = store.redeem_share_link("demo.example", &once, now + 10).unwrap().expect("first use");
+        assert!(redeemed.single_use);
+        assert_eq!(redeemed.link_id, once_id);
+        assert!(store.redeem_share_link("demo.example", &once, now + 11).unwrap().is_none(), "second use refused");
+        let once_row = store.share_links_for("alice", &t.id).unwrap().into_iter().find(|r| r.id == once_id).unwrap();
+        assert_eq!(once_row.used_at, Some((now + 10) as i64));
+        assert!(!once_row.is_active((now + 11) as i64));
+        assert!(
+            store.share_link_active(&once_id, "demo.example", now + 11).unwrap(),
+            "the session minted from the one redemption stays honored until the link expires"
+        );
+        assert!(!store.share_link_active(&once_id, "demo.example", now + 3600).unwrap(), "... and not past it");
+
+        // Revoke: owner-scoped, refuses the token and kills live sessions.
+        assert!(!store.revoke_share_link("bob", &t.id, &multi_id, now + 20).unwrap(), "non-owner cannot revoke");
+        assert!(!store.revoke_share_link("alice", "other-tunnel", &multi_id, now + 20).unwrap(), "wrong tunnel id");
+        assert!(store.redeem_share_link("demo.example", &multi, now + 21).unwrap().is_some(), "still valid after the refused revokes");
+        assert!(store.revoke_share_link("alice", &t.id, &multi_id, now + 20).unwrap());
+        assert!(!store.revoke_share_link("alice", &t.id, &multi_id, now + 22).unwrap(), "already revoked");
+        assert!(store.redeem_share_link("demo.example", &multi, now + 21).unwrap().is_none(), "revoked");
+        assert!(!store.share_link_active(&multi_id, "demo.example", now + 21).unwrap(), "revoke ends live sessions");
+        let multi_row = store.share_links_for("alice", &t.id).unwrap().into_iter().find(|r| r.id == multi_id).unwrap();
+        assert_eq!(multi_row.revoked_at, Some((now + 20) as i64));
+        assert!(!store.share_link_active("no-such-link", "demo.example", now).unwrap());
+        assert!(!store.share_link_active(&once_id, "other.example", now + 11).unwrap(), "session bound to its hostname");
+    }
+
+    #[test]
+    fn share_links_are_capped_per_tunnel_deleted_with_it_and_pruned_after_seven_days_780() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "demo", Some("demo.example")).unwrap().created().expect("hostname free");
+        let u = store.create("alice", "second", Some("second.example")).unwrap().created().expect("hostname free");
+        let now = 1_700_000_000u64;
+
+        for _ in 0..MAX_ACTIVE_SHARE_LINKS_PER_TUNNEL {
+            minted(store.mint_share_link("alice", &t.id, None, 3600, false, now).unwrap());
+        }
+        assert_eq!(
+            store.mint_share_link("alice", &t.id, None, 3600, false, now).unwrap(),
+            ShareLinkMint::TooMany,
+            "the 51st active link is refused"
+        );
+        minted(store.mint_share_link("alice", &u.id, None, 3600, false, now).unwrap());
+        // Revoking one frees a slot: the cap counts ACTIVE links only.
+        let victim = store.share_links_for("alice", &t.id).unwrap()[0].id.clone();
+        assert!(store.revoke_share_link("alice", &t.id, &victim, now).unwrap());
+        minted(store.mint_share_link("alice", &t.id, None, 3600, false, now).unwrap());
+
+        // Prune: rows expired or revoked more than 7 days ago go, younger ones stay.
+        let (_old_id, _) = minted(store.mint_share_link("alice", &u.id, Some("old"), 60, false, now).unwrap());
+        let (young_id, _) = minted(store.mint_share_link("alice", &u.id, Some("young"), 60, false, now + 10).unwrap());
+        let later = now + 60 + SHARE_LINK_PRUNE_AFTER_SECS + 5;
+        let pruned = store.prune_share_links(later).unwrap();
+        assert_eq!(pruned, 2, "the link that expired > 7 days ago and the one revoked > 7 days ago, got {pruned}");
+        let remaining: Vec<String> = store.share_links_for("alice", &u.id).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(remaining.contains(&young_id), "expired only 5 s short of the prune window: kept");
+        assert_eq!(remaining.len(), 2, "the untouched 3600 s link and the young one");
+
+        // Deleted with the tunnel.
+        assert!(store.revoke("alice", &t.id, now).unwrap().is_some());
+        assert!(store.share_links_for("alice", &t.id).unwrap().is_empty(), "no share link outlives its tunnel");
+        assert_eq!(store.share_links_for("alice", &u.id).unwrap().len(), 2, "the other tunnel's links are untouched");
+    }
+
+    // ===== #780 share links (end) =====
 
     #[test]
     fn rest_bridges_for_subject_lists_only_the_owners_own_non_off_tunnels_with_their_mode() {
