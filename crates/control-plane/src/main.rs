@@ -380,6 +380,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // once, by `with_graceful_shutdown`) so `serve_with_bounded_grace` can start its own
     // grace clock at the exact moment shutdown was requested, not at process start.
     let (shutdown_tx, shutdown_fired) = tokio::sync::watch::channel(false);
+    // #777: the dead-man alert loop (`ct_control_plane::alerts`) -- evaluates every
+    // enabled tunnel alert against the edge once a minute and delivers signed webhooks.
+    // Raced against the same shutdown event the server drains on, so a SIGTERM stops the
+    // loop instead of leaving a tick's retries running past the grace period.
+    tokio::spawn(ct_control_plane::alerts::run_alert_loop(
+        ct_control_plane::alerts::AlertLoopConfig {
+            db_path: db.clone(),
+            edge_admin: ct_control_plane::alerts::edge_admin_from_env(),
+        },
+        shutdown_fired.clone(),
+    ));
     let with_shutdown = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

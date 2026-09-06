@@ -311,6 +311,11 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/rename", post(rename_tunnel))
+        // ===== #777 dead-man alerts (begin) =====
+        .route("/portal/tunnels/:id/alert", post(set_tunnel_alert))
+        .route("/portal/tunnels/:id/alert/test", post(test_tunnel_alert))
+        .route("/portal/tunnels/:id/alert/delete", post(delete_tunnel_alert))
+        // ===== #777 dead-man alerts (end) =====
         .route("/portal/tunnels/:id/agent-bridge", post(set_tunnel_rest_bridge))
         .route("/portal/tunnels/:id/agent-bridge/grant", post(set_tunnel_bridge_grant))
         .route("/portal/tunnels/:id/agent-bridge/call", post(call_tunnel_bridge_tool))
@@ -332,6 +337,42 @@ pub fn portal_api_router_with_verifier(
     }
     router.with_state(state)
 }
+
+// ===== #777 dead-man alerts (begin) =====
+// Thin session-resolving shims: validation, storage, delivery and the secret-once
+// page all live in `crate::alerts` (its module doc carries the webhook contract).
+
+/// `POST /portal/tunnels/:id/alert` (#777): create/replace the tunnel's dead-man
+/// alert. Owner-scoped 404, 400 on a bad URL/threshold, and -- on a fresh create --
+/// the secret-once page instead of a redirect.
+async fn set_tunnel_alert(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<crate::alerts::AlertForm>,
+) -> Response {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    crate::alerts::set_alert(&st.tunnels, st.audit.as_deref(), &claims, &id, form)
+}
+
+/// `POST /portal/tunnels/:id/alert/test` (#777): one immediate signed `tunnel.test`.
+async fn test_tunnel_alert(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    crate::alerts::test_alert(&st.tunnels, st.audit.as_deref(), &claims, &id).await
+}
+
+/// `POST /portal/tunnels/:id/alert/delete` (#777).
+async fn delete_tunnel_alert(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    crate::alerts::delete_alert(&st.tunnels, st.audit.as_deref(), &claims, &id)
+}
+// ===== #777 dead-man alerts (end) =====
 
 #[derive(Deserialize)]
 struct ProvisionTunnelReq {
@@ -3818,6 +3859,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             let allow_and_pending = st.tunnels.allowlist_and_pending_batch(&subject, &tunnel_ids).unwrap_or_default();
             let topology_links = st.tunnels.topology_link_batch(&subject, &tunnel_ids).unwrap_or_default();
             let rest_bridge_modes = st.tunnels.rest_bridge_mode_batch(&subject, &tunnel_ids).unwrap_or_default();
+            // #777: the per-tunnel dead-man alert blocks, pre-rendered by `crate::alerts`.
+            let alert_blocks = crate::alerts::card_blocks(&st.tunnels, &subject, &tunnel_ids);
             // #776: the connection history rides in the SAME concurrent join as the
             // status scrape -- two bounded edge calls per tunnel, all in flight at
             // once, never a second sequential round.
@@ -3855,7 +3898,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     history,
                 ));
             }
-            Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan)).into_response()
+            Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan, &alert_blocks))
+                .into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
@@ -5704,7 +5748,7 @@ fn human_bytes(n: u64) -> String {
 /// admin console's shell has, and a history is read across time zones anyway (the
 /// header says UTC). Proleptic-Gregorian civil-from-days (Howard Hinnant's algorithm),
 /// so no chrono dependency for a display concern; negative inputs clamp to the epoch.
-fn utc_ymd_hm(secs: i64) -> String {
+pub(crate) fn utc_ymd_hm(secs: i64) -> String {
     let secs = secs.max(0);
     let days = secs / 86_400;
     let rem = secs % 86_400;
@@ -5905,7 +5949,14 @@ type TunnelRow = (
     Option<EdgeTunnelHistory>, // #776: edge connection history; None = edge not asked/answered
 );
 
-fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is_business_plan: bool) -> String {
+fn tunnels_html(
+    tunnels: &[TunnelRow],
+    max_tunnels: u32,
+    email: Option<&str>,
+    is_business_plan: bool,
+    // #777: pre-rendered dead-man alert block per tunnel id (`crate::alerts::card_blocks`).
+    alert_blocks: &HashMap<String, String>,
+) -> String {
     // #439 follow-up: owned_count is derived from the SAME rows the page just
     // fetched live from the store (list_authorized_for_subject), not a cached
     // value -- so a revoke that already committed (delete_tunnel -> revoke())
@@ -6053,6 +6104,8 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             } else {
                 String::new()
             };
+            // #777: dead-man alert block -- owner-only, like the login gate above.
+            let alert_section = if *owned { alert_blocks.get(&t.id).cloned().unwrap_or_default() } else { String::new() };
             // data-search: lowercased name+hostname, read by the search box's JS
             // filter below -- client-side (an account's own tunnel count is small,
             // no round trip needed) and independent of what's actually displayed
@@ -6073,7 +6126,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}
+{owner_actions}{bytes_line}{history_section}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}{alert_section}
 </details></div>"#,
                 name = escape(&t.name),
             )
