@@ -385,6 +385,41 @@ pub async fn get_user_email(client: &reqwest::Client, cfg: &KeycloakAdminConfig,
     resp.json::<UserRepresentationEmail>().await.map(|u| u.email).map_err(|e| KcError::Http(e.to_string()))
 }
 
+/// Whether `user_id` still exists in this realm at all -- deliberately distinct from
+/// [`get_user_email`]'s `Ok(None)`, which conflates "no such user" with "user exists but
+/// has no email attribute" (their doc comments cover this too). A ledger-account
+/// reconciliation sweep that wants to know "is this subject's Keycloak identity
+/// genuinely gone" must not treat an existing-but-email-less user the same as a deleted
+/// one -- doing so would risk deleting a real account. `Err` on anything but a clean
+/// success/404 (a transport error, a non-2xx status) so a transient Keycloak outage
+/// never gets misread as "confirmed gone" by a caller that deletes on `Ok(false)`.
+pub async fn user_exists(client: &reqwest::Client, cfg: &KeycloakAdminConfig, user_id: &str) -> Result<bool, KcError> {
+    let mut token = cached_admin_token(client, cfg, false).await?;
+    let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
+    let mut resp = client
+        .get(format!("{realm_url}/users/{user_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        resp = client
+            .get(format!("{realm_url}/users/{user_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(KcError::Http(format!("GET user returned {}", resp.status())));
+    }
+    Ok(true)
+}
+
 /// Regenerate `internal_id`'s client secret and return the new value -- the
 /// old secret stops working immediately (Keycloak's own regenerate semantics).
 /// Ownership must already be verified by the caller (`SqliteServiceAccountStore
@@ -1687,5 +1722,92 @@ mod tests {
         };
         let email = get_user_email(&reqwest::Client::new(), &cfg, "long-gone").await.unwrap();
         assert_eq!(email, None);
+    }
+
+    #[tokio::test]
+    async fn user_exists_is_true_for_a_real_user_even_with_no_email_attribute() {
+        // The distinction get_user_email can't make: a genuinely-existing user with an
+        // empty email must never be treated the same as a deleted one by a reconciliation
+        // sweep that deletes on `Ok(false)`.
+        use axum::extract::Path;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user_no_email(Path(id): Path<String>) -> Json<serde_json::Value> {
+            Json(json!({ "id": id, "username": "no-email-user" }))
+        }
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", get(user_no_email));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        assert!(user_exists(&reqwest::Client::new(), &cfg, "no-email-user-id").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_exists_is_false_for_a_deleted_user() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user_gone() -> axum::http::StatusCode {
+            axum::http::StatusCode::NOT_FOUND
+        }
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", axum::routing::get(user_gone));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        assert!(!user_exists(&reqwest::Client::new(), &cfg, "long-gone").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_exists_errs_rather_than_silently_reporting_gone_on_a_server_error() {
+        // A transient Keycloak 500 must never be misread by a caller as "confirmed
+        // deleted" -- that would make an outage look like grounds to delete real accounts.
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user_broken() -> axum::http::StatusCode {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", axum::routing::get(user_broken));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        assert!(user_exists(&reqwest::Client::new(), &cfg, "whoever").await.is_err());
     }
 }

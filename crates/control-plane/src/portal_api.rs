@@ -1281,6 +1281,7 @@ pub fn admin_ui_router(
         .route("/admin-ui/accounts/:subject/block", post(admin_ui_block_account))
         .route("/admin-ui/accounts/:subject/unblock", post(admin_ui_unblock_account))
         .route("/admin-ui/accounts/:subject/delete", post(admin_ui_delete_account))
+        .route("/admin-ui/accounts/reconcile", post(admin_ui_reconcile_accounts))
         .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
         .route("/admin-ui/accounts/:subject/max-channels", post(admin_ui_set_max_channels))
         .route("/admin-ui/accounts/:subject/clear-device-fingerprint", post(admin_ui_clear_device_fingerprint))
@@ -1498,6 +1499,16 @@ async fn admin_ui_delete_account(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    cascade_delete_account(&st, &subject).await;
+    let _ = st.audit.record(&session.email, "account_delete", Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+/// The actual "remove everything `subject` owns, then the ledger row itself" cascade --
+/// factored out of [`admin_ui_delete_account`] so [`admin_ui_reconcile_accounts`] (#166,
+/// bulk-deleting accounts whose Keycloak identity is confirmed gone) can reuse the exact
+/// same, already-tested revoke/delete-order instead of a second hand-rolled copy.
+async fn cascade_delete_account(st: &AdminUiState, subject: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1505,26 +1516,26 @@ async fn admin_ui_delete_account(
 
     // Same best-effort, independently-logged cascade shape as `delete_account`
     // (2026-08-24 gap fix: log every step's failure, never `let _ =` it away).
-    if let Ok(owned) = st.tunnels.list_for_subject(&subject) {
+    if let Ok(owned) = st.tunnels.list_for_subject(subject) {
         for t in owned {
-            if let Err(e) = st.tunnels.revoke(&subject, &t.id, now) {
+            if let Err(e) = st.tunnels.revoke(subject, &t.id, now) {
                 eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
             }
         }
     }
-    if let Ok(owned) = st.channels.channels_owned_by(&subject) {
+    if let Ok(owned) = st.channels.channels_owned_by(subject) {
         for c in owned {
-            if let Err(e) = st.channels.delete_channel(&subject, &c) {
+            if let Err(e) = st.channels.delete_channel(subject, &c) {
                 eprintln!("ct-cp: admin account deletion for {subject}: deleting channel {} failed: {e}", hex(&c.0));
             }
         }
     }
-    if let Err(e) = st.topologies.delete_all_owned_by(&subject) {
+    if let Err(e) = st.topologies.delete_all_owned_by(subject) {
         eprintln!("ct-cp: admin account deletion for {subject}: deleting owned topologies failed: {e}");
     }
-    if let Ok(owned) = st.networks.list(&subject) {
+    if let Ok(owned) = st.networks.list(subject) {
         for id in owned {
-            if let Err(e) = st.networks.delete(&subject, &id) {
+            if let Err(e) = st.networks.delete(subject, &id) {
                 eprintln!("ct-cp: admin account deletion for {subject}: deleting network {id} failed: {e}");
             }
         }
@@ -1532,18 +1543,81 @@ async fn admin_ui_delete_account(
     if let Ok(all) = st.pipelines.list() {
         for (id, owner) in all {
             if owner == subject {
-                if let Err(e) = st.pipelines.unpublish(&subject, &id) {
+                if let Err(e) = st.pipelines.unpublish(subject, &id) {
                     eprintln!("ct-cp: admin account deletion for {subject}: unpublishing pipeline {id} failed: {e}");
                 }
             }
         }
     }
-    if let Err(e) = st.ledger.delete_account_for_subject(&subject) {
+    if let Err(e) = st.ledger.delete_account_for_subject(subject) {
         eprintln!("ct-cp: admin account deletion for {subject}: removing ledger row failed: {e}");
     }
+}
 
-    let _ = st.audit.record(&session.email, "account_delete", Some(&subject), None);
-    StatusCode::OK.into_response()
+/// `POST /admin-ui/accounts/reconcile` (#166): bulk-delete every ledger account whose
+/// Keycloak identity is CONFIRMED gone (a real `404`, not merely "no email attribute" --
+/// see [`crate::keycloak_admin::user_exists`]'s own doc comment for why that distinction
+/// matters), restricted to zero-balance accounts as an extra safety margin (a paying
+/// account should never vanish via an automated sweep, orphaned or not -- flag it for
+/// manual review instead by simply not touching it here).
+///
+/// Fails closed on anything uncertain: no `keycloak_admin` config configured refuses the
+/// whole sweep outright (`412`, this deployment can't safely tell "gone" from "transient
+/// lookup failure"); a single subject's lookup erroring (timeout, non-2xx, etc.) just
+/// skips that one subject rather than treating the error as "confirmed gone" -- an
+/// outage must never look like grounds to delete real accounts.
+#[derive(Serialize)]
+struct ReconcileAccountsResp {
+    checked: usize,
+    deleted: Vec<String>,
+    skipped_errors: usize,
+}
+
+async fn admin_ui_reconcile_accounts(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(cfg) = st.observability.keycloak_admin.clone() else {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            "keycloak_admin not configured -- cannot safely confirm any subject is gone, refusing the sweep",
+        )
+            .into_response();
+    };
+    let rows = match st.ledger.list_accounts() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_reconcile_accounts/list_accounts", e).into_response(),
+    };
+    let candidates: Vec<String> = rows.into_iter().filter(|r| r.balance == 0).map(|r| r.subject).collect();
+    let checked = candidates.len();
+    let client = keycloak_admin_http_client();
+    let verdicts = futures::future::join_all(candidates.into_iter().map(|subject| {
+        let client = client.clone();
+        let cfg = cfg.clone();
+        async move {
+            let exists = crate::keycloak_admin::user_exists(&client, &cfg, &subject).await;
+            (subject, exists)
+        }
+    }))
+    .await;
+    let mut deleted = Vec::new();
+    let mut skipped_errors = 0usize;
+    for (subject, exists) in verdicts {
+        match exists {
+            Ok(false) => {
+                cascade_delete_account(&st, &subject).await;
+                let _ = st.audit.record(&session.email, "account_reconcile_delete", Some(&subject), None);
+                deleted.push(subject);
+            }
+            Ok(true) => {}
+            Err(e) => {
+                eprintln!("ct-cp: admin_ui_reconcile_accounts: existence check for {subject} failed, skipping: {e}");
+                skipped_errors += 1;
+            }
+        }
+    }
+    Json(ReconcileAccountsResp { checked, deleted, skipped_errors }).into_response()
 }
 
 /// `POST /admin-ui/accounts/:subject/max-tunnels {max}` (admin-identity-gated):
@@ -10841,6 +10915,101 @@ mod tests {
         let recreated = ledger.account_for_subject("kc-target").unwrap();
         assert_ne!(recreated.0, account.0, "a fresh account id was minted -- the old row is gone");
         assert_eq!(ledger.balance(&recreated).unwrap(), 0);
+    }
+
+    /// #166: a bulk sweep must delete ONLY zero-balance accounts whose Keycloak identity
+    /// is CONFIRMED gone (a real 404) -- never a still-existing user (even one with no
+    /// email attribute), and never a gone-but-funded account (flag for manual review by
+    /// simply not touching it, rather than risk destroying real money on an automated
+    /// sweep).
+    #[tokio::test]
+    async fn admin_ui_reconcile_accounts_deletes_only_confirmed_orphans_with_zero_balance() {
+        use axum::extract::Path as AxPath;
+        use axum::routing::{get, post};
+        use axum::Json;
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user(AxPath(id): AxPath<String>) -> axum::response::Response {
+            match id.as_str() {
+                // Exists, but no email attribute -- must NOT be treated as gone.
+                "kc-noemail" => Json(serde_json::json!({ "id": id, "username": "kc-noemail" })).into_response(),
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+        let kc_app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", get(user));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kc_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, kc_app).await.unwrap() });
+
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+
+        // kc-noemail: exists in Keycloak (no email attribute) -- must survive.
+        ledger.account_for_subject("kc-noemail").unwrap();
+        // kc-gone: confirmed 404, zero balance, owns a tunnel -- must be deleted, and
+        // the cascade must still revoke its tunnel exactly like the single-subject route.
+        tunnels.create("kc-gone", "t1", None).unwrap();
+        let gone_account = ledger.account_for_subject("kc-gone").unwrap();
+        // kc-richgone: confirmed 404 too, but has a real balance -- must survive despite
+        // being just as "orphaned" as kc-gone, per the balance=0 safety gate.
+        let rich_account = ledger.account_for_subject("kc-richgone").unwrap();
+        ledger.credit(&rich_account, 100).unwrap();
+
+        let app = admin_ui_router(
+            KEY,
+            admin,
+            audit,
+            ledger.clone(),
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+            ObservabilityConfig {
+                keycloak_admin: Some(crate::keycloak_admin::KeycloakAdminConfig {
+                    base_url: format!("http://{kc_addr}"),
+                    realm: "ct-demo".to_string(),
+                    admin_user: "admin".to_string(),
+                    admin_password: "pw".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let resp = admin_ui_req(&app, "POST", "/admin-ui/accounts/reconcile", &super_session, None).await;
+        assert_eq!(resp, StatusCode::OK);
+
+        let recreated_gone = ledger.account_for_subject("kc-gone").unwrap();
+        assert_ne!(recreated_gone.0, gone_account.0, "the confirmed-orphan zero-balance account was actually deleted");
+        assert!(tunnels.list_for_subject("kc-gone").unwrap().is_empty(), "its tunnel was revoked by the same cascade");
+
+        let subjects: Vec<String> = ledger.list_accounts().unwrap().into_iter().map(|r| r.subject).collect();
+        assert!(subjects.contains(&"kc-noemail".to_string()), "a real Keycloak user with no email must survive");
+        assert!(subjects.contains(&"kc-richgone".to_string()), "a funded orphan must survive (flagged, not auto-deleted)");
+        assert_eq!(ledger.balance(&rich_account).unwrap(), 100, "its balance is untouched");
+    }
+
+    #[tokio::test]
+    async fn admin_ui_reconcile_accounts_refuses_outright_without_keycloak_admin_configured() {
+        // Fails closed: with no way to confirm any subject is actually gone, the whole
+        // sweep must refuse rather than silently doing nothing (which could read as "ran
+        // clean, no orphans" when really it never checked anything).
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        ledger.account_for_subject("kc-whatever").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/reconcile", &super_session, None).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
     }
 
     // ===== ADR-0025 Decision 4/6: hostname disable/enable + domains + certs =====
