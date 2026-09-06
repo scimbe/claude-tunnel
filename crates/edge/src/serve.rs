@@ -2048,10 +2048,31 @@ pub async fn serve_connection(
                 // is the only place the two refusal causes are distinguishable —
                 // an authorization miss here is usually the agent's bind racing the
                 // control plane's authorize-host call (freshly onboarded agent).
-                eprintln!(
-                    "ct-edge: refused hostname bind for '{host}' (no authorization for this token — \
-                     authorize-host not yet landed, or never granted) (#502)"
-                );
+                //
+                // #639 follow-up: name the actual (presented, authorized) token
+                // mismatch here -- this is exactly the manual `mesh_ownership` DB
+                // read #639's forensics needed to diagnose a stale/wrong configured
+                // token (e.g. docker/deploy/.env drifting from what the control
+                // plane actually authorized). Both fingerprints are the existing
+                // #342/#583 first-4-bytes-hex convention, never the full token.
+                let mut presented_buf = [0u8; 8];
+                let presented = token_hex(&token, &mut presented_buf);
+                match state.authorized_token_for(host) {
+                    Some(authorized) => {
+                        let mut authorized_buf = [0u8; 8];
+                        let authorized = token_hex(&authorized, &mut authorized_buf);
+                        eprintln!(
+                            "ct-edge: refused hostname bind for '{host}': presented token={presented} \
+                             does not match the authorized token={authorized} on file (#502, #639)"
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "ct-edge: refused hostname bind for '{host}' (no authorization for this token \
+                             ({presented}) — authorize-host not yet landed, or never granted) (#502, #639)"
+                        );
+                    }
+                }
                 send.write_all(b"NO").await?;
                 send.finish()?;
                 return Ok(None);

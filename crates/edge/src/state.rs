@@ -913,6 +913,18 @@ impl<H: Clone> EdgeState<H> {
         }
     }
 
+    /// #639 follow-up: the token this edge currently has on file as authorized
+    /// for `host`, if any -- diagnostics-only, so a refused bind's log line can
+    /// name the actual (presented, authorized) mismatch directly instead of an
+    /// operator having to read `mesh_ownership` out of the control plane's DB by
+    /// hand (exactly the manual step #639's forensics needed). `None` covers
+    /// both "authorization not required" and "no entry for this hostname yet" --
+    /// callers needing to distinguish those already have `host_bind_allowed`.
+    pub fn authorized_token_for(&self, host: &str) -> Option<RoutingToken> {
+        let key = ct_common::normalize_hostname(host)?;
+        self.host_auth.read_safe().as_ref()?.get(&key).cloned()
+    }
+
     /// Enable the per-token rendezvous rate limit (#86, ADR-0018): at most
     /// `max_per_window` rendezvous per routing token per window. Off until called.
     pub fn set_rendezvous_limit(&self, max_per_window: u32) {
@@ -2020,6 +2032,30 @@ mod tests {
         assert!(state.host_bind_allowed("x.test", &token(1)), "authorized pair allowed");
         assert!(!state.host_bind_allowed("x.test", &token(2)), "wrong token refused");
         assert!(!state.host_bind_allowed("y.test", &token(1)), "unauthorized host refused");
+    }
+
+    #[test]
+    fn authorized_token_for_names_the_actual_mismatch_639() {
+        // #639 follow-up: a refused bind's log line needs to name BOTH the
+        // presented and the actually-authorized token, not just "refused" --
+        // this is the accessor that makes that possible.
+        let state = EdgeState::<u32>::new();
+        // Legacy (auth never required): nothing on file to name.
+        assert_eq!(state.authorized_token_for("x.test"), None);
+
+        state.require_host_auth();
+        assert_eq!(state.authorized_token_for("x.test"), None, "required but nothing authorized yet");
+
+        state.authorize_host("X.Test", token(1)); // case-insensitive, same as host_bind_allowed
+        assert_eq!(state.authorized_token_for("x.test"), Some(token(1)));
+        assert_eq!(
+            state.authorized_token_for("y.test"),
+            None,
+            "a different, never-authorized hostname has nothing on file"
+        );
+
+        state.unauthorize_host("x.test");
+        assert_eq!(state.authorized_token_for("x.test"), None, "de-authorized host has nothing on file again");
     }
 
     #[test]
