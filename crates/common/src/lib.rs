@@ -46,6 +46,9 @@ pub mod policy;
 pub mod pow;
 pub mod preimage;
 pub mod ratelimit;
+/// #782: signed forensic receipts -- the hash-chained, ed25519-signed tunnel metadata
+/// event record an edge emits and the wasm32-portable offline verifier for it.
+pub mod receipt;
 pub mod replay;
 pub mod settlement;
 pub mod sync;

@@ -35,6 +35,9 @@ mod fleet;
 mod access;
 /// #780: time-boxed share links for login-gated hostnames -- see `portal_api/share.rs`.
 mod share;
+/// #782: signed forensic receipts -- the owner-scoped `receipts.jsonl` export, fetched
+/// from the edge and verifiable offline; see `portal_api/receipts.rs`.
+mod receipts;
 
 /// #297: map a storage/DB error to a generic 500 instead of leaking `e`'s `Display`
 /// (SQLite internals — constraint/table/column names, schema state) to the caller.
@@ -345,7 +348,8 @@ pub fn portal_api_router_with_verifier(
         .merge(uptime::routes())
         .merge(fleet::routes())
         .merge(access::routes())
-        .merge(share::routes());
+        .merge(share::routes())
+        .merge(receipts::routes());
     if verifier.is_some() {
         router = router
             .route("/me/signup", post(me_signup))

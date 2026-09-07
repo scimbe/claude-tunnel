@@ -41,6 +41,12 @@ git = "https://github.com/scimbe/ct-agent"
 tag = "v0.7.22"
 optional = true
 
+# #782: the `verify_receipts` bin's tests verify the fixture chain ct-common's own
+# tests are built on (`ct_common::receipt::test_support`); same feature-on-dev-dependency
+# pattern as ct-edge's, never enabled by a non-test build.
+[dev-dependencies]
+ct-common = { path = "../common", features = ["test-support"] }
+
 [[bin]]
 name = "metrics_probe"
 path = "src/bin/metrics_probe.rs"
@@ -53,3 +59,8 @@ path = "src/bin/udp_echo.rs"
 name = "natlab"
 path = "src/bin/natlab.rs"
 required-features = ["nat-lab"]
+
+# #782: offline verifier for a tunnel's signed forensic receipts export.
+[[bin]]
+name = "verify_receipts"
+path = "src/bin/verify_receipts.rs"

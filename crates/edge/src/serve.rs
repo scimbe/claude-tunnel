@@ -3788,9 +3788,41 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         None => eprintln!("ct-edge: tunnel session history DISABLED (CT_EDGE_TUNNEL_HISTORY=off, #776)"),
         Some(path) => {
             if let Some((history, durable)) = crate::tunnel_history::open_with_fallback(&path) {
+                // #782: signed forensic receipts ride in the same store, signed with a
+                // DEDICATED key beside the CA key (never the CA key itself -- see
+                // `receipts.rs`). `CT_EDGE_RECEIPTS=off` disables signing; a key that cannot
+                // be loaded/created disables it too, loudly, rather than refusing tunnel
+                // service -- the session history itself keeps working without receipts.
+                let mut history = history;
+                if crate::receipts::receipts_enabled(std::env::var("CT_EDGE_RECEIPTS").ok().as_deref()) {
+                    let key_path = crate::receipts::receipts_key_path_for(&ca_key_path);
+                    let edge_id = crate::receipts::edge_id_from_env();
+                    match crate::receipts::load_or_create_signer(&key_path, &edge_id) {
+                        Ok(signer) => {
+                            let pubkey = signer.pubkey_hex();
+                            match history.install_receipts(signer) {
+                                Ok(()) => eprintln!(
+                                    "ct-edge: signed receipts enabled (edge_id={edge_id}, pubkey={pubkey}, \
+                                     key {key_path}, #782)"
+                                ),
+                                Err(e) => eprintln!(
+                                    "ct-edge: WARNING — receipts chain state failed to load ({e}); receipts \
+                                     DISABLED, session history continues without them (#782)"
+                                ),
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "ct-edge: WARNING — receipts key at {key_path} unusable ({e}); receipts DISABLED, \
+                             session history continues without them (#782)"
+                        ),
+                    }
+                } else {
+                    eprintln!("ct-edge: signed receipts DISABLED (CT_EDGE_RECEIPTS=off, #782)");
+                }
                 let history = std::sync::Arc::new(history);
                 // Rows left open by the previous process (redeploy, crash) would otherwise
                 // be adopted by the token's next registration and count the gap as uptime.
+                // (#782: after the signer is installed, so each gets a close receipt.)
                 match history.close_stale_open_sessions(crate::tunnel_history::now_secs(), "edge-restart") {
                     Ok(n) if n > 0 => eprintln!("ct-edge: tunnel history: closed {n} session(s) left open by the previous process (#776)"),
                     Ok(_) => {}

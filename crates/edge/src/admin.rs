@@ -55,6 +55,11 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // card -- same listener, gate, and `/internal/...` naming as the #763 presence
         // routes above, for the same reason (the CP is its only caller).
         .route("/internal/tunnel/history/:token_hex", get(tunnel_history))
+        // #782: signed forensic receipts -- the edge's receipts public key and a token's
+        // receipt chain page, for the control plane's `receipts.jsonl` export. Same
+        // listener, gate and `/internal/...` naming as the history route above.
+        .route("/internal/receipts/pubkey", get(receipts_pubkey))
+        .route("/internal/tunnel/receipts/:token_hex", get(tunnel_receipts))
         // #779: the control plane pushes a tunnel's access window here on every change
         // (and alongside a fresh hostname authorization); boot-time state comes from the
         // rehydrate replay instead. Routing token via the `x-ct-routing-token` header,
@@ -502,6 +507,100 @@ async fn tunnel_history(
     let uptime = history.uptime_summary(&hex, now).map_err(store_error)?;
     let sessions = history.sessions_for(&hex, limit).map_err(store_error)?;
     Ok(Json(TunnelHistoryResp { open, uptime, sessions }))
+}
+
+/// #782: the body of [`receipts_pubkey`].
+#[derive(Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct ReceiptsPubkeyResp {
+    /// Always `"ed25519"`.
+    alg: String,
+    /// 64 lowercase hex chars.
+    pubkey: String,
+    edge_id: String,
+}
+
+/// `GET /internal/receipts/pubkey` (#782): the public half of this edge's dedicated
+/// receipts signing key (`edge-receipts-key.bin`, never the CA key) and the `edge_id`
+/// every receipt carries -- what an offline verifier checks a chain against. Admin-token
+/// gated like every other route here (the key is public, but the listener is private
+/// and nothing on it is unauthenticated); `404` when receipts are disabled
+/// (`CT_EDGE_RECEIPTS=off`, or no history store at all).
+async fn receipts_pubkey(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+) -> Result<Json<ReceiptsPubkeyResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(history) = state.tunnel_history() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let (Some(pubkey), Some(edge_id)) = (history.receipts_pubkey_hex(), history.receipts_edge_id()) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(ReceiptsPubkeyResp { alg: "ed25519".into(), pubkey, edge_id: edge_id.to_string() }))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TunnelReceiptsQuery {
+    /// Return receipts with `seq` strictly greater than this (a cursor: the last seq the
+    /// caller already holds). Absent -> from the oldest retained.
+    #[serde(default)]
+    since: Option<u64>,
+    /// Page size, clamped to `1..=`[`crate::tunnel_history::RECEIPTS_MAX_LIMIT`];
+    /// absent -> [`RECEIPTS_DEFAULT_LIMIT`].
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+const RECEIPTS_DEFAULT_LIMIT: usize = 200;
+
+/// #782: the body of [`tunnel_receipts`].
+#[derive(Serialize, serde::Deserialize, Debug)]
+struct TunnelReceiptsResp {
+    /// The key the chain verifies under (same as [`receipts_pubkey`]'s).
+    pubkey: String,
+    edge_id: String,
+    /// Ascending by `seq`; empty for a token with no retained receipts.
+    receipts: Vec<ct_common::receipt::Receipt>,
+}
+
+/// `GET /internal/tunnel/receipts/:token_hex?since=<seq>&limit=<n>` (#782): the token's
+/// signed receipts, ascending, strictly after `since`, at most `limit` (default 200,
+/// cap 1000) -- the page the control plane streams out as `receipts.jsonl`. Admin-token
+/// gated; `400` malformed hex; `404` when receipts are disabled so the CP can say so
+/// rather than export an empty file. What is disclosed is exactly what the receipts
+/// carry (see `ct_common::receipt`): metadata events for a token the caller already
+/// names, with the token itself present only as its SHA-256.
+async fn tunnel_receipts(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Path(token_hex): Path<String>,
+    Query(q): Query<TunnelReceiptsQuery>,
+) -> Result<Json<TunnelReceiptsResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(t) = parse_token_hex(&token_hex) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(history) = state.tunnel_history() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let (Some(pubkey), Some(edge_id)) = (history.receipts_pubkey_hex(), history.receipts_edge_id()) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let limit = q
+        .limit
+        .filter(|&l| l > 0)
+        .unwrap_or(RECEIPTS_DEFAULT_LIMIT)
+        .min(crate::tunnel_history::RECEIPTS_MAX_LIMIT);
+    let token_hash = ct_common::receipt::routing_token_hash(&t);
+    let receipts = history.receipts_for(&token_hash, q.since.unwrap_or(0), limit).map_err(|e| {
+        eprintln!("ct-edge: receipts read failed: {e} (#782)");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(TunnelReceiptsResp { pubkey, edge_id: edge_id.to_string(), receipts }))
 }
 
 /// `POST /internal/tunnel/access-policy` (#779): the control plane's push of one
@@ -1018,6 +1117,125 @@ mod tests {
         // Malformed hex -> 400, not a panic.
         assert_eq!(
             get(Some(secret_hex), "/internal/tunnel/history/not-hex".to_string()).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn receipts_routes_are_admin_gated_404_when_disabled_and_paginate_with_since_782() {
+        // #782: the two reads the control plane's receipts export is built from. Both must
+        // require the admin token (401), answer 404 while no signer is installed (history
+        // off, or CT_EDGE_RECEIPTS=off) so the CP reports "unavailable" instead of
+        // exporting an empty file, and -- with a signer -- publish the key and page the
+        // token's chain ascending with an exclusive `since` cursor. The chain's own
+        // construction is proven in tunnel_history.rs; this covers the HTTP layer.
+        use crate::tunnel_history::{SqliteTunnelHistory, TRANSPORT_QUIC};
+        use ct_common::receipt::{self, ReceiptSigner};
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x82u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let tok_hex = "7c".repeat(32);
+        let tok = RoutingToken([0x7c; 32]);
+
+        let get = |auth: Option<String>, path: String| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get(path);
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+        let pubkey_path = "/internal/receipts/pubkey".to_string();
+        let path = format!("/internal/tunnel/receipts/{tok_hex}");
+
+        // No admin token -> 401 on both.
+        assert_eq!(get(None, pubkey_path.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(get(None, path.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // No history store at all -> 404 on both.
+        assert_eq!(get(Some(secret_hex.clone()), pubkey_path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(get(Some(secret_hex.clone()), path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        // A history store WITHOUT a signer (CT_EDGE_RECEIPTS=off) -> still 404 on both,
+        // while the history route itself keeps working.
+        state.set_tunnel_history(Arc::new(SqliteTunnelHistory::open_in_memory().unwrap()));
+        assert_eq!(get(Some(secret_hex.clone()), pubkey_path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(get(Some(secret_hex.clone()), path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(Some(secret_hex.clone()), format!("/internal/tunnel/history/{tok_hex}")).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // With a signer: the pubkey route publishes the key + edge id...
+        let signer = ReceiptSigner::from_seed(&[0x82u8; 32], "edge-82");
+        let expected_pubkey = signer.pubkey_hex();
+        let history = Arc::new(SqliteTunnelHistory::open_in_memory().unwrap().with_receipts(signer).unwrap());
+        state.set_tunnel_history(history.clone());
+        let resp = get(Some(secret_hex.clone()), pubkey_path.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: ReceiptsPubkeyResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            ReceiptsPubkeyResp { alg: "ed25519".into(), pubkey: expected_pubkey.clone(), edge_id: "edge-82".into() }
+        );
+
+        // ...and the receipts route pages the token's chain. Three sessions via the
+        // store (six receipts), then one live open via the registration path.
+        let hex = crate::tunnel_history::routing_token_hex(&tok);
+        for i in 0..3 {
+            history.open_session(&hex, TRANSPORT_QUIC, 1_000 + i * 100).unwrap();
+            history.close_session(&hex, 1_050 + i * 100, "removed").unwrap();
+        }
+        let _park = state.park_tcp_agent(tok.clone());
+
+        let resp = get(Some(secret_hex.clone()), path.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.pubkey, expected_pubkey);
+        assert_eq!(parsed.edge_id, "edge-82");
+        assert_eq!(parsed.receipts.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+        assert_eq!(parsed.receipts[6].kind, receipt::KIND_SESSION_OPEN, "the live park's open receipt");
+        assert_eq!(parsed.receipts[6].payload["transport"], "tcp-fallback");
+        assert!(!body.windows(64).any(|w| w == tok_hex.as_bytes()), "the raw routing token never appears");
+        assert_eq!(parsed.receipts[0].routing_token_hash, receipt::routing_token_hash(&tok.0));
+        let key = receipt::pubkey_from_hex(&parsed.pubkey).unwrap();
+        receipt::verify_chain(&parsed.receipts, &key).expect("the served page verifies under the served key");
+        // The raw JSON carries exactly the documented top-level keys and receipt keys.
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut keys: Vec<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["edge_id", "pubkey", "receipts"]);
+        let mut rkeys: Vec<&str> = raw["receipts"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        rkeys.sort_unstable();
+        assert_eq!(
+            rkeys,
+            ["edge_id", "hash", "kind", "payload", "prev_hash", "routing_token_hash", "seq", "sig", "ts"]
+        );
+
+        // `since` is an exclusive cursor and `limit` a page size (upper-case hex resolves too).
+        let upper = format!("/internal/tunnel/receipts/{}?since=2&limit=3", tok_hex.to_uppercase());
+        let resp = get(Some(secret_hex.clone()), upper).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.receipts.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        let resp = get(Some(secret_hex.clone()), format!("{path}?since=7")).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.receipts.is_empty(), "past the head -> empty page, not an error");
+
+        // An unknown token is an empty page; malformed hex -> 400.
+        let unknown = format!("/internal/tunnel/receipts/{}", "7d".repeat(32));
+        let resp = get(Some(secret_hex.clone()), unknown).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.receipts.is_empty());
+        assert_eq!(
+            get(Some(secret_hex), "/internal/tunnel/receipts/not-hex".to_string()).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
     }

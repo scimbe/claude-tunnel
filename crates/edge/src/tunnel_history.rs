@@ -28,10 +28,22 @@
 //! `CT_EDGE_TUNNEL_HISTORY_PATH` overrides it and `CT_EDGE_TUNNEL_HISTORY=off` disables
 //! it. A path that cannot be opened falls back to an in-memory store with a loud warning
 //! -- the feature keeps working for the process lifetime, it just isn't durable.
+//!
+//! #782: the same store also holds the edge's **signed forensic receipts** -- a
+//! `tunnel_receipts` table appended to, under the same connection lock, whenever a
+//! session row is opened or closed and, hourly, when an open session's byte counters
+//! moved. Each receipt is hash-chained to the previous one and ed25519-signed with the
+//! edge's dedicated receipts key ([`crate::receipts`]); the chain head (last seq + hash)
+//! lives in `tunnel_receipts_head` so retention pruning of old receipts never resets the
+//! sequence. What a receipt proves, its exact JSON shape and the canonical form the
+//! hash covers are documented once, on `ct_common::receipt`. Receipts are metadata only,
+//! like the session rows they attest, and carry the routing token only as a SHA-256.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ct_common::receipt::{self, Receipt, ReceiptSigner};
 use ct_common::sync::MutexExt;
 use ct_common::RoutingToken;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -85,9 +97,30 @@ pub struct UptimeSummary {
     pub d30: f64,
 }
 
+/// #782: the admin route's page cap for `receipts_for`.
+pub const RECEIPTS_MAX_LIMIT: usize = 1000;
+
 /// SQLite-backed per-tunnel session history. See the module doc for scope/rationale.
 pub struct SqliteTunnelHistory {
     conn: Mutex<Connection>,
+    /// #782: receipt signing state; `None` when receipts are disabled (no signer was
+    /// installed via [`with_receipts`](Self::with_receipts)). Its own mutexes are only
+    /// ever taken while the `conn` guard is held (lock order: `conn`, then these), so
+    /// emission is serialized with the row write it attests and seqs never interleave.
+    receipts: Option<ReceiptEmitter>,
+}
+
+/// #782: the signer plus the in-memory chain head and the per-session byte high-water
+/// marks the hourly snapshot compares against.
+struct ReceiptEmitter {
+    signer: ReceiptSigner,
+    /// `(last seq, last hash hex)`; `(0, GENESIS_PREV_HASH)` before the first receipt.
+    head: Mutex<(u64, String)>,
+    /// Open session row id -> the `(bytes_in, bytes_out)` the last `bytes` receipt
+    /// carried, so a snapshot is only emitted when the counters actually moved. Entries
+    /// are dropped on close; a restart starts empty (every open row is closed at boot
+    /// anyway, see [`close_stale_open_sessions`](SqliteTunnelHistory::close_stale_open_sessions)).
+    snapshots: Mutex<HashMap<i64, (u64, u64)>>,
 }
 
 impl SqliteTunnelHistory {
@@ -118,11 +151,226 @@ impl SqliteTunnelHistory {
              CREATE INDEX IF NOT EXISTS idx_tunnel_sessions_token_connected
                  ON tunnel_sessions (routing_token, connected_at);
              CREATE INDEX IF NOT EXISTS idx_tunnel_sessions_disconnected
-                 ON tunnel_sessions (disconnected_at);",
+                 ON tunnel_sessions (disconnected_at);
+             CREATE TABLE IF NOT EXISTS tunnel_receipts (
+                 seq                INTEGER PRIMARY KEY,
+                 prev_hash          TEXT NOT NULL,
+                 ts                 INTEGER NOT NULL,
+                 edge_id            TEXT NOT NULL,
+                 kind               TEXT NOT NULL,
+                 routing_token_hash TEXT NOT NULL,
+                 payload            TEXT NOT NULL,
+                 hash               TEXT NOT NULL,
+                 sig                TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_tunnel_receipts_token_seq
+                 ON tunnel_receipts (routing_token_hash, seq);
+             CREATE INDEX IF NOT EXISTS idx_tunnel_receipts_ts
+                 ON tunnel_receipts (ts);
+             CREATE TABLE IF NOT EXISTS tunnel_receipts_head (
+                 id        INTEGER PRIMARY KEY CHECK (id = 1),
+                 last_seq  INTEGER NOT NULL,
+                 last_hash TEXT NOT NULL
+             );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            receipts: None,
         })
+    }
+
+    /// #782: install the receipts signer, resuming the chain from the persisted head
+    /// (`tunnel_receipts_head`; genesis when the table is empty). Every open/close from
+    /// here on appends a signed receipt. Consumes and returns `self` so the store cannot
+    /// be shared before its chain state is loaded.
+    pub fn with_receipts(mut self, signer: ReceiptSigner) -> rusqlite::Result<Self> {
+        self.install_receipts(signer)?;
+        Ok(self)
+    }
+
+    /// [`with_receipts`](Self::with_receipts) in place: on `Err` the store is unchanged
+    /// (no signer installed), so the caller can keep using it without receipts.
+    pub fn install_receipts(&mut self, signer: ReceiptSigner) -> rusqlite::Result<()> {
+        let head: Option<(i64, String)> = self
+            .conn
+            .lock_safe()
+            .query_row("SELECT last_seq, last_hash FROM tunnel_receipts_head WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let head = match head {
+            Some((seq, hash)) => (seq.max(0) as u64, hash),
+            None => (0, receipt::GENESIS_PREV_HASH.to_string()),
+        };
+        self.receipts = Some(ReceiptEmitter {
+            signer,
+            head: Mutex::new(head),
+            snapshots: Mutex::new(HashMap::new()),
+        });
+        Ok(())
+    }
+
+    /// #782: whether a signer is installed (the admin routes answer 404 otherwise).
+    pub fn receipts_enabled(&self) -> bool {
+        self.receipts.is_some()
+    }
+
+    /// #782: the receipts public key (64 hex) when signing is enabled.
+    pub fn receipts_pubkey_hex(&self) -> Option<String> {
+        self.receipts.as_ref().map(|r| r.signer.pubkey_hex())
+    }
+
+    /// #782: the `edge_id` every receipt carries, when signing is enabled.
+    pub fn receipts_edge_id(&self) -> Option<&str> {
+        self.receipts.as_ref().map(|r| r.signer.edge_id())
+    }
+
+    /// #782: the chain head `(last seq, last hash)` -- `(0, genesis)` before the first
+    /// receipt; `None` when signing is disabled.
+    pub fn receipts_head(&self) -> Option<(u64, String)> {
+        let _conn = self.conn.lock_safe();
+        self.receipts.as_ref().map(|r| r.head.lock_safe().clone())
+    }
+
+    /// #782: append one signed receipt for `token_hex` (the caller holds the `conn`
+    /// guard; the receipt row and the head update commit in one transaction so a crash
+    /// between them cannot fork the chain). No-op when signing is disabled. A store
+    /// error here is returned to the caller, which logs it and keeps the session row --
+    /// a missed receipt is visible later as a seq gap, a lost session row is not.
+    fn emit(
+        &self,
+        conn: &Connection,
+        ts: i64,
+        kind: &str,
+        token_hex: &str,
+        payload: serde_json::Value,
+    ) -> rusqlite::Result<()> {
+        let Some(em) = &self.receipts else {
+            return Ok(());
+        };
+        let token_hash = routing_token_hash_of_hex(token_hex);
+        let mut head = em.head.lock_safe();
+        let seq = head.0 + 1;
+        let r = em.signer.sign(seq, &head.1, ts, kind, &token_hash, payload);
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO tunnel_receipts (seq, prev_hash, ts, edge_id, kind, routing_token_hash, payload, hash, sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                clamp_i64(r.seq),
+                r.prev_hash,
+                r.ts,
+                r.edge_id,
+                r.kind,
+                r.routing_token_hash,
+                receipt::canonical_json(&r.payload),
+                r.hash,
+                r.sig,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO tunnel_receipts_head (id, last_seq, last_hash) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET last_seq = excluded.last_seq, last_hash = excluded.last_hash",
+            params![clamp_i64(r.seq), r.hash],
+        )?;
+        tx.commit()?;
+        *head = (r.seq, r.hash);
+        Ok(())
+    }
+
+    /// #782: receipts for the token whose SHA-256 is `token_hash`, ascending by `seq`,
+    /// strictly after `since_seq` (`0` = from the oldest retained), at most `limit`
+    /// (capped at [`RECEIPTS_MAX_LIMIT`]). Empty for an unknown token or when signing
+    /// is disabled.
+    pub fn receipts_for(&self, token_hash: &str, since_seq: u64, limit: usize) -> rusqlite::Result<Vec<Receipt>> {
+        if self.receipts.is_none() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT seq, prev_hash, ts, edge_id, kind, routing_token_hash, payload, hash, sig
+             FROM tunnel_receipts WHERE routing_token_hash = ?1 AND seq > ?2
+             ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let limit = clamp_i64(limit.clamp(1, RECEIPTS_MAX_LIMIT) as u64);
+        let rows = stmt.query_map(params![token_hash, clamp_i64(since_seq), limit], |r| {
+            let payload_text: String = r.get(6)?;
+            let payload = serde_json::from_str(&payload_text).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            Ok(Receipt {
+                seq: r.get::<_, i64>(0)?.max(0) as u64,
+                prev_hash: r.get(1)?,
+                ts: r.get(2)?,
+                edge_id: r.get(3)?,
+                kind: r.get(4)?,
+                routing_token_hash: r.get(5)?,
+                payload,
+                hash: r.get(7)?,
+                sig: r.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// #782: the hourly `bytes` snapshot -- one receipt per OPEN session whose
+    /// `(bytes_in, bytes_out)` moved since its last snapshot (or since it opened),
+    /// carrying the cumulative counters. Called from the flush loop AFTER the byte
+    /// deltas were written into the rows, so the receipt attests what the row says.
+    /// Returns how many were emitted; `0` when signing is disabled.
+    pub fn emit_bytes_snapshots(&self, now: i64) -> rusqlite::Result<usize> {
+        let Some(em) = &self.receipts else {
+            return Ok(0);
+        };
+        let conn = self.conn.lock_safe();
+        let open: Vec<(i64, String, i64, u64, u64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, routing_token, connected_at, bytes_in, bytes_out FROM tunnel_sessions
+                 WHERE disconnected_at IS NULL ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)?.max(0) as u64,
+                    r.get::<_, i64>(4)?.max(0) as u64,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut emitted = 0usize;
+        for (id, token_hex, connected_at, bytes_in, bytes_out) in open {
+            let last = em.snapshots.lock_safe().get(&id).copied().unwrap_or((0, 0));
+            if last == (bytes_in, bytes_out) {
+                continue;
+            }
+            self.emit(
+                &conn,
+                now,
+                receipt::KIND_BYTES,
+                &token_hex,
+                serde_json::json!({ "bytes_in": bytes_in, "bytes_out": bytes_out, "connected_at": connected_at }),
+            )?;
+            em.snapshots.lock_safe().insert(id, (bytes_in, bytes_out));
+            emitted += 1;
+        }
+        Ok(emitted)
+    }
+
+    /// #782: delete receipts with `ts` before `cutoff` (the same window as the session
+    /// rows). The chain head is untouched, so the next receipt still continues the
+    /// sequence; an export after pruning simply starts mid-chain (its verifier accepts
+    /// that -- see `ct_common::receipt`). Returns the count removed.
+    pub fn prune_receipts_older_than(&self, cutoff: i64) -> rusqlite::Result<usize> {
+        self.conn.lock_safe().execute("DELETE FROM tunnel_receipts WHERE ts < ?1", params![cutoff])
+    }
+
+    /// #782: forget a closed session's snapshot high-water mark.
+    fn forget_snapshot(&self, id: i64) {
+        if let Some(em) = &self.receipts {
+            em.snapshots.lock_safe().remove(&id);
+        }
     }
 
     /// Open a session for `token_hex` at `now` and return its row id. **One open session
@@ -156,19 +404,60 @@ impl SqliteTunnelHistory {
              VALUES (?1, ?2, ?3, ?3)",
             params![token_hex, transport, now],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        // #782: attest the new streak. Only here, not on the reuse path above: a
+        // re-park or transport switch is not a new session.
+        self.emit(
+            &conn,
+            now,
+            receipt::KIND_SESSION_OPEN,
+            token_hex,
+            serde_json::json!({ "connected_at": now, "transport": transport }),
+        )?;
+        Ok(id)
     }
 
     /// Close the open session for `token_hex` (if any) at `now` with `reason`. Returns
     /// whether a row was actually closed -- `false` when none was open, which is a normal
     /// outcome for a teardown of a token that never opened one.
+    ///
+    /// #782: every row closed here gets a `session_close` receipt carrying the row's
+    /// final counters (the caller flushes the last byte delta first -- see
+    /// `EdgeState::close_tunnel_session`), so the receipt and the row agree.
     pub fn close_session(&self, token_hex: &str, now: i64, reason: &str) -> rusqlite::Result<bool> {
-        let n = self.conn.lock_safe().execute(
+        let conn = self.conn.lock_safe();
+        let open = open_rows(&conn, Some(token_hex))?;
+        if open.is_empty() {
+            return Ok(false);
+        }
+        conn.execute(
             "UPDATE tunnel_sessions SET disconnected_at = ?1, reason = ?2, last_flush = ?1
              WHERE routing_token = ?3 AND disconnected_at IS NULL",
             params![now, reason, token_hex],
         )?;
-        Ok(n > 0)
+        for row in open {
+            self.emit_close(&conn, &row, now, reason)?;
+        }
+        Ok(true)
+    }
+
+    /// #782: the `session_close` receipt for one just-closed row.
+    fn emit_close(&self, conn: &Connection, row: &OpenRow, now: i64, reason: &str) -> rusqlite::Result<()> {
+        self.emit(
+            conn,
+            now,
+            receipt::KIND_SESSION_CLOSE,
+            &row.token_hex,
+            serde_json::json!({
+                "bytes_in": row.bytes_in,
+                "bytes_out": row.bytes_out,
+                "connected_at": row.connected_at,
+                "disconnected_at": now,
+                "reason": reason,
+            }),
+        )?;
+        self.forget_snapshot(row.id);
+        Ok(())
     }
 
     /// Add byte deltas to the open session for `token_hex`. No-op (returns `false`) when
@@ -258,13 +547,21 @@ impl SqliteTunnelHistory {
     /// the previous process (crash, redeploy -- nothing runs the close paths then) would
     /// otherwise be adopted by [`open_session`](Self::open_session)'s one-open-row rule on
     /// the token's next registration, and the whole restart gap would count as uptime.
-    /// Returns how many rows were closed.
+    /// Returns how many rows were closed. #782: each gets a `session_close` receipt too
+    /// (reason `"edge-restart"`), so the chain records the gap rather than a session
+    /// that silently never ended.
     pub fn close_stale_open_sessions(&self, now: i64, reason: &str) -> rusqlite::Result<usize> {
-        self.conn.lock_safe().execute(
+        let conn = self.conn.lock_safe();
+        let open = open_rows(&conn, None)?;
+        let n = conn.execute(
             "UPDATE tunnel_sessions SET disconnected_at = ?1, reason = ?2, last_flush = ?1
              WHERE disconnected_at IS NULL",
             params![now, reason],
-        )
+        )?;
+        for row in &open {
+            self.emit_close(&conn, row, now, reason)?;
+        }
+        Ok(n)
     }
 
     #[cfg(test)]
@@ -272,6 +569,44 @@ impl SqliteTunnelHistory {
         self.conn
             .lock_safe()
             .query_row("SELECT COUNT(*) FROM tunnel_sessions", [], |r| r.get(0))
+    }
+}
+
+/// #782: what a close receipt needs from the row it closes.
+struct OpenRow {
+    id: i64,
+    token_hex: String,
+    connected_at: i64,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+/// Every open session row, for one token or (`None`) all of them, oldest first.
+fn open_rows(conn: &Connection, token_hex: Option<&str>) -> rusqlite::Result<Vec<OpenRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, routing_token, connected_at, bytes_in, bytes_out FROM tunnel_sessions
+         WHERE disconnected_at IS NULL AND (?1 IS NULL OR routing_token = ?1) ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![token_hex], |r| {
+        Ok(OpenRow {
+            id: r.get(0)?,
+            token_hex: r.get(1)?,
+            connected_at: r.get(2)?,
+            bytes_in: r.get::<_, i64>(3)?.max(0) as u64,
+            bytes_out: r.get::<_, i64>(4)?.max(0) as u64,
+        })
+    })?;
+    rows.collect()
+}
+
+/// #782: `ct_common::receipt::routing_token_hash` over the token the store is keyed by.
+/// The store's key is always the lowercase hex `routing_token_hex` produces, so the
+/// decode cannot fail for anything the edge wrote itself; a foreign string (a test
+/// passing junk) hashes its own bytes rather than aborting the write.
+fn routing_token_hash_of_hex(token_hex: &str) -> String {
+    match receipt::hex_decode(token_hex) {
+        Some(bytes) => receipt::routing_token_hash(&bytes),
+        None => receipt::routing_token_hash(token_hex.as_bytes()),
     }
 }
 
@@ -409,7 +744,9 @@ pub(crate) fn now_secs() -> i64 {
 /// flush into its open session row, and (b) evicts from the in-memory maps every token
 /// with no live registration whose last activity is older than `idle_evict_secs` (both
 /// via [`EdgeState::flush_tunnel_history`]); once an hour it also prunes closed sessions
-/// older than `retention_secs`. Raced against `shutdown` like `run_audit_retention_loop`.
+/// older than `retention_secs`, emits the `bytes` receipt snapshot for open sessions
+/// whose counters moved (#782), and prunes receipts on the same window. Raced against
+/// `shutdown` like `run_audit_retention_loop`.
 /// The final byte flush of a session happens on the close paths themselves, not here, so
 /// nothing relayed in the last minute of a session is lost to shutdown timing.
 pub async fn run_tunnel_history_flush_loop<H: Clone + Send + Sync + 'static>(
@@ -442,6 +779,16 @@ pub async fn run_tunnel_history_flush_loop<H: Clone + Send + Sync + 'static>(
                         ),
                         Ok(_) => {}
                         Err(e) => eprintln!("ct-edge: tunnel-history retention sweep failed: {e} (#776)"),
+                    }
+                    if history.receipts_enabled() {
+                        if let Err(e) = history.emit_bytes_snapshots(now) {
+                            eprintln!("ct-edge: receipts: hourly bytes snapshot failed: {e} (#782)");
+                        }
+                        match history.prune_receipts_older_than(cutoff) {
+                            Ok(n) if n > 0 => eprintln!("ct-edge: receipts: retention pruned {n} receipt(s) (#782)"),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("ct-edge: receipts: retention sweep failed: {e} (#782)"),
+                        }
                     }
                 }
                 ticks = ticks.wrapping_add(1);
@@ -710,6 +1057,183 @@ mod tests {
         assert!(!durable);
         h.open_session(&hex(0x10), TRANSPORT_QUIC, 1).unwrap();
         assert!(h.open_session_exists(&hex(0x10)).unwrap());
+    }
+
+    // ----- #782 receipts -----
+
+    fn signer() -> ReceiptSigner {
+        ReceiptSigner::from_seed(&[0x51u8; 32], "edge-test")
+    }
+
+    fn receipts_store() -> SqliteTunnelHistory {
+        store().with_receipts(signer()).unwrap()
+    }
+
+    fn token_hash(b: u8) -> String {
+        receipt::routing_token_hash(&[b; 32])
+    }
+
+    #[test]
+    fn open_and_close_emit_linked_signed_receipts_that_verify_782() {
+        let s = receipts_store();
+        assert!(s.receipts_enabled());
+        assert_eq!(s.receipts_head(), Some((0, receipt::GENESIS_PREV_HASH.to_string())));
+        assert_eq!(s.receipts_pubkey_hex().as_deref(), Some(signer().pubkey_hex().as_str()));
+        assert_eq!(s.receipts_edge_id(), Some("edge-test"));
+
+        let t = hex(0x21);
+        s.open_session(&t, TRANSPORT_QUIC, 1_000).unwrap();
+        // A re-park / transport switch reuses the row and emits NOTHING.
+        s.open_session(&t, TRANSPORT_TCP_FALLBACK, 1_100).unwrap();
+        s.add_session_bytes(&t, 300, 40, 1_200).unwrap();
+        s.close_session(&t, 1_500, "removed").unwrap();
+        // Closing nothing emits nothing.
+        assert!(!s.close_session(&t, 1_600, "removed").unwrap());
+
+        let rs = s.receipts_for(&token_hash(0x21), 0, 100).unwrap();
+        assert_eq!(rs.len(), 2, "one open, one close: {rs:?}");
+        assert_eq!((rs[0].seq, rs[0].kind.as_str()), (1, receipt::KIND_SESSION_OPEN));
+        assert_eq!(rs[0].prev_hash, receipt::GENESIS_PREV_HASH);
+        assert_eq!(rs[0].payload, serde_json::json!({ "connected_at": 1_000, "transport": "quic" }));
+        assert_eq!((rs[1].seq, rs[1].kind.as_str()), (2, receipt::KIND_SESSION_CLOSE));
+        assert_eq!(rs[1].prev_hash, rs[0].hash, "chained");
+        assert_eq!(
+            rs[1].payload,
+            serde_json::json!({
+                "bytes_in": 300, "bytes_out": 40, "connected_at": 1_000, "disconnected_at": 1_500, "reason": "removed"
+            })
+        );
+        assert_eq!(rs[1].ts, 1_500);
+        assert_eq!(rs[1].edge_id, "edge-test");
+        assert!(!rs.iter().any(|r| r.routing_token_hash == t), "the token itself never appears");
+        let summary = receipt::verify_chain(&rs, &signer().pubkey_bytes()).expect("the store's chain verifies");
+        assert_eq!((summary.sessions_opened, summary.sessions_closed, summary.bytes_in), (1, 1, 300));
+        assert_eq!(s.receipts_head(), Some((2, rs[1].hash.clone())));
+
+        // Another token's receipts continue the SAME per-edge chain but are listed apart.
+        let other = hex(0x22);
+        s.open_session(&other, TRANSPORT_QUIC, 2_000).unwrap();
+        let rs_other = s.receipts_for(&token_hash(0x22), 0, 100).unwrap();
+        assert_eq!(rs_other.len(), 1);
+        assert_eq!(rs_other[0].seq, 3);
+        assert_eq!(rs_other[0].prev_hash, rs[1].hash, "one chain per edge, across tokens");
+        assert_eq!(s.receipts_for(&token_hash(0x21), 0, 100).unwrap().len(), 2, "unchanged");
+        assert!(s.receipts_for(&token_hash(0x23), 0, 100).unwrap().is_empty(), "unknown token -> empty");
+    }
+
+    #[test]
+    fn receipts_for_paginates_ascending_with_since_and_limit_782() {
+        let s = receipts_store();
+        let t = hex(0x24);
+        for i in 0..5 {
+            s.open_session(&t, TRANSPORT_QUIC, 100 * i).unwrap();
+            s.close_session(&t, 100 * i + 50, "removed").unwrap();
+        }
+        let all = s.receipts_for(&token_hash(0x24), 0, 1000).unwrap();
+        let seqs: Vec<u64> = all.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
+        let page = s.receipts_for(&token_hash(0x24), 0, 3).unwrap();
+        assert_eq!(page.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let next = s.receipts_for(&token_hash(0x24), 3, 3).unwrap();
+        assert_eq!(next.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4, 5, 6], "`since` is exclusive");
+        assert!(s.receipts_for(&token_hash(0x24), 10, 3).unwrap().is_empty());
+        // A page verifies on its own (mid-chain start is accepted).
+        receipt::verify_chain(&next, &signer().pubkey_bytes()).unwrap();
+        // limit 0 is treated as 1, and the cap holds.
+        assert_eq!(s.receipts_for(&token_hash(0x24), 0, 0).unwrap().len(), 1);
+        assert_eq!(s.receipts_for(&token_hash(0x24), 0, usize::MAX).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn hourly_bytes_snapshot_is_emitted_only_for_open_sessions_whose_counters_moved_782() {
+        let s = receipts_store();
+        let a = hex(0x25);
+        let b = hex(0x26);
+        s.open_session(&a, TRANSPORT_QUIC, 100).unwrap();
+        s.open_session(&b, TRANSPORT_QUIC, 100).unwrap();
+        // Nothing relayed yet -> nothing to attest.
+        assert_eq!(s.emit_bytes_snapshots(3_700).unwrap(), 0);
+        s.add_session_bytes(&a, 10, 20, 200).unwrap();
+        assert_eq!(s.emit_bytes_snapshots(3_800).unwrap(), 1, "only `a` moved");
+        assert_eq!(s.emit_bytes_snapshots(3_900).unwrap(), 0, "unchanged -> no duplicate");
+        s.add_session_bytes(&a, 1, 0, 4_000).unwrap();
+        s.add_session_bytes(&b, 0, 5, 4_000).unwrap();
+        assert_eq!(s.emit_bytes_snapshots(7_400).unwrap(), 2);
+        let ra = s.receipts_for(&token_hash(0x25), 0, 100).unwrap();
+        let kinds: Vec<&str> = ra.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, vec![receipt::KIND_SESSION_OPEN, receipt::KIND_BYTES, receipt::KIND_BYTES]);
+        assert_eq!(ra[1].payload, serde_json::json!({ "bytes_in": 10, "bytes_out": 20, "connected_at": 100 }));
+        assert_eq!(ra[2].payload, serde_json::json!({ "bytes_in": 11, "bytes_out": 20, "connected_at": 100 }));
+        // A closed session is never snapshotted again, and its close carries the totals.
+        s.close_session(&a, 8_000, "removed").unwrap();
+        s.add_session_bytes(&a, 100, 100, 8_100).unwrap(); // no open row -> dropped
+        assert_eq!(s.emit_bytes_snapshots(11_000).unwrap(), 0);
+        let ra = s.receipts_for(&token_hash(0x25), 0, 100).unwrap();
+        assert_eq!(ra.last().unwrap().kind, receipt::KIND_SESSION_CLOSE);
+        assert_eq!(ra.last().unwrap().payload["bytes_in"], 11);
+        // The whole per-edge chain (both tokens interleaved) still verifies.
+        let mut all = s.receipts_for(&token_hash(0x25), 0, 100).unwrap();
+        all.extend(s.receipts_for(&token_hash(0x26), 0, 100).unwrap());
+        all.sort_by_key(|r| r.seq);
+        receipt::verify_chain(&all, &signer().pubkey_bytes()).unwrap();
+    }
+
+    #[test]
+    fn chain_head_survives_a_restart_and_retention_pruning_782() {
+        let path = temp_db_path();
+        let last_hash = {
+            let s = SqliteTunnelHistory::open(&path).unwrap().with_receipts(signer()).unwrap();
+            let t = hex(0x27);
+            s.open_session(&t, TRANSPORT_QUIC, 1_000).unwrap();
+            s.add_session_bytes(&t, 7, 8, 1_100).unwrap();
+            // Left OPEN, as a crash would.
+            s.receipts_head().unwrap().1
+        };
+        let s = SqliteTunnelHistory::open(&path).unwrap().with_receipts(signer()).unwrap();
+        assert_eq!(s.receipts_head(), Some((1, last_hash.clone())), "head reloaded from the table");
+        // Boot repair closes the stale row WITH a receipt naming the restart.
+        assert_eq!(s.close_stale_open_sessions(5_000, "edge-restart").unwrap(), 1);
+        let rs = s.receipts_for(&token_hash(0x27), 0, 100).unwrap();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[1].seq, 2, "continues the sequence");
+        assert_eq!(rs[1].prev_hash, last_hash);
+        assert_eq!(rs[1].payload["reason"], "edge-restart");
+        assert_eq!(rs[1].payload["bytes_in"].as_u64(), Some(7));
+        assert_eq!(rs[1].payload["disconnected_at"].as_i64(), Some(5_000));
+        receipt::verify_chain(&rs, &signer().pubkey_bytes()).unwrap();
+
+        // Retention drops old receipts but not the head: the next seq is still 3, and the
+        // survivor's prev_hash points at a pruned receipt (a mid-chain export).
+        assert_eq!(s.prune_receipts_older_than(2_000).unwrap(), 1, "the ts=1000 open receipt");
+        assert_eq!(s.prune_receipts_older_than(2_000).unwrap(), 0, "idempotent");
+        s.open_session(&hex(0x27), TRANSPORT_QUIC, 6_000).unwrap();
+        let rs = s.receipts_for(&token_hash(0x27), 0, 100).unwrap();
+        assert_eq!(rs.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![2, 3]);
+        let summary = receipt::verify_chain(&rs, &signer().pubkey_bytes()).unwrap();
+        assert!(!summary.from_genesis);
+        assert_eq!(summary.first_prev_hash.as_deref(), Some(last_hash.as_str()));
+        // A different key cannot resume THIS chain's verification.
+        let other = ReceiptSigner::from_seed(&[0x52u8; 32], "edge-test");
+        assert!(receipt::verify_chain(&rs, &other.pubkey_bytes()).is_err());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn a_store_without_a_signer_records_sessions_but_no_receipts_782() {
+        let s = store();
+        assert!(!s.receipts_enabled());
+        assert_eq!(s.receipts_pubkey_hex(), None);
+        assert_eq!(s.receipts_head(), None);
+        let t = hex(0x28);
+        s.open_session(&t, TRANSPORT_QUIC, 1).unwrap();
+        s.close_session(&t, 2, "removed").unwrap();
+        assert_eq!(s.emit_bytes_snapshots(3).unwrap(), 0);
+        assert!(s.receipts_for(&token_hash(0x28), 0, 100).unwrap().is_empty());
+        assert_eq!(s.sessions_for(&t, 10).unwrap().len(), 1, "the session row is still there");
+        assert_eq!(s.prune_receipts_older_than(i64::MAX).unwrap(), 0);
     }
 
     #[tokio::test]

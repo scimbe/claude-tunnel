@@ -95,7 +95,7 @@ impl Drop for Ca {
 /// part of the file's *creation* syscall itself (subject only to the umask
 /// stripping bits further, never widening them) — there is no window where the
 /// file exists at a broader mode.
-fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
+pub(crate) fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
     #[cfg(unix)]
     {
         use std::io::Write;
