@@ -5566,7 +5566,12 @@ impl SqliteChannelStore {
              CREATE INDEX IF NOT EXISTS idx_consumed_invitations_expires
                  ON consumed_invitations (expires_at);
              CREATE INDEX IF NOT EXISTS idx_channel_challenges_expires
-                 ON channel_challenges (expires_at);",
+                 ON channel_challenges (expires_at);
+             -- #775 item 8: register_channel's quota check (`WHERE owner = ?1`, every
+             -- new-channel registration) and channels_owned_by (account-deletion
+             -- cascade's discovery step) both filter on owner -- unindexed, a full
+             -- scan of every channel on the platform for either call.
+             CREATE INDEX IF NOT EXISTS idx_channels_owner ON channels (owner);",
         )?;
         // #72 AF4 (registry carries the key): each member's X25519 Noise static key,
         // which the peer pins for the direct-path Noise_IK handshake. Additive,
@@ -6798,6 +6803,10 @@ impl SqliteTopologyStore {
                  owner    TEXT NOT NULL,
                  net_uuid TEXT NOT NULL UNIQUE
              );
+             -- #775 item 8: list_topologies (the portal's own topologies page) and the
+             -- owner-scoped existence check both filter `WHERE owner = ?1` -- unindexed,
+             -- a full scan of every topology on the platform for either call.
+             CREATE INDEX IF NOT EXISTS idx_topologies_owner ON topologies (owner);
              CREATE TABLE IF NOT EXISTS topology_edges (
                  topology TEXT NOT NULL,
                  a        TEXT NOT NULL,
@@ -8542,6 +8551,27 @@ mod tests {
         assert!(store.topology("corp").unwrap().is_some(), "still there");
         assert!(store.delete_topology("alice", "corp").unwrap(), "owner deletes");
         assert!(store.topology("corp").unwrap().is_none());
+    }
+
+    /// #775 item 8: `topologies(owner)` had no index -- `list_topologies` (the portal's
+    /// own topologies page) filtered on it with a full table scan. Proves the new index
+    /// is actually used, not just present.
+    #[test]
+    fn topologies_owner_lookup_is_index_seekable_not_a_full_scan_775() {
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        let plan: String = store
+            .read()
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id, owner, net_uuid FROM topologies WHERE owner = ?1",
+                params!["alice"],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX idx_topologies_owner"),
+            "expected an index seek, got: {plan}"
+        );
+        assert!(!plan.to_uppercase().contains("SCAN TOPOLOGIES"), "must not be a full table scan: {plan}");
     }
 
     #[test]
@@ -11374,6 +11404,28 @@ mod tests {
         assert_eq!(stripped, 1);
         assert!(!s.allowlist_contains(&other, "alice@example.com").unwrap());
         assert_eq!(s.channel_owner(&other).unwrap(), Some("bob".to_string()), "bob's channel itself is untouched");
+    }
+
+    /// #775 item 8: `channels(owner)` had no index -- `register_channel`'s quota check
+    /// and `channels_owned_by` both filtered on it with a full table scan. Proves the
+    /// new index is actually used, not just present: `EXPLAIN QUERY PLAN` must show an
+    /// index SEARCH, never a bare SCAN, for the exact query `register_channel` runs.
+    #[test]
+    fn channels_owner_lookup_is_index_seekable_not_a_full_scan_775() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let plan: String = s
+            .read()
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM channels WHERE owner = ?1",
+                params!["alice"],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("INDEX idx_channels_owner"),
+            "expected an index seek, got: {plan}"
+        );
+        assert!(!plan.to_uppercase().contains("SCAN CHANNELS"), "must not be a full table scan: {plan}");
     }
 
     /// #514: grant deposit is owner- and member-scoped, idempotent, and the member's
