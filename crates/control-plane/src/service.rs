@@ -3346,8 +3346,21 @@ async fn channel_register(
         max,
         req.confirm_rekey,
     ) {
-        Ok(crate::storage::RegisterChannelOutcome::Registered)
-        | Ok(crate::storage::RegisterChannelOutcome::Unchanged) => Ok(StatusCode::OK),
+        Ok(crate::storage::RegisterChannelOutcome::Registered) => {
+            // #696 item 2: a brand-new registration, distinct from the idempotent
+            // Unchanged replay -- audited like the other membership-mutating actions
+            // in this handler group. Best-effort, same posture as the rest.
+            if let Some(audit) = &state.audit {
+                let _ = audit.record(
+                    &owner,
+                    "channel_registered",
+                    Some(&hex_encode(&channel)),
+                    Some(&format!("operator={}", req.operator_pubkey)),
+                );
+            }
+            Ok(StatusCode::OK)
+        }
+        Ok(crate::storage::RegisterChannelOutcome::Unchanged) => Ok(StatusCode::OK),
         Ok(crate::storage::RegisterChannelOutcome::Rekeyed { previous }) => {
             // #747: an explicit, opted-in operator rotation -- leave a trail (audit
             // row + stderr), because every grant the previous operator signed just
@@ -3501,6 +3514,17 @@ async fn channel_add_member(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // false → not the owner (or unknown channel): only the owner manages members.
     if ok {
+        // #696 item 2: membership mutations previously left zero forensic trail --
+        // only `channel_operator_rekeyed` (#747) was audited. Best-effort, same
+        // posture as that precedent.
+        if let Some(audit) = &state.audit {
+            let _ = audit.record(
+                &owner,
+                "channel_member_added",
+                Some(&channel_hex),
+                Some(&format!("holder={}", req.holder)),
+            );
+        }
         Ok(StatusCode::OK)
     } else {
         Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
@@ -3711,6 +3735,15 @@ async fn channel_remove_member(
         .remove_member(&ChannelId(channel), &owner, &holder)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if ok {
+        // #696 item 2: see channel_add_member's matching audit call.
+        if let Some(audit) = &state.audit {
+            let _ = audit.record(
+                &owner,
+                "channel_member_removed",
+                Some(&channel_hex),
+                Some(&format!("holder={holder_hex}")),
+            );
+        }
         Ok(StatusCode::OK)
     } else {
         Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
@@ -3738,6 +3771,10 @@ async fn channel_delete(
         .delete_channel(&owner, &ChannelId(channel))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if ok {
+        // #696 item 2: see channel_add_member's matching audit call.
+        if let Some(audit) = &state.audit {
+            let _ = audit.record(&owner, "channel_deleted", Some(&channel_hex), None);
+        }
         Ok(StatusCode::OK)
     } else {
         Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
@@ -11709,7 +11746,13 @@ mod tests {
         // Proof the cap is live: a second NEW channel is refused.
         let s = register(format!(r#"{{"channel":"{}","operator_pubkey":"{op1}"}}"#, "d4".repeat(32))).await.unwrap().status();
         assert_eq!(s, StatusCode::FORBIDDEN, "alice is at max_channels = 1");
-        assert!(audit.recent(10).unwrap().is_empty(), "plain registration records no audit entry");
+        // #696 item 2: the plain first-time registration above now DOES leave an audit
+        // trail (channel_registered) -- the FORBIDDEN attempt above does not (never a
+        // write, so nothing to audit).
+        let after_register = audit.recent(10).unwrap();
+        assert_eq!(after_register.len(), 1, "the successful first-time registration is audited");
+        assert_eq!(after_register[0].action, "channel_registered");
+        assert_eq!(after_register[0].target.as_deref(), Some(ch.as_str()));
 
         let s = register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}","confirm_rekey":true}}"#))
             .await
@@ -11719,9 +11762,9 @@ mod tests {
         assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(hex_decode_32(&op2).unwrap()));
 
         let entries = audit.recent(10).unwrap();
-        assert_eq!(entries.len(), 1, "exactly one audit row for the rotation");
+        assert_eq!(entries.len(), 2, "the earlier registration row plus one new row for the rotation");
         let e = &entries[0];
-        assert_eq!(e.action, "channel_operator_rekeyed");
+        assert_eq!(e.action, "channel_operator_rekeyed", "newest-first: the rotation is entries[0]");
         assert_eq!(e.actor_email, "alice");
         assert_eq!(e.target.as_deref(), Some(ch.as_str()));
         assert_eq!(
@@ -11729,18 +11772,20 @@ mod tests {
             Some(format!("old={op1} new={op2} via /me/channels confirm_rekey").as_str())
         );
 
-        // Same key again, flag set: Unchanged -- no write, no second audit row.
+        // Same key again, flag set: Unchanged -- no write, no third audit row.
         let s = register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}","confirm_rekey":true}}"#))
             .await
             .unwrap()
             .status();
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(audit.recent(10).unwrap().len(), 1, "a flagged same-key re-run is not a re-key");
+        assert_eq!(audit.recent(10).unwrap().len(), 2, "a flagged same-key re-run is not a re-key");
     }
 
     /// #747: the refused (no `confirm_rekey`) path writes nothing at all -- not the
-    /// channel row, and not an audit row either (a refusal is not a privileged
-    /// action; the stderr line is its only trace).
+    /// channel row, and not a NEW audit row either (a refusal is not a privileged
+    /// action; the stderr line is its only trace). #696 item 2: the preceding
+    /// successful first-time registration itself DOES leave one audit row now --
+    /// this test asserts the refusal adds no second one, not that the log stays empty.
     #[tokio::test]
     async fn channel_register_without_confirm_rekey_records_no_audit_entry_747() {
         use axum::body::Body;
@@ -11786,7 +11831,111 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(hex_decode_32(&op1).unwrap()), "no write");
-        assert!(audit.recent(10).unwrap().is_empty(), "a refused re-key records no audit entry");
+        let entries = audit.recent(10).unwrap();
+        assert_eq!(entries.len(), 1, "only the earlier successful registration -- the refusal adds nothing");
+        assert_eq!(entries[0].action, "channel_registered");
+    }
+
+    /// #696 item 2: `add_member`, `remove_member`, and `delete_channel` previously left
+    /// zero forensic trail -- only `channel_operator_rekeyed` (#747) was audited. This
+    /// drives a full lifecycle (register -> add -> remove -> delete) through the real
+    /// HTTP router with a wired audit store and asserts every mutating step left a row
+    /// (newest-first order per `SqliteAuditLog::recent`), while a refused (non-owner)
+    /// call adds nothing.
+    #[tokio::test]
+    async fn channel_membership_mutations_are_all_audited_696() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            Some(audit.clone()),
+        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let del = |path: String, bearer: Option<String>| {
+            let mut req = Request::delete(&path);
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        let ch = "7e".repeat(32);
+        let op = "1d".repeat(32);
+        assert_eq!(
+            post("/me/channels".into(), Some(alice.clone()), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#))
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let holder_sk = SigningKey::from_bytes(&[0x2au8; 32]);
+        let hbytes = holder_sk.verifying_key().to_bytes();
+        let holder = hex_encode(&hbytes);
+        let nk = hex_encode(&[0x3bu8; 32]);
+        let chan = ChannelId(hex_decode_32(&ch).unwrap());
+        let att = hex_encode(&holder_sk.sign(&ct_common::channel::member_noise_attest_bytes(&chan, &hbytes, &[0x3bu8; 32])).to_bytes());
+
+        // A non-owner's add is refused (403) and adds no audit row.
+        assert_eq!(
+            post(
+                format!("/me/channels/{ch}/members"),
+                Some(mallory.clone()),
+                format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}","noise_attestation":"{att}"}}"#)
+            )
+            .await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(audit.recent(10).unwrap().iter().all(|e| e.action != "channel_member_added"), "mallory's refused add left no trace");
+
+        assert_eq!(
+            post(
+                format!("/me/channels/{ch}/members"),
+                Some(alice.clone()),
+                format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}","noise_attestation":"{att}"}}"#)
+            )
+            .await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(format!("/me/channels/{ch}/members/{holder}/remove"), Some(alice.clone()), String::new())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(del(format!("/me/channels/{ch}"), Some(alice.clone())).await.unwrap().status(), StatusCode::OK);
+
+        let entries = audit.recent(10).unwrap();
+        let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+        // Newest-first: delete, then remove, then add, then the initial registration.
+        assert_eq!(actions, vec!["channel_deleted", "channel_member_removed", "channel_member_added", "channel_registered"]);
+        assert!(entries.iter().all(|e| e.actor_email == "alice"));
+        assert!(entries.iter().all(|e| e.target.as_deref() == Some(ch.as_str())));
+        assert_eq!(entries[2].detail.as_deref(), Some(format!("holder={holder}").as_str()), "channel_member_added detail");
+        assert_eq!(entries[1].detail.as_deref(), Some(format!("holder={holder}").as_str()), "channel_member_removed detail");
     }
 
     /// #747: `POST /me/rooms` used to go through plain `register_channel`'s
