@@ -596,7 +596,7 @@ struct LoginQuery {
 }
 
 fn known_idp_hint(hint: Option<&str>) -> Option<&str> {
-    hint.filter(|h| matches!(*h, "google" | "github" | "gitlab"))
+    hint.filter(|h| matches!(*h, "google" | "github" | "gitlab" | "haw-gitlab"))
 }
 
 async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>, headers: HeaderMap) -> Response {
@@ -1995,6 +1995,36 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::SEE_OTHER);
         let loc2 = resp2.headers().get("location").unwrap().to_str().unwrap();
         assert!(!loc2.contains("kc_idp_hint"), "an unrecognized hint is dropped, not reflected, got {loc2}");
+    }
+
+    #[tokio::test]
+    async fn login_passes_the_haw_gitlab_idp_hint_through() {
+        // 2026-09-08: `haw-gitlab` (git.haw-hamburg.de, the fourth realm IdP) was
+        // missing from `known_idp_hint`'s allowlist -- a caller-supplied
+        // `?kc_idp_hint=haw-gitlab` was silently dropped, same as any unknown
+        // provider. That forced a landing page to bypass `/portal/login` entirely
+        // and hit Keycloak's authorize endpoint directly, which skipped this
+        // route's CSRF `state` cookie and surfaced as "missing code or state" at
+        // `/portal/callback`. Fixed by adding the alias here -- this pins it.
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login?kc_idp_hint=haw-gitlab")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(loc.contains("kc_idp_hint=haw-gitlab"), "haw-gitlab hint is passed through, got {loc}");
+        assert!(resp.headers().get("set-cookie").is_some(), "state cookie IS minted, same as every other hint");
     }
 
     #[tokio::test]
