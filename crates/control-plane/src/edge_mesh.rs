@@ -27,13 +27,14 @@
 //! edge; with exactly one edge every local route always hits, so the relay
 //! path is a no-op either way.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{ensure_column, open_tuned, sqlite_store_ctors};
@@ -338,6 +339,37 @@ impl SqliteEdgeMesh {
             .optional()
     }
 
+    /// [`lookup_by_token`](Self::lookup_by_token), batched: one query for every token
+    /// instead of one query per token (#775 tier-3 -- `admin_ui_tunnels`'s per-row loop
+    /// was doing exactly that, one `SELECT` per tunnel on every dashboard load). Missing
+    /// or dead-owner tokens are simply absent from the returned map, same as `None` from
+    /// the single-token form. Empty `tokens` short-circuits to an empty map without
+    /// touching the connection at all.
+    pub fn lookup_by_token_bulk(&self, tokens: &[String]) -> rusqlite::Result<HashMap<String, (String, String)>> {
+        if tokens.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat("?").take(tokens.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT o.token, e.id, e.peer_addr FROM mesh_ownership o
+             JOIN mesh_edges e ON e.id = o.edge_id
+             WHERE o.token IN ({placeholders}) AND e.last_seen >= ?"
+        );
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(&sql)?;
+        let cutoff = now_secs() - OWNERSHIP_LIVENESS_SECS;
+        let params_iter = tokens.iter().map(|t| t as &dyn rusqlite::ToSql).chain(std::iter::once(&cutoff as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(params_from_iter(params_iter), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = HashMap::with_capacity(tokens.len());
+        for row in rows {
+            let (token, edge_id, peer_addr) = row?;
+            out.insert(token, (edge_id, peer_addr));
+        }
+        Ok(out)
+    }
+
     /// Whether `token` has ANY recorded ownership row at all (#445) — a plain existence
     /// check, deliberately NOT liveness-gated like [`lookup_by_token`](Self::lookup_by_token).
     /// Boot-time backfill uses this to decide whether a tunnel's row is genuinely MISSING
@@ -468,6 +500,12 @@ impl EdgeMeshHandle {
     /// tunnel/topology dashboard's "which edge is this tunnel on" column.
     pub fn lookup_by_token(&self, token: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.store.lookup_by_token(token)
+    }
+
+    /// [`lookup_by_token`](Self::lookup_by_token), batched (#775 tier-3) -- straight
+    /// through to [`SqliteEdgeMesh::lookup_by_token_bulk`].
+    pub fn lookup_by_token_bulk(&self, tokens: &[String]) -> rusqlite::Result<HashMap<String, (String, String)>> {
+        self.store.lookup_by_token_bulk(tokens)
     }
 }
 
@@ -957,6 +995,45 @@ mod tests {
         // same ownership row resolves again -- this isn't a permanent black hole.
         s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
         assert!(s.lookup_by_token("deadbeef").unwrap().is_some());
+    }
+
+    #[test]
+    fn lookup_by_token_bulk_matches_the_single_token_form_row_by_row_775() {
+        let s = store();
+        let now = now_secs();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
+        s.heartbeat("edge-2", "10.0.0.2:4437", None, now).unwrap();
+        s.record_ownership("deadbeef", Some("app.example.com"), "edge-1", now).unwrap();
+        s.record_ownership("cafef00d", Some("other.example.com"), "edge-2", now).unwrap();
+        // A dead edge's stale ownership row -- must be absent from the bulk result too,
+        // same liveness gate as the single-token form (#285).
+        s.heartbeat("edge-3", "10.0.0.3:4437", None, now - OWNERSHIP_LIVENESS_SECS - 1).unwrap();
+        s.record_ownership("stale-owner", None, "edge-3", now).unwrap();
+
+        let tokens = vec![
+            "deadbeef".to_string(),
+            "cafef00d".to_string(),
+            "unknown-token".to_string(),
+            "stale-owner".to_string(),
+        ];
+        let bulk = s.lookup_by_token_bulk(&tokens).unwrap();
+
+        assert_eq!(bulk.len(), 2, "only the two live, recorded tokens resolve");
+        assert_eq!(bulk.get("deadbeef"), Some(&("edge-1".to_string(), "10.0.0.1:4437".to_string())));
+        assert_eq!(bulk.get("cafef00d"), Some(&("edge-2".to_string(), "10.0.0.2:4437".to_string())));
+        assert!(bulk.get("unknown-token").is_none());
+        assert!(bulk.get("stale-owner").is_none(), "same liveness gate as the single-token form");
+
+        // Every entry matches what the single-token form would independently return.
+        for t in &tokens {
+            assert_eq!(bulk.get(t).cloned(), s.lookup_by_token(t).unwrap());
+        }
+    }
+
+    #[test]
+    fn lookup_by_token_bulk_of_empty_slice_is_an_empty_map_775() {
+        let s = store();
+        assert!(s.lookup_by_token_bulk(&[]).unwrap().is_empty());
     }
 
     #[test]

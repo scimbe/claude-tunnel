@@ -2900,8 +2900,9 @@ fn build_tunnel_overview_rows(
 /// `GET /admin-ui/tunnels` (admin-identity-gated, ADR-0025 Decision 6, read-only):
 /// live tunnel/topology overview -- every registered tunnel, which edge it's on
 /// (ADR-0021), transport, uptime, and last-seen, aggregated server-side into one
-/// response (one bulk edge scrape, one edge_mesh lookup per tunnel) rather than a
-/// dashboard the UI has to build itself out of N per-token calls.
+/// response (one bulk edge scrape, one batched edge_mesh lookup -- #775 tier-3,
+/// previously one query per tunnel) rather than a dashboard the UI has to build
+/// itself out of N per-token calls.
 async fn admin_ui_tunnels(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
     if let Err(resp) = admin_ui_authed(&st, &headers) {
         return resp;
@@ -2912,16 +2913,14 @@ async fn admin_ui_tunnels(State(st): State<AdminUiState>, headers: HeaderMap) ->
     };
     let tokens: Vec<String> = tunnels.iter().map(|t| t.routing_token.clone()).collect();
     let edge_status = edge_tunnel_status_bulk(&st, &tokens).await;
+    // #775 tier-3: one batched edge_mesh query for every tunnel, not one query per tunnel.
     let mut edge_by_token = HashMap::new();
     if let Some(mesh) = &st.observability.edge_mesh {
-        for t in &tunnels {
-            match mesh.lookup_by_token(&t.routing_token) {
-                Ok(Some((edge_id, _peer_addr))) => {
-                    edge_by_token.insert(t.routing_token.clone(), edge_id);
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("ct-cp: admin_ui_tunnels: edge_mesh lookup for tunnel {} failed: {e}", t.id),
+        match mesh.lookup_by_token_bulk(&tokens) {
+            Ok(found) => {
+                edge_by_token = found.into_iter().map(|(token, (edge_id, _peer_addr))| (token, edge_id)).collect();
             }
+            Err(e) => eprintln!("ct-cp: admin_ui_tunnels: edge_mesh bulk lookup failed: {e}"),
         }
     }
     let rows = build_tunnel_overview_rows(admin_ui_now_secs(), &tunnels, &edge_status, &edge_by_token);
