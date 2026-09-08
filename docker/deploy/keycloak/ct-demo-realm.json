@@ -163,6 +163,121 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "praktikum-creator",
+      "name": "RN Praktikum Creator",
+      "description": "2026-09-08, scimbe-authorized: dedicated relying-party client for the RN Praktikum's own oauth2-proxy-fronted service at praktikum.bunsenbrenner.org (Gelb-tier tunnel, hostname authorized via scripts/authorize-pipeline.sh's underlying API, not a portal self-service tunnel). Carries the gitlab-groups-claim mapper below so course/semester-group gating can read a real claim instead of a hardcoded email allowlist.",
+      "secret": "${KC_PRAKTIKUM_CREATOR_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "https://praktikum.bunsenbrenner.org/oauth2/callback",
+        "https://rn-praktikum.bunsenbrenner.org/oauth2/callback",
+        "https://riisc.bunsenbrenner.org/oauth2/callback"
+      ],
+      "webOrigins": [
+        "https://praktikum.bunsenbrenner.org",
+        "https://rn-praktikum.bunsenbrenner.org",
+        "https://riisc.bunsenbrenner.org"
+      ],
+      "defaultClientScopes": [
+        "email",
+        "profile"
+      ],
+      "protocolMappers": [
+        {
+          "name": "gitlab-groups-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "gitlab_groups",
+            "claim.name": "gitlab_groups",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience-praktikum-creator",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "praktikum-creator",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "sort-bridge-automation",
+      "name": "sort bridge auto-approval (service account, #501/sort#9)",
+      "secret": "${KC_SORT_BRIDGE_AUTOMATION_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "devsystem-remote-cli",
+      "name": "CADS-devsystem devsystem_iterate --remote",
+      "description": "Real M2M service account for headless devsystem_iterate --remote calls against devsystem-demo.bunsenbrenner.org (CADS-devsystem issue #7 / CADS-Tunnel#382-follow).",
+      "secret": "${KC_DEVSYSTEM_REMOTE_CLI_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "labor-setup-android-emulator-test",
+      "name": "labor-setup.com Android emulator/walkthrough service",
+      "description": "M2M service account for labor-setup.com real Android emulator walkthrough service report-back (CADS-devsystem issue, docs/android-emulator-walkthrough-service-requirements.md).",
+      "secret": "${KC_LABOR_SETUP_ANDROID_EMULATOR_TEST_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "labor-setup-document-extraction",
+      "name": "labor-setup.com document-extraction agent",
+      "description": "M2M service account for labor-setup.com real devsystem.document_extraction agent report-back (CADS-devsystem issue, docs/document-extraction-agent-requirements.md).",
+      "secret": "${KC_LABOR_SETUP_DOCUMENT_EXTRACTION_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true
     }
   ],
   "identityProviders": [
@@ -204,6 +319,28 @@
         "clientSecret": "${KC_GITLAB_CLIENT_SECRET:}",
         "syncMode": "FORCE"
       }
+    },
+    {
+      "alias": "haw-gitlab",
+      "displayName": "HAW GitLab (git.haw-hamburg.de)",
+      "providerId": "oidc",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "linkOnly": false,
+      "config": {
+        "clientId": "${KC_HAW_GITLAB_CLIENT_ID:}",
+        "clientSecret": "${KC_HAW_GITLAB_CLIENT_SECRET:}",
+        "issuer": "https://git.haw-hamburg.de",
+        "authorizationUrl": "https://git.haw-hamburg.de/oauth/authorize",
+        "tokenUrl": "https://git.haw-hamburg.de/oauth/token",
+        "userInfoUrl": "https://git.haw-hamburg.de/oauth/userinfo",
+        "jwksUrl": "https://git.haw-hamburg.de/oauth/discovery/keys",
+        "useJwksUrl": "true",
+        "defaultScope": "openid profile email",
+        "hideOnLoginPage": "true",
+        "syncMode": "FORCE"
+      }
     }
   ],
   "identityProviderMappers": [
@@ -234,6 +371,16 @@
       "config": {
         "claim": "email",
         "user.attribute": "email",
+        "syncMode": "FORCE"
+      }
+    },
+    {
+      "name": "gitlab-groups",
+      "identityProviderAlias": "haw-gitlab",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "claim": "groups",
+        "user.attribute": "gitlab_groups",
         "syncMode": "FORCE"
       }
     }
