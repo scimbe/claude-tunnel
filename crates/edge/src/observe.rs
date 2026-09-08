@@ -29,6 +29,17 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// `ConnectionCap` itself (ws_channel.rs has no `EdgeState` of its own; wiring one in
 /// just for this would be a much larger, unrelated change for one metric).
 pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Option<&ConnectionCap>) -> String {
+    // #775: no sample at all before the reaper's first tick (a few seconds after
+    // boot) -- same "absent renders nothing" convention as every other best-effort
+    // gauge in this file, rather than a misleading placeholder value.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let reaper_tick_line = match state.reap_tick_secs_ago(now) {
+        Some(secs) => format!("ct_edge_tcp_fallback_reaper_last_tick_seconds_ago {secs}\n"),
+        None => String::new(),
+    };
     let mut out = format!(
         "# HELP ct_edge_active_tunnels Distinct routing tokens with at least one live agent.\n\
          # TYPE ct_edge_active_tunnels gauge\n\
@@ -112,6 +123,13 @@ completely, while both at 0 means nothing was measured, not that offload succeed
          # rise is the regression signal that agents are abandoning parks faster than usual.\n\
          # TYPE ct_edge_tcp_fallback_reaped_total counter\n\
          ct_edge_tcp_fallback_reaped_total {tcp_reaped}\n\
+         # HELP ct_edge_tcp_fallback_reaper_last_tick_seconds_ago (#775) Seconds since the #522\n\
+         # reaper's tick loop last ran, unconditionally on every tick regardless of whether\n\
+         # anything was reaped. Absent before the first tick. A value climbing well past 10\n\
+         # means the tick loop itself died -- distinct from ct_edge_tcp_fallback_reaped_total\n\
+         # simply not moving, which is equally true of a live reaper finding nothing to reap.\n\
+         # TYPE ct_edge_tcp_fallback_reaper_last_tick_seconds_ago gauge\n\
+         {reaper_tick_line}\
          # HELP ct_edge_tcp_fallback_deliveries_total TLS-TCP fallback parks consumed by a client.\n\
          # TYPE ct_edge_tcp_fallback_deliveries_total counter\n\
          ct_edge_tcp_fallback_deliveries_total {tcp_deliveries}\n",
@@ -131,6 +149,7 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         front_door_client_aborts = crate::serve::front_door_client_aborts_total(),
         failovers = state.failovers_total(),
         tcp_parked = state.tcp_parked(),
+        reaper_tick_line = reaper_tick_line,
         tcp_parks = state.tcp_parks_total(),
         tcp_reaped = state.tcp_reaped_total(),
         tcp_deliveries = state.tcp_deliveries_total(),

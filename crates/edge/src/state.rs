@@ -660,6 +660,15 @@ pub struct EdgeState<H> {
     /// rate after the #522 fix is the regression signal to watch on `/metrics`.
     tcp_reaped: Counter,
     tcp_parked_gauge: AtomicU64,
+    /// #775: wall-clock (Unix seconds) of the most recent #522 reaper tick --
+    /// updated unconditionally at the START of every tick, whether or not it found
+    /// anything to reap. A silent gap here (found live 2026-09-08: gauge=94, reaped
+    /// counter flat for 20+ minutes) is the ONLY way to tell "the reaper is alive and
+    /// there's simply nothing dead to reap right now" apart from "the reaper task
+    /// panicked and its detached tokio::spawn loop silently died" -- the reap counter
+    /// alone cannot distinguish these, since it only ever increments on a nonzero
+    /// reap. Zero until the first tick (a few seconds after boot).
+    last_reap_tick: AtomicU64,
     /// #517 V1: per-plane relay byte tallies (browser / QUIC data plane / TCP
     /// fallback) -- their sum equals `relay_bytes`, keeping the historical total
     /// untouched while making the offload split visible. The sum invariant holds
@@ -782,6 +791,7 @@ impl<H: Clone> EdgeState<H> {
             tcp_parks: Counter::default(),
             tcp_deliveries: Counter::default(),
             tcp_reaped: Counter::default(),
+            last_reap_tick: AtomicU64::new(0),
             tcp_parked_gauge: AtomicU64::new(0),
             relay_bytes_browser: AtomicU64::new(0),
             relay_bytes_dataplane: AtomicU64::new(0),
@@ -1268,6 +1278,26 @@ impl<H: Clone> EdgeState<H> {
     /// #522: cumulative dead TCP-fallback parks reaped since start (see `tcp_reaped`).
     pub fn tcp_reaped_total(&self) -> u64 {
         self.tcp_reaped.get()
+    }
+
+    /// #775: record that the #522 reaper's tick loop is still alive, right now --
+    /// call this unconditionally at the top of every tick, before `reap_dead_tcp_parks`.
+    pub fn note_reap_tick(&self, now: u64) {
+        self.last_reap_tick.store(now, Ordering::Relaxed);
+    }
+
+    /// #775: seconds since the reaper last ticked, for `/metrics`. `None` before the
+    /// first tick has ever happened (a few seconds after boot). A value that keeps
+    /// growing well past the reaper's own 10s interval means the tick loop died --
+    /// distinct from `tcp_reaped_total` simply not moving, which is equally true of
+    /// a live reaper finding nothing to reap.
+    pub fn reap_tick_secs_ago(&self, now: u64) -> Option<u64> {
+        let last = self.last_reap_tick.load(Ordering::Relaxed);
+        if last == 0 {
+            None
+        } else {
+            Some(now.saturating_sub(last))
+        }
     }
 
     pub fn tcp_parks_total(&self) -> u64 {
@@ -3075,6 +3105,24 @@ mod tests {
         assert_eq!(state.tcp_parked(), 0);
     }
 
+    #[test]
+    fn reap_tick_secs_ago_distinguishes_never_ticked_from_a_recent_tick_775() {
+        // #775: found live 2026-09-08 -- tcp_reaped_total staying flat is equally
+        // consistent with "reaper alive, nothing dead to reap" and "reaper's
+        // detached tick loop panicked and silently died". This is the liveness
+        // signal that actually distinguishes them.
+        let state: EdgeState<u32> = EdgeState::new();
+        assert_eq!(state.reap_tick_secs_ago(1_000), None, "never ticked yet (fresh state)");
+
+        state.note_reap_tick(1_000);
+        assert_eq!(state.reap_tick_secs_ago(1_000), Some(0), "just ticked, 0s ago");
+        assert_eq!(state.reap_tick_secs_ago(1_015), Some(15), "15s have passed since that tick");
+
+        // A later tick moves the clock forward regardless of whether anything was
+        // reaped that time -- the whole point is it's independent of tcp_reaped_total.
+        state.note_reap_tick(1_015);
+        assert_eq!(state.reap_tick_secs_ago(1_015), Some(0), "fresh tick resets the age");
+    }
     #[tokio::test]
     async fn deliver_draining_consumes_dead_slots_and_hands_back_when_none_live_510() {
         // #510: the drain loop (#505) lived inline on the primary serve paths only;
