@@ -391,6 +391,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         },
         shutdown_fired.clone(),
     ));
+    // #775 item 2: several housekeeping prune functions (join tokens, batch-issuance
+    // idempotency records, bootstrap tokens, stale edge-mesh rows) existed with real,
+    // tested implementations but no scheduled caller -- each table grew forever in a
+    // real long-running deployment. Same shutdown wiring as the alert loop above.
+    tokio::spawn(ct_control_plane::retention::run_retention_loop(
+        ct_control_plane::retention::RetentionLoopConfig { db_path: db.clone() },
+        shutdown_fired.clone(),
+    ));
     let with_shutdown = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
