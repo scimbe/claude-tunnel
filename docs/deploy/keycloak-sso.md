@@ -105,12 +105,26 @@ callback returns a clear "not on the access list" page and mints no session (#43
 
 ## Social login / identity brokering (#49)
 
-The `ct-demo` realm ships with **Google, GitHub, and GitLab** identity providers
-declared (see `keycloak/ct-demo-realm.json`). Once you supply real OAuth-app
-credentials for the ones you want, Keycloak's login page grows "Sign in with
-Google / GitHub / GitLab" buttons alongside the local account form — **no
+The `ct-demo` realm ships with **Google, GitHub, GitLab, and HAW GitLab**
+identity providers declared (see `keycloak/ct-demo-realm.json`), but not all of
+them show up on the public login page. Once you supply real OAuth-app
+credentials, **Google and GitHub** grow "Sign in with Google / GitHub" buttons
+on Keycloak's normal login page alongside the local account form — **no
 control-plane change**, and `#43`'s email-domain allow-list still gates access
-using whatever `email` the broker passes through (the providers set `trustEmail`).
+using whatever `email` the broker passes through (the providers set
+`trustEmail`).
+
+**GitLab** (the generic `gitlab.com`-style provider) is declared but currently
+**disabled** (`enabled: false`) on this deployment — flip it on in the admin
+console if you want it live.
+
+**HAW GitLab** (`git.haw-hamburg.de`) is deliberately **hidden from the public
+login page** (`hideOnLoginPage: true`) — it's an institution-scoped provider,
+not a general-audience option. It's only reachable via a direct link carrying
+`kc_idp_hint=haw-gitlab` (e.g. a dedicated landing page for that institution),
+which sends the browser straight to `/broker/haw-gitlab/login`, skipping
+Keycloak's normal provider-picker page entirely. Use this pattern for any
+future institution/partner-specific IdP you don't want showing to everyone.
 
 For each provider you want active, register an OAuth app on that platform and set
 its **redirect / callback URI** to Keycloak's broker endpoint:
@@ -124,6 +138,7 @@ https://<AUTH_PUBLIC_HOST>/realms/ct-demo/broker/<alias>/endpoint
 | Google | `google` | Google Cloud Console → APIs & Services → Credentials → OAuth client ID (Web) | `KC_GOOGLE_CLIENT_ID`, `KC_GOOGLE_CLIENT_SECRET` |
 | GitHub | `github` | GitHub → Settings → Developer settings → OAuth Apps → New | `KC_GITHUB_CLIENT_ID`, `KC_GITHUB_CLIENT_SECRET` |
 | GitLab | `gitlab` | GitLab → Preferences → Applications (scopes: `openid`, `email`, `profile`) | `KC_GITLAB_CLIENT_ID`, `KC_GITLAB_CLIENT_SECRET` |
+| HAW GitLab (`git.haw-hamburg.de`) | `haw-gitlab` | git.haw-hamburg.de → User Settings → Applications, Confidential, scopes `openid`, `profile`, `email` | `KC_HAW_GITLAB_CLIENT_ID`, `KC_HAW_GITLAB_CLIENT_SECRET` |
 
 Put the credentials in `docker/deploy/.env`, then redeploy (or restart Keycloak) —
 the realm import substitutes them via `${KC_*}`. A provider left with **empty**
