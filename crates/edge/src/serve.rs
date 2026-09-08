@@ -315,6 +315,36 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prepend<S> {
     }
 }
 
+/// A `route_host` miss's log line, upgraded when the diagnosis is actually known
+/// instead of a bare "no tunnel registered" (#795, found live: an owner's agent had
+/// 6 TCP-fallback slots parked and pinging for over two hours -- a genuinely live,
+/// authorized token -- yet never bound this hostname at all, because it wasn't
+/// running in browser mode; the bind-carrying `'B'/'L'/'F'` frames are a browser-mode-only
+/// thing, distinct from the Noise `'K'/'A'` frames that DO make an agent "registered"
+/// in every other sense). The control plane's own authorization (`host_auth`) already
+/// knows this hostname is real; cross-referencing it against the live agent-pool state
+/// turns "no tunnel registered" from a dead end into a one-line diagnosis of exactly
+/// which of the two very different causes (never authorized, vs. authorized-but-never-bound)
+/// actually applies -- without that, both looked identical to an operator reading logs.
+fn route_host_miss_reason(state: &EdgeState<Connection>, host: &str) -> String {
+    let Some(token) = state.authorized_token_for(host) else {
+        return format!("no tunnel registered for host '{host}' (not authorized either -- authorize-host never landed, or never granted)");
+    };
+    let parked = state.tcp_parked_for(&token);
+    let quic = state.registration_count(&token);
+    if parked > 0 || quic > 0 {
+        let mut tbuf = [0u8; 8];
+        format!(
+            "no tunnel registered for host '{host}': hostname authorized for token {} ({parked} fallback \
+             parked, {quic} QUIC registered, 0 bound hostnames) -- the agent never bound this hostname; \
+             not running in browser mode?",
+            token_hex(&token, &mut tbuf),
+        )
+    } else {
+        format!("no tunnel registered for host '{host}' (authorized, but no agent currently connected)")
+    }
+}
+
 pub async fn serve_sni_passthrough<S>(
     mut inbound: S,
     state: &EdgeState<Connection>,
@@ -333,7 +363,7 @@ where
     .ok_or("no SNI in the TLS ClientHello")?;
     let token = state
         .route_host(&sni)
-        .ok_or_else(|| format!("no tunnel registered for host '{sni}'"))?;
+        .ok_or_else(|| route_host_miss_reason(state, &sni))?;
     // #779: access window, evaluated locally from the pushed policy. On this
     // passthrough leg the edge never terminates TLS, so there is no page to show --
     // the connection is closed right after the ClientHello, the same refusal shape a
@@ -443,7 +473,7 @@ where
 {
     let token = state
         .route_host(host)
-        .ok_or_else(|| format!("no tunnel registered for host '{host}'"))?;
+        .ok_or_else(|| route_host_miss_reason(state, host))?;
     let tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, wildcard_acceptor.accept(inbound))
         .await
         .map_err(|_| -> BoxError { "gelb-terminate: TLS handshake not completed within the timeout (#422)".into() })??;
@@ -5983,6 +6013,41 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         let _ = server_task.await;
+    }
+
+    /// #795: a `route_host` miss used to be a dead end, one bare message regardless of
+    /// cause. Names the actual situation: never authorized at all, vs. authorized with a
+    /// live agent pool that simply never bound the hostname (the real #795 case -- an
+    /// agent not running in browser mode), vs. authorized with nothing currently connected.
+    #[test]
+    fn route_host_miss_reason_distinguishes_unauthorized_from_authorized_but_unbound_795() {
+        let state = EdgeState::<Connection>::new();
+
+        // Never authorized at all.
+        let unauth = route_host_miss_reason(&state, "unauth.test");
+        assert!(unauth.contains("not authorized either"), "{unauth}");
+
+        let token = RoutingToken([0x79; 32]);
+        state.authorize_host("site.test", token.clone());
+
+        // Authorized, but nothing connected yet.
+        let idle = route_host_miss_reason(&state, "site.test");
+        assert!(idle.contains("authorized, but no agent currently connected"), "{idle}");
+
+        // Authorized AND a live TCP-fallback pool -- the actual #795 symptom: parked
+        // agents, zero bound hostnames, because the agent never sent a bind frame.
+        let _rx1 = state.park_tcp_agent(token.clone());
+        let _rx2 = state.park_tcp_agent(token.clone());
+        let unbound = route_host_miss_reason(&state, "site.test");
+        assert!(unbound.contains("2 fallback parked"), "{unbound}");
+        assert!(unbound.contains("0 QUIC registered"), "{unbound}");
+        assert!(unbound.contains("not running in browser mode"), "{unbound}");
+        assert!(unbound.contains("79797979"), "names the token (first-4-bytes-hex convention): {unbound}");
+
+        // Once the hostname is actually bound, route_host itself succeeds --
+        // route_host_miss_reason is only ever consulted on the miss path.
+        state.register_host("site.test", token.clone()).unwrap();
+        assert_eq!(state.route_host("site.test"), Some(token));
     }
 
     #[tokio::test(start_paused = true)]
