@@ -1649,18 +1649,29 @@ mod tests {
             "the healthcheck must not probe :8080 (health 404s there on KC 25)"
         );
 
-        // #42 regression (bug 3): on the pinned :25.0 image the admin bootstrap
-        // env is KEYCLOAK_ADMIN[_PASSWORD]; the KC_BOOTSTRAP_ADMIN_* names are
-        // 26+ only and silently create no admin, blocking client-secret retrieval.
-        assert!(compose.contains("KEYCLOAK_ADMIN"), "uses the :25.0 admin bootstrap env names");
+        // #42 regression (bug 3), updated 2026-09-08 for the 25.0.6 -> 26.7.3 upgrade:
+        // the pinned image is 26+, where the admin bootstrap env is KC_BOOTSTRAP_ADMIN_*
+        // (KEYCLOAK_ADMIN[_PASSWORD] is now silently ignored). The compose still sets
+        // both pairs from the same .env values -- harmless on either Keycloak major
+        // version, and the real admin already exists in the persisted prod DB either
+        // way -- but the version-correct pair (KC_BOOTSTRAP_ADMIN_*) must be present,
+        // or a genuinely fresh/empty DB would boot with no admin and no way to fetch a
+        // client secret, exactly the failure mode this test originally guarded.
+        assert!(
+            !compose.contains(r#"image: quay.io/keycloak/keycloak:25."#),
+            "this guard's admin-bootstrap-var assertions below assume a 26+ image -- update both together if repinning to 25.x"
+        );
         // Check active (non-comment) lines only — a comment may still mention the
-        // wrong name to explain the pitfall.
+        // other name to explain the pitfall.
         let sets_bootstrap_admin = compose
             .lines()
-            .any(|l| l.trim().starts_with("KC_BOOTSTRAP_ADMIN"));
+            .any(|l| l.trim().starts_with("KC_BOOTSTRAP_ADMIN_USERNAME"))
+            && compose
+                .lines()
+                .any(|l| l.trim().starts_with("KC_BOOTSTRAP_ADMIN_PASSWORD"));
         assert!(
-            !sets_bootstrap_admin,
-            "KC_BOOTSTRAP_ADMIN_* is ignored on KC 25 — no admin gets created"
+            sets_bootstrap_admin,
+            "KC_BOOTSTRAP_ADMIN_USERNAME/_PASSWORD must be set -- KEYCLOAK_ADMIN[_PASSWORD] alone is silently ignored on 26+, leaving no admin user at all on a fresh DB"
         );
 
         // #48: Keycloak is reached through the edge :443 front door (auth route),
