@@ -1051,6 +1051,21 @@ pub(crate) const CHANNEL_PARK_TTL_SECS: u64 = 30;
 /// figure named in `docs/legal/privacy-policy.html` §9's evidentiary-record text.
 const AUDIT_LOG_DEFAULT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// CADS-Tunnel#775 item 1: default age-out for `EdgeState::age_out_stale_history`
+/// when `CT_EDGE_HISTORY_MAX_AGE_SECS` isn't set -- 30 days. Deliberately much
+/// longer than the audit log's own 7-day default above: this only prunes a dead
+/// token's in-memory byte/last-seen counters, not the durable per-session history
+/// (`tunnel_history.rs`, #776), so there is no compliance-evidence reason to keep
+/// it short -- the tradeoff is purely memory growth vs. how long a revoked/replaced
+/// tunnel's stale counters linger, and a month is generous either way.
+const HISTORY_MAX_AGE_DEFAULT_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn history_max_age_secs_from(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(HISTORY_MAX_AGE_DEFAULT_SECS)
+}
+
 /// #575: the first ct-agent release whose KA legs actually survive a long park.
 ///
 /// This number is the whole safety argument for raising `CT_EDGE_KA_PARK_TTL_SECS`, and it
@@ -3686,6 +3701,32 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             Err(_) => {
                                 eprintln!("ct-edge: #522 reaper tick panicked -- recovered, will retry in 10s (#775)");
                             }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // CADS-Tunnel#775 item 1: daily age-out of `tunnel_bytes`/`last_seen` entries
+    // for a token that's both stale (older than CT_EDGE_HISTORY_MAX_AGE_SECS, 30
+    // days by default) AND not currently live -- see `age_out_stale_history`'s own
+    // doc for why `connected_since` doesn't need this (already self-cleans).
+    // Daily, not #522's 10s cadence: this is a slow, unbounded-growth-over-months
+    // concern, not a correctness issue any single connection depends on.
+    {
+        let history_state = state.clone();
+        let history_shutdown = shutdown.clone();
+        let max_age = history_max_age_secs_from(std::env::var("CT_EDGE_HISTORY_MAX_AGE_SECS").ok().as_deref());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = history_shutdown.cancelled() => return,
+                    _ = tick.tick() => {
+                        let pruned = history_state.age_out_stale_history(unix_now(), max_age);
+                        if pruned > 0 {
+                            eprintln!("ct-edge: aged out {pruned} stale tunnel history entr(ies) (#775)");
                         }
                     }
                 }
