@@ -4735,6 +4735,27 @@ impl SqliteTunnelStore {
         )
     }
 
+    /// CADS-Tunnel#797: requeue any row that dead-ended at `claim_state='lapsed'`
+    /// *before* [`Self::lapse_expired_claims`]'s auto-requeue existed (#758) --
+    /// that fix only fires on a fresh expiry transition, so a row already sitting
+    /// at `lapsed` when the fix deployed is never touched again automatically.
+    /// Found live twice on the same account (2026-09-03, then again 2026-09-08)
+    /// as the "found by accident when a user complains" cycle this closes.
+    /// Same semantics as the auto-requeue: back of the FIFO queue, fresh
+    /// `queued_at`, skips anything the owner opted out of
+    /// (`cert_claim_opt_out`) exactly like [`Self::gelb_queue_fifo`] already
+    /// does. Idempotent and safe to call every sweep tick -- a steady state
+    /// with no legacy rows left is just a `0`-row update. Returns the number
+    /// of rows requeued.
+    pub fn requeue_legacy_lapsed_claims(&self, now: i64) -> rusqlite::Result<usize> {
+        self.writer.lock_safe().execute(
+            "UPDATE subject_tunnels
+             SET claim_state = 'none', queued_at = ?1
+             WHERE claim_state = 'lapsed' AND cert_claim_opt_out = 0",
+            params![now],
+        )
+    }
+
     /// Explicit customer re-request after a lapse (#233): back of the queue,
     /// fresh `queued_at`. Deliberately never preserves the old position --
     /// otherwise a customer who simply never claims could keep a permanent
@@ -9519,6 +9540,38 @@ mod tests {
 
         assert!(store.reclaim_cert_slot("alice", "a.example", 600).unwrap());
         assert_eq!(store.gelb_queue_fifo().unwrap(), vec!["b.example", "a.example"]);
+    }
+
+    #[test]
+    fn requeue_legacy_lapsed_claims_sweeps_pre_758_rows_but_skips_opted_out_ones() {
+        // CADS-Tunnel#797: `lapse_expired_claims`'s auto-requeue (#758) only fires on
+        // a fresh expiry transition -- a row already sitting at `lapsed` before that
+        // fix deployed is otherwise never touched again. Simulated directly, same as
+        // the `reclaim_cert_slot` legacy-row test above (no code path produces
+        // 'lapsed' anymore to drive it through naturally).
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        let b = store.create("alice", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "c", Some("c.example")).unwrap().created().expect("hostname is free in this test");
+        store.enter_gelb_queue("a.example", 100).unwrap();
+        store.enter_gelb_queue("b.example", 200).unwrap();
+        store.enter_gelb_queue("c.example", 300).unwrap();
+        store.set_lapsed_for_test("a.example").unwrap();
+        store.set_lapsed_for_test("b.example").unwrap();
+        // b opted out of claiming before it lapsed -- must stay parked, not requeued.
+        store.set_cert_claim_opt_out("alice", &b.id, true).unwrap();
+
+        assert_eq!(store.requeue_legacy_lapsed_claims(600).unwrap(), 1, "only a.example should be swept");
+        assert_eq!(store.gelb_queue_fifo().unwrap(), vec!["c.example", "a.example"], "c was already queued; a rejoins at the back");
+
+        let admission_a = store.cert_admission_for_hostname("a.example").unwrap().unwrap();
+        assert_eq!(admission_a.claim_state, "none");
+
+        let admission_b = store.cert_admission_for_hostname("b.example").unwrap().unwrap();
+        assert_eq!(admission_b.claim_state, "lapsed", "opted-out row must stay dead-ended, not requeued");
+
+        // Idempotent: a second sweep with nothing left to catch is a true no-op.
+        assert_eq!(store.requeue_legacy_lapsed_claims(700).unwrap(), 0);
     }
 
     #[test]

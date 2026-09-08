@@ -38,6 +38,15 @@ use serde::{Deserialize, Serialize};
 use crate::edge_mesh::SqliteEdgeMesh;
 use crate::storage::SqliteTunnelStore;
 
+/// CADS-Tunnel#797: rows requeued this run by the legacy-lapsed sweep (step 3b of
+/// `sweep_once`). Should stay `0` forever once every pre-#758 lapsed row has been
+/// swept exactly once; a nonzero total is only expected right after this fix first
+/// ships, or if `lapse_expired_claims`'s auto-requeue itself regresses. Logged on
+/// every nonzero tick (see step 3b) -- not currently surfaced on `/status`, since
+/// nothing else in this module is either; wire it in there too if it needs to be
+/// alertable beyond the log line.
+static LEGACY_LAPSED_REQUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How long a front-of-queue claim offer stays open before lapsing.
 const CLAIM_WINDOW_SECS: i64 = 48 * 3600;
 /// #467: the Gelb re-affirm sweep (step 2 of `sweep_once`) used to push every
@@ -569,6 +578,25 @@ async fn sweep_once(
     // should abort the tick on failure (#468's own carve-out).
     tunnels.lapse_expired_claims(now)?;
 
+    // 3b. CADS-Tunnel#797: catch any row that dead-ended at `claim_state='lapsed'`
+    // *before* step 3's auto-requeue existed (#758) -- that fix only fires on a
+    // fresh expiry transition, so a pre-existing lapsed row is otherwise never
+    // touched again automatically and just sits there until the owner notices and
+    // manually reclaims. Runs every tick (cheap, a single bulk statement, `0` rows
+    // in the steady state) rather than only at startup, so it also catches any
+    // lapsed row a bug elsewhere produces outside the normal expiry path.
+    let legacy_requeued = tunnels.requeue_legacy_lapsed_claims(now)?;
+    if legacy_requeued > 0 {
+        let total = LEGACY_LAPSED_REQUEUED.fetch_add(legacy_requeued as u64, std::sync::atomic::Ordering::Relaxed)
+            + legacy_requeued as u64;
+        eprintln!(
+            "ct-cp: acme_broker: requeued {legacy_requeued} legacy lapsed claim(s) this tick \
+             ({total} total) -- CADS-Tunnel#797. Expected only right after this fix first ships; \
+             a recurring nonzero count means something is producing `claim_state='lapsed'` rows \
+             outside the normal expiry path again."
+        );
+    }
+
     // 4. Admit as much of the FIFO queue as current CA headroom allows.
     // #468: `pick_ca`/`offer_claim`'s own `?`s fault-isolated per hostname --
     // a `None` (no CA has headroom) still correctly `break`s the queue scan;
@@ -922,6 +950,31 @@ mod tests {
         assert_eq!(a.status, "gelb");
         assert_eq!(a.claim_state, "offered");
         assert!(a.assigned_ca.is_some());
+    }
+
+    #[tokio::test]
+    async fn sweep_once_requeues_a_pre_existing_legacy_lapsed_row_and_it_gets_readmitted() {
+        // CADS-Tunnel#797: end-to-end through the real sweep tick, not just the
+        // storage method in isolation -- a legacy lapsed row must come all the way
+        // back around to a fresh CA offer within the same run, exactly as if the
+        // owner had clicked "reclaim" themselves.
+        let edge_mesh = SqliteEdgeMesh::open_in_memory().unwrap();
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        tunnels.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        tunnels.enter_gelb_queue("a.example", 100).unwrap();
+        tunnels.set_lapsed_for_test("a.example").unwrap();
+        assert_eq!(tunnels.cert_admission_for_hostname("a.example").unwrap().unwrap().claim_state, "lapsed");
+
+        let before = LEGACY_LAPSED_REQUEUED.load(std::sync::atomic::Ordering::Relaxed);
+        sweep_once(&tunnels, &edge_mesh, &None).await.unwrap();
+        assert_eq!(LEGACY_LAPSED_REQUEUED.load(std::sync::atomic::Ordering::Relaxed), before + 1);
+
+        let admission = tunnels.cert_admission_for_hostname("a.example").unwrap().unwrap();
+        assert_eq!(admission.claim_state, "offered", "readmitted and immediately offered a CA, budget is wide open");
+
+        // A second tick with nothing legacy left to catch doesn't bump the counter again.
+        sweep_once(&tunnels, &edge_mesh, &None).await.unwrap();
+        assert_eq!(LEGACY_LAPSED_REQUEUED.load(std::sync::atomic::Ordering::Relaxed), before + 1);
     }
 
     /// A minimal mock edge admin API recording every `authorize-host` call it receives:
