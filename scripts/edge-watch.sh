@@ -278,14 +278,26 @@ else
     # Edge-Neustart ist ein Stau normal, und eine Messung darin sagt nichts.
     PARK=$(printf '%s' "$MET" | awk '/^ct_edge_tcp_fallback_parked /{print $2}' | head -1)
     REAPED=$(printf '%s' "$MET" | awk '/^ct_edge_tcp_fallback_reaped_total /{print $2}' | head -1)
+    # #775: a direct liveness signal for the reaper tick loop itself, independent of
+    # whether there happened to be anything to reap this tick -- exactly the ambiguity
+    # the REAP_PREV heuristic below can't resolve on its own. A missing gauge means an
+    # edge older than #775 (fall through to the old heuristic unchanged); a present,
+    # small value is authoritative and overrides a flat reap counter.
+    REAPER_TICK_AGO=$(printf '%s' "$MET" | awk '/^ct_edge_tcp_fallback_reaper_last_tick_seconds_ago /{print $2}' | head -1)
     PARK_AGE=$(( $(date +%s) - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null)" +%s 2>/dev/null || date +%s) ))
     REAP_FILE="$STATE_DIR/tcp-reaped"
     REAP_PREV=$(cat "$REAP_FILE" 2>/dev/null || echo "")
     if [ -n "${PARK:-}" ] && [ "${PARK%.*}" -gt "$PARK_MAX" ]; then
       if [ "$PARK_AGE" -lt "$SETTLE" ]; then
         log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), aber der Edge lief erst ${PARK_AGE}s -- nach einem Neustart parken alle Agenten gleichzeitig neu. NICHT bewertet, kein Freispruch."
+      elif [ -n "${REAPER_TICK_AGO:-}" ] && [ "${REAPER_TICK_AGO%.*}" -lt 120 ]; then
+        log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), Reap-Zaehler steht still, ABER der Reaper-Heartbeat tickte vor ${REAPER_TICK_AGO%.*}s -- Reaper lebt nachweislich, nur nichts zu raeumen. Keine Leichen (#775)."
       elif [ -n "$REAP_PREV" ] && [ "${REAPED%.*}" -le "$REAP_PREV" ]; then
-        ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) -- das ist die Leichen-Signatur: der TCP-Park-Reaper raeumt nicht mehr (#522).")
+        if [ -n "${REAPER_TICK_AGO:-}" ]; then
+          ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) UND der Reaper-Heartbeat selbst ist ${REAPER_TICK_AGO%.*}s alt -- das ist die Leichen-Signatur, jetzt per Heartbeat bestaetigt: der TCP-Park-Reaper raeumt nicht mehr (#522/#775).")
+        else
+          ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) -- das ist die Leichen-Signatur: der TCP-Park-Reaper raeumt nicht mehr (#522). Kein Heartbeat-Gauge vorhanden (Edge aelter als #775) -- Redeploy wuerde eine sichere Unterscheidung ermoeglichen.")
+        fi
       elif [ -z "$REAP_PREV" ]; then
         log "Park-Gauge bei $PARK (Schwelle $PARK_MAX); ob Reaps fliessen, ist erst ab dem naechsten Lauf entscheidbar (kein Vorwert)."
       else
@@ -321,7 +333,21 @@ else
 
   # 4. refused-111-Signatur (#522). Nur das jüngste Fenster ansehen: die Zeilen
   #    sind der Beleg fuer eine Auslieferung an einen toten Park.
-  REFUSED=$(docker logs --since 15m "$CONTAINER" 2>&1 | grep -ciE "os error 111|connection refused|no live park" || true)
+  #    Gleiches Anlauffenster wie bei Check 3 (PARK_AGE): unmittelbar nach einem
+  #    Edge-Neustart loggt der Prozess selbst ein paar generische
+  #    "Connection refused (os error 111)"-Zeilen (Client-Abort waehrend des
+  #    eigenen Hochfahrens, nicht park-bezogen) -- 2026-09-09 real als Fehlalarm
+  #    beobachtet, zwei Zeilen exakt bei StartedAt+0.5s.
+  # Nicht nur "gerade eben neu gestartet" ausklammern, sondern das Anlauffenster
+  # aus dem 15-Minuten-Suchfenster HERAUSSCHNEIDEN, egal wie lange der Edge
+  # inzwischen schon laeuft -- sonst zaehlen Zeilen aus dem Anlaufen noch bis zu
+  # 15 Minuten nach dem Neustart mit (PARK_AGE allein wuerde das nur fuer die
+  # ersten $SETTLE Sekunden abdecken).
+  STARTED_EPOCH=$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null)" +%s 2>/dev/null || echo 0)
+  SETTLE_END_EPOCH=$(( STARTED_EPOCH > 0 ? STARTED_EPOCH + SETTLE : 0 ))
+  FIFTEEN_MIN_AGO_EPOCH=$(( $(date +%s) - 900 ))
+  REFUSED_SINCE_EPOCH=$(( SETTLE_END_EPOCH > FIFTEEN_MIN_AGO_EPOCH ? SETTLE_END_EPOCH : FIFTEEN_MIN_AGO_EPOCH ))
+  REFUSED=$(docker logs --since "@${REFUSED_SINCE_EPOCH}" "$CONTAINER" 2>&1 | grep -ciE "os error 111|connection refused|no live park" || true)
   [ "${REFUSED:-0}" -gt 0 ] && \
     ALARMS+=("$REFUSED Zeile(n) mit der refused-111-Signatur in den letzten 15 Minuten (Basiswert 0) -- Browser-Auslieferung an einen toten Park (#522).")
 
