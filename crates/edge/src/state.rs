@@ -2056,18 +2056,44 @@ impl<H: Clone> EdgeState<H> {
             .is_some_and(|v| !v.is_empty())
     }
 
+    /// #799 load-test finding (Expert Rust): how long a token whose TCP-fallback
+    /// pool has just gone empty still counts as resolvable. `park_tcp_agent`
+    /// refreshes `last_seen` on every re-park, but under a real burst
+    /// (many parallel client requests draining the pool faster than the Agent
+    /// re-parks) the pool can sit briefly empty between one slot's consumption
+    /// and the next park -- a single-hop dial+TLS+register, well under a
+    /// second on a healthy path. Without this grace window, a fallback-only
+    /// token (never QUIC-registered, so `is_known` is false) failed
+    /// `is_resolvable` on exactly that gap and the 'C' admission arms
+    /// fast-failed with "unknown routing token" instead of reaching the
+    /// bounded deliver wait (`wait_for_tcp_agent`) that would have caught the
+    /// replacement park moments later. Reproduced: 24/30 immediate misses
+    /// against a pool of 6 under 30 concurrent clients.
+    const TCP_FALLBACK_RESOLVABLE_GRACE_SECS: u64 = 2;
+
     /// Whether `token` resolves to *any* registered Agent -- QUIC
-    /// ([`Self::is_known`]) or TCP-fallback ([`Self::has_tcp_agent`]) (#472).
-    /// This is the admission gate the rendezvous ('C') paths must run
-    /// **before** [`Self::rendezvous_allowed`]: the rate limiter is keyed on
-    /// the routing token the Client itself supplies, so a flooder rotating
-    /// random tokens got a fresh limiter budget and a fresh map entry on
-    /// every attempt when the limiter was checked first -- the per-token cap
-    /// never actually engaged against that attack shape. Gating on this
-    /// first means only tokens that resolve to a real tunnel ever occupy a
-    /// limiter slot; an unresolvable token is rejected outright.
+    /// ([`Self::is_known`]), a currently-parked TCP-fallback slot
+    /// ([`Self::has_tcp_agent`]), or one that was parked within the last
+    /// [`Self::TCP_FALLBACK_RESOLVABLE_GRACE_SECS`] (#472/#799). This is the
+    /// admission gate the rendezvous ('C') paths must run **before**
+    /// [`Self::rendezvous_allowed`]: the rate limiter is keyed on the routing
+    /// token the Client itself supplies, so a flooder rotating random tokens
+    /// got a fresh limiter budget and a fresh map entry on every attempt when
+    /// the limiter was checked first -- the per-token cap never actually
+    /// engaged against that attack shape. Gating on this first means only
+    /// tokens that resolve to a real tunnel ever occupy a limiter slot.
+    /// #472's invariant still holds with the grace window: `last_seen` only
+    /// has an entry for a token that has genuinely registered or parked at
+    /// least once, so an attacker's never-seen random token gets no entry at
+    /// all and is rejected exactly as before -- the window only extends
+    /// resolvability for a token that was legitimately live moments ago, and
+    /// it correctly ages back out to unresolvable once truly abandoned.
     pub fn is_resolvable(&self, token: &RoutingToken) -> bool {
-        self.is_known(token) || self.has_tcp_agent(token)
+        self.is_known(token)
+            || self.has_tcp_agent(token)
+            || self.last_seen.lock_safe().get(token).is_some_and(|&last_seen| {
+                Self::wall_now().saturating_sub(last_seen) <= Self::TCP_FALLBACK_RESOLVABLE_GRACE_SECS
+            })
     }
 }
 
@@ -3238,6 +3264,62 @@ mod tests {
         assert!(
             !state.is_resolvable(&unknown_token),
             "a token with no registration on either transport is not resolvable"
+        );
+    }
+
+    #[test]
+    fn is_resolvable_stays_true_in_the_grace_window_after_the_last_tcp_fallback_slot_drains_799() {
+        // #799 load-test finding: a fallback-only token (never QUIC-registered)
+        // must not fast-fail `is_resolvable` the instant its pool of parked
+        // slots hits zero -- the Agent re-parks within a single dial+TLS+
+        // register round trip, and the bounded deliver wait exists exactly to
+        // cover that gap. Before this fix, draining the only parked slot made
+        // `is_resolvable` false immediately (neither `is_known` nor
+        // `has_tcp_agent` held), even though the token had just parked.
+        let state: EdgeState<u32> = EdgeState::new();
+        let fallback_only = token(23);
+
+        let _rx = state.park_tcp_agent_unless_revoked(fallback_only.clone());
+        assert!(state.has_tcp_agent(&fallback_only), "one slot parked");
+
+        let stream: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(
+            state.deliver_to_tcp_agent(&fallback_only, stream).is_ok(),
+            "the one parked slot delivers"
+        );
+        assert!(!state.has_tcp_agent(&fallback_only), "the pool is now empty");
+        assert!(!state.is_known(&fallback_only), "never QUIC-registered");
+
+        assert!(
+            state.is_resolvable(&fallback_only),
+            "a token parked moments ago must stay resolvable through the grace window, \
+             not fast-fail the instant its pool empties"
+        );
+    }
+
+    #[test]
+    fn is_resolvable_ages_back_out_once_the_grace_window_passes_799() {
+        // The other half of the #472 invariant this grace window must preserve:
+        // it only extends resolvability for a token that was GENUINELY live
+        // recently, and it must correctly expire, not turn into a permanent
+        // "once seen, forever resolvable" loophole a flooder could exploit by
+        // parking once and then rotating.
+        let state: EdgeState<u32> = EdgeState::new();
+        let stale_token = token(24);
+
+        // Simulate `park_tcp_agent`'s `note_connected` call, but with a
+        // `last_seen` timestamp already outside the grace window -- same
+        // private method the production park path uses, called directly
+        // since this test lives in the same module.
+        let long_ago = EdgeState::<u32>::wall_now()
+            .saturating_sub(EdgeState::<u32>::TCP_FALLBACK_RESOLVABLE_GRACE_SECS + 1);
+        state.note_connected(&stale_token, long_ago, crate::tunnel_history::TRANSPORT_TCP_FALLBACK);
+
+        assert!(!state.has_tcp_agent(&stale_token), "nothing currently parked");
+        assert!(!state.is_known(&stale_token), "never QUIC-registered");
+        assert!(
+            !state.is_resolvable(&stale_token),
+            "a token last seen outside the grace window must not stay resolvable forever"
         );
     }
 
