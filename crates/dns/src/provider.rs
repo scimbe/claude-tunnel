@@ -36,13 +36,36 @@ use crate::store::AcmeDnsStore;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 2026-09-09, real production failure: this #486 comment's own reasoning was
+/// wrong for one of its two callers. `RemoteAgentDns01Client::publish` calls
+/// `/agent/dns01-challenge`, whose handler holds the connection open for the
+/// FULL [`crate::convergence::DEFAULT_TIMEOUT`] (300s) waiting for deSEC
+/// convergence before responding -- confirmed live (a real publish took
+/// 2m27s and returned 200). `REQUEST_TIMEOUT` (10s) is nowhere near "well
+/// under" that budget for this specific call; it is the exact call the
+/// convergence wait blocks on, so the 10s client timeout fired on every
+/// single attempt, every retry started a fresh ACME order (a new nonce, so
+/// a new TXT value/convergence key -- no propagation progress carries over
+/// between attempts), and DNS-01 issuance via this path could never
+/// actually succeed once convergence took longer than 10s (routine per
+/// #229's own doc comment: "measured up to 152s to fully converge"). Give
+/// this one caller its own timeout sized to the budget it actually waits
+/// on, with margin for the surrounding request/response overhead --
+/// `DesecClient` (a fast, direct API call with no convergence wait inside
+/// it) keeps the original 10s via `http_client()` below, unaffected.
+const REMOTE_AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(320);
+
 /// Shared client construction for both HTTP-backed DNS-01 clients (#486): an
 /// explicit connect timeout and overall request timeout, so a stalling
 /// provider endpoint can never hang an awaited call forever.
 fn http_client() -> reqwest::Client {
+    http_client_with_timeout(REQUEST_TIMEOUT)
+}
+
+fn http_client_with_timeout(request_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(request_timeout)
         .build()
         // `build()` only fails for a malformed static config (e.g. a bad TLS
         // backend setup) -- never a runtime condition -- so a fixed, always-valid
@@ -123,7 +146,11 @@ impl RemoteAgentDns01Client {
     /// hostname via host-authorization, so the control plane's ownership
     /// check (`edge_mesh::token_owns_hostname`) accepts it.
     pub fn new(cp_url: impl Into<String>, routing_token: impl Into<String>) -> Self {
-        Self { cp_url: cp_url.into(), routing_token: routing_token.into(), http: http_client() }
+        Self {
+            cp_url: cp_url.into(),
+            routing_token: routing_token.into(),
+            http: http_client_with_timeout(REMOTE_AGENT_REQUEST_TIMEOUT),
+        }
     }
 
     /// Recover the bare hostname from a full `_acme-challenge.<hostname>`
@@ -584,10 +611,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_hung_control_plane_times_out_for_the_agent_side_client_too_486() {
         // #486: the second of the two HTTP clients this issue names --
-        // RemoteAgentDns01Client -- had exactly the same gap. Same proof shape.
+        // RemoteAgentDns01Client -- had exactly the same "never times out" gap.
+        // Same proof shape, but the expected duration changed 2026-09-09 (see
+        // REMOTE_AGENT_REQUEST_TIMEOUT's own doc comment): this client's own
+        // endpoint (`/agent/dns01-challenge`) legitimately blocks for up to
+        // convergence::DEFAULT_TIMEOUT (300s) on a real, successful call, so a
+        // 10s ceiling here was actively wrong -- it fired on every genuine
+        // slow-but-working convergence, not just on a truly hung server. Uses
+        // tokio's paused virtual clock (real elapsed test time stays ~instant)
+        // so this can assert the FULL ~320s ceiling without a real 5+ minute
+        // test run, same pattern already used elsewhere in this crate
+        // (convergence.rs, server.rs) for exactly this reason.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -598,14 +635,21 @@ mod tests {
         let client = RemoteAgentDns01Client::new(format!("http://{addr}"), "deadbeef");
         let provider = Dns01Provider::RemoteAgent(client);
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let result = provider.set_txt("_acme-challenge.app.example.com", "tok").await;
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "a hung control plane must surface as an error, not hang forever");
         assert!(
-            elapsed < Duration::from_secs(15),
-            "must time out around the configured 10s request timeout, not hang indefinitely (took {elapsed:?})"
+            elapsed >= Duration::from_secs(300),
+            "must NOT fire at the old 10s ceiling -- the real endpoint routinely takes longer than \
+             that on a genuinely successful call (2m27s observed live 2026-09-09), so this client's \
+             timeout must cover the full convergence budget, not undercut it (fired after {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(330),
+            "must still time out eventually, around REMOTE_AGENT_REQUEST_TIMEOUT (320s), not hang \
+             indefinitely (took {elapsed:?})"
         );
     }
 
