@@ -3667,9 +3667,25 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 tokio::select! {
                     _ = reaper_shutdown.cancelled() => return,
                     _ = tick.tick() => {
-                        let reaped = reaper_state.reap_dead_tcp_parks();
-                        if reaped > 0 {
-                            eprintln!("ct-edge: reaped {reaped} dead TCP-fallback park(s) (#522)");
+                        // #775: record the tick FIRST, unconditionally -- this is the only
+                        // liveness signal that survives a panic in reap_dead_tcp_parks below
+                        // (tcp_reaped_total alone can't tell "alive, nothing to reap" apart
+                        // from "the tick loop died"; found live 2026-09-08 with the gauge at
+                        // 94 and the reap counter flat for 20+ minutes -- genuinely ambiguous
+                        // without this).
+                        reaper_state.note_reap_tick(unix_now());
+                        // Catch a panic here rather than let it silently kill this detached
+                        // task forever (no supervisor restarts a bare tokio::spawn) --
+                        // EdgeState's own lock_safe() already tolerates a poisoned mutex, so
+                        // recovering here and ticking again in 10s is safe.
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reaper_state.reap_dead_tcp_parks())) {
+                            Ok(reaped) if reaped > 0 => {
+                                eprintln!("ct-edge: reaped {reaped} dead TCP-fallback park(s) (#522)");
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                eprintln!("ct-edge: #522 reaper tick panicked -- recovered, will retry in 10s (#775)");
+                            }
                         }
                     }
                 }
