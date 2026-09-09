@@ -1456,6 +1456,41 @@ impl<H: Clone> EdgeState<H> {
         reaped
     }
 
+    /// CADS-Tunnel#775 item 1: age out `tunnel_bytes`/`last_seen` entries for a token
+    /// that hasn't been seen in `max_age_secs` AND isn't currently live -- both maps'
+    /// own doc comments note they are otherwise "never removed", so over months of
+    /// uptime they grow by one entry per distinct routing token the operator has ever
+    /// provisioned and later revoked/replaced, unbounded. `connected_since` is NOT
+    /// touched here: it already self-cleans on disconnect (removed the moment the last
+    /// live registration for a token drops), so it was never actually unbounded the
+    /// way the other two are -- the original survey item's own file:line citations
+    /// covered all three, but only two need this sweep.
+    ///
+    /// A currently-live token (`is_known` or `has_tcp_agent`) is never pruned
+    /// regardless of its `last_seen` age -- that can only lag behind "now" for an
+    /// agent that registered once and has been relaying quietly ever since, which is
+    /// exactly the case this must not disturb. Returns how many tokens were pruned
+    /// (from `last_seen`; `tunnel_bytes` may prune fewer of those same tokens, since
+    /// not every token that registered ever actually relayed a byte).
+    pub fn age_out_stale_history(&self, now: u64, max_age_secs: u64) -> u64 {
+        let stale: Vec<RoutingToken> = self
+            .last_seen
+            .lock_safe()
+            .iter()
+            .filter(|(token, &seen)| {
+                now.saturating_sub(seen) > max_age_secs && !self.is_known(token) && !self.has_tcp_agent(token)
+            })
+            .map(|(token, _)| token.clone())
+            .collect();
+        let mut last_seen = self.last_seen.lock_safe();
+        let mut tunnel_bytes = self.tunnel_bytes.lock_safe();
+        for token in &stale {
+            last_seen.remove(token);
+            tunnel_bytes.remove(token);
+        }
+        stale.len() as u64
+    }
+
     /// Wait up to `timeout` for a TCP-fallback registration to appear for
     /// `token`, returning `true` as soon as one does (or immediately, if one
     /// is already parked) and `false` if `timeout` elapses first. For a
@@ -3149,6 +3184,47 @@ mod tests {
         state.note_reap_tick(1_015);
         assert_eq!(state.reap_tick_secs_ago(1_015), Some(0), "fresh tick resets the age");
     }
+
+    #[test]
+    fn age_out_stale_history_prunes_only_a_dead_tokens_old_entries_775() {
+        // CADS-Tunnel#775 item 1: tunnel_bytes/last_seen otherwise grow forever, one
+        // entry per distinct routing token the operator has ever provisioned.
+        let state: EdgeState<u32> = EdgeState::new();
+
+        // A token that relayed once, long ago, and is not registered on either
+        // transport right now -- exactly the case that must age out.
+        let dead = token(50);
+        state.note_relay(&dead, 10, 20, RelayKind::DataPlane);
+        let long_ago = EdgeState::<u32>::wall_now().saturating_sub(100);
+        state.note_connected(&dead, long_ago, crate::tunnel_history::TRANSPORT_TCP_FALLBACK);
+
+        // A token seen just as long ago, but STILL currently registered (QUIC) --
+        // must survive regardless of how stale last_seen looks.
+        let quiet_but_live = token(51);
+        state.register(quiet_but_live.clone(), 1u32);
+        state.note_connected(&quiet_but_live, long_ago, crate::tunnel_history::TRANSPORT_QUIC);
+
+        // A token seen recently -- must survive, it isn't old enough yet.
+        let recent = token(52);
+        state.note_relay(&recent, 1, 1, RelayKind::DataPlane);
+
+        assert_eq!(
+            state.age_out_stale_history(EdgeState::<u32>::wall_now(), 50),
+            1,
+            "only the dead, truly-stale token is pruned"
+        );
+
+        let (_since, seen) = state.connection_timing(&dead);
+        assert!(seen.is_none(), "dead token's last_seen is gone");
+        assert_eq!(state.tunnel_bytes(&dead), (0, 0), "dead token's byte counters are gone too");
+
+        let (_since, seen) = state.connection_timing(&quiet_but_live);
+        assert!(seen.is_some(), "still-registered token's last_seen survives despite its age");
+
+        let (_since, seen) = state.connection_timing(&recent);
+        assert!(seen.is_some(), "recently-seen token is untouched");
+    }
+
     #[tokio::test]
     async fn deliver_draining_consumes_dead_slots_and_hands_back_when_none_live_510() {
         // #510: the drain loop (#505) lived inline on the primary serve paths only;
