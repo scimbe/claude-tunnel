@@ -6386,16 +6386,16 @@ this.textContent=willExpand?'Collapse all':'Expand all';
     let body = format!(
         r#"<h1>Your tunnels</h1>
 {quota_bar}
+{create_form}
+<p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
+assigned hostname (e.g. <code>site-a1b2c3d4.bunsenbrenner.org</code>) &mdash; already set up for
+you below, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
 {search_box}
 {toggle_all}
 <div class="tunnel-grid">
 {rows}
 </div>
 {topology_select_script}
-<p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
-assigned hostname (e.g. <code>site-a1b2c3d4.bunsenbrenner.org</code>) &mdash; already set up for
-you above, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
-{create_form}
 <h2>Next steps</h2>
 <ol class="steps">
  <li>Click <strong>Install</strong> on your tunnel above to get its tokens.</li>
@@ -9963,6 +9963,27 @@ mod tests {
         assert!(
             html.contains("You're using 1 of 2 tunnels included in your plan"),
             "accurate real-numbers copy: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_shows_the_create_form_above_the_tunnel_list_515() {
+        // #515: a first-time visitor previously had to scroll past the quota bar,
+        // search box, and the whole tunnel grid to find "Create another tunnel" --
+        // moved it directly under the quota bar instead, right where the account's
+        // plan-gating (owned/max) is already visible.
+        let app = test_app();
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Look for the actual elements in the body, not their class names --
+        // both also appear earlier, in the page's own <style> block.
+        let quota_at = html.find(r#"<div class="quota-bar">"#).expect("quota bar renders");
+        let create_form_at = html.find("Create another tunnel").expect("create form renders");
+        let grid_at = html.find(r#"<div class="tunnel-grid">"#).expect("tunnel grid renders");
+        assert!(
+            quota_at < create_form_at && create_form_at < grid_at,
+            "expected order quota bar -> create form -> tunnel grid, got quota={quota_at} create_form={create_form_at} grid={grid_at}: {html}"
         );
     }
 
